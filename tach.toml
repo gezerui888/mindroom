@@ -7898,6 +7898,7 @@ expose = [
     "owned_table",
     "insert_run_row",
     "upsert_run_at_end",
+    "session_run_rows",
     "run_deletion_transaction",
     "cached_run_counts",
 ]

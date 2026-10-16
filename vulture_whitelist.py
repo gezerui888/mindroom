@@ -118,6 +118,7 @@ _.async_get_embeddings_batch_and_usage  # unused method (src/mindroom/embeddings
 _.embed  # mem0 embedding adapter protocol (src/mindroom/memory/config.py)
 _.embed_batch  # mem0 embedding adapter protocol (src/mindroom/memory/config.py)
 _._handle_vector_db_insert  # Agno insertion callback override (src/mindroom/knowledge/strict_knowledge.py)
+_._get_session_run_rows  # Agno session read override that feeds its run cache (src/mindroom/session_storage/agent_storage.py)
 _.generate_image  # Agno toolkit override (src/mindroom/custom_tools/gemini_media.py)
 _.cache_results  # disables Agno's tool result cache, which would skip hooks and approval (src/mindroom/mcp_gateway/tools.py, src/mindroom/scheduling/scheduled_tool_calls.py, src/mindroom/script_runs/broker.py, src/mindroom/tool_system/agent_tool_calls.py)
 _.to_config_dict  # used by scripts/sync_config.py (src/mindroom/model_defaults.py)

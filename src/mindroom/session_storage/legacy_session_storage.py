@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from agno.run.team import TeamRunOutput
+from sqlalchemy import Text, and_, case, func
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable
 
     from agno.run.agent import RunOutput
-    from sqlalchemy import Table
+    from sqlalchemy import ColumnElement, Table
     from sqlalchemy.orm import Session
 
 # LEGACY_COMPAT: Agno 2 session history stored in JSON run blobs.
@@ -92,11 +93,30 @@ def _string_field(entry: object, key: str) -> str | None:
 
 # LEGACY_COMPAT: Run metadata carrying a copy of every model-visible tool schema.
 # Legacy format: Run rows whose `metadata` holds a `tools_schema` list of tool definitions, written with every run.
-# Last legacy release: v2026.10.281; replacement: the unreleased run metadata omits tool schemas.
-# Handling: Each loaded run, including member responses embedded in a paused team run, drops the key, so cached and
-# replayed runs stop holding the schemas; rows written by current releases omit it.
+# Last legacy release: v2026.10.281; replacement: v2026.10.282, whose run metadata omits tool schemas.
+# Handling: Agent session reads remove the key in SQLite before Python parses a row, so the copy is never decoded;
+# rows without it, or that are not strict JSON, keep their exact text. Each loaded run, including member responses
+# embedded in a paused team run, also drops the key, so cached and replayed runs stop holding the schemas on every
+# read path; rows written by current releases omit it.
 # Coverage: tests/test_agent_storage_runs.py::test_loaded_runs_drop_their_stored_tool_schemas,
+# tests/test_agent_storage_runs.py::test_session_reads_remove_stored_tool_schemas_before_parsing,
 # tests/test_agent_storage_runs.py::test_loaded_team_runs_drop_tool_schemas_of_embedded_member_responses.
+def run_text_without_tool_schemas(run_data: ColumnElement[Any]) -> ColumnElement[str]:
+    """Select stored run text with the tool-schema copy removed by SQLite instead of by Python after parsing.
+
+    Rows that do not mention the key, or that hold values only JSON5 allows, such as ``NaN``, which SQLite would
+    rewrite as ``null``, come back unchanged.
+    """
+    text = run_data.cast(Text)
+    return case(
+        (
+            and_(func.instr(text, '"tools_schema"') > 0, func.json_valid(text) == 1),
+            func.json_remove(text, "$.metadata.tools_schema", type_=Text),
+        ),
+        else_=text,
+    )
+
+
 def drop_run_tool_schemas(runs: Iterable[RunOutput | TeamRunOutput]) -> None:
     """Drop the per-run tool schema copy that older releases stored in run metadata."""
     for run in runs:

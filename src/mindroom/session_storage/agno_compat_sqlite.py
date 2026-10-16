@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from agno.run.agent import RunOutput
     from agno.run.team import TeamRunOutput
     from agno.run.workflow import WorkflowRunOutput
-    from sqlalchemy import Engine, Row, Table
+    from sqlalchemy import ColumnElement, Engine, Row, Table
     from sqlalchemy.orm import Session
 
 _CONNECT_LISTENER_NAME = "_set_sqlite_pragmas"
@@ -129,6 +129,29 @@ def upsert_run_at_end(
                 usage_upsert_sql(db.session_table_name),
                 (stored.session_id, stored.run_id, json.dumps(payload)),
             )
+
+
+# AGNO_COMPAT: Cached session reads parse each stored run's whole text.
+# Reason: Agno 3.0.9's agent-session read selects every run's raw `run_data` for its run cache, which parses each
+# changed row with `json.loads`, so stored data the owner drops after loading still costs a full parse and its objects.
+# Upstream issue: Tracking gap; no matching issue identified.
+# Upstream PR: None identified.
+# Remove when: Agno lets the adapter choose the run text its cached session read selects, or no stored rows hold data
+# the owner drops on load; keep Agno's row order. The select below is copied from `SqliteDb._get_session_run_rows`.
+# Coverage: tests/test_agent_storage_runs.py::test_session_reads_remove_stored_tool_schemas_before_parsing.
+def session_run_rows(
+    session: Session,
+    runs_table: Table,
+    session_id: str,
+    run_text: ColumnElement[str],
+) -> list[tuple[str, str]]:
+    """Return one session's ordered (run_id, run text) rows for Agno's run cache, selecting ``run_text``."""
+    statement = (
+        select(runs_table.c.run_id, run_text)
+        .where(runs_table.c.session_id == session_id)
+        .order_by(runs_table.c.run_index.asc(), runs_table.c.created_at.asc(), runs_table.c.run_id.asc())
+    )
+    return [(run_id, text) for run_id, text in session.execute(statement).tuples()]
 
 
 # AGNO_COMPAT: Run deletion and legacy-blob cleanup are not atomic.

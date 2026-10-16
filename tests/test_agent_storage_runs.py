@@ -19,6 +19,7 @@ from agno.run.team import TeamRunOutput
 from agno.session.agent import AgentSession
 from agno.session.summary import SessionSummary
 from agno.session.team import TeamSession
+from sqlalchemy import Text, select
 
 from mindroom.session_storage.agent_storage import (
     create_state_storage,
@@ -126,6 +127,33 @@ def test_loaded_runs_drop_their_stored_tool_schemas(tmp_path: Path) -> None:
 
     assert loaded is not None
     assert [loaded_run.metadata for loaded_run in loaded.runs or []] == [{"room_id": "!room:example.test"}]
+
+
+def test_session_reads_remove_stored_tool_schemas_before_parsing(tmp_path: Path) -> None:
+    """SQLite drops the stored copy before Python parses a run; other rows reach Python byte for byte."""
+    schema = [{"name": "demo", "description": "Demo"}]
+    legacy = _run("s1", "r1")
+    legacy.metadata = {"room_id": "!room:example.test", "tools_schema": schema}
+    current = _run("s1", "r2")
+    # SQLite would rewrite NaN as null, so a row that is not strict JSON keeps its text and loses the copy in Python.
+    not_strict = _run("s1", "r3")
+    not_strict.metadata = {"score": float("nan"), "tools_schema": schema}
+    storage = _storage(tmp_path)
+    try:
+        storage.upsert_session(_session("s1", []))
+        for index, run in enumerate((legacy, current, not_strict)):
+            storage.upsert_run(run=run, session_id="s1", user_id="@alice:example.test", run_index=index)
+        runs = storage._get_table(table_type="runs")
+        with storage.Session() as session:
+            stored = dict(session.execute(select(runs.c.run_id, runs.c.run_data.cast(Text))).tuples().all())
+            read = dict(storage._get_session_run_rows(sess=session, runs_table=runs, session_id="s1"))
+    finally:
+        storage.close()
+
+    assert list(read) == ["r1", "r2", "r3"]
+    assert json.loads(read["r1"])["metadata"] == {"room_id": "!room:example.test"}
+    assert read["r2"] == stored["r2"]
+    assert read["r3"] == stored["r3"]
 
 
 def test_loaded_team_runs_drop_tool_schemas_of_embedded_member_responses(tmp_path: Path) -> None:

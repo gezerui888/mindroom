@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agno.agent import Agent
 from agno.db.base import SessionType
@@ -82,6 +82,46 @@ def test_persist_response_event_id_keeps_assistant_history_plain(tmp_path: Path)
         assert persisted_run.messages[-1].content == "Final answer"
     finally:
         storage.close()
+
+
+def test_persist_response_event_id_reads_only_the_linked_run(tmp_path: Path) -> None:
+    """Linking a response rewrites its own run without loading the rest of the conversation."""
+    runs = [
+        RunOutput(run_id=run_id, agent_id="test_agent", session_id="session-1", content=run_id)
+        for run_id in ("run-1", "run-2")
+    ]
+    storage = create_state_storage("test_agent", tmp_path, subdir="sessions", session_table="test_agent_sessions")
+    seed_session(
+        storage,
+        AgentSession(session_id="session-1", agent_id="test_agent", runs=runs, created_at=1, updated_at=1),
+    )
+    writer = ConversationStateWriter(
+        ConversationStateWriterDeps(
+            runtime=MagicMock(),
+            logger=MagicMock(),
+            runtime_paths=test_runtime_paths(tmp_path),
+            agent_name="test_agent",
+        ),
+    )
+
+    try:
+        with patch.object(storage, "get_session", side_effect=AssertionError("loaded the whole session")):
+            writer._persist_response_event_id_in_session_run(
+                storage=storage,
+                session_id="session-1",
+                session_type=SessionType.AGENT,
+                run_id="run-2",
+                response_event_id="$answer",
+            )
+        persisted = get_agent_session(storage, "session-1")
+    finally:
+        storage.close()
+
+    assert persisted is not None
+    assert [(run.run_id, run.metadata) for run in persisted.runs or []] == [
+        ("run-1", None),
+        ("run-2", {MATRIX_RESPONSE_EVENT_ID_METADATA_KEY: "$answer"}),
+    ]
 
 
 def test_private_ad_hoc_team_history_scope_is_requester_partitioned(tmp_path: Path) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -18,10 +17,8 @@ from mindroom.history.types import HistoryScope
 from mindroom.runtime_protocols import SupportsConfig  # noqa: TC001
 from mindroom.session_storage.agent_storage import (
     create_session_storage,
-    get_agent_session,
-    get_team_session,
     run_session_storage_operation,
-    save_runs,
+    save_run,
 )
 
 if TYPE_CHECKING:
@@ -125,25 +122,18 @@ class ConversationStateWriter:
         run_id: str,
         response_event_id: str,
     ) -> None:
-        """Persist Matrix response linkage onto the run that produced it."""
-        session = (
-            get_team_session(storage, session_id)
-            if session_type is SessionType.TEAM
-            else get_agent_session(storage, session_id)
-        )
-        if session is None or not session.runs:
+        """Persist Matrix response linkage onto the run that produced it, reading and writing only that run."""
+        run = storage.get_run(run_id)
+        if not isinstance(run, TeamRunOutput if session_type is SessionType.TEAM else RunOutput):
             return
-        for run in session.runs:
-            if not isinstance(run, (RunOutput, TeamRunOutput)) or run.run_id != run_id:
-                continue
-            metadata = dict(run.metadata or {})
-            if metadata.get(MATRIX_RESPONSE_EVENT_ID_METADATA_KEY) == response_event_id:
-                return
-            metadata[MATRIX_RESPONSE_EVENT_ID_METADATA_KEY] = response_event_id
-            linked_run = copy(run)
-            linked_run.metadata = metadata
-            save_runs(storage, session, [linked_run])
+        if run.session_id != session_id:
             return
+        metadata = dict(run.metadata or {})
+        if metadata.get(MATRIX_RESPONSE_EVENT_ID_METADATA_KEY) == response_event_id:
+            return
+        metadata[MATRIX_RESPONSE_EVENT_ID_METADATA_KEY] = response_event_id
+        run.metadata = metadata
+        save_run(storage, session_id, run)
 
     async def apersist_response_event_id_in_session_run(
         self,

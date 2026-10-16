@@ -67,6 +67,7 @@ from mindroom.legacy_revision_replay import summary_depends_on_source
 from mindroom.logging_config import get_logger
 from mindroom.session_storage.agent_storage import (
     get_agent_session,
+    get_session_without_runs,
     get_team_session,
     replace_runs,
     runs_without,
@@ -258,7 +259,23 @@ def consume_pending_force_compaction_scope(
     return True
 
 
-def has_pending_force_compaction_scope(
+def has_queued_force_compaction(
+    storage: BaseDb,
+    session_id: str,
+    session_type: SessionType,
+    scope: HistoryScope,
+) -> bool:
+    """Return whether one scope should compact before its next run, reading the session row but none of its runs."""
+    session = get_session_without_runs(storage, session_id, session_type)
+    if session is None:
+        return False
+    return read_scope_state(session, scope).force_compact_before_next_run or _has_pending_force_compaction_scope(
+        session,
+        scope,
+    )
+
+
+def _has_pending_force_compaction_scope(
     session: AgentSession | TeamSession,
     scope: HistoryScope,
 ) -> bool:

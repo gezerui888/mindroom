@@ -68,6 +68,7 @@ __all__ = [
     "delete_run_subtrees",
     "get_agent_runtime_state_dbs",
     "get_agent_session",
+    "get_session_without_runs",
     "get_team_session",
     "load_agent_session",
     "replace_runs",
@@ -75,6 +76,7 @@ __all__ = [
     "runs_without",
     "save_compaction_usage",
     "save_independent_usage",
+    "save_run",
     "save_runs",
 ]
 
@@ -518,10 +520,7 @@ def save_runs(
         msg = "save_runs received a run object loaded from the session; edit a copy instead"
         raise ValueError(msg)
     for run in runs:
-        if isinstance(storage, _ConversationSqliteDb):
-            storage.upsert_run(run=run, session_id=session.session_id, user_id=run.user_id, record_usage=False)
-        else:
-            storage.upsert_run(run=run, session_id=session.session_id, user_id=run.user_id)
+        save_run(storage, session.session_id, run)
     replacements: dict[str, RunOutput | TeamRunOutput] = {run.run_id: run for run in runs if run.run_id}
     merged: list[Any] = []
     for existing in session.runs or []:
@@ -582,10 +581,33 @@ def _run_without_prompt_messages(run: _PersistedRun, prompt_roles: frozenset[str
     return sanitized_run
 
 
+def save_run(storage: BaseDb, session_id: str, run: RunOutput | TeamRunOutput) -> None:
+    """Write one conversation-only run change without loading its session; the usage rule is ``save_runs``'s."""
+    if isinstance(storage, _ConversationSqliteDb):
+        storage.upsert_run(run=run, session_id=session_id, user_id=run.user_id, record_usage=False)
+    else:
+        storage.upsert_run(run=run, session_id=session_id, user_id=run.user_id)
+
+
 def get_agent_session(storage: BaseDb, session_id: str) -> AgentSession | None:
     """Load one agent session, or None when the row is missing or not an agent session."""
     session = storage.get_session(session_id, SessionType.AGENT)
     return session if isinstance(session, AgentSession) else None
+
+
+def get_session_without_runs(
+    storage: BaseDb,
+    session_id: str,
+    session_type: SessionType,
+) -> AgentSession | TeamSession | None:
+    """Load one session's own fields, such as metadata and session state, without decoding its stored runs.
+
+    Agno reads no run rows for ``runs_limit=0``; MindRoom's adapter ignores ``runs_limit`` on purpose, so this asks
+    Agno's own read. A session that still holds an Agno 2 runs blob comes back with those runs.
+    """
+    reader = super(_ConversationSqliteDb, storage) if isinstance(storage, _ConversationSqliteDb) else storage
+    session = reader.get_session(session_id=session_id, session_type=session_type, runs_limit=0)
+    return session if isinstance(session, (AgentSession, TeamSession)) else None
 
 
 def load_agent_session(

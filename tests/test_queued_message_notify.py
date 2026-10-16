@@ -59,7 +59,8 @@ from mindroom.dispatch_source import (
 from mindroom.entity_resolution import current_internal_sender_ids
 from mindroom.final_delivery import FinalDeliveryOutcome
 from mindroom.history.session_context import ScopeSessionContext, open_bound_scope_session_context
-from mindroom.history.types import HistoryScope
+from mindroom.history.storage import set_force_compaction_state
+from mindroom.history.types import HistoryScope, HistoryScopeState
 from mindroom.hooks import MessageEnvelope
 from mindroom.interactive import InteractiveMetadata
 from mindroom.interactive_models import InteractivePrompt
@@ -1278,6 +1279,31 @@ async def test_forced_compaction_placeholder_check_degrades_on_storage_error(tmp
         )
 
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_forced_compaction_placeholder_check_decodes_no_stored_runs(tmp_path: Path) -> None:
+    """The hint reads the queued flag from the session row instead of decoding every stored run first."""
+    coordinator = unwrap_extracted_collaborator(_bot(tmp_path)._response_runner)
+    scope = HistoryScope(kind="agent", scope_id="general")
+    session = AgentSession(
+        session_id="session",
+        agent_id="general",
+        runs=[RunOutput(run_id="run-1", agent_id="general", session_id="session", content="Earlier answer")],
+    )
+    set_force_compaction_state(session, scope, HistoryScopeState(), force=True)
+    storage = coordinator.deps.state_writer.create_storage(None, scope=scope)
+    try:
+        seed_session(storage, session)
+    finally:
+        storage.close()
+
+    with patch.object(RunOutput, "from_dict", side_effect=AssertionError("decoded a stored run")):
+        assert await coordinator._has_queued_forced_compaction(
+            session_id="session",
+            scope=scope,
+            execution_identity=None,
+        )
 
 
 @pytest.mark.asyncio

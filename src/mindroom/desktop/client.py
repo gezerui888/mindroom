@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import weakref
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 from nio import AuthenticatedToDeviceEvent
@@ -54,6 +56,7 @@ class DesktopResponseRouter:
         self._client_ref = weakref.ref(client)
         self._pending: dict[str, _PendingDesktopResponse] = {}
         self._targets_in_flight: set[PinnedMatrixDevice] = set()
+        self._target_locks: defaultdict[PinnedMatrixDevice, asyncio.Lock] = defaultdict(asyncio.Lock)
         client.add_to_device_callback(self.on_to_device_event, AuthenticatedToDeviceEvent)
 
     async def request(
@@ -62,8 +65,15 @@ class DesktopResponseRouter:
         command: DesktopCommand,
         *,
         timeout_seconds: float,
+        queued: bool = False,
     ) -> DesktopResponse:
-        """Send one command and wait for its exact pinned response."""
+        """Send one command and wait for its exact pinned response.
+
+        A device takes one agent action at a time. A ``queued`` request, such as a running command's check, waits
+        its turn instead and leaves the device free for the next action. Requests reach the device in the order
+        they were created, which keeps their sequence numbers increasing, and each one's lifetime starts when it
+        is sent.
+        """
         try:
             command = DesktopCommand.from_content(command.to_content())
         except DesktopProtocolError as exc:
@@ -72,7 +82,7 @@ class DesktopResponseRouter:
         if command.request_id in self._pending:
             msg = f"Desktop request ID is already pending: {command.request_id}."
             raise DesktopRequestError(msg)
-        if target in self._targets_in_flight:
+        if not queued and target in self._targets_in_flight:
             msg = "A desktop request is already in progress for this device; inspect its result before the next action."
             raise DesktopRequestError(msg)
         loop = asyncio.get_running_loop()
@@ -82,33 +92,53 @@ class DesktopResponseRouter:
             session_id=command.session_id,
             future=future,
         )
-        self._targets_in_flight.add(target)
+        if not queued:
+            self._targets_in_flight.add(target)
         try:
-            try:
-                async with asyncio.timeout(timeout_seconds):
-                    client = self._client_ref()
-                    if client is None:
-                        msg = "Desktop Matrix client closed before the request could be sent."
-                        raise DesktopRequestError(msg)
-                    await send_encrypted_to_device(
-                        client,
-                        target,
-                        event_type=DESKTOP_COMMAND_EVENT_TYPE,
-                        content=command.to_content(),
-                    )
-                    return await future
-            except TimeoutError as exc:
-                msg = _timeout_message(command, timeout_seconds=timeout_seconds)
-                raise DesktopRequestError(msg, request_id=command.request_id) from exc
-            except OlmToDeviceError as exc:
-                msg = (
-                    f"Desktop delivery failed: {exc}. The action outcome is unknown; do not repeat automatically. "
-                    f"Query request_status with request_id={command.request_id!r}."
+            # The lock is FIFO, and callers create a command and enter here without awaiting in between.
+            async with self._target_locks[target]:
+                now_ms = round(time.time() * 1000)
+                command = replace(
+                    command,
+                    issued_at_ms=now_ms,
+                    expires_at_ms=now_ms + command.expires_at_ms - command.issued_at_ms,
                 )
-                raise DesktopRequestError(msg, request_id=command.request_id) from exc
+                return await self._send_and_wait(target, command, future, timeout_seconds=timeout_seconds)
         finally:
             self._pending.pop(command.request_id, None)
-            self._targets_in_flight.discard(target)
+            if not queued:
+                self._targets_in_flight.discard(target)
+
+    async def _send_and_wait(
+        self,
+        target: PinnedMatrixDevice,
+        command: DesktopCommand,
+        future: asyncio.Future[DesktopResponse],
+        *,
+        timeout_seconds: float,
+    ) -> DesktopResponse:
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                client = self._client_ref()
+                if client is None:
+                    msg = "Desktop Matrix client closed before the request could be sent."
+                    raise DesktopRequestError(msg)
+                await send_encrypted_to_device(
+                    client,
+                    target,
+                    event_type=DESKTOP_COMMAND_EVENT_TYPE,
+                    content=command.to_content(),
+                )
+                return await future
+        except TimeoutError as exc:
+            msg = _timeout_message(command, timeout_seconds=timeout_seconds)
+            raise DesktopRequestError(msg, request_id=command.request_id) from exc
+        except OlmToDeviceError as exc:
+            msg = (
+                f"Desktop delivery failed: {exc}. The action outcome is unknown; do not repeat automatically. "
+                f"Query request_status with request_id={command.request_id!r}."
+            )
+            raise DesktopRequestError(msg, request_id=command.request_id) from exc
 
     def on_to_device_event(self, event: nio.ToDeviceEvent) -> None:
         """Resolve a waiter only for a valid response from its exact pinned device."""
@@ -142,13 +172,6 @@ def _timeout_message(command: DesktopCommand, *, timeout_seconds: float) -> str:
             f"{message} The command may still be awaiting local approval, may have run, or may still be running; "
             "do not run the command again automatically."
         )
-    if command.action == "check_shell":
-        return (
-            f"{message} A finished handle's output is handed over only once, so do not call check_shell again "
-            "for this handle; call it again only if request_status reports not_found."
-        )
-    if command.action == "kill_shell":
-        return f"{message} The kill outcome is unknown; query request_status before deciding the next step."
     if command.action not in DESKTOP_CONTROL_ACTIONS:
         return message
     recovery_action = (

@@ -190,6 +190,34 @@ async def test_only_one_request_per_target_can_be_in_flight(monkeypatch: pytest.
     send.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_queued_requests_wait_their_turn_without_blocking_the_next_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running command's checks queue behind other requests, and each lifetime starts when it is sent."""
+    client = FakeClient()
+    router = DesktopResponseRouter(client)
+    send = AsyncMock()
+    monkeypatch.setattr("mindroom.desktop.client.send_encrypted_to_device", send)
+    monkeypatch.setattr("mindroom.desktop.client.authenticated_sender_matches", lambda *_args: True)
+    monkeypatch.setattr("mindroom.desktop.client.time.time", lambda: 50.0)
+
+    check = asyncio.create_task(router.request(TARGET, _command(request_id="check"), timeout_seconds=1, queued=True))
+    action = asyncio.create_task(router.request(TARGET, _command(request_id="action"), timeout_seconds=1))
+    queued = asyncio.create_task(router.request(TARGET, _command(request_id="later"), timeout_seconds=1, queued=True))
+    await asyncio.sleep(0)
+    assert [call.kwargs["content"]["request_id"] for call in send.await_args_list] == ["check"]
+
+    for request_id in ("check", "action", "later"):
+        router.on_to_device_event(_event(DesktopResponse(request_id, "session-1", True)))
+        await asyncio.sleep(0)
+    await asyncio.gather(check, action, queued)
+
+    sent = [call.kwargs["content"] for call in send.await_args_list]
+    assert [content["request_id"] for content in sent] == ["check", "action", "later"]
+    assert {(content["issued_at_ms"], content["expires_at_ms"]) for content in sent} == {(50_000, 51_000)}
+
+
 def test_cached_router_does_not_keep_closed_matrix_client_alive() -> None:
     """Hot-reloaded clients disappear from the weak router cache after collection."""
     _ROUTERS.clear()
@@ -221,18 +249,3 @@ async def test_shell_start_timeout_never_advises_running_the_command_again(monke
     assert "do not run the command again" in message
     assert "request_status with request_id='request-1'" in message
     assert exc_info.value.action_outcome == "unknown"
-
-
-@pytest.mark.asyncio
-async def test_handle_check_timeout_recovers_through_request_status(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A completed handle is handed over once, so a lost check must be recovered from its receipt."""
-    client = FakeClient()
-    router = DesktopResponseRouter(client)
-    monkeypatch.setattr("mindroom.desktop.client.send_encrypted_to_device", AsyncMock())
-
-    with pytest.raises(DesktopRequestError) as exc_info:
-        await router.request(TARGET, _command(action="check_shell"), timeout_seconds=0.001)
-
-    message = str(exc_info.value)
-    assert "do not call check_shell again" in message
-    assert "only if request_status reports not_found" in message

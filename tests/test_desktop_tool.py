@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -17,8 +18,9 @@ from mindroom.custom_tools.desktop import DesktopTools
 from mindroom.desktop.client import DesktopRequestError
 from mindroom.desktop.configuration import DesktopConfigurationStatus, desktop_configuration_state
 from mindroom.desktop.media import DesktopMediaError
-from mindroom.desktop.protocol import MAX_SHELL_OUTPUT_BYTES, DesktopResponse, EncryptedDesktopMedia
+from mindroom.desktop.protocol import MAX_SHELL_OUTPUT_BYTES, DesktopCommand, DesktopResponse, EncryptedDesktopMedia
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
+from mindroom.tool_system.progress import tool_progress_reporter
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity, WorkerScope
 from tests.conftest import test_runtime_paths
 
@@ -810,31 +812,31 @@ def _output_media(output: bytes) -> EncryptedDesktopMedia:
 
 
 def test_local_folder_and_shell_actions_are_discoverable_with_their_own_parameters() -> None:
-    """The schema advertises read-only folder and handle-based shell actions with bounded arguments."""
+    """The schema advertises read-only folder actions and one shell action that returns when its command ends."""
     function = DesktopTools().async_functions["desktop"]
     schema = function.parameters
     properties = schema["properties"]
 
-    assert {"list_folders", "list_directory", "read_file", "run_shell", "check_shell", "kill_shell"} <= set(
-        properties["action"]["enum"],
-    )
+    actions = set(properties["action"]["enum"])
+    assert {"list_folders", "list_directory", "read_file", "run_shell"} <= actions
+    assert not actions & {"check_shell", "kill_shell"}
     assert properties["root_id"]["type"] == "string"
     assert properties["path"]["maxLength"] == 4096
     assert (properties["offset"]["type"], properties["offset"]["minimum"]) == ("integer", 0)
     assert properties["command"]["maxLength"] == 8192
     assert properties["cwd"]["maxLength"] == 4096
-    assert (properties["timeout_seconds"]["minimum"], properties["timeout_seconds"]["maximum"]) == (1, 60)
-    assert properties["handle"]["type"] == "string"
-    assert properties["force"]["type"] == "boolean"
+    assert properties["timeout_seconds"]["minimum"] == 1
+    assert "maximum" not in properties["timeout_seconds"]
+    assert not {"handle", "force"} & set(properties)
     description = function.description or ""
     assert "read-only" in description
     assert "full account access" in description
     assert "request_status" in description
-    assert "check_shell" in description
-    assert "kill_shell" in description
     assert "untrusted" in description
     assert "gui_mode (observe_only or control) covers only app control" in description
-    assert "kill_shell finishes with state killed" in description
+    assert "The call returns when the command ends" in description
+    assert "background job has no time limit and any other stops after 120 seconds" in description
+    assert "_shell" not in description.replace("run_shell", "")
 
 
 def test_shell_guidance_states_output_limits_and_the_shell_it_runs_in() -> None:
@@ -855,11 +857,6 @@ def test_shell_guidance_states_output_limits_and_the_shell_it_runs_in() -> None:
     command = function.parameters["properties"]["command"]["description"]
     assert "/bin/sh" in command
     assert "2>file" in command
-    handle = function.parameters["properties"]["handle"]["description"]
-    assert handle == (
-        "Shell handle from a run_shell or check_shell reply; a finished command keeps one only while output is "
-        "still undelivered."
-    )
 
 
 @pytest.mark.asyncio
@@ -887,64 +884,77 @@ async def test_remote_folder_read_encodes_root_and_path_and_returns_text_without
 
 @pytest.mark.asyncio
 async def test_folder_listing_omits_unspecified_optional_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Optional folder and handle arguments are sent only when the agent supplies them."""
+    """Optional folder arguments are sent only when the agent supplies them."""
     request = _route_desktop_requests(
         monkeypatch,
         DesktopResponse("r1", "s", True, result={"folders": []}),
         DesktopResponse("r2", "s", True, result={"entries": [], "truncated": False}),
-        DesktopResponse("r3", "s", True, result={"state": "killed", "handle": "shell:1"}),
-        DesktopResponse("r4", "s", True, result={"state": "killed", "handle": "shell:1"}),
     )
     tool = _configured_tool(monkeypatch)
 
     await tool.desktop("list_folders")
     await tool.desktop("list_directory", root_id="root-1")
-    await tool.desktop("kill_shell", handle="shell:1")
-    await tool.desktop("kill_shell", handle="shell:1", force=True)
 
-    assert [call.args[1].parameters for call in request.await_args_list] == [
-        {},
-        {"root_id": "root-1"},
-        {"handle": "shell:1"},
-        {"handle": "shell:1", "force": True},
-    ]
+    assert [call.args[1].parameters for call in request.await_args_list] == [{}, {"root_id": "root-1"}]
 
 
-@pytest.mark.asyncio
-async def test_check_shell_polls_from_an_offset_and_returns_where_to_continue(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The agent passes the last next_offset to check_shell; other shell actions refuse an offset."""
-    polled = _shell_result(state="running", handle="shell:1", exit_code=None, output="new", next_offset=9)
-    request = _route_desktop_requests(monkeypatch, DesktopResponse("r1", "s", True, result=polled))
-    tool = _configured_tool(monkeypatch)
+def _running(output: str = "") -> DesktopResponse:
+    return DesktopResponse(
+        "running",
+        "s",
+        True,
+        result=_shell_result(state="running", handle="shell:1", exit_code=None, output=output),
+    )
 
-    result = await tool.desktop("check_shell", handle="shell:1", offset=6)
 
-    assert request.await_args.args[1].parameters == {"handle": "shell:1", "offset": 6}
-    assert json.loads(result.content)["result"]["next_offset"] == 9
-    for action, arguments, message in (
-        ("check_shell", {"handle": "shell:1", "offset": -1}, "offset must be an integer of at least 0"),
-        ("kill_shell", {"handle": "shell:1", "offset": 6}, "does not accept offset"),
-        ("run_shell", {"command": "ls", "offset": 6}, "does not accept offset"),
-    ):
-        payload = json.loads((await tool.desktop(action, **arguments)).content)
-        assert (payload["status"], message in payload["message"]) == ("error", True)
-    assert request.await_count == 1
-    properties = tool.async_functions["desktop"].parameters["properties"]
-    assert "check_shell" in properties["offset"]["description"]
-    description = tool.async_functions["desktop"].description or ""
-    assert "next_offset" in description
-    assert "an output_start above the offset you asked for" in description
+def _check_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mindroom.custom_tools.desktop._FIRST_SHELL_CHECK_SECONDS", 0.0)
+    monkeypatch.setattr("mindroom.custom_tools.desktop._MAX_SHELL_CHECK_SECONDS", 0.0)
+
+
+def _sent(request: AsyncMock) -> list[tuple[str, dict[str, object]]]:
+    return [(call.args[1].action, call.args[1].parameters) for call in request.await_args_list]
+
+
+async def _settle_background_stops() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio
-async def test_run_shell_waits_for_local_approval_while_other_actions_keep_configured_timeout(
+async def test_run_shell_waits_for_local_approval_and_returns_a_short_command_in_one_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Shell starts may wait the full command lifetime; handle checks keep the authored timeout."""
+    """A start may wait the full command lifetime for approval; the bridge answers one second after the start."""
     request = _route_desktop_requests(
         monkeypatch,
-        DesktopResponse("r1", "s", True, result=_shell_result(output="done\n", output_bytes=5)),
-        DesktopResponse("r2", "s", True, result=_shell_result(state="running", handle="shell:1", exit_code=None)),
+        DesktopResponse("r1", "s", True, result=_shell_result(output="done\n", output_bytes=5, output_start=0)),
+    )
+    tool = _configured_tool(monkeypatch)
+
+    run = await tool.desktop("run_shell", command="make test", cwd="/work/project", timeout_seconds=45)
+
+    (run_call,) = request.await_args_list
+    assert run_call.args[1].parameters == {"command": "make test", "cwd": "/work/project", "timeout_seconds": 1}
+    assert run_call.args[1].expires_at_ms - run_call.args[1].issued_at_ms == 120_000
+    assert run_call.kwargs["timeout_seconds"] == 120
+    run_result = json.loads(run.content)["result"]
+    assert run_result["output"] == "done\n"
+    assert not {"handle", "output_attachment", "output_start", "next_offset"} & set(run_result)
+
+
+@pytest.mark.asyncio
+async def test_run_shell_checks_a_running_command_until_it_ends_and_reports_its_newest_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The call follows the bridge's handle itself, so the model gets one complete result."""
+    _check_immediately(monkeypatch)
+    finished = _shell_result(handle="shell:1", output="step 1\nstep 2\n", output_start=0, next_offset=14)
+    request = _route_desktop_requests(
+        monkeypatch,
+        _running(),
+        _running("step 1\n"),
+        DesktopResponse("done", "s", True, result=finished),
     )
     monkeypatch.setattr(
         "mindroom.custom_tools.desktop.load_desktop_credentials",
@@ -959,21 +969,120 @@ async def test_run_shell_waits_for_local_approval_while_other_actions_keep_confi
         credentials_manager=MagicMock(spec=CredentialsManager),
         worker_target=_desktop_target(),
     )
+    reports: list[str] = []
 
-    run = await tool.desktop("run_shell", command="make test", cwd="/work/project", timeout_seconds=45)
-    check = await tool.desktop("check_shell", handle="shell:1")
+    with tool_progress_reporter(reports.append):
+        result = await tool.desktop("run_shell", command="make test")
 
-    run_call, check_call = request.await_args_list
-    assert run_call.args[1].parameters == {"command": "make test", "cwd": "/work/project", "timeout_seconds": 45}
-    assert run_call.args[1].expires_at_ms - run_call.args[1].issued_at_ms == 120_000
-    assert run_call.kwargs["timeout_seconds"] == 120
-    assert check_call.args[1].parameters == {"handle": "shell:1"}
+    assert _sent(request)[1:] == [("check_shell", {"handle": "shell:1"})] * 2
+    check_call = request.await_args_list[1]
+    assert check_call.kwargs == {"timeout_seconds": 12, "queued": True}
     assert check_call.args[1].expires_at_ms - check_call.args[1].issued_at_ms == 12_000
-    assert check_call.kwargs["timeout_seconds"] == 12
-    run_result = json.loads(run.content)["result"]
-    assert run_result["output"] == "done\n"
-    assert "output_attachment" not in run_result
-    assert json.loads(check.content)["result"]["handle"] == "shell:1"
+    assert reports == ["step 1\n"]
+    payload = json.loads(result.content)
+    assert payload["status"] == "ok"
+    assert payload["result"]["output"] == "step 1\nstep 2\n"
+    assert not {"handle", "output_start", "next_offset", "message"} & set(payload["result"])
+
+
+@pytest.mark.asyncio
+async def test_run_shell_stops_its_command_at_the_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At its timeout the call kills the command's process group and returns its output so far."""
+    _check_immediately(monkeypatch)
+    killed = _shell_result(state="killed", handle="shell:1", exit_code=-9, output="partial\n")
+    request = _route_desktop_requests(
+        monkeypatch,
+        _running(),
+        DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"}),
+        DesktopResponse("done", "s", True, result=killed),
+    )
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="sleep 300", timeout_seconds=1)
+
+    assert _sent(request)[1:] == [
+        ("kill_shell", {"handle": "shell:1", "force": True}),
+        ("check_shell", {"handle": "shell:1"}),
+    ]
+    payload = json.loads(result.content)["result"]
+    assert (payload["state"], payload["output"], payload["message"]) == ("killed", "partial\n", "Stopped after 1s.")
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_run_shell_stops_its_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancelling the call, as a cancelled background job does, kills the command on the computer."""
+    _check_immediately(monkeypatch)
+    checking = asyncio.Event()
+
+    async def respond(_target: object, command: DesktopCommand, **_kwargs: object) -> DesktopResponse:
+        if command.action == "run_shell":
+            return _running()
+        if command.action == "check_shell":
+            checking.set()
+            await asyncio.Event().wait()
+        return DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"})
+
+    request = _route_desktop_requests(monkeypatch)
+    request.side_effect = respond
+    call = asyncio.create_task(_configured_tool(monkeypatch).desktop("run_shell", command="sleep 300"))
+    await checking.wait()
+
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    await _settle_background_stops()
+
+    assert _sent(request)[-1] == ("kill_shell", {"handle": "shell:1", "force": True})
+    assert request.await_args_list[-1].kwargs["queued"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_run_shell_cancelled_before_approval_stops_a_command_that_starts_later(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command approved after its call was cancelled is killed as soon as its start reply arrives."""
+    approved = asyncio.Event()
+
+    async def respond(_target: object, command: DesktopCommand, **_kwargs: object) -> DesktopResponse:
+        if command.action == "run_shell":
+            await approved.wait()
+            return _running()
+        return DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"})
+
+    request = _route_desktop_requests(monkeypatch)
+    request.side_effect = respond
+    call = asyncio.create_task(_configured_tool(monkeypatch).desktop("run_shell", command="make deploy"))
+    await _settle_background_stops()
+
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    assert _sent(request) == [("run_shell", {"command": "make deploy", "timeout_seconds": 1})]
+    approved.set()
+    await _settle_background_stops()
+
+    assert _sent(request)[-1] == ("kill_shell", {"handle": "shell:1", "force": True})
+
+
+@pytest.mark.asyncio
+async def test_a_failed_check_names_a_lost_reply_and_stops_the_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A lost check reply may have carried the output, so the failure says how to recover it."""
+    _check_immediately(monkeypatch)
+    request = _route_desktop_requests(
+        monkeypatch,
+        _running(),
+        DesktopRequestError("Timed out", request_id="lost-check"),
+        DesktopResponse("check", "s", False, error="Unknown shell handle."),
+        DesktopResponse("kill", "s", False, error="Unknown shell handle."),
+    )
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="make test")
+    await _settle_background_stops()
+
+    payload = json.loads(result.content)
+    assert payload["status"] == "error"
+    assert payload["message"].startswith("Unknown shell handle.")
+    assert "request_status with request_id='lost-check'" in payload["message"]
+    assert _sent(request)[-1] == ("kill_shell", {"handle": "shell:1", "force": True})
 
 
 @pytest.mark.asyncio
@@ -985,13 +1094,11 @@ async def test_run_shell_waits_for_local_approval_while_other_actions_keep_confi
         ("read_file", {"root_id": "root-1"}, "path"),
         ("read_file", {"root_id": "root-1", "path": "a.txt", "offset": -1}, "offset"),
         ("run_shell", {"command": "ls", "app": "com.example.Editor"}, "app"),
-        ("run_shell", {"command": "ls", "timeout_seconds": 61}, "timeout_seconds"),
+        ("run_shell", {"command": "ls", "timeout_seconds": 0}, "timeout_seconds"),
         ("run_shell", {"command": "ls", "timeout_seconds": True}, "timeout_seconds"),
-        ("run_shell", {"command": "ls", "handle": "shell:1"}, "handle"),
+        ("run_shell", {"command": "ls", "offset": 6}, "offset"),
         ("run_shell", {}, "command"),
         ("run_shell", {"command": "x" * 8193}, "command"),
-        ("check_shell", {"handle": "shell:1", "force": True}, "force"),
-        ("kill_shell", {}, "handle"),
         ("status", {"root_id": "root-1"}, "root_id"),
         ("get_app_state", {"app": "com.example.Editor", "cwd": "/work"}, "cwd"),
     ],
@@ -1063,14 +1170,14 @@ async def test_failed_output_download_is_partial_and_points_to_request_status(mo
         AsyncMock(side_effect=DesktopMediaError("Matrix media authentication or decryption failed.")),
     )
 
-    result = await _configured_tool(monkeypatch).desktop("check_shell", handle="shell:1")
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="seq 50000")
 
     payload = json.loads(result.content)
     assert payload["status"] == "partial"
     assert payload["result"]["exit_code"] == 0
     assert "output_attachment" not in payload["result"]
     assert "request_status" in payload["message"]
-    assert "check_shell again" in payload["message"]
+    assert "Do not run the command again" in payload["message"]
     assert payload["request_id"] == request.await_args.args[1].request_id
     assert payload["recovery_action"] == "request_status"
     assert media.key not in result.content
@@ -1099,7 +1206,7 @@ async def test_interrupted_shell_command_is_partial_with_the_bridge_warning(monk
 
 @pytest.mark.asyncio
 async def test_request_status_recovers_a_lost_shell_reply_with_its_full_output(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A lost check_shell reply is recovered from its receipt, including output sent as an attachment."""
+    """A lost shell reply is recovered from its receipt, including output sent as an attachment."""
     output = b"recovered\n" * 10_000
     media = _output_media(output)
     recorded = DesktopResponse(

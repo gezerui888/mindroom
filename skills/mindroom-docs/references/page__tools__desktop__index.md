@@ -42,7 +42,7 @@ agents:
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `timeout_seconds` | number | `30` | From 1 to 120; bounds each call and each shell-output download. `run_shell` always waits up to 120 seconds so the person at the computer has time to decide. |
+| `timeout_seconds` | number | `30` | From 1 to 120; bounds each request to the computer and each shell-output download. `run_shell` always waits up to 120 seconds so the person at the computer has time to decide, then follows its command until it ends. |
 
 Never put device identity fields in agent YAML for the `desktop` tool; each user pairs their own computer through chat.
 Pairings are already scoped to one requester and one agent, so add `private: {per: user_agent}` only when the agent's whole runtime and state should also be requester-private.
@@ -280,7 +280,7 @@ On macOS, `get_app_state` returns the app's accessibility tree with roles, names
 The agent normally acts on an element from that state instead of guessing a coordinate, and every completed action returns fresh state for the next step.
 Taking a screenshot on macOS brings the selected app to the front.
 
-Observation actions are `status` (screen, lease, enabled capabilities, pending shell request, auto-approval time, and the caller's shell handles), `list_apps`, `get_app_state`, `screenshot`, and `request_status` (see [Uncertain Outcomes](#uncertain-outcomes)).
+Observation actions are `status` (screen, lease, enabled capabilities, pending shell request, auto-approval time, and the caller's running shell commands), `list_apps`, `get_app_state`, `screenshot`, and `request_status` (see [Uncertain Outcomes](#uncertain-outcomes)).
 With `return_attachment=true`, `screenshot` also returns an `att_*` handle that `matrix_message` can send in the same turn.
 
 Control actions require a control lease:
@@ -321,11 +321,9 @@ A saved folder that no longer exists makes startup fail with `Cannot open local 
 
 Enable shell requests locally with **Allow shell command requests** in the macOS app's **Access** step or with `mindroom desktop access --shell`.
 
-- `run_shell` runs `command`, up to 8,192 characters, with `/bin/sh -c` in `cwd`, an absolute local directory that defaults to the home directory.
-  `timeout_seconds`, from 1 to 60 with a default of 30, is how long the call waits for the command to finish before returning a handle.
-- `check_shell` returns a handle's newest output while it runs, and its complete output and exit code once it finishes.
-  Pass `offset=0` to read a running command's output from the beginning, then continue from the returned `next_offset`.
-- `kill_shell` asks a handle's command to terminate, or kills it immediately with `force=true`.
+`run_shell` runs `command`, up to 8,192 characters, with `/bin/sh -c` in `cwd`, an absolute local directory that defaults to the home directory, and returns the complete output and exit code when the command ends.
+A command still running after `timeout_seconds` is stopped together with the processes it started, and the call returns its output so far.
+Without `timeout_seconds`, a call that runs as a [background job](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) has no time limit, and any other command stops after 120 seconds.
 
 Commands or working directories padded with long runs of whitespace, invisible characters, blank lines, or combining marks are refused before approval, because padding could hide part of the request from the approver.
 
@@ -344,16 +342,13 @@ A request nobody answers within 120 seconds expires, and rejected or expired req
 In the macOS app, **Allow Without Asking…** grants auto-approval before any request arrives; in the terminal, use `--shell-auto-approve-minutes`.
 Revoking shell access or stopping the bridge also rejects a waiting request and kills every running command.
 
-### Handles
+### Long-Running Commands
 
-A command still running after its inline wait keeps running as a handle; the agent polls it with `check_shell` and stops it with `kill_shell`.
-Handles belong to the requester and agent that started them, and checking or killing your own handle needs no approval.
-The macOS app lists every handle with its requester, agent, command preview, elapsed time, and state, and can kill running ones.
-
-The bridge keeps at most 16 handles; a new command drops the handle that finished longest ago, and is refused if all 16 are still running.
-Finished output is kept until it is read in full or dropped for a newer command.
-Handles do not survive revoking shell access or a bridge restart, so a later `check_shell` reports an unknown handle.
-When a command finishes, other processes it started in the background, such as children started with `&`, are terminated, so keep long-running work in the foreground and let it continue as a handle.
+While a command runs, its background job shows the command's newest output, and cancelling the job stops the command.
+The macOS app lists every running command with its requester, agent, command preview, elapsed time, and state, and can kill it.
+The bridge runs at most 16 commands at once and refuses a new one while 16 are still running.
+A command stopped by revoking shell access or restarting the bridge ends its call with an error.
+When a command finishes, other processes it started in the background, such as children started with `&`, are terminated, so keep long-running work in the foreground.
 
 ### Environment and Output
 

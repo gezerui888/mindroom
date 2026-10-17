@@ -516,6 +516,9 @@ class DesktopTools(Toolkit):
                 try:
                     request_id, response = await self._check(route, {"handle": handle})
                 except DesktopRequestError as exc:
+                    if exc.request_id is None:
+                        # Never sent, such as after this agent's Matrix client closed, so asking again cannot help.
+                        raise
                     lost_request_id = exc.request_id
                     unanswered = loop.time() - answered_at
                     if deadline is not None and loop.time() >= deadline and unanswered >= _SHELL_UNREACHABLE_SECONDS:

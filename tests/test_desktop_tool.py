@@ -1313,6 +1313,27 @@ async def test_a_call_past_its_timeout_counts_silence_from_the_last_answer(monke
 
 
 @pytest.mark.asyncio
+async def test_a_check_that_could_not_be_sent_ends_the_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A closed Matrix client cannot send any check, so even a job's call ends instead of waiting forever."""
+    _check_immediately(monkeypatch)
+    closed = DesktopRequestError("Desktop Matrix client closed before the request could be sent.")
+    request = _reply_by_action(
+        monkeypatch,
+        run_shell=[_running()],
+        check_shell=[closed],
+        kill_shell=[DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"})],
+    )
+
+    with job_control_context(JobControl()):
+        result = await _configured_tool(monkeypatch).desktop("run_shell", command="make build")
+    await _settle_background_stops()
+
+    payload = json.loads(result.content)
+    assert (payload["status"], payload["action_outcome"]) == ("error", "not_sent")
+    assert _sent(request)[-1] == ("kill_shell", {"handle": "shell:1", "force": True})
+
+
+@pytest.mark.asyncio
 async def test_a_job_keeps_waiting_for_a_computer_that_stops_answering(monkeypatch: pytest.MonkeyPatch) -> None:
     """A job's call has no limit, so it waits through an outage, reporting it, and finishes when the computer is back."""
     _check_immediately(monkeypatch)

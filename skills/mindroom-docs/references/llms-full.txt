@@ -8256,7 +8256,7 @@ agents:
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `timeout_seconds` | number | `30` | From 1 to 120; bounds each request to the computer and each shell-output download. `run_shell` always waits up to 120 seconds so the person at the computer has time to decide, then follows its command until it ends. |
+| `timeout_seconds` | number | `30` | From 1 to 120; bounds each request to the computer and each shell-output download, while `run_shell` always waits up to 120 seconds for the person at the computer to decide and then follows its command until it ends. |
 
 Never put device identity fields in agent YAML for the `desktop` tool; each user pairs their own computer through chat.
 Pairings are already scoped to one requester and one agent, so add `private: {per: user_agent}` only when the agent's whole runtime and state should also be requester-private.
@@ -8535,7 +8535,7 @@ A saved folder that no longer exists makes startup fail with `Cannot open local 
 
 Enable shell requests locally with **Allow shell command requests** in the macOS app's **Access** step or with `mindroom desktop access --shell`.
 
-`run_shell` runs `command`, up to 8,192 characters, with `/bin/sh -c` in `cwd`, an absolute local directory that defaults to the home directory, and returns the complete output and exit code when the command ends.
+`run_shell` runs `command`, up to 8,192 characters, with `/bin/sh -c` in `cwd`, an absolute local directory that defaults to the home directory, and returns its captured output and exit code when the command ends.
 A command still running after `timeout_seconds` is stopped together with the processes it started, and the call returns its output so far.
 Without `timeout_seconds`, a call that runs as a [background job](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) has no time limit, and any other command stops after 120 seconds.
 

@@ -17,7 +17,7 @@ from mindroom.credentials.manager import CredentialsManager
 from mindroom.custom_tools.desktop import DesktopTools
 from mindroom.desktop.client import DesktopRequestError
 from mindroom.desktop.configuration import DesktopConfigurationStatus, desktop_configuration_state
-from mindroom.desktop.media import DesktopMediaError
+from mindroom.desktop.media import MEDIA_UPLOAD_TIMEOUT_SECONDS, DesktopMediaError
 from mindroom.desktop.protocol import MAX_SHELL_OUTPUT_BYTES, DesktopCommand, DesktopResponse, EncryptedDesktopMedia
 from mindroom.tool_jobs.control import JobControl, job_control_context
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
@@ -922,6 +922,23 @@ async def _settle_background_stops() -> None:
         await asyncio.sleep(0)
 
 
+def _reply_by_action(
+    monkeypatch: pytest.MonkeyPatch,
+    **replies: list[DesktopResponse | DesktopRequestError],
+) -> AsyncMock:
+    """Answer each action from its own queue, since a call's checks and its timeout kill run side by side."""
+
+    async def respond(_target: object, command: DesktopCommand, **_kwargs: object) -> DesktopResponse:
+        reply = replies[command.action].pop(0)
+        if isinstance(reply, DesktopRequestError):
+            raise reply
+        return reply
+
+    request = _route_desktop_requests(monkeypatch)
+    request.side_effect = respond
+    return request
+
+
 @pytest.mark.asyncio
 async def test_run_shell_waits_for_local_approval_and_returns_a_short_command_in_one_reply(
     monkeypatch: pytest.MonkeyPatch,
@@ -977,7 +994,7 @@ async def test_run_shell_checks_a_running_command_until_it_ends_and_reports_its_
 
     assert _sent(request)[1:] == [("check_shell", {"handle": "shell:1"})] * 2
     check_call = request.await_args_list[1]
-    assert check_call.kwargs == {"timeout_seconds": 12, "queued": True}
+    assert check_call.kwargs == {"timeout_seconds": 12 + MEDIA_UPLOAD_TIMEOUT_SECONDS, "queued": True}
     assert check_call.args[1].expires_at_ms - check_call.args[1].issued_at_ms == 12_000
     assert reports == ["step 1\n"]
     payload = json.loads(result.content)
@@ -991,21 +1008,75 @@ async def test_run_shell_stops_its_command_at_the_timeout(monkeypatch: pytest.Mo
     """At its timeout the call kills the command's process group and returns its output so far."""
     _check_immediately(monkeypatch)
     killed = _shell_result(state="killed", handle="shell:1", exit_code=-9, output="partial\n")
-    request = _route_desktop_requests(
+    request = _reply_by_action(
         monkeypatch,
-        _running(),
-        DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"}),
-        DesktopResponse("done", "s", True, result=killed),
+        run_shell=[_running()],
+        kill_shell=[DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"})],
+        check_shell=[DesktopResponse("done", "s", True, result=killed)],
     )
 
     result = await _configured_tool(monkeypatch).desktop("run_shell", command="sleep 300", timeout_seconds=1)
 
-    assert _sent(request)[1:] == [
-        ("kill_shell", {"handle": "shell:1", "force": True}),
-        ("check_shell", {"handle": "shell:1"}),
-    ]
+    assert ("kill_shell", {"handle": "shell:1", "force": True}) in _sent(request)
     payload = json.loads(result.content)["result"]
     assert (payload["state"], payload["output"], payload["message"]) == ("killed", "partial\n", "Stopped after 1s.")
+
+
+@pytest.mark.asyncio
+async def test_a_kill_the_computer_refuses_is_tried_again(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refused kill, such as one hit by a passing device-key failure, does not leave the command running."""
+    _check_immediately(monkeypatch)
+    kills = [
+        DesktopResponse("kill-1", "s", False, error="Desktop controller device keys could not be verified."),
+        DesktopResponse("kill-2", "s", True, result={"state": "killed", "handle": "shell:1"}),
+    ]
+
+    checks = 0
+
+    async def respond(_target: object, command: DesktopCommand, **_kwargs: object) -> DesktopResponse:
+        nonlocal checks
+        if command.action == "run_shell":
+            return _running()
+        if command.action == "kill_shell":
+            return kills.pop(0)
+        checks += 1
+        if kills and checks < 50:
+            return _running()
+        return DesktopResponse("done", "s", True, result=_shell_result(state="killed", handle="shell:1", exit_code=-9))
+
+    request = _route_desktop_requests(monkeypatch)
+    request.side_effect = respond
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="sleep 300", timeout_seconds=1)
+
+    assert [action for action, _parameters in _sent(request)].count("kill_shell") == 2
+    assert json.loads(result.content)["result"]["message"] == "Stopped after 1s."
+
+
+@pytest.mark.asyncio
+async def test_a_check_waiting_on_a_slow_reply_does_not_delay_the_timeout_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The kill goes out at the timeout even while a check still waits for its reply."""
+    _check_immediately(monkeypatch)
+    killed_sent = asyncio.Event()
+    killed = _shell_result(state="killed", handle="shell:1", exit_code=-9)
+
+    async def respond(_target: object, command: DesktopCommand, **_kwargs: object) -> DesktopResponse:
+        if command.action == "run_shell":
+            return _running()
+        if command.action == "kill_shell":
+            killed_sent.set()
+            return DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"})
+        await asyncio.wait_for(killed_sent.wait(), 1)
+        return DesktopResponse("done", "s", True, result=killed)
+
+    request = _route_desktop_requests(monkeypatch)
+    request.side_effect = respond
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="sleep 300", timeout_seconds=1)
+
+    assert json.loads(result.content)["result"]["message"] == "Stopped after 1s."
 
 
 @pytest.mark.asyncio
@@ -1099,12 +1170,12 @@ async def test_a_call_past_its_timeout_stops_waiting_for_a_computer_that_does_no
     """An unreachable computer cannot hold a call with a timeout open; the call names the last lost reply."""
     _check_immediately(monkeypatch)
     monkeypatch.setattr("mindroom.custom_tools.desktop._SHELL_UNREACHABLE_SECONDS", 0.0)
-    request = _route_desktop_requests(
+    lost = [DesktopRequestError("Timed out", request_id=f"lost-kill-{index}") for index in range(50)]
+    request = _reply_by_action(
         monkeypatch,
-        _running(),
-        DesktopRequestError("Timed out", request_id="lost-kill"),
-        DesktopRequestError("Timed out", request_id="lost-check"),
-        DesktopRequestError("Timed out", request_id="lost-stop"),
+        run_shell=[_running()],
+        kill_shell=lost,
+        check_shell=[DesktopRequestError("Timed out", request_id="lost-check")],
     )
 
     result = await _configured_tool(monkeypatch).desktop("run_shell", command="sleep 300", timeout_seconds=1)
@@ -1114,12 +1185,7 @@ async def test_a_call_past_its_timeout_stops_waiting_for_a_computer_that_does_no
     assert payload["status"] == "error"
     assert "has not answered" in payload["message"]
     assert "request_id='lost-check'" in payload["message"]
-    assert [action for action, _parameters in _sent(request)] == [
-        "run_shell",
-        "kill_shell",
-        "check_shell",
-        "kill_shell",
-    ]
+    assert [action for action, _parameters in _sent(request)].count("check_shell") == 1
 
 
 @pytest.mark.asyncio
@@ -1127,17 +1193,19 @@ async def test_a_call_past_its_timeout_counts_silence_from_the_last_answer(monke
     """One lost reply right after an answer does not end the call, even long after the command started."""
     _check_immediately(monkeypatch)
     monkeypatch.setattr("mindroom.custom_tools.desktop._SHELL_UNREACHABLE_SECONDS", 0.2)
-    replies: list[DesktopResponse | DesktopRequestError] = [
-        _running(),
-        DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"}),
+    checks: list[DesktopResponse | DesktopRequestError] = [
         _running(),
         DesktopRequestError("Timed out", request_id="lost-check"),
         DesktopResponse("done", "s", True, result=_shell_result(state="killed", handle="shell:1", exit_code=-9)),
     ]
 
     async def respond(_target: object, command: DesktopCommand, **_kwargs: object) -> DesktopResponse:
-        reply = replies.pop(0)
-        if command.action == "check_shell" and len(replies) == 2:
+        if command.action == "run_shell":
+            return _running()
+        if command.action == "kill_shell":
+            return DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"})
+        reply = checks.pop(0)
+        if len(checks) == 2:
             await asyncio.sleep(0.3)  # The command has now run longer than the silence limit.
         if isinstance(reply, DesktopRequestError):
             raise reply

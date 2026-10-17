@@ -31,7 +31,12 @@ from mindroom.desktop.configuration import (
 )
 from mindroom.desktop.credentials import load_desktop_credentials
 from mindroom.desktop.input import DESKTOP_SCROLL_DIRECTIONS, normalize_key_chord
-from mindroom.desktop.media import DesktopMediaError, download_encrypted_media, download_encrypted_screenshot
+from mindroom.desktop.media import (
+    MEDIA_UPLOAD_TIMEOUT_SECONDS,
+    DesktopMediaError,
+    download_encrypted_media,
+    download_encrypted_screenshot,
+)
 from mindroom.desktop.protocol import (
     DESKTOP_CONTROL_ACTIONS,
     DESKTOP_FILE_ACTIONS,
@@ -485,26 +490,24 @@ class DesktopTools(Toolkit):
         loop = asyncio.get_running_loop()
         # The command started when the bridge began its first wait.
         deadline = None if stop_after is None else loop.time() + stop_after - _SHELL_START_WAIT_SECONDS
+        # Its own timer, so a check waiting on a slow reply never delays the kill.
+        kill = None if deadline is None else asyncio.create_task(self._kill_at(route, handle, deadline))
         interval = _FIRST_SHELL_CHECK_SECONDS
-        kill_sent = False
         # A reply lost in transit; if it was the command's last check, the bridge forgot the handle after sending it.
         lost_request_id: str | None = None
         answered_at = loop.time()
         ended = False
         try:
             while True:
-                due = interval
-                if deadline is not None and not kill_sent and loop.time() < deadline:
-                    due = min(interval, deadline - loop.time())
-                await asyncio.sleep(due)
-                interval = min(interval * 2, _MAX_SHELL_CHECK_SECONDS)
-                if deadline is not None and not kill_sent and loop.time() >= deadline:
-                    with suppress(DesktopRequestError):
-                        await self._send(route, "kill_shell", {"handle": handle, "force": True}, queued=True)
-                        kill_sent = True
-                        interval = _FIRST_SHELL_CHECK_SECONDS
+                if kill is None or kill.done():
+                    await asyncio.sleep(interval)
+                else:
+                    await asyncio.wait({kill}, timeout=interval)
+                # A killed command ends at once, so it is checked again soon.
+                killed = kill is not None and kill.done()
+                interval = _FIRST_SHELL_CHECK_SECONDS if killed else min(interval * 2, _MAX_SHELL_CHECK_SECONDS)
                 try:
-                    request_id, response = await self._send(route, "check_shell", {"handle": handle}, queued=True)
+                    request_id, response = await self._check(route, {"handle": handle})
                 except DesktopRequestError as exc:
                     lost_request_id = exc.request_id
                     unanswered = loop.time() - answered_at
@@ -527,8 +530,40 @@ class DesktopTools(Toolkit):
                 lost_request_id = None
                 report_tool_progress(str(response.result.get("output", "")))
         finally:
+            if kill is not None:
+                kill.cancel()
             if not ended:
                 create_background_task(self._stop_shell(route, handle), name="desktop_shell_stop")
+
+    async def _check(self, route: _DesktopRoute, parameters: dict[str, object]) -> tuple[str, DesktopResponse]:
+        # An ended command's check may first spend the bridge's whole upload timeout attaching its output.
+        return await self._send(
+            route,
+            "check_shell",
+            parameters,
+            reply_grace_seconds=MEDIA_UPLOAD_TIMEOUT_SECONDS,
+            queued=True,
+        )
+
+    async def _kill_at(self, route: _DesktopRoute, handle: str, deadline: float) -> None:
+        """Kill the command at its deadline, trying again until the computer takes the kill.
+
+        The call cancels this once the command ends, so a kill refused because the command is gone stops retrying.
+        """
+        await asyncio.sleep(deadline - asyncio.get_running_loop().time())
+        interval = _FIRST_SHELL_CHECK_SECONDS
+        while True:
+            with suppress(DesktopRequestError):
+                _request_id, response = await self._send(
+                    route,
+                    "kill_shell",
+                    {"handle": handle, "force": True},
+                    queued=True,
+                )
+                if response.ok:
+                    return
+            await asyncio.sleep(interval)
+            interval = min(interval * 2, _MAX_SHELL_CHECK_SECONDS)
 
     async def _shell_result(
         self,
@@ -548,12 +583,7 @@ class DesktopTools(Toolkit):
             and isinstance(next_offset := response.result.get("next_offset"), int)
         ):
             earlier_output += str(response.result.get("output", ""))
-            request_id, response = await self._send(
-                route,
-                "check_shell",
-                {"handle": handle, "offset": next_offset},
-                queued=True,
-            )
+            request_id, response = await self._check(route, {"handle": handle, "offset": next_offset})
         return await _shell_tool_result(
             route,
             request_id,

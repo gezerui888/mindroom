@@ -351,7 +351,7 @@ Revoking shell access or stopping the bridge also rejects a waiting request and 
 While a command runs, its background job shows the command's newest output, and cancelling the job stops the command.
 The macOS app lists every running command with its requester, agent, command preview, elapsed time, and state, and can kill it.
 The bridge runs at most 16 commands at once and refuses a new one while 16 are still running.
-If the computer stops answering, a background job keeps waiting and its progress says so, and any other call stops waiting 120 seconds after its timeout.
+If the computer stops answering, a background job keeps waiting and its progress says so, and any other call stops waiting once its timeout has passed and the computer has not answered for 120 seconds.
 A command stopped by revoking shell access or stopping the bridge ends its call with an error once the bridge answers again.
 When a command finishes, other processes it started in the background, such as children started with `&`, are terminated, so keep long-running work in the foreground.
 

@@ -93,6 +93,9 @@ _SHELL_START_WAIT_SECONDS = 1
 _SHELL_START_REPLY_GRACE_SECONDS = 15.0
 # Past its timeout, a call stops waiting for a computer that has not answered for this long.
 _SHELL_UNREACHABLE_SECONDS = MAX_COMMAND_TTL_MS / 1000
+# A passing failure on the computer, such as a device-key lookup, refuses a check; a command that is gone refuses
+# every one, so this many refusals in a row end the call.
+_SHELL_CHECK_REFUSALS = 3
 # A running command is checked after 1 second, then at doubling intervals up to every 5 seconds.
 _FIRST_SHELL_CHECK_SECONDS = 1.0
 _MAX_SHELL_CHECK_SECONDS = 5.0
@@ -466,7 +469,7 @@ class DesktopTools(Toolkit):
     ) -> ToolResult:
         """Run one locally approved command until it ends, reporting its newest output, and stop it at ``stop_after``.
 
-        The bridge keeps a command that outlives its first reply under a handle, which this call checks until the
+        The bridge keeps a command that outlives its first reply under a handle, which this call follows until the
         command ends. A call that ends early for any reason, including cancellation, stops its command.
         """
         start = asyncio.ensure_future(
@@ -487,6 +490,10 @@ class DesktopTools(Toolkit):
         handle = response.result.get("handle")
         if not response.ok or response.result.get("state") != "running" or not isinstance(handle, str):
             return await self._shell_result(route, request_id, response, stopped_after=None, lost_request_id=None)
+        return await self._follow_shell(route, handle, stop_after=stop_after)
+
+    async def _follow_shell(self, route: _DesktopRoute, handle: str, *, stop_after: float | None) -> ToolResult:
+        """Check a running command until it ends, kill it at ``stop_after``, and stop it if this call ends early."""
         loop = asyncio.get_running_loop()
         # The command started when the bridge began its first wait.
         deadline = None if stop_after is None else loop.time() + stop_after - _SHELL_START_WAIT_SECONDS
@@ -496,6 +503,7 @@ class DesktopTools(Toolkit):
         # A reply lost in transit; if it was the command's last check, the bridge forgot the handle after sending it.
         lost_request_id: str | None = None
         answered_at = loop.time()
+        refusals = 0
         ended = False
         try:
             while True:
@@ -517,8 +525,11 @@ class DesktopTools(Toolkit):
                     report_tool_progress(f"The computer has not answered for {unanswered:.0f} seconds.")
                     continue
                 answered_at = loop.time()
+                refusals = refusals + 1 if not response.ok else 0
+                if 0 < refusals < _SHELL_CHECK_REFUSALS:
+                    continue
                 if not response.ok or response.result.get("state") != "running":
-                    # A failed check leaves the command's state unknown, so it is stopped like any early end.
+                    # A command that refuses every check has an unknown state, so it is stopped like any early end.
                     ended = response.ok
                     return await self._shell_result(
                         route,
@@ -546,11 +557,17 @@ class DesktopTools(Toolkit):
         )
 
     async def _kill_at(self, route: _DesktopRoute, handle: str, deadline: float) -> None:
-        """Kill the command at its deadline, trying again until the computer takes the kill.
-
-        The call cancels this once the command ends, so a kill refused because the command is gone stops retrying.
-        """
+        """Kill the command at its deadline; the call cancels this once the command ends."""
         await asyncio.sleep(deadline - asyncio.get_running_loop().time())
+        await self._kill(route, handle, give_up_after=None)
+
+    async def _kill(self, route: _DesktopRoute, handle: str, *, give_up_after: float | None) -> None:
+        """Kill the command, trying again after a lost or refused kill until one is taken or ``give_up_after`` passes.
+
+        A passing delivery or device-key failure can refuse a kill, and nothing tells it apart from a command gone.
+        """
+        loop = asyncio.get_running_loop()
+        give_up_at = None if give_up_after is None else loop.time() + give_up_after
         interval = _FIRST_SHELL_CHECK_SECONDS
         while True:
             with suppress(DesktopRequestError):
@@ -562,6 +579,8 @@ class DesktopTools(Toolkit):
                 )
                 if response.ok:
                     return
+            if give_up_at is not None and loop.time() >= give_up_at:
+                return
             await asyncio.sleep(interval)
             interval = min(interval * 2, _MAX_SHELL_CHECK_SECONDS)
 
@@ -605,8 +624,8 @@ class DesktopTools(Toolkit):
                 await self._stop_shell(route, handle)
 
     async def _stop_shell(self, route: _DesktopRoute, handle: str) -> None:
-        with suppress(DesktopRequestError):
-            await self._send(route, "kill_shell", {"handle": handle, "force": True}, queued=True)
+        # The call has ended, so nothing cancels this; a computer that stays unreachable is given up on.
+        await self._kill(route, handle, give_up_after=_SHELL_UNREACHABLE_SECONDS)
 
     def _credential_scope(self, context: ToolRuntimeContext | None) -> tuple[str, str] | None:
         if context is not None:
@@ -1161,7 +1180,7 @@ async def _shell_tool_result(
     except (DesktopMediaError, DesktopProtocolError) as exc:
         return _partial_result(
             "run_shell",
-            result=_without_transport_fields(result),
+            result={**_without_transport_fields(result), "output": earlier_output + str(result.get("output", ""))},
             message=(
                 f"The shell command finished, but its full output could not be downloaded: {exc} "
                 "Do not run the command again; recover the recorded reply with request_status."

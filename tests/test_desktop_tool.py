@@ -918,7 +918,7 @@ def _sent(request: AsyncMock) -> list[tuple[str, dict[str, object]]]:
 
 
 async def _settle_background_stops() -> None:
-    for _ in range(5):
+    for _ in range(50):
         await asyncio.sleep(0)
 
 
@@ -1108,6 +1108,44 @@ async def test_a_cancelled_run_shell_stops_its_command(monkeypatch: pytest.Monke
 
 
 @pytest.mark.asyncio
+async def test_a_cancelled_run_shell_tries_its_kill_again_after_a_lost_or_refused_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A passing delivery or device-key failure during a cancel does not leave the command running."""
+    _check_immediately(monkeypatch)
+    checking = asyncio.Event()
+    kills: list[DesktopResponse | DesktopRequestError] = [
+        DesktopRequestError("Timed out", request_id="lost-kill"),
+        DesktopResponse("kill-2", "s", False, error="Desktop controller device keys could not be verified."),
+        DesktopResponse("kill-3", "s", True, result={"state": "killed", "handle": "shell:1"}),
+    ]
+
+    async def respond(_target: object, command: DesktopCommand, **_kwargs: object) -> DesktopResponse:
+        if command.action == "run_shell":
+            return _running()
+        if command.action == "check_shell":
+            checking.set()
+            await asyncio.Event().wait()
+        reply = kills.pop(0)
+        if isinstance(reply, DesktopRequestError):
+            raise reply
+        return reply
+
+    request = _route_desktop_requests(monkeypatch)
+    request.side_effect = respond
+    call = asyncio.create_task(_configured_tool(monkeypatch).desktop("run_shell", command="sleep 300"))
+    await checking.wait()
+
+    call.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    await _settle_background_stops()
+
+    assert [action for action, _parameters in _sent(request)].count("kill_shell") == 3
+    assert not kills
+
+
+@pytest.mark.asyncio
 async def test_a_run_shell_cancelled_before_approval_stops_a_command_that_starts_later(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1161,6 +1199,31 @@ async def test_output_kept_back_after_a_failed_upload_is_read_before_the_call_re
     payload = json.loads(result.content)["result"]
     assert (payload["output"], payload["output_truncated"]) == ("first rest\n", False)
     assert "warning" not in payload
+
+
+@pytest.mark.asyncio
+async def test_output_read_before_a_failed_download_stays_in_the_partial_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pages already read after a failed upload are kept when a later page's attachment cannot be downloaded."""
+    first_page = _shell_result(handle="shell:1", output="first ", next_offset=6, warning="Upload failed.")
+    media = _output_media(b"rest")
+    rest = _shell_result(handle="shell:1", output="", output_start=6, output_attachment=media.to_content())
+    _route_desktop_requests(
+        monkeypatch,
+        DesktopResponse("start", "s", True, result=first_page),
+        DesktopResponse("rest", "s", True, result=rest),
+    )
+    monkeypatch.setattr(
+        "mindroom.custom_tools.desktop.download_encrypted_media",
+        AsyncMock(side_effect=DesktopMediaError("Matrix media download failed.")),
+    )
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="make logs")
+
+    payload = json.loads(result.content)
+    assert (payload["status"], payload["result"]["output"]) == ("partial", "first ")
+    assert payload["recovery_action"] == "request_status"
 
 
 @pytest.mark.asyncio
@@ -1244,6 +1307,25 @@ async def test_a_job_keeps_waiting_for_a_computer_that_stops_answering(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_check_the_computer_refuses_once_does_not_stop_the_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A passing failure on the computer, such as a device-key lookup, refuses one check without ending the call."""
+    _check_immediately(monkeypatch)
+    request = _route_desktop_requests(
+        monkeypatch,
+        _running(),
+        DesktopResponse("refused", "s", False, error="Matrix device-key query failed: 502."),
+        _running("still going\n"),
+        DesktopResponse("done", "s", True, result=_shell_result(handle="shell:1", output="done\n")),
+    )
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="make build")
+    await _settle_background_stops()
+
+    assert json.loads(result.content)["result"]["output"] == "done\n"
+    assert "kill_shell" not in [action for action, _parameters in _sent(request)]
+
+
+@pytest.mark.asyncio
 async def test_a_failed_check_names_a_lost_reply_and_stops_the_command(monkeypatch: pytest.MonkeyPatch) -> None:
     """A lost check reply may have carried the output, so the failure says how to recover it."""
     _check_immediately(monkeypatch)
@@ -1251,8 +1333,8 @@ async def test_a_failed_check_names_a_lost_reply_and_stops_the_command(monkeypat
         monkeypatch,
         _running(),
         DesktopRequestError("Timed out", request_id="lost-check"),
-        DesktopResponse("check", "s", False, error="Unknown shell handle."),
-        DesktopResponse("kill", "s", False, error="Unknown shell handle."),
+        *[DesktopResponse("check", "s", False, error="Unknown shell handle.")] * 3,
+        DesktopResponse("kill", "s", True, result={"state": "completed", "handle": "shell:1"}),
     )
 
     result = await _configured_tool(monkeypatch).desktop("run_shell", command="make test")

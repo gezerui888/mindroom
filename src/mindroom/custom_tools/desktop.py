@@ -87,8 +87,8 @@ _SHELL_START_WAIT_SECONDS = 1
 # A running command is checked after 1 second, then at doubling intervals up to every 5 seconds.
 _FIRST_SHELL_CHECK_SECONDS = 1.0
 _MAX_SHELL_CHECK_SECONDS = 5.0
-# Paging fields of the bridge's command handles, which this tool follows itself.
-_SHELL_HANDLE_FIELDS = frozenset({"handle", "output_start", "next_offset", "output_attachment"})
+# Fields about the bridge's requests rather than the command: its handle, output paging, and one request's timing.
+_SHELL_TRANSPORT_FIELDS = frozenset({"handle", "output_start", "next_offset", "output_attachment", "metrics"})
 _MAX_LOCAL_PATH_LENGTH = 4096
 _MAX_SHELL_COMMAND_LENGTH = 8192
 _ACTION_SCHEMA = {
@@ -472,19 +472,19 @@ class DesktopTools(Toolkit):
         # The command started when the bridge began its first wait.
         deadline = None if stop_after is None else loop.time() + stop_after - _SHELL_START_WAIT_SECONDS
         interval = _FIRST_SHELL_CHECK_SECONDS
-        killed = False
+        kill_sent = False
         # A reply lost in transit; if it was the command's last check, the bridge forgot the handle after sending it.
         lost_request_id: str | None = None
         ended = False
         try:
             while True:
-                due = interval if deadline is None or killed else min(interval, deadline - loop.time())
+                due = interval if deadline is None or kill_sent else min(interval, deadline - loop.time())
                 await asyncio.sleep(max(0.0, due))
                 interval = min(interval * 2, _MAX_SHELL_CHECK_SECONDS)
-                if deadline is not None and not killed and loop.time() >= deadline:
+                if deadline is not None and not kill_sent and loop.time() >= deadline:
                     with suppress(DesktopRequestError):
                         await self._send(route, "kill_shell", {"handle": handle, "force": True}, queued=True)
-                        killed = True
+                        kill_sent = True
                         interval = _FIRST_SHELL_CHECK_SECONDS
                 try:
                     request_id, response = await self._send(route, "check_shell", {"handle": handle}, queued=True)
@@ -1074,7 +1074,7 @@ async def _shell_tool_result(
     except (DesktopMediaError, DesktopProtocolError) as exc:
         return _partial_result(
             "run_shell",
-            result=_without_handle(result),
+            result=_without_transport_fields(result),
             message=(
                 f"The shell command finished, but its full output could not be downloaded: {exc} "
                 "Do not run the command again; recover the recorded reply with request_status."
@@ -1082,7 +1082,7 @@ async def _shell_tool_result(
             request_id=request_id,
             recovery_action="request_status",
         )
-    shown = _without_handle(shown)
+    shown = _without_transport_fields(shown)
     if "warning" in shown:
         shown["warning"] = "The rest of the output could not be attached; only its beginning is shown."
     if stopped_after is not None and shown.get("state") == "killed":
@@ -1130,8 +1130,8 @@ def _without_attachment(result: dict[str, object]) -> dict[str, object]:
     return {key: value for key, value in result.items() if key != "output_attachment"}
 
 
-def _without_handle(result: dict[str, object]) -> dict[str, object]:
-    return {key: value for key, value in result.items() if key not in _SHELL_HANDLE_FIELDS}
+def _without_transport_fields(result: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in result.items() if key not in _SHELL_TRANSPORT_FIELDS}
 
 
 def _ok_result(action: str, result: dict[str, object]) -> ToolResult:

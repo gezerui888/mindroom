@@ -982,7 +982,7 @@ async def test_run_shell_checks_a_running_command_until_it_ends_and_reports_its_
     payload = json.loads(result.content)
     assert payload["status"] == "ok"
     assert payload["result"]["output"] == "step 1\nstep 2\n"
-    assert not {"handle", "output_start", "next_offset", "message"} & set(payload["result"])
+    assert not {"handle", "output_start", "next_offset", "metrics", "message"} & set(payload["result"])
 
 
 @pytest.mark.asyncio

@@ -69,10 +69,10 @@ class DesktopResponseRouter:
     ) -> DesktopResponse:
         """Send one command and wait for its exact pinned response.
 
-        A device takes one agent action at a time. A ``queued`` request, such as a running command's check, waits
-        its turn instead and leaves the device free for the next action. Requests reach the device in the order
-        they were created, which keeps their sequence numbers increasing, and each one's lifetime starts when it
-        is sent.
+        A device takes one agent action at a time. A ``queued`` request, such as a running command's check, is
+        sent even while an action awaits its reply, and leaves the device free for the next action. Commands are
+        sent in the order they were created, which keeps their sequence numbers increasing, and each one's
+        lifetime starts when it is sent.
         """
         try:
             command = DesktopCommand.from_content(command.to_content())
@@ -95,15 +95,7 @@ class DesktopResponseRouter:
         if not queued:
             self._targets_in_flight.add(target)
         try:
-            # The lock is FIFO, and callers create a command and enter here without awaiting in between.
-            async with self._target_locks[target]:
-                now_ms = round(time.time() * 1000)
-                command = replace(
-                    command,
-                    issued_at_ms=now_ms,
-                    expires_at_ms=now_ms + command.expires_at_ms - command.issued_at_ms,
-                )
-                return await self._send_and_wait(target, command, future, timeout_seconds=timeout_seconds)
+            return await self._send_and_wait(target, command, future, timeout_seconds=timeout_seconds)
         finally:
             self._pending.pop(command.request_id, None)
             if not queued:
@@ -117,18 +109,30 @@ class DesktopResponseRouter:
         *,
         timeout_seconds: float,
     ) -> DesktopResponse:
+        loop = asyncio.get_running_loop()
         try:
-            async with asyncio.timeout(timeout_seconds):
-                client = self._client_ref()
-                if client is None:
-                    msg = "Desktop Matrix client closed before the request could be sent."
-                    raise DesktopRequestError(msg)
-                await send_encrypted_to_device(
-                    client,
-                    target,
-                    event_type=DESKTOP_COMMAND_EVENT_TYPE,
-                    content=command.to_content(),
+            # Only sending is serialized, so a reply that takes long, such as one awaiting approval, holds up no other
+            # request. The lock is FIFO, and callers create a command and enter here without awaiting in between.
+            async with self._target_locks[target]:
+                now_ms = round(time.time() * 1000)
+                command = replace(
+                    command,
+                    issued_at_ms=now_ms,
+                    expires_at_ms=now_ms + command.expires_at_ms - command.issued_at_ms,
                 )
+                deadline = loop.time() + timeout_seconds
+                async with asyncio.timeout_at(deadline):
+                    client = self._client_ref()
+                    if client is None:
+                        msg = "Desktop Matrix client closed before the request could be sent."
+                        raise DesktopRequestError(msg)
+                    await send_encrypted_to_device(
+                        client,
+                        target,
+                        event_type=DESKTOP_COMMAND_EVENT_TYPE,
+                        content=command.to_content(),
+                    )
+            async with asyncio.timeout_at(deadline):
                 return await future
         except TimeoutError as exc:
             msg = _timeout_message(command, timeout_seconds=timeout_seconds)

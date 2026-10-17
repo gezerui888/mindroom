@@ -191,10 +191,10 @@ async def test_only_one_request_per_target_can_be_in_flight(monkeypatch: pytest.
 
 
 @pytest.mark.asyncio
-async def test_queued_requests_wait_their_turn_without_blocking_the_next_action(
+async def test_queued_requests_leave_in_order_without_waiting_for_earlier_replies(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A running command's checks queue behind other requests, and each lifetime starts when it is sent."""
+    """A running command's check goes out while an action awaits approval, and each lifetime starts when it is sent."""
     client = FakeClient()
     router = DesktopResponseRouter(client)
     send = AsyncMock()
@@ -202,19 +202,21 @@ async def test_queued_requests_wait_their_turn_without_blocking_the_next_action(
     monkeypatch.setattr("mindroom.desktop.client.authenticated_sender_matches", lambda *_args: True)
     monkeypatch.setattr("mindroom.desktop.client.time.time", lambda: 50.0)
 
-    check = asyncio.create_task(router.request(TARGET, _command(request_id="check"), timeout_seconds=1, queued=True))
     action = asyncio.create_task(router.request(TARGET, _command(request_id="action"), timeout_seconds=1))
-    queued = asyncio.create_task(router.request(TARGET, _command(request_id="later"), timeout_seconds=1, queued=True))
-    await asyncio.sleep(0)
-    assert [call.kwargs["content"]["request_id"] for call in send.await_args_list] == ["check"]
-
-    for request_id in ("check", "action", "later"):
-        router.on_to_device_event(_event(DesktopResponse(request_id, "session-1", True)))
+    check = asyncio.create_task(router.request(TARGET, _command(request_id="check"), timeout_seconds=1, queued=True))
+    later = asyncio.create_task(router.request(TARGET, _command(request_id="later"), timeout_seconds=1, queued=True))
+    for _ in range(3):
         await asyncio.sleep(0)
-    await asyncio.gather(check, action, queued)
+    router.on_to_device_event(_event(DesktopResponse("check", "session-1", True)))
+    await asyncio.wait_for(check, 1)
+    assert not action.done()
+
+    for request_id in ("later", "action"):
+        router.on_to_device_event(_event(DesktopResponse(request_id, "session-1", True)))
+    await asyncio.gather(action, later)
 
     sent = [call.kwargs["content"] for call in send.await_args_list]
-    assert [content["request_id"] for content in sent] == ["check", "action", "later"]
+    assert [content["request_id"] for content in sent] == ["action", "check", "later"]
     assert {(content["issued_at_ms"], content["expires_at_ms"]) for content in sent} == {(50_000, 51_000)}
 
 

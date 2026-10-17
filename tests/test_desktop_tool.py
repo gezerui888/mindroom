@@ -19,6 +19,7 @@ from mindroom.desktop.client import DesktopRequestError
 from mindroom.desktop.configuration import DesktopConfigurationStatus, desktop_configuration_state
 from mindroom.desktop.media import DesktopMediaError
 from mindroom.desktop.protocol import MAX_SHELL_OUTPUT_BYTES, DesktopCommand, DesktopResponse, EncryptedDesktopMedia
+from mindroom.tool_jobs.control import JobControl, job_control_context
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
 from mindroom.tool_system.progress import tool_progress_reporter
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity, WorkerScope
@@ -925,7 +926,7 @@ async def _settle_background_stops() -> None:
 async def test_run_shell_waits_for_local_approval_and_returns_a_short_command_in_one_reply(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A start may wait the full command lifetime for approval; the bridge answers one second after the start."""
+    """A start may wait the full command lifetime for approval, and its reply a little longer, a second after the start."""
     request = _route_desktop_requests(
         monkeypatch,
         DesktopResponse("r1", "s", True, result=_shell_result(output="done\n", output_bytes=5, output_start=0)),
@@ -937,7 +938,7 @@ async def test_run_shell_waits_for_local_approval_and_returns_a_short_command_in
     (run_call,) = request.await_args_list
     assert run_call.args[1].parameters == {"command": "make test", "cwd": "/work/project", "timeout_seconds": 1}
     assert run_call.args[1].expires_at_ms - run_call.args[1].issued_at_ms == 120_000
-    assert run_call.kwargs["timeout_seconds"] == 120
+    assert run_call.kwargs["timeout_seconds"] == 135
     run_result = json.loads(run.content)["result"]
     assert run_result["output"] == "done\n"
     assert not {"handle", "output_attachment", "output_start", "next_offset"} & set(run_result)
@@ -1061,6 +1062,117 @@ async def test_a_run_shell_cancelled_before_approval_stops_a_command_that_starts
     await _settle_background_stops()
 
     assert _sent(request)[-1] == ("kill_shell", {"handle": "shell:1", "force": True})
+
+
+@pytest.mark.asyncio
+async def test_output_kept_back_after_a_failed_upload_is_read_before_the_call_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the bridge could not attach the output, the call pages through the rest from the bridge's handle."""
+    first_page = _shell_result(
+        handle="shell:1",
+        output="first ",
+        output_bytes=11,
+        output_truncated=True,
+        next_offset=6,
+        warning="The rest of the output could not be attached. Continue with check_shell from next_offset.",
+    )
+    rest = _shell_result(handle="shell:1", output="rest\n", output_bytes=11, output_start=6, next_offset=11)
+    request = _route_desktop_requests(
+        monkeypatch,
+        DesktopResponse("start", "s", True, result=first_page),
+        DesktopResponse("rest", "s", True, result=rest),
+    )
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="make logs")
+
+    assert _sent(request)[1:] == [("check_shell", {"handle": "shell:1", "offset": 6})]
+    payload = json.loads(result.content)["result"]
+    assert (payload["output"], payload["output_truncated"]) == ("first rest\n", False)
+    assert "warning" not in payload
+
+
+@pytest.mark.asyncio
+async def test_a_call_past_its_timeout_stops_waiting_for_a_computer_that_does_not_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable computer cannot hold a call with a timeout open; the call names the last lost reply."""
+    _check_immediately(monkeypatch)
+    monkeypatch.setattr("mindroom.custom_tools.desktop._SHELL_UNREACHABLE_SECONDS", 0.0)
+    request = _route_desktop_requests(
+        monkeypatch,
+        _running(),
+        DesktopRequestError("Timed out", request_id="lost-kill"),
+        DesktopRequestError("Timed out", request_id="lost-check"),
+        DesktopRequestError("Timed out", request_id="lost-stop"),
+    )
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="sleep 300", timeout_seconds=1)
+    await _settle_background_stops()
+
+    payload = json.loads(result.content)
+    assert payload["status"] == "error"
+    assert "has not answered" in payload["message"]
+    assert "request_id='lost-check'" in payload["message"]
+    assert [action for action, _parameters in _sent(request)] == [
+        "run_shell",
+        "kill_shell",
+        "check_shell",
+        "kill_shell",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_call_past_its_timeout_counts_silence_from_the_last_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One lost reply right after an answer does not end the call, even long after the command started."""
+    _check_immediately(monkeypatch)
+    monkeypatch.setattr("mindroom.custom_tools.desktop._SHELL_UNREACHABLE_SECONDS", 0.2)
+    replies: list[DesktopResponse | DesktopRequestError] = [
+        _running(),
+        DesktopResponse("kill", "s", True, result={"state": "killed", "handle": "shell:1"}),
+        _running(),
+        DesktopRequestError("Timed out", request_id="lost-check"),
+        DesktopResponse("done", "s", True, result=_shell_result(state="killed", handle="shell:1", exit_code=-9)),
+    ]
+
+    async def respond(_target: object, command: DesktopCommand, **_kwargs: object) -> DesktopResponse:
+        reply = replies.pop(0)
+        if command.action == "check_shell" and len(replies) == 2:
+            await asyncio.sleep(0.3)  # The command has now run longer than the silence limit.
+        if isinstance(reply, DesktopRequestError):
+            raise reply
+        return reply
+
+    request = _route_desktop_requests(monkeypatch)
+    request.side_effect = respond
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="sleep 300", timeout_seconds=1)
+
+    assert json.loads(result.content)["result"]["message"] == "Stopped after 1s."
+
+
+@pytest.mark.asyncio
+async def test_a_job_keeps_waiting_for_a_computer_that_stops_answering(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job's call has no limit, so it waits through an outage, reporting it, and finishes when the computer is back."""
+    _check_immediately(monkeypatch)
+    monkeypatch.setattr("mindroom.custom_tools.desktop._SHELL_UNREACHABLE_SECONDS", 0.0)
+    finished = _shell_result(handle="shell:1", output="done\n")
+    request = _route_desktop_requests(
+        monkeypatch,
+        _running(),
+        DesktopRequestError("Timed out", request_id="lost-1"),
+        DesktopRequestError("Timed out", request_id="lost-2"),
+        DesktopResponse("done", "s", True, result=finished),
+    )
+    reports: list[str] = []
+
+    with job_control_context(JobControl()), tool_progress_reporter(reports.append):
+        result = await _configured_tool(monkeypatch).desktop("run_shell", command="make build")
+
+    assert json.loads(result.content)["result"]["output"] == "done\n"
+    assert "kill_shell" not in [action for action, _parameters in _sent(request)]
+    assert len(reports) == 2
+    assert all(report.startswith("The computer has not answered for") for report in reports)
 
 
 @pytest.mark.asyncio

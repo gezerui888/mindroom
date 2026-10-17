@@ -84,6 +84,10 @@ _LOCAL_ACTIONS = DESKTOP_FILE_ACTIONS | {"run_shell"}
 _SHELL_START_TIMEOUT_SECONDS = MAX_COMMAND_TTL_MS / 1000
 # The bridge replies this long after a command starts, so a still-running command can be stopped soon after.
 _SHELL_START_WAIT_SECONDS = 1
+# A command approved just before its request expires still gets its start reply, a second after it starts.
+_SHELL_START_REPLY_GRACE_SECONDS = 15.0
+# Past its timeout, a call stops waiting for a computer that has not answered for this long.
+_SHELL_UNREACHABLE_SECONDS = MAX_COMMAND_TTL_MS / 1000
 # A running command is checked after 1 second, then at doubling intervals up to every 5 seconds.
 _FIRST_SHELL_CHECK_SECONDS = 1.0
 _MAX_SHELL_CHECK_SECONDS = 5.0
@@ -420,9 +424,13 @@ class DesktopTools(Toolkit):
         parameters: dict[str, object],
         *,
         timeout_seconds: float | None = None,
+        reply_grace_seconds: float = 0.0,
         queued: bool = False,
     ) -> tuple[str, DesktopResponse]:
-        """Send one command and return its request ID with the device's response."""
+        """Send one command and return its request ID with the device's response.
+
+        ``timeout_seconds`` is the command's lifetime; the reply may arrive ``reply_grace_seconds`` after it ends.
+        """
         timeout = route.timeout_seconds if timeout_seconds is None else timeout_seconds
         now_ms = round(time.time() * 1000)
         command = DesktopCommand(
@@ -439,7 +447,7 @@ class DesktopTools(Toolkit):
         response = await desktop_response_router(route.client).request(
             route.target,
             command,
-            timeout_seconds=timeout,
+            timeout_seconds=timeout + reply_grace_seconds,
             queued=queued,
         )
         return command.request_id, response
@@ -457,7 +465,13 @@ class DesktopTools(Toolkit):
         command ends. A call that ends early for any reason, including cancellation, stops its command.
         """
         start = asyncio.ensure_future(
-            self._send(route, "run_shell", parameters, timeout_seconds=_SHELL_START_TIMEOUT_SECONDS),
+            self._send(
+                route,
+                "run_shell",
+                parameters,
+                timeout_seconds=_SHELL_START_TIMEOUT_SECONDS,
+                reply_grace_seconds=_SHELL_START_REPLY_GRACE_SECONDS,
+            ),
         )
         try:
             request_id, response = await asyncio.shield(start)
@@ -467,7 +481,7 @@ class DesktopTools(Toolkit):
             raise
         handle = response.result.get("handle")
         if not response.ok or response.result.get("state") != "running" or not isinstance(handle, str):
-            return await _shell_tool_result(route, request_id, response, stopped_after=None, lost_request_id=None)
+            return await self._shell_result(route, request_id, response, stopped_after=None, lost_request_id=None)
         loop = asyncio.get_running_loop()
         # The command started when the bridge began its first wait.
         deadline = None if stop_after is None else loop.time() + stop_after - _SHELL_START_WAIT_SECONDS
@@ -475,11 +489,14 @@ class DesktopTools(Toolkit):
         kill_sent = False
         # A reply lost in transit; if it was the command's last check, the bridge forgot the handle after sending it.
         lost_request_id: str | None = None
+        answered_at = loop.time()
         ended = False
         try:
             while True:
-                due = interval if deadline is None or kill_sent else min(interval, deadline - loop.time())
-                await asyncio.sleep(max(0.0, due))
+                due = interval
+                if deadline is not None and not kill_sent and loop.time() < deadline:
+                    due = min(interval, deadline - loop.time())
+                await asyncio.sleep(due)
                 interval = min(interval * 2, _MAX_SHELL_CHECK_SECONDS)
                 if deadline is not None and not kill_sent and loop.time() >= deadline:
                     with suppress(DesktopRequestError):
@@ -490,11 +507,17 @@ class DesktopTools(Toolkit):
                     request_id, response = await self._send(route, "check_shell", {"handle": handle}, queued=True)
                 except DesktopRequestError as exc:
                     lost_request_id = exc.request_id
+                    unanswered = loop.time() - answered_at
+                    if deadline is not None and loop.time() >= deadline and unanswered >= _SHELL_UNREACHABLE_SECONDS:
+                        return _unreachable_result(unanswered, lost_request_id)
+                    # A job waits on, so a computer that slept carries on; its progress says why nothing changes.
+                    report_tool_progress(f"The computer has not answered for {unanswered:.0f} seconds.")
                     continue
+                answered_at = loop.time()
                 if not response.ok or response.result.get("state") != "running":
                     # A failed check leaves the command's state unknown, so it is stopped like any early end.
                     ended = response.ok
-                    return await _shell_tool_result(
+                    return await self._shell_result(
                         route,
                         request_id,
                         response,
@@ -506,6 +529,39 @@ class DesktopTools(Toolkit):
         finally:
             if not ended:
                 create_background_task(self._stop_shell(route, handle), name="desktop_shell_stop")
+
+    async def _shell_result(
+        self,
+        route: _DesktopRoute,
+        request_id: str,
+        response: DesktopResponse,
+        *,
+        stopped_after: float | None,
+        lost_request_id: str | None,
+    ) -> ToolResult:
+        """Return an ended command's result, first reading the output its bridge kept back after an upload failed."""
+        earlier_output = ""
+        while (
+            response.ok
+            and "warning" in response.result
+            and isinstance(handle := response.result.get("handle"), str)
+            and isinstance(next_offset := response.result.get("next_offset"), int)
+        ):
+            earlier_output += str(response.result.get("output", ""))
+            request_id, response = await self._send(
+                route,
+                "check_shell",
+                {"handle": handle, "offset": next_offset},
+                queued=True,
+            )
+        return await _shell_tool_result(
+            route,
+            request_id,
+            response,
+            stopped_after=stopped_after,
+            lost_request_id=lost_request_id,
+            earlier_output=earlier_output,
+        )
 
     async def _stop_when_started(
         self,
@@ -1056,6 +1112,7 @@ async def _shell_tool_result(
     *,
     stopped_after: float | None,
     lost_request_id: str | None,
+    earlier_output: str,
 ) -> ToolResult:
     """Return an ended command's complete output, or why it can no longer be followed."""
     result = response.result
@@ -1083,7 +1140,9 @@ async def _shell_tool_result(
             recovery_action="request_status",
         )
     shown = _without_transport_fields(shown)
+    shown["output"] = earlier_output + str(shown.get("output", ""))
     if "warning" in shown:
+        # Only a command stopped by revoked shell access as it started leaves no handle to read the rest from.
         shown["warning"] = "The rest of the output could not be attached; only its beginning is shown."
     if stopped_after is not None and shown.get("state") == "killed":
         shown["message"] = f"Stopped after {stopped_after:g}s."
@@ -1124,6 +1183,18 @@ async def _with_full_output(
     media = EncryptedDesktopMedia.from_content(raw_media, kind="output_attachment")
     output = await download_encrypted_media(client, media, timeout_seconds=timeout_seconds)
     return {**shown, "output": output.decode()}
+
+
+def _unreachable_result(unanswered: float, lost_request_id: str | None) -> ToolResult:
+    message = (
+        f"The computer has not answered for {unanswered:.0f} seconds, past the command's timeout, so the call stopped "
+        "waiting. The command may still be running there until it ends or the person at the computer stops it."
+    )
+    if lost_request_id is not None:
+        message += (
+            f" If the command had finished, request_status with request_id={lost_request_id!r} returns its output."
+        )
+    return _error_result("run_shell", message)
 
 
 def _without_attachment(result: dict[str, object]) -> dict[str, object]:

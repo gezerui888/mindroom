@@ -94,8 +94,8 @@ _SHELL_START_REPLY_GRACE_SECONDS = 15.0
 # Past its timeout, a call stops waiting for a computer that has not answered for this long.
 _SHELL_UNREACHABLE_SECONDS = MAX_COMMAND_TTL_MS / 1000
 # A passing failure on the computer, such as a device-key lookup, refuses a check; a command that is gone refuses
-# every one, so this many refusals in a row end the call.
-_SHELL_CHECK_REFUSALS = 3
+# every one, so a check is asked this many times before its refusal stands.
+_SHELL_CHECK_ATTEMPTS = 3
 # A running command is checked after 1 second, then at doubling intervals up to every 5 seconds.
 _FIRST_SHELL_CHECK_SECONDS = 1.0
 _MAX_SHELL_CHECK_SECONDS = 5.0
@@ -503,7 +503,6 @@ class DesktopTools(Toolkit):
         # A reply lost in transit; if it was the command's last check, the bridge forgot the handle after sending it.
         lost_request_id: str | None = None
         answered_at = loop.time()
-        refusals = 0
         ended = False
         try:
             while True:
@@ -525,9 +524,6 @@ class DesktopTools(Toolkit):
                     report_tool_progress(f"The computer has not answered for {unanswered:.0f} seconds.")
                     continue
                 answered_at = loop.time()
-                refusals = refusals + 1 if not response.ok else 0
-                if 0 < refusals < _SHELL_CHECK_REFUSALS:
-                    continue
                 if not response.ok or response.result.get("state") != "running":
                     # A command that refuses every check has an unknown state, so it is stopped like any early end.
                     ended = response.ok
@@ -547,14 +543,21 @@ class DesktopTools(Toolkit):
                 create_background_task(self._stop_shell(route, handle), name="desktop_shell_stop")
 
     async def _check(self, route: _DesktopRoute, parameters: dict[str, object]) -> tuple[str, DesktopResponse]:
-        # An ended command's check may first spend the bridge's whole upload timeout attaching its output.
-        return await self._send(
-            route,
-            "check_shell",
-            parameters,
-            reply_grace_seconds=MEDIA_UPLOAD_TIMEOUT_SECONDS,
-            queued=True,
-        )
+        """Check a command, asking again after a refusal until it has been refused ``_SHELL_CHECK_ATTEMPTS`` times."""
+        for attempt in range(_SHELL_CHECK_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_FIRST_SHELL_CHECK_SECONDS * attempt)
+            # An ended command's check may first spend the bridge's whole upload timeout attaching its output.
+            request_id, response = await self._send(
+                route,
+                "check_shell",
+                parameters,
+                reply_grace_seconds=MEDIA_UPLOAD_TIMEOUT_SECONDS,
+                queued=True,
+            )
+            if response.ok:
+                break
+        return request_id, response
 
     async def _kill_at(self, route: _DesktopRoute, handle: str, deadline: float) -> None:
         """Kill the command at its deadline; the call cancels this once the command ends."""
@@ -602,7 +605,13 @@ class DesktopTools(Toolkit):
             and isinstance(next_offset := response.result.get("next_offset"), int)
         ):
             earlier_output += str(response.result.get("output", ""))
-            request_id, response = await self._check(route, {"handle": handle, "offset": next_offset})
+            page = response
+            try:
+                request_id, response = await self._check(route, {"handle": handle, "offset": next_offset})
+            except DesktopRequestError as exc:
+                return _output_read_so_far(page, earlier_output, str(exc), exc.request_id)
+            if not response.ok:
+                return _output_read_so_far(page, earlier_output, response.error or "The page was refused.", None)
         return await _shell_tool_result(
             route,
             request_id,
@@ -1232,6 +1241,24 @@ async def _with_full_output(
     media = EncryptedDesktopMedia.from_content(raw_media, kind="output_attachment")
     output = await download_encrypted_media(client, media, timeout_seconds=timeout_seconds)
     return {**shown, "output": output.decode()}
+
+
+def _output_read_so_far(page: DesktopResponse, output: str, reason: str, lost_request_id: str | None) -> ToolResult:
+    """Return an ended command's result with the output read before a page of the rest failed.
+
+    Only a page whose reply was lost may have been read on the computer, so only it has a receipt to recover.
+    """
+    result = {key: value for key, value in _without_transport_fields(page.result).items() if key != "warning"}
+    message = f"The command ended, but the rest of its output could not be read: {reason} Do not run the command again."
+    if lost_request_id is not None:
+        message += " request_status with the request_id may return the rest."
+    return _partial_result(
+        "run_shell",
+        result={**result, "output": output, "output_truncated": True},
+        message=message,
+        request_id=lost_request_id,
+        recovery_action="request_status" if lost_request_id is not None else None,
+    )
 
 
 def _unreachable_result(unanswered: float, lost_request_id: str | None) -> ToolResult:

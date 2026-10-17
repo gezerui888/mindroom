@@ -1227,6 +1227,36 @@ async def test_output_read_before_a_failed_download_stays_in_the_partial_result(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        DesktopRequestError("Timed out", request_id="lost-page"),
+        [DesktopResponse("lost-page", "s", False, error="Matrix device-key query failed: 502.")] * 3,
+    ],
+)
+async def test_output_read_before_a_failed_page_stays_in_the_partial_result(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: list[DesktopResponse] | DesktopRequestError,
+) -> None:
+    """A page of the rest that is lost or keeps being refused keeps what was read and says how to recover the rest."""
+    _check_immediately(monkeypatch)
+    first_page = _shell_result(handle="shell:1", output="first ", exit_code=3, next_offset=6, warning="Upload failed.")
+    failures = failure if isinstance(failure, list) else [failure]
+    _route_desktop_requests(monkeypatch, DesktopResponse("start", "s", True, result=first_page), *failures)
+
+    result = await _configured_tool(monkeypatch).desktop("run_shell", command="make logs")
+
+    payload = json.loads(result.content)
+    assert (payload["status"], payload["result"]["output"], payload["result"]["exit_code"]) == ("partial", "first ", 3)
+    assert payload["result"]["output_truncated"] is True
+    assert "warning" not in payload["result"]
+    lost = isinstance(failure, DesktopRequestError)
+    assert (payload["request_id"], payload["recovery_action"]) == (
+        ("lost-page", "request_status") if lost else (None, None)
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_call_past_its_timeout_stops_waiting_for_a_computer_that_does_not_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

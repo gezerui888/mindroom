@@ -1314,9 +1314,9 @@ async def test_a_call_past_its_timeout_counts_silence_from_the_last_answer(monke
 
 @pytest.mark.asyncio
 async def test_a_check_that_could_not_be_sent_ends_the_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A closed Matrix client cannot send any check, so even a job's call ends instead of waiting forever."""
+    """A check that can never be sent ends even a job's call, without presenting the started command as not run."""
     _check_immediately(monkeypatch)
-    closed = DesktopRequestError("Desktop Matrix client closed before the request could be sent.")
+    closed = DesktopRequestError("Desktop command is invalid and was not sent.")
     request = _reply_by_action(
         monkeypatch,
         run_shell=[_running()],
@@ -1329,7 +1329,9 @@ async def test_a_check_that_could_not_be_sent_ends_the_call(monkeypatch: pytest.
     await _settle_background_stops()
 
     payload = json.loads(result.content)
-    assert (payload["status"], payload["action_outcome"]) == ("error", "not_sent")
+    assert payload["status"] == "error"
+    assert "action_outcome" not in payload
+    assert "do not run it again" in payload["message"]
     assert _sent(request)[-1] == ("kill_shell", {"handle": "shell:1", "force": True})
 
 

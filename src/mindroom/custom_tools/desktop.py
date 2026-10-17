@@ -517,8 +517,9 @@ class DesktopTools(Toolkit):
                     request_id, response = await self._check(route, {"handle": handle})
                 except DesktopRequestError as exc:
                     if exc.request_id is None:
-                        # Never sent, such as after this agent's Matrix client closed, so asking again cannot help.
-                        raise
+                        # A check that could not be sent never will be, but the command has already started.
+                        message = f"{exc} The command started and may still be running; do not run it again."
+                        return _error_result("run_shell", message)
                     lost_request_id = exc.request_id
                     unanswered = loop.time() - answered_at
                     if deadline is not None and loop.time() >= deadline and unanswered >= _SHELL_UNREACHABLE_SECONDS:

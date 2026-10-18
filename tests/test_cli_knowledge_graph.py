@@ -161,3 +161,33 @@ def test_an_infinite_timeout_is_refused(api: _Api, tmp_path: Path) -> None:
     assert "--timeout must be finite." in result.output
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert api.sent == []
+
+
+def test_a_validation_error_shows_only_its_fields(api: _Api, tmp_path: Path) -> None:
+    """A 422 lists what was wrong without echoing the request body back."""
+    detail = [{"loc": ["body", "keep"], "msg": "Field required", "input": {"secret": "x"}}]
+    api.responses.append(httpx.Response(422, json={"detail": detail}))
+
+    result = runner.invoke(
+        app,
+        ["knowledge-graph", "merge", "mind", "Alice N.", "Alice", "--config", str(tmp_path / "c.yaml")],
+    )
+
+    assert result.exit_code == 2
+    assert "HTTP 422" in result.output
+    assert "body.keep: Field required" in result.output
+    assert "secret" not in result.output
+
+
+def test_a_reply_that_is_no_report_is_refused(api: _Api, tmp_path: Path) -> None:
+    """A reply from something other than MindRoom, or another version, is reported instead of half printed."""
+    api.responses.append(httpx.Response(200, json={"keep": "Alice Example"}))
+
+    result = runner.invoke(
+        app,
+        ["knowledge-graph", "merge", "mind", "Alice Example", "Alice", "--config", str(tmp_path / "c.yaml")],
+    )
+
+    assert result.exit_code == 2
+    assert "invalid response" in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)

@@ -89,6 +89,7 @@ path = "mindroom.http_error_detail"
 depends_on = []
 visibility = [
     "mindroom.cli.connect",
+    "mindroom.cli.knowledge_graph",
     "mindroom.matrix.provisioning",
     "mindroom.script_runs.worker_client",
 ]
@@ -9195,7 +9196,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.knowledge_graph.maintenance"
 depends_on = []
-visibility = ["mindroom.api.knowledge_graph"]
+visibility = ["mindroom.api.knowledge_graph", "mindroom.cli.knowledge_graph"]
 
 [[modules]]
 path = "mindroom.api.knowledge_graph"
@@ -9211,7 +9212,13 @@ visibility = ["mindroom.api.main"]
 
 [[modules]]
 path = "mindroom.cli.knowledge_graph"
-depends_on = ["mindroom.cli.api", "mindroom.cli.config", "mindroom.cli.help_format"]
+depends_on = [
+    "mindroom.cli.api",
+    "mindroom.cli.config",
+    "mindroom.cli.help_format",
+    "mindroom.http_error_detail",
+    "mindroom.knowledge_graph.maintenance",
+]
 visibility = ["mindroom.cli.main"]
 
 [[modules]]

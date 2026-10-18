@@ -283,7 +283,9 @@ async def test_names_that_match_nothing_are_reported(graph: GraphDriver) -> None
         ("TCP/IP", False),
         ("e5eaa51", True),
         ("MEMORY.md", True),
-        ("src/mindroom", True),
+        # Two lowercase segments are an owner/name slug of a repository or model unless something marks a path.
+        ("src/mindroom", False),
+        ("src/mindroom/bot", True),
         ("index.js", True),
         ("vite.config.js", True),
         ("#general:mindroom.chat", True),
@@ -313,6 +315,15 @@ async def test_names_that_match_nothing_are_reported(graph: GraphDriver) -> None
         ("@ann:example.md", False),
         ("@ann:example.py", False),
         ("@ann:example.js", False),
+        ("mindroom-ai/mindroom", False),
+        ("getzep/graphiti", False),
+        ("annlee/dotfiles", False),
+        ("deepseek/deepseek-v4.1-flash", False),
+        ("z-ai/glm-5.3", False),
+        ("anthropic/claude-opus-5.5", False),
+        ("openai/gpt-6-astra", False),
+        ("./mindroom", True),
+        ("~/dotfiles", True),
     ],
 )
 def test_looks_like_junk(name: str, junk: bool) -> None:

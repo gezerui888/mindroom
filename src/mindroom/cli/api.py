@@ -1,4 +1,4 @@
-"""Small shared transport for operational CLI reads."""
+"""Shared transport for CLI requests to the running MindRoom API."""
 
 from __future__ import annotations
 

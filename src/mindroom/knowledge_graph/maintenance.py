@@ -137,9 +137,11 @@ _TARGET_KEYS = ("target_uuid", "target_node_uuid")
 # patterns catch the common shapes, not every one; an operator reads the dry run's list before deleting.
 _URL = re.compile(r"^(?:[a-z][a-z0-9+.-]*://|www\.)", re.IGNORECASE)
 _ABSOLUTE_PATH = re.compile(r"^(?:~|\.\.?)?/|^[a-z]:\\", re.IGNORECASE)
-# Lowercase segments with a letter (`src/mindroom`), or three or more segments of two or more characters
-# (`Users/Ann/Desktop`); not `TCP/IP`, `A/B/C`, or `1/2/2026`.
-_RELATIVE_PATH = re.compile(r"^(?=.*[a-z])[a-z0-9_.-]+(?:/[a-z0-9_.-]*)+$")
+# Three or more segments: lowercase with a letter (`src/mindroom/bot`), or of two or more characters
+# (`Users/Ann/Desktop`). Two segments are an owner/name slug of a repository or model (`getzep/graphiti`,
+# `openai/gpt-6-astra`) unless a leading `/`, `~/`, or `./` or a file extension marks a path; and `TCP/IP`, `A/B/C`,
+# and `1/2/2026` are no paths.
+_RELATIVE_PATH = re.compile(r"^(?=.*[a-z])[a-z0-9_.-]+(?:/[a-z0-9_.-]*){2,}$")
 _DEEP_PATH = re.compile(r"^(?=.*[A-Za-z])[\w.-]{2,}(?:/[\w.-]{2,}){2,}/?$")
 _FILE = re.compile(
     r"^(?P<stem>\S*)\.(?P<extension>py|pyi|ipynb|js|ts|tsx|jsx|mjs|rs|go|java|kt|swift|rb|php|lua|c|h|cpp|sh|bash|zsh"

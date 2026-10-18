@@ -106,7 +106,8 @@ The kept entity keeps its own name and summary, and fact texts still read as ext
 The report lists, for each duplicate, the facts and mentions that move and those dropped, and any name that matched no entity; a misspelled name is skipped, so check that list before applying.
 
 A delete removes each entity with its facts and mentions, including facts it shared with other entities.
-`--junk` adds every entity whose name looks like a file path, a file with a code or data extension, a URL, an environment variable, a commit hash or UUID, or a Matrix room ID, alias, or link.
+`--junk` adds every entity whose name looks like a file path (starting with `/`, `~/`, or `./`, or with three or more parts such as `src/app/main`), a file with a code or data extension, a URL, an environment variable, a commit hash or UUID, or a Matrix room ID, alias, or link.
+A two-part name such as `owner/project` is left alone, because repositories and model IDs look like that.
 The patterns are guesses, and a real entity can land in the list; when it does, delete the others by name instead, for example `mindroom knowledge-graph delete mind compaction.py config.yaml --apply`.
 Email addresses and Matrix user IDs are never treated as junk; merge them into the person they belong to.
 

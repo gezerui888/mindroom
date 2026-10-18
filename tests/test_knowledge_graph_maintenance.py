@@ -16,6 +16,7 @@ from mindroom.knowledge_graph.clients import MindRoomFalkorDriver
 from mindroom.knowledge_graph.embedded_server import start_embedded_server
 from mindroom.knowledge_graph.maintenance import (
     EntityCount,
+    MergedEntity,
     MergeInputError,
     delete_entities,
     list_entities,
@@ -129,7 +130,17 @@ async def test_merge_moves_facts_and_mentions_and_drops_the_duplicate(graph: Gra
 
     assert (report.facts_moved, report.self_loops_dropped, report.applied) == (1, 1, False)
     assert report.keep == EntityCount(name="Bas Nijholt", uuid=kept.uuid, facts=2, mentions=0)
-    assert report.merged == [EntityCount(name="Bas", uuid=bas.uuid, facts=2, mentions=1)]
+    assert report.merged == [
+        MergedEntity(
+            name="Bas",
+            uuid=bas.uuid,
+            facts_moved=1,
+            self_loops_dropped=1,
+            mentions_moved=1,
+            mentions_dropped=0,
+        ),
+    ]
+    assert report.unmatched == []
     assert await _names(graph, "bas") == {"Bas Nijholt", "Bas"}  # dry run changed nothing
     assert len(await _stored_fact(graph, f3.uuid)) == 1
 
@@ -173,7 +184,11 @@ async def test_merge_rejects_keep_in_duplicates_or_missing(graph: GraphDriver) -
 
 @pytest.mark.asyncio
 async def test_merging_several_duplicates_drops_the_facts_between_them(graph: GraphDriver) -> None:
-    """Facts among the merged entities become no self-loops, and an episode mentioning several keeps one mention."""
+    """Facts among the merged entities become no self-loops, and an episode mentioning several keeps one mention.
+
+    Each fact and mention is reported under one duplicate, the first in merge order, so the dry run's numbers add up to
+    what the merge does.
+    """
     kept, same_name = _entity("Bas Nijholt"), _entity("Bas Nijholt")
     bas, email, acme, fastmail = _entity("Bas"), _entity("bas@nijho.lt"), _entity("Acme"), _entity("Fastmail")
     works = _fact(kept, acme, "Bas Nijholt works at Acme", [1.0, 0.0, 0.0, 0.0])
@@ -183,6 +198,8 @@ async def test_merging_several_duplicates_drops_the_facts_between_them(graph: Gr
     since = _fact(email, fastmail, "bas@nijho.lt has been on Fastmail since 2019", [0.0, 0.0, 1.0, 1.0])
     entities = [kept, same_name, bas, email, acme, fastmail]
     episode = await _ingest(graph, entities, [works, uses, signs, since], [bas, email])
+    # An episode that already mentions the kept entity keeps that one mention.
+    other_episode = await _ingest(graph, [], [], [kept, bas])
     # A fact Graphiti saved one at a time, which stores the other pair of endpoint copies.
     hosted = _fact(email, fastmail, "bas@nijho.lt is hosted by Fastmail", [0.0, 0.0, 1.0, 0.0])
     await hosted.save(graph)
@@ -191,14 +208,21 @@ async def test_merging_several_duplicates_drops_the_facts_between_them(graph: Gr
     report = await merge_entities(graph, "Bas Nijholt", ["Bas", "BAS@nijho.lt"], apply=True)
 
     # The kept entity is the one with most facts; another entity with its name is merged into it too.
-    assert report.keep.uuid == kept.uuid
+    assert report.keep == EntityCount(name="Bas Nijholt", uuid=kept.uuid, facts=1, mentions=1)
     assert report.merged == [
-        EntityCount(name="Bas Nijholt", uuid=same_name.uuid, facts=0, mentions=0),
-        EntityCount(name="bas@nijho.lt", uuid=email.uuid, facts=4, mentions=1),
-        EntityCount(name="Bas", uuid=bas.uuid, facts=2, mentions=1),
+        # Facts moved, self-loops dropped, mentions moved, mentions dropped. What two duplicates share counts
+        # under the first: the facts between them, and the episode that mentions both.
+        MergedEntity("Bas Nijholt", same_name.uuid, 0, 0, 0, 0),
+        MergedEntity("bas@nijho.lt", email.uuid, 2, 2, 1, 0),
+        MergedEntity("Bas", bas.uuid, 0, 0, 0, 2),
     ]
+    assert dry_run.merged == report.merged
     assert (dry_run.facts_moved, dry_run.self_loops_dropped, dry_run.applied) == (2, 2, False)
     assert (report.facts_moved, report.self_loops_dropped, report.applied) == (2, 2, True)
+    # The kept entity now has what the report said would move, and nothing that it said would be dropped.
+    assert await list_entities(graph, "bas nijholt") == [
+        EntityCount(name="Bas Nijholt", uuid=kept.uuid, facts=1 + 2, mentions=1 + 1),
+    ]
     assert await _names(graph) == {"Bas Nijholt", "Acme", "Fastmail"}
     assert await _rows(graph, "MATCH (entity:Entity)-[fact:RELATES_TO]->(entity) RETURN fact.uuid AS uuid") == []
     assert await _stored_fact(graph, uses.uuid) == await _stored_fact(graph, signs.uuid) == []
@@ -208,7 +232,22 @@ async def test_merging_several_duplicates_drops_the_facts_between_them(graph: Gr
     assert (moved["properties"]["source_uuid"], moved["properties"]["target_uuid"]) == (kept.uuid, fastmail.uuid)
     assert "source_node_uuid" not in moved["properties"]
     assert moved["embedding_type"] == "Vectorf32"
-    assert await _mentions(graph) == [(episode.uuid, "Bas Nijholt")]
+    assert await _mentions(graph) == sorted([(episode.uuid, "Bas Nijholt"), (other_episode.uuid, "Bas Nijholt")])
+
+
+@pytest.mark.asyncio
+async def test_names_that_match_nothing_are_reported(graph: GraphDriver) -> None:
+    """A mistyped name is listed as unmatched, so an operator does not merge or delete half of what they meant."""
+    kept, bas, seattle = _entity("Bas Nijholt"), _entity("Bas"), _entity("Seattle")
+    await _ingest(graph, [kept, bas, seattle], [], [bas])
+
+    merge = await merge_entities(graph, "Bas Nijholt", ["Bsa", "bas", "Bas N."], apply=False)
+    delete = await delete_entities(graph, ["Seatle", "SEATTLE"], apply=False)
+
+    assert [entity.name for entity in merge.merged] == ["Bas"]
+    assert merge.unmatched == ["Bsa", "Bas N."]
+    assert [entity.name for entity in delete.deleted] == ["Seattle"]
+    assert delete.unmatched == ["Seatle"]
 
 
 @pytest.mark.parametrize(
@@ -231,6 +270,26 @@ async def test_merging_several_duplicates_drops_the_facts_between_them(graph: Gr
         ("bas@nijho.lt", False),
         ("@basnijholt:mindroom.chat", False),
         ("Node.js", False),
+        # Product names that end like a file, words with a number, and slashed names that are no paths.
+        ("Bun.sh", False),
+        ("docs.rs", False),
+        ("Tailwind.css", False),
+        ("feb2026", False),
+        ("dec2025", False),
+        ("face2face", False),
+        ("abc1234", False),
+        ("1/2/2026", False),
+        ("A/B/C", False),
+        ("TCP/IP", False),
+        ("e5eaa51", True),
+        ("MEMORY.md", True),
+        ("src/mindroom", True),
+        ("index.js", True),
+        ("vite.config.js", True),
+        ("#general:mindroom.chat", True),
+        ("matrix:r/general:mindroom.chat", True),
+        ("matrix.to/#/!room:mindroom.chat", True),
+        ("#MeToo", False),
     ],
 )
 def test_looks_like_junk(name: str, junk: bool) -> None:

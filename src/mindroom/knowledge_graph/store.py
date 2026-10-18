@@ -340,7 +340,7 @@ class GraphitiStore:
 
     async def _maintain[T](self, scope: GraphScope, operation: Callable[[GraphDriver], Awaitable[T]]) -> T:
         graphiti = await self._graphiti_client()
-        assert self._write_lock is not None, "the client is only used on the graph loop"
+        assert self._write_lock is not None, "maintenance runs on the graph loop, which creates the write lock"
         async with self._write_lock:
             return await operation(graphiti.driver.clone(database=scope.graph_name))
 
@@ -349,7 +349,7 @@ class GraphitiStore:
         graphiti = await self._graphiti_client()
         from graphiti_core.nodes import EpisodeType  # noqa: PLC0415
 
-        assert self._write_lock is not None, "the client is only used on the graph loop"
+        assert self._write_lock is not None, "episodes are added on the graph loop, which creates the write lock"
         async with self._write_lock:
             with usage_target(usage):
                 await graphiti.add_episode(

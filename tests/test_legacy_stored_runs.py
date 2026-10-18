@@ -12,18 +12,13 @@ from mindroom.history.legacy_stored_runs import (
     is_recovered_legacy_run,
     legacy_prompt_utterances,
     recover_legacy_run_metadata,
+    without_added_blocks,
 )
 from mindroom.prompt_message_tags import render_msg_tag
 
 
-def _run(session_id: str, metadata: dict[str, Any] | None, *, parent_run_id: str | None = None) -> RunOutput:
-    return RunOutput(
-        run_id="r",
-        session_id=session_id,
-        parent_run_id=parent_run_id,
-        metadata=metadata,
-        status=RunStatus.completed,
-    )
+def _run(session_id: str, metadata: dict[str, Any] | None) -> RunOutput:
+    return RunOutput(run_id="r", session_id=session_id, metadata=metadata, status=RunStatus.completed)
 
 
 def test_recovers_room_and_thread_from_the_session_id() -> None:
@@ -67,15 +62,6 @@ def test_leaves_other_runs_alone(session_id: str, metadata: dict[str, Any] | Non
 
     assert run.metadata == metadata
     assert not is_recovered_legacy_run(run)
-
-
-def test_member_runs_are_left_alone() -> None:
-    """Only a top-level turn is a Matrix turn; a member run inside it keeps its metadata."""
-    run = _run("!abc:mindroom.chat:$root", {"matrix_event_id": "$e"}, parent_run_id="top")
-
-    recover_legacy_run_metadata(run)
-
-    assert run.metadata == {"matrix_event_id": "$e"}
 
 
 MEMORY_FILE = "[File memory entrypoint (agent)]\n# MEMORY.md - Long-term Memory\n\n## Alice Example\n\n- **Prefers short answers**"
@@ -218,3 +204,24 @@ def test_tagged_legacy_messages_lose_mindroom_blocks_and_drafts() -> None:
         ("@r:x", "Ship it now?"),
     ]
     assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=f"{MEMORY_FILE}\n\nhello"), "@r:x") == []
+
+
+def test_blocks_in_a_tagged_message_of_a_turn_that_names_its_room_are_dropped() -> None:
+    """A v2026.5 turn names its room but kept the memory list, attachment line, and Matrix IDs block in the tag."""
+    degraded = (
+        "Semantic memory search is unavailable this turn (embedder offline); stored memories may be missing or "
+        "keyword-only. Do not claim to have checked stored memories."
+    )
+    body = f"Ship it now?\n\nsecond paragraph\n\n{degraded}\n\n{MEMORY_LIST}\n\n{ATTACHMENTS}\n\n{MATRIX_METADATA}"
+    newline_note = INLINE_MEDIA.replace("] ", "]\n", 1)
+
+    assert without_added_blocks(body) == "Ship it now?\n\nsecond paragraph"
+    assert without_added_blocks(f"Look\n\n{newline_note}") == "Look"
+    assert without_added_blocks(f"{ATTACHMENTS}\n\n{MATRIX_METADATA}") == ""
+
+
+def test_a_current_message_is_read_byte_for_byte() -> None:
+    """A body with no block MindRoom added, including one quoting part of a block, is returned unchanged."""
+    body = "  Ship it?\n\n\nAvailable attachment IDs: are listed below.\n\nPrevious agent memories that might be related:\n "
+
+    assert without_added_blocks(body) is body

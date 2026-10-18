@@ -193,3 +193,17 @@ def test_a_legacy_turn_keeps_only_peoples_words() -> None:
     ]
     assert _kinds(tagged) == [("said", "@bob:x", "And Bolt?")]
     assert _kinds(current) == [("said", "@alice:x", prompt)]
+
+
+def test_blocks_mindroom_added_inside_a_tag_are_nobodys_words() -> None:
+    """A turn that names its room but stored MindRoom's blocks in the requester's tag keeps only the person's words."""
+    body = (
+        "Ship it now?\n\n"
+        "[Automatically extracted agent file memories - may not be relevant to current context]\n"
+        "Previous agent file memories that might be related:\n- Bob owns Atlas.\n\n"
+        "[Matrix metadata for tool calls]\nroom_id: !r:x\nthread_id: $t\nreply_to_event_id: $e\n"
+        "Use these IDs when calling matrix_message."
+    )
+    run = _run(Message(role="user", content=render_msg_tag(sender="@bob:x", body=body)), room_id="!r:x")
+
+    assert _kinds(run) == [("said", "@bob:x", "Ship it now?")]

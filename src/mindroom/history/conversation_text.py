@@ -13,7 +13,11 @@ from typing import TYPE_CHECKING, Literal
 from mindroom.automations.steps import is_automation_hook_source
 from mindroom.constants import HOOK_SOURCE_RUN_METADATA_KEY, TURN_INTENT_RUN_METADATA_KEY
 from mindroom.history.interrupted_replay import is_interrupted_replay_run
-from mindroom.history.legacy_stored_runs import is_recovered_legacy_run, legacy_prompt_utterances
+from mindroom.history.legacy_stored_runs import (
+    is_recovered_legacy_run,
+    legacy_prompt_utterances,
+    without_added_blocks,
+)
 from mindroom.history.run_visibility import is_model_history_visible_run, is_queued_notice_message
 from mindroom.prompt_message_tags import parse_msg_tags
 from mindroom.turn_origin import TurnIntent
@@ -78,7 +82,10 @@ def utterances(run: RunOutput | TeamRunOutput, *, agent_work: bool = False) -> l
             messages = (
                 legacy_prompt_utterances(content, requester)
                 if legacy
-                else parse_msg_tags(content, default_sender=requester)
+                else [
+                    (sender, without_added_blocks(body))
+                    for sender, body in parse_msg_tags(content, default_sender=requester)
+                ]
             )
             said.extend(
                 Utterance("runtime", None, body, message)

@@ -27,35 +27,38 @@ _CURRENT_MESSAGE = re.compile(r"(?:^|\n\n)Current message:\n")
 _SENDER_LINE = re.compile(r"(@[^\s:]+:\S+?): (.*)")
 _OWN_DRAFT_LINE = re.compile(r"You \([^)]*\): ")
 _TIME_PREFIX = re.compile(r"^\[(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2} [^\]]+\](?:\s+|$)")
-# Blocks, separated by blank lines, that MindRoom added to a legacy message.
+# Paragraphs, separated by blank lines, that MindRoom added to stored messages.
 _MEMORY_FILE = "[File memory entrypoint"
-_MEMORY_LIST = re.compile(
-    r"\[Automatically extracted [^\n]*memories - may not be relevant to current context\](?:\n|$)"
-    r"|Previous [^\n]*memories that might be related:(?:\n|$)",
+_MEMORY_LIST = (
+    r"\[Automatically extracted [^\n]* memories - may not be relevant to current context\]\n"
+    r"Previous [^\n]* memories that might be related:(?:\n[^\n]*)*"
 )
+_MEMORY_LIST_BLOCK = re.compile(_MEMORY_LIST)
 _ADDED_BLOCK = re.compile(
-    r"Available attachment IDs: [^\n]*\. Use tool calls to inspect or process them\."
+    rf"{_MEMORY_LIST}"
+    r"|Semantic memory search is unavailable this turn \([^\n]*\); stored memories may be missing or keyword-only\. "
+    r"Do not claim to have checked stored memories\."
+    r"|Available attachment IDs: [^\n]*\. Use tool calls to inspect or process them\."
     r"|\[Matrix metadata for tool calls\]\nroom_id: [^\n]*\nthread_id: [^\n]*\nreply_to_event_id: [^\n]*\n"
     r"Use these IDs when calling matrix_message\."
-    r"|\[Inline media unavailable for this model\] The model rejected inline attachments for this turn\. "
+    r"|\[Inline media unavailable for this model\][ \n]The model rejected inline attachments for this turn\. "
     r"Use available attachment IDs and tools to inspect files instead\.",
 )
 
 
 # LEGACY_COMPAT: Run metadata without room_id.
 # Legacy format: Matrix turns stored their event IDs (`matrix_event_id`, `matrix_seen_event_ids`) in run metadata but
-# no `room_id` or `thread_id`; the rule selects a top-level run whose metadata holds `matrix_event_id` and no `room_id`
-# and whose session ID is a Matrix room ID (`!...`), optionally followed by `:` and the thread root event ID.
-# A current turn interrupted before its run started is stored from the recorder's seed metadata, which also lacks
-# `room_id`; the rule applies to it too, and its session ID names the same room.
+# no `room_id` or `thread_id`; the rule selects a run whose metadata holds `matrix_event_id` and no `room_id` and
+# whose session ID is a Matrix room ID (`!...`), optionally followed by `:` and the thread root event ID.
 # Last legacy release: v2026.5.26; replacement: v2026.5.27 (#665) stores `room_id` and `thread_id` in run metadata.
+# A turn that failed before its run started was stored from the turn recorder's seed metadata, which kept no room
+# through v2026.10.344; the unreleased writer seeds `room_id` and `thread_id` there too.
 # Handling: The room and thread root are read from the session ID (split at the first `:$`; none means a room-mode
 # session without a thread) and written into the loaded run's metadata, so background readers group, filter, and
 # describe the turn by its real room, and marked recovered for the prompt rule below. Stored rows are not rewritten.
 # Coverage: tests/test_legacy_stored_runs.py::test_recovers_room_and_thread_from_the_session_id,
 # tests/test_legacy_stored_runs.py::test_room_mode_session_has_no_thread,
 # tests/test_legacy_stored_runs.py::test_leaves_other_runs_alone,
-# tests/test_legacy_stored_runs.py::test_member_runs_are_left_alone,
 # tests/test_history_session_runs.py::test_session_runs_returns_legacy_runs_with_their_room_and_thread, and
 # tests/test_history_session_runs.py::test_legacy_runs_are_checked_for_redactions_in_their_room.
 def recover_legacy_run_metadata(run: RunOutput) -> None:
@@ -64,7 +67,6 @@ def recover_legacy_run_metadata(run: RunOutput) -> None:
     session_id = run.session_id or ""
     if (
         not metadata
-        or run.parent_run_id is not None
         or metadata.get("room_id")
         or not metadata.get(MATRIX_EVENT_ID_METADATA_KEY)
         or not session_id.startswith("!")
@@ -85,13 +87,37 @@ def is_recovered_legacy_run(run: RunOutput | TeamRunOutput) -> bool:
     return (run.metadata or {}).get(_RECOVERED_KEY) is True
 
 
+# LEGACY_COMPAT: MindRoom blocks stored inside Matrix messages.
+# Legacy format: Paragraphs MindRoom appended to the current message and stored with it, inside the requester's
+# `<msg>` tag from v2026.4.175: a retrieved-memory list (`[Automatically extracted ... memories ...]` then
+# `Previous ... memories that might be related:` and its lines), the semantic memory search notice (from v2026.7.141),
+# the `Available attachment IDs:` line, the `[Matrix metadata for tool calls]` block, and the
+# `[Inline media unavailable for this model]` note (followed by a space before v2026.5.134 and a line break after).
+# The rule selects every user message body of a stored turn.
+# Last legacy release: the memory list and search notice v2026.7.213, replaced by v2026.7.214 (#1596), which keeps
+# retrieved memory out of stored turns; the attachment line v2026.6.82, replaced by v2026.6.83 (#1214), which places
+# attachments by time; the Matrix metadata block v2026.7.220, replaced by v2026.7.221 (#1599), which moves it into
+# structured context; the inline media note v2026.8.109, replaced by v2026.8.110 (#1890), which adds it at the
+# provider call only.
+# Handling: A paragraph that matches one of these blocks exactly is removed, so turns of those releases credit only
+# the person's words; a body without one is returned unchanged, so current messages are read byte for byte.
+# Coverage: tests/test_legacy_stored_runs.py::test_blocks_in_a_tagged_message_of_a_turn_that_names_its_room_are_dropped,
+# tests/test_legacy_stored_runs.py::test_a_current_message_is_read_byte_for_byte, and
+# tests/test_conversation_text.py::test_blocks_mindroom_added_inside_a_tag_are_nobodys_words.
+def without_added_blocks(body: str) -> str:
+    """Return a stored message body without the paragraphs MindRoom added, or the body itself when it has none."""
+    paragraphs = body.split("\n\n")
+    kept = [paragraph for paragraph in paragraphs if not _ADDED_BLOCK.fullmatch(paragraph.strip())]
+    return body if len(kept) == len(paragraphs) else "\n\n".join(kept).strip()
+
+
 # LEGACY_COMPAT: Matrix prompt text without <msg> tags, and MindRoom blocks inside them.
 # Legacy format: A user message held the prompt MindRoom built as plain text: optionally a heading
 # (`Messages from other participants since your last response:`, `Messages since your last response:`, or
 # `Previous conversation in this thread:`; a team's `Thread Context:`) over `@sender:server: body` lines, then
 # `Current message:`. MindRoom added
 # blocks, each separated by a blank line: memory files (`[File memory entrypoint (...)]`) and memory lists
-# (`[Automatically extracted ... memories ...]` / `Previous ... memories that might be related:`) before the person's
+# (`[Automatically extracted ... memories ...]` over `Previous ... memories that might be related:`) before the person's
 # text, then `Available attachment IDs:` lines, a `[Matrix metadata for tool calls]` block, and, from v2026.3.14, an
 # `[Inline media unavailable for this model]` note. The rule selects every user message of a run recovered above.
 # Last legacy release: v2026.4.174 for untagged prompts; replacement: v2026.4.175 (#645) wraps earlier messages, and
@@ -165,7 +191,7 @@ def _person_text(text: str) -> str:
         stripped = block.strip()
         if stripped.startswith(_MEMORY_FILE):
             in_memory_file = True
-        elif _MEMORY_LIST.match(stripped):
+        elif _MEMORY_LIST_BLOCK.fullmatch(stripped):
             in_memory_file = False
         elif not in_memory_file and stripped and not _ADDED_BLOCK.fullmatch(stripped):
             kept.append(block)

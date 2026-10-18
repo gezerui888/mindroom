@@ -49,7 +49,8 @@ Changing the embedder starts a new, empty graph that fills again from conversati
 - From [`exploration`](https://docs.mindroom.chat/scheduling/#exploration) threads, tasks another agent delegated to it, and an automation's turn inside an ordinary conversation, only the tool calls and their results, never the agent's own summary.
 
 Not added: threads started by other automations such as `dreaming`, graph lookups, including those through a shell, the `reasoning` tool's thoughts, answers from subagents, workflows, and Claude Code, results collected from background jobs, conversations through the OpenAI-compatible API, and team conversations.
-Turns stored by releases before v2026.5.27, whose records did not name their room, are read too, with the room and thread taken from the conversation. From each of their messages, MindRoom's own blocks are removed: memory files and memory lists, attachment IDs, the Matrix IDs block, the inline media note, and the time prefix. In messages without per-message tags (releases before v2026.4.175), earlier messages listed under a "since your last response" heading are their senders' words and the text after "Current message:" is the requester's; copies of the thread, the agent's own drafts, and headings those releases did not write are skipped. In tagged messages, each tag keeps its sender, including tags inside a copy of the thread, and the agent's draft tags are dropped. A message with a memory file that has no memory list after it, or an untagged one with earlier messages but no "Current message:" heading, is skipped entirely rather than attributed to anyone.
+Turns stored by releases before v2026.5.27, which did not record a turn's room, are added too.
+Text that older releases added to stored messages, such as memory files, memory lists, attachment IDs, and Matrix IDs, is never credited to anyone, and a message whose own words cannot be told apart from it is skipped.
 Credential-like values are removed on a best-effort basis before anything is sent for extraction.
 A turn waiting for tool approval holds back the later turns of its conversation until it finishes or its approval expires.
 
@@ -58,6 +59,15 @@ When later evidence contradicts a fact, the fact is marked superseded with the d
 Facts are extracted by a model, so they can be wrong; check a fact's source before relying on it.
 A message redacted before its conversation is added stays out of the graph, and so does the turn that read it.
 Redacting a message later does not remove facts already extracted from it; to forget them, stop MindRoom and delete `knowledge_graph/` in the storage directory, and the graph rebuilds from the remaining conversations of the last `backfill_days`, without redacted messages.
+
+### Older Conversations in an Existing Graph
+
+A graph built by an earlier MindRoom version recorded conversations from releases before v2026.5.27 as finished without adding anything.
+To add them, stop MindRoom and open each file in `knowledge_graph/ingestion/` in the storage directory, one per graph.
+Delete the entries under `sessions` whose `markers` is empty, since those conversations produced nothing.
+Set `knowledge_graph.ingest.backfill_days` to reach back to those conversations, counted from the file's `started_at`, and start MindRoom.
+A conversation that already added later turns keeps its older turns out.
+To add those too, and to drop facts read from text MindRoom added in older releases, stop MindRoom, delete `knowledge_graph/` in the storage directory, and start it with `backfill_days` covering the period.
 
 ## The `knowledge_graph` Tool
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -206,22 +207,33 @@ def test_tagged_legacy_messages_lose_mindroom_blocks_and_drafts() -> None:
     assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=f"{MEMORY_FILE}\n\nhello"), "@r:x") == []
 
 
-def test_blocks_in_a_tagged_message_of_a_turn_that_names_its_room_are_dropped() -> None:
-    """A v2026.5 turn names its room but kept the memory list, attachment line, and Matrix IDs block in the tag."""
+def _at(timestamp: str) -> int:
+    return int(datetime.fromisoformat(timestamp).timestamp())
+
+
+def test_blocks_are_dropped_only_from_turns_stored_while_a_release_wrote_them() -> None:
+    """A v2026.5 turn kept the memory list, attachment line, and Matrix IDs block in the tag; each block has its own end."""
     degraded = (
         "Semantic memory search is unavailable this turn (embedder offline); stored memories may be missing or "
         "keyword-only. Do not claim to have checked stored memories."
     )
     body = f"Ship it now?\n\nsecond paragraph\n\n{degraded}\n\n{MEMORY_LIST}\n\n{ATTACHMENTS}\n\n{MATRIX_METADATA}"
     newline_note = INLINE_MEDIA.replace("] ", "]\n", 1)
+    may = _at("2026-05-20T12:00:00+00:00")
 
-    assert without_added_blocks(body) == "Ship it now?\n\nsecond paragraph"
-    assert without_added_blocks(f"Look\n\n{newline_note}") == "Look"
-    assert without_added_blocks(f"{ATTACHMENTS}\n\n{MATRIX_METADATA}") == ""
+    assert without_added_blocks(body, may) == "Ship it now?\n\nsecond paragraph"
+    assert without_added_blocks(f"Look\n\n{newline_note}", may) == "Look"
+    assert without_added_blocks(f"{ATTACHMENTS}\n\n{MATRIX_METADATA}", may) == ""
+    # v2026.6.83 stopped writing the attachment line; the memory list and Matrix IDs block lasted into July.
+    july = _at("2026-07-01T12:00:00+00:00")
+    assert without_added_blocks(f"Look\n\n{ATTACHMENTS}\n\n{MEMORY_LIST}", july) == f"Look\n\n{ATTACHMENTS}"
 
 
 def test_a_current_message_is_read_byte_for_byte() -> None:
-    """A body with no block MindRoom added, including one quoting part of a block, is returned unchanged."""
-    body = "  Ship it?\n\n\nAvailable attachment IDs: are listed below.\n\nPrevious agent memories that might be related:\n "
+    """A body from after every cutoff, or with no stored time, is returned unchanged even when it quotes a block."""
+    body = f"  Ship it?\n\n\n{ATTACHMENTS}\n\n{MATRIX_METADATA}\n "
 
-    assert without_added_blocks(body) is body
+    assert without_added_blocks(body, _at("2026-10-01T12:00:00+00:00")) is body
+    assert without_added_blocks(body, None) is body
+    partial = "Available attachment IDs: are listed below.\n\nPrevious agent memories that might be related:\n "
+    assert without_added_blocks(partial, _at("2026-05-20T12:00:00+00:00")) is partial

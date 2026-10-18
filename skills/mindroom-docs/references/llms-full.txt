@@ -3916,6 +3916,7 @@ Changing the embedder starts a new, empty graph that fills again from conversati
 Not added: threads started by other automations such as `dreaming`, graph lookups, including those through a shell, the `reasoning` tool's thoughts, answers from subagents, workflows, and Claude Code, results collected from background jobs, conversations through the OpenAI-compatible API, and team conversations.
 Turns stored by releases before v2026.5.27, which did not record a turn's room, are added too.
 Text that older releases added to stored messages, such as memory files, memory lists, attachment IDs, and Matrix IDs, is never credited to anyone, and a message whose own words cannot be told apart from it is skipped.
+Which text counts as added depends on when the turn was stored, so a person who pastes the same text into a message today keeps it.
 Credential-like values are removed on a best-effort basis before anything is sent for extraction.
 A turn waiting for tool approval holds back the later turns of its conversation until it finishes or its approval expires.
 

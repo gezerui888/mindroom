@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY
@@ -34,15 +35,30 @@ _MEMORY_LIST = (
     r"Previous [^\n]* memories that might be related:(?:\n[^\n]*)*"
 )
 _MEMORY_LIST_BLOCK = re.compile(_MEMORY_LIST)
-_ADDED_BLOCK = re.compile(
-    rf"{_MEMORY_LIST}"
-    r"|Semantic memory search is unavailable this turn \([^\n]*\); stored memories may be missing or keyword-only\. "
+_MEMORY_SEARCH_NOTICE = (
+    r"Semantic memory search is unavailable this turn \([^\n]*\); stored memories may be missing or keyword-only\. "
     r"Do not claim to have checked stored memories\."
-    r"|Available attachment IDs: [^\n]*\. Use tool calls to inspect or process them\."
-    r"|\[Matrix metadata for tool calls\]\nroom_id: [^\n]*\nthread_id: [^\n]*\nreply_to_event_id: [^\n]*\n"
+)
+_ATTACHMENTS = r"Available attachment IDs: [^\n]*\. Use tool calls to inspect or process them\."
+_MATRIX_METADATA = (
+    r"\[Matrix metadata for tool calls\]\nroom_id: [^\n]*\nthread_id: [^\n]*\nreply_to_event_id: [^\n]*\n"
     r"Use these IDs when calling matrix_message\."
-    r"|\[Inline media unavailable for this model\][ \n]The model rejected inline attachments for this turn\. "
-    r"Use available attachment IDs and tools to inspect files instead\.",
+)
+_INLINE_MEDIA = (
+    r"\[Inline media unavailable for this model\][ \n]The model rejected inline attachments for this turn\. "
+    r"Use available attachment IDs and tools to inspect files instead\."
+)
+_ADDED_BLOCK = re.compile(f"{_MEMORY_LIST}|{_MEMORY_SEARCH_NOTICE}|{_ATTACHMENTS}|{_MATRIX_METADATA}|{_INLINE_MEDIA}")
+# Each block, with the commit time of the first release that no longer stored it in messages.
+_STORED_BLOCKS = tuple(
+    (re.compile(pattern), datetime.fromisoformat(stopped).timestamp())
+    for pattern, stopped in (
+        (_MEMORY_LIST, "2026-07-19T20:29:11-07:00"),  # v2026.7.214
+        (_MEMORY_SEARCH_NOTICE, "2026-07-19T20:29:11-07:00"),  # v2026.7.214
+        (_ATTACHMENTS, "2026-06-11T10:23:51-07:00"),  # v2026.6.83
+        (_MATRIX_METADATA, "2026-07-20T15:18:33-07:00"),  # v2026.7.221
+        (_INLINE_MEDIA, "2026-08-24T13:25:21+02:00"),  # v2026.8.110
+    )
 )
 
 
@@ -93,21 +109,29 @@ def is_recovered_legacy_run(run: RunOutput | TeamRunOutput) -> bool:
 # `Previous ... memories that might be related:` and its lines), the semantic memory search notice (from v2026.7.141),
 # the `Available attachment IDs:` line, the `[Matrix metadata for tool calls]` block, and the
 # `[Inline media unavailable for this model]` note (followed by a space before v2026.5.134 and a line break after).
-# The rule selects every user message body of a stored turn.
-# Last legacy release: the memory list and search notice v2026.7.213, replaced by v2026.7.214 (#1596), which keeps
-# retrieved memory out of stored turns; the attachment line v2026.6.82, replaced by v2026.6.83 (#1214), which places
-# attachments by time; the Matrix metadata block v2026.7.220, replaced by v2026.7.221 (#1599), which moves it into
-# structured context; the inline media note v2026.8.109, replaced by v2026.8.110 (#1890), which adds it at the
-# provider call only.
-# Handling: A paragraph that matches one of these blocks exactly is removed, so turns of those releases credit only
-# the person's words; a body without one is returned unchanged, so current messages are read byte for byte.
-# Coverage: tests/test_legacy_stored_runs.py::test_blocks_in_a_tagged_message_of_a_turn_that_names_its_room_are_dropped,
-# tests/test_legacy_stored_runs.py::test_a_current_message_is_read_byte_for_byte, and
-# tests/test_conversation_text.py::test_blocks_mindroom_added_inside_a_tag_are_nobodys_words.
-def without_added_blocks(body: str) -> str:
-    """Return a stored message body without the paragraphs MindRoom added, or the body itself when it has none."""
+# The rule selects each user message body of a stored turn created before the release that stopped writing a block.
+# Last legacy release: the memory list and search notice v2026.7.213, replaced by v2026.7.214 (#1596, cut
+# 2026-07-19T20:29:11-07:00), which keeps retrieved memory out of stored turns; the attachment line v2026.6.82,
+# replaced by v2026.6.83 (#1214, cut 2026-06-11T10:23:51-07:00), which places attachments by time; the Matrix
+# metadata block v2026.7.220, replaced by v2026.7.221 (#1599, cut 2026-07-20T15:18:33-07:00), which moves it into
+# structured context; the inline media note v2026.8.109, replaced by v2026.8.110 (#1890, cut
+# 2026-08-24T13:25:21+02:00), which adds it at the provider call only. The cut times are the tags' commit times.
+# Handling: In a turn whose `created_at` is before a block's cut time, a paragraph that matches that block exactly is
+# removed, so turns of those releases credit only the person's words. A turn created later, or without a creation
+# time, is read byte for byte, so a person who pastes one of these blocks today keeps it.
+# Coverage: tests/test_legacy_stored_runs.py::test_blocks_are_dropped_only_from_turns_stored_while_a_release_wrote_them,
+# tests/test_legacy_stored_runs.py::test_a_current_message_is_read_byte_for_byte,
+# tests/test_conversation_text.py::test_blocks_mindroom_added_inside_a_tag_are_nobodys_words, and
+# tests/test_conversation_text.py::test_a_current_message_quoting_an_old_block_is_read_as_written.
+def without_added_blocks(body: str, created_at: int | None) -> str:
+    """Return a stored message body without the paragraphs MindRoom added when its turn was created, else unchanged."""
+    if not created_at:
+        return body
+    written = [pattern for pattern, stopped in _STORED_BLOCKS if created_at < stopped]
+    if not written:
+        return body
     paragraphs = body.split("\n\n")
-    kept = [paragraph for paragraph in paragraphs if not _ADDED_BLOCK.fullmatch(paragraph.strip())]
+    kept = [paragraph for paragraph in paragraphs if not any(p.fullmatch(paragraph.strip()) for p in written)]
     return body if len(kept) == len(paragraphs) else "\n\n".join(kept).strip()
 
 

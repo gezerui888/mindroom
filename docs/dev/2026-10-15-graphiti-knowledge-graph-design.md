@@ -103,7 +103,8 @@ Graphiti needs structured output; small local models may fail extraction, which 
 - Episodes are rendered from full messages and tool results, not the skill-learning digest, which shortens older messages and drops older tool results.
 - Turns stored through v2026.5.26 have no `room_id`, so the run reader recovers the room and thread from the session ID before it filters, and the redaction check and source descriptions use the real room.
   Their user messages, tagged or not, are read by the legacy prompt rule, because releases through v2026.4.198 kept the memory file and memory list inside the requester's `<msg>` tag.
-  Later turns name their room but kept memory lists, attachment IDs, and Matrix IDs inside the tag until v2026.7.220, so every message body drops paragraphs that exactly match a block MindRoom wrote.
+  Later turns name their room but kept memory lists, attachment IDs, and Matrix IDs inside the tag until v2026.7.220, so a turn created before the release that stopped writing a block drops paragraphs that exactly match it.
+  The turn's creation time is the evidence, because the text alone cannot tell an injected block from a person pasting one; later turns are read as written.
   Releases before v2026.3.122 (#404) listed the agent's own interrupted drafts under its Matrix ID, so those drafts become the agent's lines.
   Text that cannot be placed is dropped, never attributed to the requester; the `LEGACY_COMPAT` comments in `history/legacy_stored_runs.py` own the details.
 - Each episode kind has its own marker, so a kind that keeps failing never repeats the other kind's episodes.

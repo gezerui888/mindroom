@@ -195,15 +195,40 @@ def test_a_legacy_turn_keeps_only_peoples_words() -> None:
     assert _kinds(current) == [("said", "@alice:x", prompt)]
 
 
-def test_blocks_mindroom_added_inside_a_tag_are_nobodys_words() -> None:
-    """A turn that names its room but stored MindRoom's blocks in the requester's tag keeps only the person's words."""
-    body = (
-        "Ship it now?\n\n"
-        "[Automatically extracted agent file memories - may not be relevant to current context]\n"
-        "Previous agent file memories that might be related:\n- Bob owns Atlas.\n\n"
-        "[Matrix metadata for tool calls]\nroom_id: !r:x\nthread_id: $t\nreply_to_event_id: $e\n"
-        "Use these IDs when calling matrix_message."
-    )
-    run = _run(Message(role="user", content=render_msg_tag(sender="@bob:x", body=body)), room_id="!r:x")
+_MEMORY_SEARCH_NOTICE = (
+    "Semantic memory search is unavailable this turn (embedder offline); stored memories may be missing or "
+    "keyword-only. Do not claim to have checked stored memories."
+)
+_OLD_BLOCKS = (
+    _MEMORY_SEARCH_NOTICE,
+    "[Automatically extracted agent file memories - may not be relevant to current context]\n"
+    "Previous agent file memories that might be related:\n- Bob owns Atlas.",
+    "Available attachment IDs: att_1. Use tool calls to inspect or process them.",
+    "[Matrix metadata for tool calls]\nroom_id: !r:x\nthread_id: $t\nreply_to_event_id: $e\n"
+    "Use these IDs when calling matrix_message.",
+    "[Inline media unavailable for this model]\nThe model rejected inline attachments for this turn. "
+    "Use available attachment IDs and tools to inspect files instead.",
+)
 
-    assert _kinds(run) == [("said", "@bob:x", "Ship it now?")]
+
+def _tagged_turn(body: str, created_at: int) -> RunOutput:
+    run = _run(Message(role="user", content=render_msg_tag(sender="@bob:x", body=body)), room_id="!r:x")
+    run.created_at = created_at
+    return run
+
+
+def test_blocks_mindroom_added_inside_a_tag_are_nobodys_words() -> None:
+    """A turn stored while releases wrote these blocks into the requester's tag keeps only the person's words."""
+    historical = _tagged_turn("Ship it now?\n\n" + "\n\n".join(_OLD_BLOCKS), 1_779_000_000)  # 2026-05-17
+
+    assert _kinds(historical) == [("said", "@bob:x", "Ship it now?")]
+
+
+@pytest.mark.parametrize("block", _OLD_BLOCKS)
+def test_a_current_message_quoting_an_old_block_is_read_as_written(block: str) -> None:
+    """Someone pasting a complete old block today keeps it, in a longer message or on its own."""
+    current = 1_791_000_000  # 2026-10-03
+    quoted = f"Why did my agent show this notice?\n\n{block}\n\nPlease help me fix it."
+
+    assert _kinds(_tagged_turn(quoted, current)) == [("said", "@bob:x", quoted)]
+    assert _kinds(_tagged_turn(block, current)) == [("said", "@bob:x", block)]

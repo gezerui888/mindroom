@@ -83,7 +83,7 @@ def utterances(run: RunOutput | TeamRunOutput, *, agent_work: bool = False) -> l
                 legacy_prompt_utterances(content, requester)
                 if legacy
                 else [
-                    (sender, without_added_blocks(body))
+                    (sender, without_added_blocks(body, run.created_at))
                     for sender, body in parse_msg_tags(content, default_sender=requester)
                 ]
             )

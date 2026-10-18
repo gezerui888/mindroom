@@ -63,6 +63,7 @@ Each fact keeps its sources: `conversation` means someone said it, `tool_results
 When later evidence contradicts a fact, the fact is marked superseded with the date it stopped holding instead of being deleted.
 Facts are extracted by a model, so they can be wrong; check a fact's source before relying on it.
 A message redacted before its conversation is added stays out of the graph, and so does the turn that read it.
+Redactions are known from the event journal, which records them from v2026.8.31 on, so a message redacted while an older release was running can still be added, as can the turns that read it.
 Redacting a message later does not remove facts already extracted from it; to forget them, stop MindRoom and delete `knowledge_graph/` in the storage directory, and the graph rebuilds from the remaining conversations of the last `backfill_days`, without redacted messages.
 
 ### Older Conversations in an Existing Graph

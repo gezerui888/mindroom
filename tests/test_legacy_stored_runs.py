@@ -22,6 +22,14 @@ def _run(session_id: str, metadata: dict[str, Any] | None) -> RunOutput:
     return RunOutput(run_id="r", session_id=session_id, metadata=metadata, status=RunStatus.completed)
 
 
+def _at(timestamp: str) -> int:
+    return int(datetime.fromisoformat(timestamp).timestamp())
+
+
+# When a release before v2026.4.175 stored a turn.
+MARCH = _at("2026-03-20T12:00:00+00:00")
+
+
 def test_recovers_room_and_thread_from_the_session_id() -> None:
     """A legacy thread turn gets the room and thread root its session ID was built from."""
     run = _run("!abc:mindroom.chat:$root", {"matrix_event_id": "$e"})
@@ -90,7 +98,7 @@ CURRENT = (
 
 def test_legacy_prompt_keeps_only_peoples_words() -> None:
     """Earlier messages are their senders' words and the current message is what follows the memories."""
-    assert legacy_prompt_utterances(CURRENT, "@alice:example.org") == [
+    assert legacy_prompt_utterances(CURRENT, "@alice:example.org", MARCH) == [
         ("@alice:example.org", "hi"),
         ("@alice:example.org", "What can you do?"),
     ]
@@ -106,7 +114,7 @@ def test_previous_conversation_copies_are_skipped() -> None:
         "[2026-03-10 09:05 PDT] And Bolt?"
     )
 
-    assert legacy_prompt_utterances(prompt, "@r:x") == [("@r:x", "And Bolt?")]
+    assert legacy_prompt_utterances(prompt, "@r:x", MARCH) == [("@r:x", "And Bolt?")]
 
 
 def test_interrupted_draft_notes_are_dropped() -> None:
@@ -124,7 +132,7 @@ def test_interrupted_draft_notes_are_dropped() -> None:
         "[2026-03-28 10:02 PDT] go on"
     )
 
-    assert legacy_prompt_utterances(prompt, "@r:x") == [
+    assert legacy_prompt_utterances(prompt, "@r:x", MARCH) == [
         ("@r:x", "first line\nsecond line"),
         ("@carol:x", "Bolt is late."),
         ("@r:x", "go on"),
@@ -134,7 +142,11 @@ def test_interrupted_draft_notes_are_dropped() -> None:
 def test_memory_entrypoint_without_bullet_list_drops_the_current_message() -> None:
     """Where a memory file ends cannot be told without a list after it, so nothing is attributed."""
     assert (
-        legacy_prompt_utterances("Current message:\n[File memory entrypoint (agent)]\n# MEMORY.md\n\nhello", "@r:x")
+        legacy_prompt_utterances(
+            "Current message:\n[File memory entrypoint (agent)]\n# MEMORY.md\n\nhello",
+            "@r:x",
+            MARCH,
+        )
         == []
     )
 
@@ -149,43 +161,43 @@ def test_a_memory_entrypoint_after_the_last_memory_list_drops_the_current_messag
         "hello"
     )
 
-    assert legacy_prompt_utterances(prompt, "@r:x") == []
+    assert legacy_prompt_utterances(prompt, "@r:x", MARCH) == []
 
 
 def test_plain_legacy_message_is_the_requesters() -> None:
     """A prompt with no sections is the requester's message without its time prefix."""
-    assert legacy_prompt_utterances("[2026-04-13 10:53 PDT] continue", "@r:x") == [("@r:x", "continue")]
-    assert legacy_prompt_utterances("The user selected: shell", "@r:x") == [("@r:x", "The user selected: shell")]
+    assert legacy_prompt_utterances("[2026-04-13 10:53 PDT] continue", "@r:x", MARCH) == [("@r:x", "continue")]
+    assert legacy_prompt_utterances("The user selected: shell", "@r:x", MARCH) == [("@r:x", "The user selected: shell")]
 
 
 def test_unknown_sections_are_dropped() -> None:
     """Text under a heading no release wrote, or earlier messages without a current message, is nobody's words."""
     prompt = "Some other heading:\n@bob:x: hi\n\nCurrent message:\nhey"
 
-    assert legacy_prompt_utterances(prompt, "@r:x") == [("@r:x", "hey")]
-    assert legacy_prompt_utterances("Messages since your last response:\n@bob:x: hi", "@r:x") == []
+    assert legacy_prompt_utterances(prompt, "@r:x", MARCH) == [("@r:x", "hey")]
+    assert legacy_prompt_utterances("Messages since your last response:\n@bob:x: hi", "@r:x", MARCH) == []
 
 
 def test_a_bare_time_prefix_is_nobodys_words() -> None:
     """A message that is only its time prefix says nothing, so it yields no utterance."""
-    assert legacy_prompt_utterances("[2026-04-13 10:53 PDT]", "@r:x") == []
-    assert legacy_prompt_utterances("Current message:\n[2026-04-13 10:53 PDT]\n\n" + ATTACHMENTS, "@r:x") == []
+    assert legacy_prompt_utterances("[2026-04-13 10:53 PDT]", "@r:x", MARCH) == []
+    assert legacy_prompt_utterances("Current message:\n[2026-04-13 10:53 PDT]\n\n" + ATTACHMENTS, "@r:x", MARCH) == []
 
 
 def test_attachment_metadata_and_inline_media_blocks_are_dropped() -> None:
     """The attachment line, the Matrix IDs block, and the inline media note are MindRoom's, in the order it added them."""
     prompt = f"[2026-03-20 08:00 PDT] What is in this file?\n\n{ATTACHMENTS}\n\n{MATRIX_METADATA}\n\n{INLINE_MEDIA}"
 
-    assert legacy_prompt_utterances(prompt, "@r:x") == [("@r:x", "What is in this file?")]
-    assert legacy_prompt_utterances(f"Current message:\n{prompt}", "@r:x") == [("@r:x", "What is in this file?")]
+    assert legacy_prompt_utterances(prompt, "@r:x", MARCH) == [("@r:x", "What is in this file?")]
+    assert legacy_prompt_utterances(f"Current message:\n{prompt}", "@r:x", MARCH) == [("@r:x", "What is in this file?")]
 
 
 def test_without_a_current_message_heading_only_plain_text_is_kept() -> None:
     """Without the heading, MindRoom's blocks are dropped, and a transcript leaves nothing that can be placed."""
-    assert legacy_prompt_utterances("Thread Context:\n@bob:x: secret\n\nhello", "@r:x") == []
-    assert legacy_prompt_utterances("@bob:x: secret\n\nhello", "@r:x") == []
+    assert legacy_prompt_utterances("Thread Context:\n@bob:x: secret\n\nhello", "@r:x", MARCH) == []
+    assert legacy_prompt_utterances("@bob:x: secret\n\nhello", "@r:x", MARCH) == []
     prompt = f"{MEMORY_FILE}\n\n{MEMORY_LIST}\n\n[2026-03-20 08:00 PDT] hello\n\nsecond paragraph\n\n{ATTACHMENTS}"
-    assert legacy_prompt_utterances(prompt, "@r:x") == [("@r:x", "hello\n\nsecond paragraph")]
+    assert legacy_prompt_utterances(prompt, "@r:x", MARCH) == [("@r:x", "hello\n\nsecond paragraph")]
 
 
 def test_tagged_legacy_messages_lose_mindroom_blocks_and_drafts() -> None:
@@ -200,15 +212,17 @@ def test_tagged_legacy_messages_lose_mindroom_blocks_and_drafts() -> None:
         + render_msg_tag(sender="@r:x", body=through_v2026_4_198)
     )
 
-    assert legacy_prompt_utterances(prompt, "@r:x") == [("@bob:x", "Bolt is late."), ("@r:x", "Ship it?")]
-    assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=from_v2026_4_199), "@r:x") == [
+    april, may = _at("2026-04-18T17:00:00+00:00"), _at("2026-05-01T17:00:00+00:00")
+
+    assert legacy_prompt_utterances(prompt, "@r:x", april) == [("@bob:x", "Bolt is late."), ("@r:x", "Ship it?")]
+    assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=from_v2026_4_199), "@r:x", may) == [
         ("@r:x", "Ship it now?"),
     ]
-    assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=f"{MEMORY_FILE}\n\nhello"), "@r:x") == []
-
-
-def _at(timestamp: str) -> int:
-    return int(datetime.fromisoformat(timestamp).timestamp())
+    assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=f"{MEMORY_FILE}\n\nhello"), "@r:x", april) == []
+    # No tagged writer stored a memory file after v2026.4.199, so a later turn's text starting like one is a person's.
+    assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=f"{MEMORY_FILE}\n\nhello"), "@r:x", may) == [
+        ("@r:x", f"{MEMORY_FILE}\n\nhello"),
+    ]
 
 
 def test_blocks_are_dropped_only_from_turns_stored_while_a_release_wrote_them() -> None:

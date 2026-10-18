@@ -159,9 +159,10 @@ def test_a_queued_message_notice_is_nobodys_words() -> None:
     assert [kind for kind, _, _ in _kinds(run, agent_work=True)] == ["said", "reply", "runtime", "reply"]
 
 
-def _recovered(*messages: Message) -> RunOutput:
+def _recovered(*messages: Message, created_at: int = 1_773_000_000) -> RunOutput:  # 2026-03-08
     """A turn as releases before run metadata named its room stored it, read through the run reader."""
     run = _run(*messages)
+    run.created_at = created_at
     run.session_id = "!r:x:$t"
     run.metadata = {"matrix_event_id": "$e"}
     recover_legacy_run_metadata(run)
@@ -232,3 +233,15 @@ def test_a_current_message_quoting_an_old_block_is_read_as_written(block: str) -
 
     assert _kinds(_tagged_turn(quoted, current)) == [("said", "@bob:x", quoted)]
     assert _kinds(_tagged_turn(block, current)) == [("said", "@bob:x", block)]
+
+
+@pytest.mark.parametrize("block", _OLD_BLOCKS)
+def test_a_recovered_tagged_turn_of_a_later_release_keeps_a_quoted_block(block: str) -> None:
+    """A turn recovered for its room but stored after a block's release, such as one that failed early, keeps it."""
+    quoted = f"Why did my agent show this notice?\n\n{block}\n\nPlease help me fix it."
+    run = _recovered(
+        Message(role="user", content=render_msg_tag(sender="@bob:x", body=quoted)),
+        created_at=1_791_000_000,  # 2026-10-03
+    )
+
+    assert _kinds(run) == [("said", "@bob:x", quoted)]

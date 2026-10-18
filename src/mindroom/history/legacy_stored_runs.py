@@ -10,6 +10,8 @@ from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY
 from mindroom.prompt_message_tags import has_msg_tags, parse_msg_tags
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from agno.run.agent import RunOutput
     from agno.run.team import TeamRunOutput
 
@@ -48,7 +50,6 @@ _INLINE_MEDIA = (
     r"\[Inline media unavailable for this model\][ \n]The model rejected inline attachments for this turn\. "
     r"Use available attachment IDs and tools to inspect files instead\."
 )
-_ADDED_BLOCK = re.compile(f"{_MEMORY_LIST}|{_MEMORY_SEARCH_NOTICE}|{_ATTACHMENTS}|{_MATRIX_METADATA}|{_INLINE_MEDIA}")
 # Each block, with the commit time of the first release that no longer stored it in messages.
 _STORED_BLOCKS = tuple(
     (re.compile(pattern), datetime.fromisoformat(stopped).timestamp())
@@ -60,6 +61,9 @@ _STORED_BLOCKS = tuple(
         (_INLINE_MEDIA, "2026-08-24T13:25:21+02:00"),  # v2026.8.110
     )
 )
+_ALL_BLOCKS = tuple(pattern for pattern, _ in _STORED_BLOCKS)
+# v2026.4.199 (#576) moved the memory file out of stored messages into the system context.
+_MEMORY_FILE_STOPPED = datetime.fromisoformat("2026-04-20T20:44:43-07:00").timestamp()
 
 
 # LEGACY_COMPAT: Run metadata without room_id.
@@ -67,8 +71,8 @@ _STORED_BLOCKS = tuple(
 # no `room_id` or `thread_id`; the rule selects a run whose metadata holds `matrix_event_id` and no `room_id` and
 # whose session ID is a Matrix room ID (`!...`), optionally followed by `:` and the thread root event ID.
 # Last legacy release: v2026.5.26; replacement: v2026.5.27 (#665) stores `room_id` and `thread_id` in run metadata.
-# A turn that failed before its run started was stored from the turn recorder's seed metadata, which kept no room
-# through v2026.10.344; the unreleased writer seeds `room_id` and `thread_id` there too.
+# A turn that failed before its run started was stored from the turn recorder's seed metadata, which kept no room:
+# last legacy release v2026.10.346; replacement: the next release seeds `room_id` and `thread_id` there too.
 # Handling: The room and thread root are read from the session ID (split at the first `:$`; none means a room-mode
 # session without a thread) and written into the loaded run's metadata, so background readers group, filter, and
 # describe the turn by its real room, and marked recovered for the prompt rule below. Stored rows are not rewritten.
@@ -125,14 +129,17 @@ def is_recovered_legacy_run(run: RunOutput | TeamRunOutput) -> bool:
 # tests/test_conversation_text.py::test_a_current_message_quoting_an_old_block_is_read_as_written.
 def without_added_blocks(body: str, created_at: int | None) -> str:
     """Return a stored message body without the paragraphs MindRoom added when its turn was created, else unchanged."""
-    if not created_at:
-        return body
-    written = [pattern for pattern, stopped in _STORED_BLOCKS if created_at < stopped]
+    written = _blocks_written_at(created_at)
     if not written:
         return body
     paragraphs = body.split("\n\n")
     kept = [paragraph for paragraph in paragraphs if not any(p.fullmatch(paragraph.strip()) for p in written)]
     return body if len(kept) == len(paragraphs) else "\n\n".join(kept).strip()
+
+
+def _blocks_written_at(created_at: int | None) -> list[re.Pattern[str]]:
+    """Return the blocks releases still stored in messages when a turn was created; none without a creation time."""
+    return [pattern for pattern, stopped in _STORED_BLOCKS if created_at and created_at < stopped]
 
 
 # LEGACY_COMPAT: Matrix prompt text without <msg> tags, and MindRoom blocks inside them.
@@ -149,8 +156,12 @@ def without_added_blocks(body: str, created_at: int | None) -> str:
 # through v2026.4.198 the requester's tag held the whole prompt with its memory file and list; v2026.4.199 (#576)
 # moved the memory file to the system context and put the memory list after the person's text. Runs through
 # v2026.5.26 are recovered, so their tagged and untagged messages both take this rule.
-# Handling: Every message body loses the blocks above; a memory file runs until the next memory list, and a body
-# whose memory file has no list after it is nothing. The time prefix is stripped and an empty body yields nothing.
+# Handling: An untagged body loses the blocks above, since its missing tags show an old writer. A tagged body loses
+# each block only when its turn was created before the release that stopped writing it: the memory file before
+# v2026.4.199 (cut 2026-04-20T20:44:43-07:00), the others at the cut times of the rule above, and none without a
+# creation time, so a recovered turn of a later release, such as one that failed before its run started, keeps a
+# block a person quoted. A memory file runs until the next memory list, and a body whose memory file has no list
+# after it is nothing. The time prefix is stripped and an empty body yields nothing.
 # Tagged messages keep their senders when the sender is a Matrix ID; `You (...)` drafts are dropped, while releases
 # before v2026.3.122 (#404) listed the agent's own drafts under its Matrix ID, so those read as its words. Untagged, new
 # earlier messages under their heading are their senders' (continuation lines joined; `You (...)` drafts, notes
@@ -167,23 +178,26 @@ def without_added_blocks(body: str, created_at: int | None) -> str:
 # tests/test_legacy_stored_runs.py::test_attachment_metadata_and_inline_media_blocks_are_dropped,
 # tests/test_legacy_stored_runs.py::test_unknown_sections_are_dropped,
 # tests/test_legacy_stored_runs.py::test_without_a_current_message_heading_only_plain_text_is_kept,
-# tests/test_legacy_stored_runs.py::test_tagged_legacy_messages_lose_mindroom_blocks_and_drafts, and
-# tests/test_conversation_text.py::test_a_legacy_turn_keeps_only_peoples_words.
-def legacy_prompt_utterances(text: str, requester: str) -> list[tuple[str, str]]:
+# tests/test_legacy_stored_runs.py::test_tagged_legacy_messages_lose_mindroom_blocks_and_drafts,
+# tests/test_conversation_text.py::test_a_legacy_turn_keeps_only_peoples_words, and
+# tests/test_conversation_text.py::test_a_recovered_tagged_turn_of_a_later_release_keeps_a_quoted_block.
+def legacy_prompt_utterances(text: str, requester: str, created_at: int | None) -> list[tuple[str, str]]:
     """Return the ``(sender, body)`` messages people wrote in a user message of a run stored in a legacy layout."""
     if has_msg_tags(text):
+        blocks = _blocks_written_at(created_at)
+        memory_files = created_at is not None and 0 < created_at < _MEMORY_FILE_STOPPED
         return [
             (sender, body)
             for sender, tagged in parse_msg_tags(text, default_sender=requester)
-            if sender.startswith("@") and (body := _person_text(tagged))
+            if sender.startswith("@") and (body := _person_text(tagged, blocks, memory_files=memory_files))
         ]
     # The first heading is the legacy writer's; one pasted into an earlier message would be read here (a known limit).
     current_heading = _CURRENT_MESSAGE.search(text)
     if current_heading is not None:
         earlier = _earlier_messages(text[: current_heading.start()])
-        current = _person_text(text[current_heading.end() :])
+        current = _person_text(text[current_heading.end() :], _ALL_BLOCKS, memory_files=True)
     else:
-        earlier, current = [], _person_text(text)
+        earlier, current = [], _person_text(text, _ALL_BLOCKS, memory_files=True)
         if any(line in _HISTORY_HEADINGS or _SENDER_LINE.match(line) for line in current.splitlines()):
             return []
     return [*earlier, (requester, current)] if current else earlier
@@ -203,21 +217,23 @@ def _earlier_messages(section: str) -> list[tuple[str, str]]:
         elif messages:
             messages[-1][1].append(line)
     return [
-        (sender, body) for sender, body_lines in messages if sender and (body := _person_text("\n".join(body_lines)))
+        (sender, body)
+        for sender, body_lines in messages
+        if sender and (body := _person_text("\n".join(body_lines), _ALL_BLOCKS, memory_files=True))
     ]
 
 
-def _person_text(text: str) -> str:
-    """Return a legacy message body without the blocks MindRoom added, or nothing when a memory file never ends."""
+def _person_text(text: str, blocks: Sequence[re.Pattern[str]], *, memory_files: bool) -> str:
+    """Return a legacy message body without these blocks and memory files, or nothing when a memory file never ends."""
     kept: list[str] = []
     in_memory_file = False
     for block in text.split("\n\n"):
         stripped = block.strip()
-        if stripped.startswith(_MEMORY_FILE):
+        if memory_files and stripped.startswith(_MEMORY_FILE):
             in_memory_file = True
-        elif _MEMORY_LIST_BLOCK.fullmatch(stripped):
+        elif in_memory_file and _MEMORY_LIST_BLOCK.fullmatch(stripped):
             in_memory_file = False
-        elif not in_memory_file and stripped and not _ADDED_BLOCK.fullmatch(stripped):
+        elif not in_memory_file and stripped and not any(pattern.fullmatch(stripped) for pattern in blocks):
             kept.append(block)
     if in_memory_file:
         return ""

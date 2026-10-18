@@ -58,9 +58,11 @@ def utterances(run: RunOutput | TeamRunOutput, *, agent_work: bool = False) -> l
 
     Only turns the agent's own history shows count, never copies of earlier turns. A prompt MindRoom wrote is nobody's
     words: an automation's turn is left out entirely, and a background job follow-up keeps only its reply. A stopped
-    turn's answer is a rendered summary that can quote tool previews, so it is left out too. A turn stored in a legacy
-    prompt layout keeps only the people's words that layout places. ``agent_work`` keeps all of these, plus tool
-    calls and results, for a reviewer of how the agent worked.
+    turn's answer is a rendered summary that can quote tool previews, so it is left out too. ``agent_work`` keeps all of
+    these, plus tool calls and results, for a reviewer of how the agent worked.
+
+    In both modes, a turn stored in a legacy prompt layout keeps only the people's words that layout places, and the
+    blocks MindRoom stored inside messages are removed from turns created while a release still wrote them.
     """
     if not is_model_history_visible_run(run):
         return []
@@ -80,7 +82,7 @@ def utterances(run: RunOutput | TeamRunOutput, *, agent_work: bool = False) -> l
         mindroom_wrote = runtime_prompt or is_queued_notice_message(message)
         if message.role == "user" and (agent_work or not mindroom_wrote):
             messages = (
-                legacy_prompt_utterances(content, requester)
+                legacy_prompt_utterances(content, requester, run.created_at)
                 if legacy
                 else [
                     (sender, without_added_blocks(body, run.created_at))

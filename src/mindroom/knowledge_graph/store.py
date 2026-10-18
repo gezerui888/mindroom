@@ -19,7 +19,7 @@ from mindroom.knowledge_graph.usage import usage_target
 from mindroom.tool_system.dependencies import ensure_tool_deps, optional_dependency_environment
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine, Sequence
+    from collections.abc import Awaitable, Callable, Coroutine, Sequence
     from concurrent.futures import Future as ConcurrentFuture
     from datetime import datetime
 
@@ -85,7 +85,7 @@ class _GraphEntity:
 
 
 class GraphStore(Protocol):
-    """The graph operations ingestion and the tool use."""
+    """The graph operations ingestion, the tool, and operator maintenance use."""
 
     async def add_episode(self, scope: GraphScope, episode: EpisodeInput, usage: UsageTarget) -> None:
         """Extract an episode into the scope's graph, charging extraction to ``usage``."""
@@ -95,6 +95,9 @@ class GraphStore(Protocol):
 
     async def entity(self, scope: GraphScope, name: str) -> _GraphEntity | None:
         """Return the scope's entity best matching ``name``, or None."""
+
+    async def maintain[T](self, scope: GraphScope, operation: Callable[[GraphDriver], Awaitable[T]]) -> T:
+        """Run ``operation`` on the driver for the scope's graph while no episode is being added."""
 
 
 class UnusableExtractionError(ValueError):
@@ -263,6 +266,9 @@ class GraphitiStore:
         self._runtime_loop = runtime_loop
         self._graph_loop: _GraphLoop | None = None
         self._lock: asyncio.Lock | None = None
+        # Held while an episode is added or maintenance rewrites a graph, so ingestion pauses between episodes
+        # while maintenance runs. Lookups do not take it.
+        self._write_lock: asyncio.Lock | None = None
         self._graphiti: Graphiti | None = None
         self._signature: str | None = None
         self._embedded_server: EmbeddedServer | None = None
@@ -272,6 +278,7 @@ class GraphitiStore:
         if self._graph_loop is None:
             self._graph_loop = _GraphLoop()
             self._lock = asyncio.Lock()
+            self._write_lock = asyncio.Lock()
         return await run_on_loop(self._graph_loop.loop, coroutine)
 
     async def _graphiti_client(self) -> Graphiti:
@@ -327,23 +334,36 @@ class GraphitiStore:
         """Return the scope's entity best matching ``name`` with the facts that touch it."""
         return await self._run(self._entity(scope, name))
 
+    async def maintain[T](self, scope: GraphScope, operation: Callable[[GraphDriver], Awaitable[T]]) -> T:
+        """Run ``operation`` on the graph loop with the scope's graph driver while no episode is being added."""
+        return await self._run(self._maintain(scope, operation))
+
+    async def _maintain[T](self, scope: GraphScope, operation: Callable[[GraphDriver], Awaitable[T]]) -> T:
+        graphiti = await self._graphiti_client()
+        assert self._write_lock is not None, "the client is only used on the graph loop"
+        async with self._write_lock:
+            return await operation(graphiti.driver.clone(database=scope.graph_name))
+
     async def _add_episode(self, scope: GraphScope, episode: EpisodeInput, usage: UsageTarget) -> None:
         # The client installs and imports Graphiti first, so the imports below find it loaded.
         graphiti = await self._graphiti_client()
         from graphiti_core.nodes import EpisodeType  # noqa: PLC0415
 
-        with usage_target(usage):
-            await graphiti.add_episode(
-                name=episode.name,
-                episode_body=episode.body,
-                source_description=episode.source_description,
-                reference_time=episode.reference_time,
-                source=EpisodeType.message if episode.kind == "conversation" else EpisodeType.text,
-                group_id=scope.graph_name,
-                # Graphiti otherwise adds the graph's ten newest episodes, from any conversation, to every prompt,
-                # which multiplies extraction cost and overflows smaller context windows; an episode carries its own context.
-                previous_episode_uuids=[],
-            )
+        assert self._write_lock is not None, "the client is only used on the graph loop"
+        async with self._write_lock:
+            with usage_target(usage):
+                await graphiti.add_episode(
+                    name=episode.name,
+                    episode_body=episode.body,
+                    source_description=episode.source_description,
+                    reference_time=episode.reference_time,
+                    source=EpisodeType.message if episode.kind == "conversation" else EpisodeType.text,
+                    group_id=scope.graph_name,
+                    # Graphiti otherwise adds the graph's ten newest episodes, from any conversation, to every
+                    # prompt, which multiplies extraction cost and overflows smaller context windows; an episode
+                    # carries its own context.
+                    previous_episode_uuids=[],
+                )
 
     async def _search_facts(self, scope: GraphScope, query: str, limit: int) -> list[GraphFact]:
         graphiti = await self._graphiti_client()

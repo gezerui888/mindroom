@@ -23,6 +23,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_runtime_paths
 from mindroom.knowledge_graph import store as store_module
+from mindroom.knowledge_graph.maintenance import list_entities
 from mindroom.knowledge_graph.scope import GraphScope
 from mindroom.knowledge_graph.store import EpisodeInput, GraphitiStore, _FactSource
 from mindroom.knowledge_graph.usage import UsageTarget
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from falkordb.query_result import QueryResult
+    from graphiti_core.driver.driver import GraphDriver
 
 ALPHA = GraphScope(agent_name="mind", execution_identity=None, graph_name="kg_" + "a" * 24)
 BETA = GraphScope(agent_name="mind", execution_identity=None, graph_name="kg_" + "b" * 24)
@@ -444,3 +446,38 @@ async def test_extraction_sends_only_the_episode_itself(store: GraphitiStore) ->
 
     assert add.await_args is not None
     assert add.await_args.kwargs["previous_episode_uuids"] == []
+
+
+@pytest.mark.asyncio
+async def test_ingestion_waits_for_maintenance(store: GraphitiStore) -> None:
+    """An episode started while maintenance holds the scope's graph is added only after maintenance finishes."""
+    await _seed_fact(store, ALPHA, fact="Alice leads Project Atlas", source_description="conversation: a", valid_at=JAN)
+    graphiti = await store._run(store._graphiti_client())
+    order: list[str] = []
+    holding = threading.Event()
+    released = threading.Event()
+
+    async def maintenance(driver: GraphDriver) -> list[str]:
+        holding.set()
+        # Waiting in a worker thread leaves the graph loop free, so only the write lock can hold the episode back.
+        assert await asyncio.to_thread(released.wait, 10)
+        order.append("maintenance")
+        return [entity.name for entity in await list_entities(driver, "alice")]
+
+    async def add_episode(**_kwargs: object) -> None:
+        order.append("episode")
+
+    episode = EpisodeInput("conversation", "conversation", "person @alice (x): hi", "conversation: room !r", JAN)
+    with patch.object(graphiti, "add_episode", AsyncMock(side_effect=add_episode)):
+        maintaining = asyncio.create_task(store.maintain(ALPHA, maintenance))
+        assert await asyncio.to_thread(holding.wait, 10)
+        adding = asyncio.create_task(store.add_episode(ALPHA, episode, UsageTarget("mind", "!r:$t", None)))
+        # Long enough for an episode nothing holds back to be added first.
+        await asyncio.sleep(0.3)
+        released.set()
+        # The operation got the scope's own graph.
+        assert await maintaining == ["Alice"]
+        await adding
+
+    assert order == ["maintenance", "episode"]
+    assert await store.maintain(BETA, lambda driver: list_entities(driver, "alice")) == []

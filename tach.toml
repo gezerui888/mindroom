@@ -9190,6 +9190,10 @@ depends_on = [
 ]
 
 [[modules]]
+path = "mindroom.knowledge_graph.maintenance"
+depends_on = []
+
+[[modules]]
 path = "mindroom.knowledge_graph.runtime"
 depends_on = ["mindroom.knowledge_graph.ingestion", "mindroom.knowledge_graph.store"]
 visibility = ["mindroom.orchestrator"]

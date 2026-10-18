@@ -190,6 +190,7 @@ Matrix sync callback
 | `knowledge_graph/episodes.py` | Stored runs rendered as `conversation` and `tool_results` episodes, and thread classification |
 | `knowledge_graph/ingestion.py` | Background ingestion passes with per-kind markers, backoff, and dropped episodes |
 | `knowledge_graph/runtime.py` | Starts and stops the store and ingestion worker as agents enable the graph |
+| `knowledge_graph/maintenance.py` | Operator entity listing, duplicate merging, and junk deletion in one scope's graph |
 | `config/knowledge_graph.py` | The `knowledge_graph` section: extraction model and ingestion settings |
 | `custom_tools/knowledge_graph.py` | The read-only `knowledge_graph` tool |
 | `tool_system/skills.py` | Skill integration system (OpenClaw-compatible) |

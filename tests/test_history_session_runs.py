@@ -11,7 +11,7 @@ from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
 from agno.session.agent import AgentSession
 
-from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY
+from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY, MATRIX_SEEN_EVENT_IDS_METADATA_KEY
 from mindroom.history.session_runs import session_runs, unredacted_runs, updated_sessions
 from mindroom.history.types import HistoryScope
 from mindroom.session_storage.agent_storage import create_state_storage, get_agent_session
@@ -57,6 +57,19 @@ def _run(
     )
 
 
+def _legacy_run(run_id: str, created_at: int, event_id: str) -> RunOutput:
+    """A turn as releases before run metadata named its room stored it."""
+    return RunOutput(
+        run_id=run_id,
+        session_id=SESSION,
+        agent_id="mind",
+        created_at=created_at,
+        status=RunStatus.completed,
+        metadata={MATRIX_EVENT_ID_METADATA_KEY: event_id, MATRIX_SEEN_EVENT_IDS_METADATA_KEY: [event_id]},
+        messages=[Message(role="user", content=f"q {run_id}"), Message(role="assistant", content=f"a {run_id}")],
+    )
+
+
 def _seed(storage: SqliteDb, runs: list[RunOutput], session_id: str = SESSION) -> AgentSession:
     return seed_session(storage, AgentSession(session_id=session_id, agent_id="mind", runs=runs))
 
@@ -89,9 +102,7 @@ def test_unfinished_member_and_non_matrix_runs_are_excluded(storage: SqliteDb) -
 
 def test_session_runs_returns_legacy_runs_with_their_room_and_thread(storage: SqliteDb) -> None:
     """A turn stored before run metadata named its room is read with the room and thread of its session."""
-    legacy = _run("legacy", 100, room_id=None)
-    legacy.metadata = {MATRIX_EVENT_ID_METADATA_KEY: "$e", "matrix_seen_event_ids": ["$e"]}
-    _seed(storage, [legacy])
+    _seed(storage, [_legacy_run("legacy", 100, "$e")])
 
     runs = session_runs(storage, SESSION)
 
@@ -130,3 +141,19 @@ async def test_unredacted_runs_drop_redacted_turns_or_wait_while_the_agent_canno
     assert await unredacted_runs([kept, redacted], "mind", journal) == [kept]
     assert asked == [("mind", ROOM, ("$gone", "$kept"))]
     assert await unredacted_runs([kept, redacted], "mind", not_running) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_runs_are_checked_for_redactions_in_their_room(storage: SqliteDb) -> None:
+    """A legacy turn is grouped under the room its session names, so a redaction there drops it."""
+    _seed(storage, [_legacy_run("kept", 100, "$kept"), _legacy_run("gone", 200, "$gone")])
+    asked: list[tuple[str, str, tuple[str, ...]]] = []
+
+    async def journal(agent_name: str, room_id: str, event_ids: tuple[str, ...]) -> frozenset[str] | None:
+        asked.append((agent_name, room_id, event_ids))
+        return frozenset({"$gone"}) if room_id == ROOM else frozenset()
+
+    runs = await unredacted_runs(session_runs(storage, SESSION), "mind", journal)
+
+    assert [run.run_id for run in runs or []] == ["kept"]
+    assert asked == [("mind", ROOM, ("$gone", "$kept"))]

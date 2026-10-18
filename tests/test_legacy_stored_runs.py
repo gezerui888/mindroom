@@ -11,8 +11,14 @@ from agno.run.base import RunStatus
 from mindroom.history.legacy_stored_runs import recover_legacy_run_metadata
 
 
-def _run(session_id: str, metadata: dict[str, Any] | None) -> RunOutput:
-    return RunOutput(run_id="r", session_id=session_id, metadata=metadata, status=RunStatus.completed)
+def _run(session_id: str, metadata: dict[str, Any] | None, *, parent_run_id: str | None = None) -> RunOutput:
+    return RunOutput(
+        run_id="r",
+        session_id=session_id,
+        parent_run_id=parent_run_id,
+        metadata=metadata,
+        status=RunStatus.completed,
+    )
 
 
 def test_recovers_room_and_thread_from_the_session_id() -> None:
@@ -53,3 +59,12 @@ def test_leaves_other_runs_alone(session_id: str, metadata: dict[str, Any] | Non
     recover_legacy_run_metadata(run)
 
     assert run.metadata == metadata
+
+
+def test_member_runs_are_left_alone() -> None:
+    """Only a top-level turn is a Matrix turn; a member run inside it keeps its metadata."""
+    run = _run("!abc:mindroom.chat:$root", {"matrix_event_id": "$e"}, parent_run_id="top")
+
+    recover_legacy_run_metadata(run)
+
+    assert run.metadata == {"matrix_event_id": "$e"}

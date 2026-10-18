@@ -15,22 +15,27 @@ _THREAD_SEPARATOR = ":$"
 
 # LEGACY_COMPAT: Run metadata without room_id.
 # Legacy format: Matrix turns stored their event IDs (`matrix_event_id`, `matrix_seen_event_ids`) in run metadata but
-# no `room_id` or `thread_id`; the rule selects a run whose metadata holds `matrix_event_id` and no `room_id` and whose
-# session ID is a Matrix room ID (`!...`), optionally followed by `:` and the thread root event ID.
+# no `room_id` or `thread_id`; the rule selects a top-level run whose metadata holds `matrix_event_id` and no `room_id`
+# and whose session ID is a Matrix room ID (`!...`), optionally followed by `:` and the thread root event ID.
+# A current turn interrupted before its run started is stored from the recorder's seed metadata, which also lacks
+# `room_id`; the rule applies to it too, and its session ID names the same room.
 # Last legacy release: v2026.5.26; replacement: v2026.5.27 (#665) stores `room_id` and `thread_id` in run metadata.
 # Handling: The room and thread root are read from the session ID (split at the first `:$`; none means a room-mode
 # session without a thread) and written into the loaded run's metadata, so background readers group, filter, and
 # describe the turn by its real room. Stored rows are not rewritten.
 # Coverage: tests/test_legacy_stored_runs.py::test_recovers_room_and_thread_from_the_session_id,
 # tests/test_legacy_stored_runs.py::test_room_mode_session_has_no_thread,
-# tests/test_legacy_stored_runs.py::test_leaves_other_runs_alone, and
-# tests/test_history_session_runs.py::test_session_runs_returns_legacy_runs_with_their_room_and_thread.
+# tests/test_legacy_stored_runs.py::test_leaves_other_runs_alone,
+# tests/test_legacy_stored_runs.py::test_member_runs_are_left_alone,
+# tests/test_history_session_runs.py::test_session_runs_returns_legacy_runs_with_their_room_and_thread, and
+# tests/test_history_session_runs.py::test_legacy_runs_are_checked_for_redactions_in_their_room.
 def recover_legacy_run_metadata(run: RunOutput) -> None:
     """Give a turn stored before run metadata named its room the room and thread its session ID was built from."""
     metadata = run.metadata
     session_id = run.session_id or ""
     if (
         not metadata
+        or run.parent_run_id is not None
         or metadata.get("room_id")
         or not metadata.get(MATRIX_EVENT_ID_METADATA_KEY)
         or not session_id.startswith("!")

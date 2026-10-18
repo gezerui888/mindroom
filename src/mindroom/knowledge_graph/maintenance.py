@@ -157,12 +157,17 @@ _ENV_VAR = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
 _HEX = re.compile(r"^[0-9a-f]{7,64}$")
 _HEX_RUN = re.compile(r"\d+|[a-f]+")
 _UUID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
-# Room IDs, event IDs, room aliases, and links to rooms. User IDs are aliases of a person and stay.
+# Email addresses and Matrix user IDs are aliases of a person, to merge rather than delete, whatever their domain
+# ends with (`ann@example.rs`, `@ann:example.sh`).
+_IDENTITY = re.compile(r"^[^\s@/]+@[^\s@/]+\.[^\s@/]+$|^@[^\s:/]+:[^\s/]+$")
+# Room IDs, event IDs, room aliases, and links to rooms.
 _MATRIX = re.compile(r"^(?:![A-Za-z0-9]+:\S+|\$[\w+/-]{20,}|#[^\s:#]+:\S+|matrix:(?:r|roomid)/|matrix\.to/#/)")
 
 
 def _looks_like_junk(name: str) -> bool:
     """Whether a name is a path, code or data file, URL, env var, hash, or Matrix room or event."""
+    if _IDENTITY.match(name):
+        return False
     if any(pattern.search(name) for pattern in (_URL, _ABSOLUTE_PATH, _RELATIVE_PATH, _DEEP_PATH, _ENV_VAR, _MATRIX)):
         return True
     if _looks_like_hash(name):

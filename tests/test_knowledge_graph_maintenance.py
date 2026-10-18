@@ -302,6 +302,17 @@ async def test_names_that_match_nothing_are_reported(graph: GraphDriver) -> None
         ("Users/Ann/Desktop", True),
         ("Projects/Atlas/Docs", True),
         ("AC/DC", False),
+        # Aliases on domains that end like files are still aliases.
+        ("ann@example.rs", False),
+        ("ann@example.sh", False),
+        ("ann@example.md", False),
+        ("ann@example.py", False),
+        ("ann@example.js", False),
+        ("@ann:example.rs", False),
+        ("@ann:example.sh", False),
+        ("@ann:example.md", False),
+        ("@ann:example.py", False),
+        ("@ann:example.js", False),
     ],
 )
 def test_looks_like_junk(name: str, junk: bool) -> None:
@@ -346,3 +357,19 @@ async def test_delete_junk_removes_nodes_and_their_facts(graph: GraphDriver) -> 
         runs_on.uuid,
     ]
     assert await _mentions(graph) == [(episode.uuid, "MindRoom")]
+
+
+@pytest.mark.asyncio
+async def test_junk_deletion_keeps_aliases_for_merging(graph: GraphDriver) -> None:
+    """An email address or Matrix ID on a domain that ends like a file keeps its facts for merging into the person."""
+    person, email, matrix_id = _entity("Ann Lee"), _entity("ann@example.rs"), _entity("@ann:example.sh")
+    source_file = _entity("compaction.py")
+    writes = _fact(email, person, "ann@example.rs belongs to Ann Lee", [1.0, 0.0, 0.0, 0.0])
+    chats = _fact(matrix_id, person, "@ann:example.sh is Ann Lee on Matrix", [0.0, 1.0, 0.0, 0.0])
+    await _ingest(graph, [person, email, matrix_id, source_file], [writes, chats], [email, matrix_id])
+
+    report = await delete_entities(graph, junk=True, apply=True)
+
+    assert [entity.name for entity in report.deleted] == ["compaction.py"]
+    assert await _names(graph) == {"Ann Lee", "ann@example.rs", "@ann:example.sh"}
+    assert len(await _stored_fact(graph, writes.uuid)) == len(await _stored_fact(graph, chats.uuid)) == 1

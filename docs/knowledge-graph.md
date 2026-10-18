@@ -88,7 +88,8 @@ Each changed file counts as one of the pass's `max_sessions_per_cycle`, before t
 A failed piece is retried and skipped like a part of a conversation, and a file edited while a piece waits for its retry starts over with the new version.
 Deleting a file, or a line of it, does not remove the facts it already added; a new version adds its facts, and Graphiti marks the facts it contradicts superseded.
 A file that is not UTF-8 text adds nothing.
-Text that redaction cannot check is replaced by a placeholder rather than passed on: a single line longer than about 60,000 characters, or, around a secret key whose value starts on the next line, the block of about `max_episode_chars` holding it and the block after it, which sees it as context.
+Text that redaction cannot check is replaced by a placeholder rather than passed on: a single line longer than about 60,000 characters, or the text near a secret key whose value starts on the next line, which is one or two pieces at the default `max_episode_chars` and up to a few pieces when it is small.
+A `-----BEGIN ... PRIVATE KEY-----` line without its matching END line hides the rest of the file.
 A flagged base that cannot be listed, for example because its Git listing fails, is reported in health and skipped while the agent's other bases continue.
 The flag exists only on `knowledge_bases` entries; an agent's `private.knowledge` cannot feed the graph.
 

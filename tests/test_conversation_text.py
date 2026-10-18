@@ -9,6 +9,7 @@ from agno.run.base import RunStatus
 
 from mindroom.constants import HOOK_SOURCE_RUN_METADATA_KEY, TURN_INTENT_RUN_METADATA_KEY
 from mindroom.history.conversation_text import utterances
+from mindroom.history.legacy_stored_runs import recover_legacy_run_metadata
 from mindroom.history.run_visibility import QUEUED_MESSAGE_NOTICE_MARKER_KEY, QUEUED_MESSAGE_NOTICE_PERSISTED_MARKER
 from mindroom.prompt_message_tags import render_msg_tag
 
@@ -156,3 +157,33 @@ def test_a_queued_message_notice_is_nobodys_words() -> None:
         ("reply", None, "Paused."),
     ]
     assert [kind for kind, _, _ in _kinds(run, agent_work=True)] == ["said", "reply", "runtime", "reply"]
+
+
+def test_a_legacy_turn_without_msg_tags_keeps_only_peoples_words() -> None:
+    """A recovered turn without tags is split by the legacy layout; a tagged one and a current turn are not."""
+    prompt = (
+        "Messages from other participants since your last response:\n"
+        "@bob:x: [2026-03-10 09:00 PDT] Atlas ships Friday.\n\n"
+        "Current message:\n"
+        "[Automatically extracted agent memories - may not be relevant to current context]\n"
+        "Previous agent memories that might be related:\n"
+        "- Bob owns Atlas.\n\n"
+        "[2026-03-10 09:05 PDT] And Bolt?"
+    )
+    legacy = _run(Message(role="user", content=prompt), Message(role="assistant", content="Next week."))
+    legacy.session_id = "!r:x:$t"
+    legacy.metadata = {"matrix_event_id": "$e"}
+    recover_legacy_run_metadata(legacy)
+    current = _run(Message(role="user", content=prompt), room_id="!r:x", matrix_event_id="$e")
+    tagged = _run(Message(role="user", content=render_msg_tag(sender="@bob:x", body="Current message:\nhi")))
+    tagged.session_id = "!r:x:$t"
+    tagged.metadata = {"matrix_event_id": "$e"}
+    recover_legacy_run_metadata(tagged)
+
+    assert _kinds(legacy) == [
+        ("said", "@bob:x", "Atlas ships Friday."),
+        ("said", "@alice:x", "And Bolt?"),
+        ("reply", None, "Next week."),
+    ]
+    assert _kinds(current) == [("said", "@alice:x", prompt)]
+    assert _kinds(tagged) == [("said", "@bob:x", "Current message:\nhi")]

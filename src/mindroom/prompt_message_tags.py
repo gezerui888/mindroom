@@ -43,6 +43,11 @@ def render_msg_tag(
     return f"<msg {' '.join(attrs)}><![CDATA[{_cdata_body(body)}]]></msg>"
 
 
+def has_msg_tags(content: str) -> bool:
+    """Return whether the content holds any ``<msg>`` tag."""
+    return _MSG_TAG.search(content) is not None
+
+
 def parse_msg_tags(content: str, *, default_sender: str) -> list[tuple[str, str]]:
     """Return each ``<msg>`` tag's sender and body, or the whole content as ``default_sender``'s when it holds none."""
     tagged = [

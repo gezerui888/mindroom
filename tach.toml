@@ -7534,6 +7534,7 @@ depends_on = [
     "mindroom.automations.steps",
     "mindroom.constants",
     "mindroom.history.interrupted_replay",
+    "mindroom.history.legacy_stored_runs",
     "mindroom.history.run_visibility",
     "mindroom.prompt_message_tags",
     "mindroom.turn_origin",
@@ -9165,7 +9166,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.history.legacy_stored_runs"
 depends_on = ["mindroom.constants"]
-visibility = ["mindroom.history.session_runs"]
+visibility = ["mindroom.history.conversation_text", "mindroom.history.session_runs"]
 
 [[modules]]
 path = "mindroom.history.session_runs"

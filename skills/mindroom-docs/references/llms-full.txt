@@ -3914,6 +3914,7 @@ Changing the embedder starts a new, empty graph that fills again from conversati
 - From [`exploration`](https://docs.mindroom.chat/scheduling/#exploration) threads, tasks another agent delegated to it, and an automation's turn inside an ordinary conversation, only the tool calls and their results, never the agent's own summary.
 
 Not added: threads started by other automations such as `dreaming`, graph lookups, including those through a shell, the `reasoning` tool's thoughts, answers from subagents, workflows, and Claude Code, results collected from background jobs, conversations through the OpenAI-compatible API, and team conversations.
+Turns stored by releases before v2026.5.27, whose records did not name their room, are read too: the room and thread come from the conversation, and from their plain-text prompts only what people wrote is kept, without the memory, attachment, and Matrix metadata blocks MindRoom added; text that matches none of the layouts those releases wrote is skipped rather than attributed to anyone.
 Credential-like values are removed on a best-effort basis before anything is sent for extraction.
 A turn waiting for tool approval holds back the later turns of its conversation until it finishes or its approval expires.
 

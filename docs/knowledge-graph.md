@@ -82,16 +82,17 @@ agents:
 
 MindRoom reads each file itself, so a fact's evidence is the file's own text and no model spends tokens reading the files in a conversation first.
 Files are chosen by the base's own rules: include and exclude patterns, extensions, hidden files, and for a Git-backed base only tracked files.
-Every pass hashes each file of the flagged bases; a new or changed file becomes `document` episodes: its text with credential-like values removed, split between lines into pieces of at most `max_episode_chars`, dated by the file's modification time.
+Every pass checks each file of the flagged bases and hashes one whose size, modification time, or inode changed; a new or changed file becomes `document` episodes: its text with credential-like values removed line by line, split between lines into pieces of at most `max_episode_chars`, dated by the file's modification time.
 A file whose content is unchanged is not extracted again, even when a Git checkout or copy gives it a new modification time.
-Each changed file counts as one of the pass's `max_sessions_per_cycle`, after the conversations, and adds at most twenty pieces per pass.
+Each changed file counts as one of the pass's `max_sessions_per_cycle`, before the conversations, and adds at most twenty pieces per pass; an unchanged file counts for nothing, but a newly flagged base with many files holds conversations back until it is through.
 A failed piece is retried and skipped like a part of a conversation, and a file edited while a piece waits for its retry starts over with the new version.
 Deleting a file, or a line of it, does not remove the facts it already added; a new version adds its facts, and Graphiti marks the facts it contradicts superseded.
-A file that is not UTF-8 text adds nothing.
+A file that is not UTF-8 text adds nothing, and a single line longer than 65,536 characters is replaced by a placeholder because it is too long to check for credentials.
+A flagged base that cannot be listed, for example because its Git listing fails, is reported in health and skipped while the agent's other bases continue.
 The flag exists only on `knowledge_bases` entries; an agent's `private.knowledge` cannot feed the graph.
 
 Each changed file costs about 15 extraction calls per piece, so a 100,000-character file costs about five pieces' worth every time its content changes, in every graph that reads it: a [private agent](configuration/agents.md#private-instances) extracts it once per requester.
-An unchanged file costs only reading and hashing it on each pass.
+An unchanged file costs one open and status check per pass and is read again only when its size, modification time, or inode changes.
 Flag curated files that state facts, such as people, projects, and decisions, rather than daily notes or logs that change every day.
 
 ## The `knowledge_graph` Tool

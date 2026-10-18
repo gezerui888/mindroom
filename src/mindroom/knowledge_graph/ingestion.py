@@ -84,9 +84,11 @@ class _SessionState(_Backoff):
 class _DocumentState(_Backoff):
     # The content last extracted in full; a file with this hash is never extracted again.
     sha256: str
-    # The content that `pieces_done` and the failure counts belong to, so an edit during a retry starts over.
-    pending_sha256: str
-    # Pieces of the pending content added or dropped, so a retry resumes at the failed piece.
+    # The file's hash when last read and its `[size, mtime_ns, inode]` then, so an unchanged file is not read again;
+    # `pieces_done` and the failure counts belong to this content, so an edit during a retry starts over.
+    seen_sha256: str
+    seen_stat: list[int]
+    # Pieces of the seen content added or dropped, so a retry resumes at the failed piece.
     pieces_done: int
 
 
@@ -143,7 +145,8 @@ def _marker(entry: _SessionState, kind: str) -> Progress | None:
 def _new_document_state() -> _DocumentState:
     return {
         "sha256": "",
-        "pending_sha256": "",
+        "seen_sha256": "",
+        "seen_stat": [],
         "pieces_done": 0,
         "failures": 0,
         "bad_outputs": 0,
@@ -205,7 +208,7 @@ class KnowledgeGraphIngestionWorker:
             _WAKE_EVENTS.discard(self._wake_event)
 
     async def _run_cycle(self, config: Config, *, now: float) -> None:
-        """Ingest up to ``max_sessions_per_cycle`` idle conversations with new turns and new or changed files."""
+        """Ingest up to ``max_sessions_per_cycle`` new or changed files, then idle conversations with new turns."""
         budget = config.knowledge_graph.ingest.max_sessions_per_cycle
         # These read files, including every private instance's records, so they stay off the event loop.
         automation_thread_ids = await asyncio.to_thread(automation_threads, self.runtime_paths)
@@ -223,6 +226,10 @@ class KnowledgeGraphIngestionWorker:
             # One agent or private instance whose conversations cannot be read must not stop the others.
             try:
                 state = await asyncio.to_thread(self._load_state, scope.graph_name, now)
+                # Files come first, each new or changed one spending one unit; an unchanged file spends nothing.
+                document_outcomes, documents_failing = await self._ingest_documents(config, scope, state, now, budget)
+                budget -= len(document_outcomes)
+                outcomes.extend(document_outcomes)
                 due, readable = await asyncio.to_thread(self._due_sessions, config, scope, state, now, budget)
                 if not readable:
                     outcomes.append(False)
@@ -233,10 +240,6 @@ class KnowledgeGraphIngestionWorker:
                 # A conversation whose agent is not running is looked at again later and spends none of the budget.
                 budget -= sum(result is not None for result in results)
                 outcomes.extend(result for result in results if result is not None)
-                # Files come after the conversations, each new or changed one spending one unit of what is left.
-                document_outcomes, documents_failing = await self._ingest_documents(config, scope, state, now, budget)
-                budget -= len(document_outcomes)
-                outcomes.extend(document_outcomes)
                 if documents_failing or any(entry["failing_piece"] for entry in state["sessions"].values()):
                     self._failing_graphs.add(scope.graph_name)
                 else:
@@ -417,28 +420,46 @@ class KnowledgeGraphIngestionWorker:
     ) -> tuple[list[bool], bool]:
         """Ingest up to ``limit`` new or changed files of the scope's flagged knowledge bases.
 
-        Return whether each ingested file had no piece fail or dropped, and whether a listed file waits for a retry.
-        A deleted file is left alone, and so are the facts it added.
+        Return whether each ingested file had no piece fail or dropped, and whether a base could not be listed or a
+        listed file waits for a retry. A deleted file is left alone, and so are the facts it added.
         """
-        # Listing and hashing read every flagged file, which must not stall the event loop.
-        files = await asyncio.to_thread(document_files, config, scope, self.runtime_paths)
+        known = {
+            key: ((entry["seen_stat"][0], entry["seen_stat"][1], entry["seen_stat"][2]), entry["seen_sha256"])
+            for key, entry in state["documents"].items()
+            if len(entry["seen_stat"]) == 3
+        }
+        # Listing opens every flagged file and reads the changed ones, which must not stall the event loop.
+        files, errors = await asyncio.to_thread(document_files, config, scope, self.runtime_paths, known)
+        for base_id, exc in errors.items():
+            _report_failure(
+                "Knowledge graph could not list a knowledge base",
+                exc,
+                agent=scope.agent_name,
+                base=base_id,
+            )
+        seen_changed = False
+        for file in files:
+            entry = state["documents"].setdefault(file.key, _new_document_state())
+            if entry["seen_sha256"] != file.sha256:
+                # Progress and failure counts belong to one content; a backoff still waiting keeps waiting.
+                entry.update(seen_sha256=file.sha256, pieces_done=0, failures=0, bad_outputs=0, failing_since=0)
+            if entry["seen_stat"] != list(file.stat):
+                entry["seen_stat"] = list(file.stat)
+                seen_changed = True
+        if seen_changed:
+            await self._persist(scope.graph_name, state)
         outcomes: list[bool] = []
         for file in files:
             if len(outcomes) >= limit:
                 break
-            entry = state["documents"].get(file.key)
-            if entry is not None and (entry["sha256"] == file.sha256 or entry["retry_at"] > now):
+            entry = state["documents"][file.key]
+            if entry["sha256"] == file.sha256 or entry["retry_at"] > now:
                 continue
             outcome = await self._ingest_document(config, scope, state, file, now)
             if outcome is not None:
                 outcomes.append(outcome)
         # A file deleted, or changed back to what was extracted, while a piece of it waited no longer keeps health failing.
-        failing = any(
-            (entry := state["documents"].get(file.key)) is not None
-            and entry["failures"] > 0
-            and entry["sha256"] != file.sha256
-            for file in files
-        )
+        failing = bool(errors) or any(state["documents"][file.key]["failures"] > 0 for file in files)
         return outcomes, failing
 
     async def _ingest_document(
@@ -456,18 +477,16 @@ class KnowledgeGraphIngestionWorker:
         text = await asyncio.to_thread(read_document, file)
         if text is None:
             return None
-        # Rendering redacts every piece of the file, which must not stall the event loop.
-        episodes = await asyncio.to_thread(render_document, file, text, config.knowledge_graph.ingest)
-        entry = state["documents"].setdefault(file.key, _new_document_state())
-        if entry["pending_sha256"] != file.sha256:
-            entry.update(
-                pending_sha256=file.sha256,
-                pieces_done=0,
-                failures=0,
-                bad_outputs=0,
-                failing_since=0,
-                retry_at=0,
-            )
+        entry = state["documents"][file.key]
+        # Rendering redacts the file line by line, which must not stall the event loop; it stops one piece past what
+        # this pass may add, which tells whether more remain.
+        episodes = await asyncio.to_thread(
+            render_document,
+            file,
+            text,
+            config.knowledge_graph.ingest,
+            limit=entry["pieces_done"] + _MAX_EPISODES_PER_PASS + 1,
+        )
         usage = UsageTarget(scope.agent_name, None, scope.execution_identity)
         clean = True
         for added, index in enumerate(range(entry["pieces_done"], len(episodes))):
@@ -516,7 +535,8 @@ class KnowledgeGraphIngestionWorker:
         else:
             # LEGACY_COMPAT: Ingestion state saved before knowledge-base files fed the graph.
             # Legacy format: The state file has no `documents` key.
-            # Last legacy release: v2026.10.342; replacement: the next release saves `documents`, each file's extracted content hash.
+            # Last legacy release: v2026.10.344, like every release since graph ingestion shipped in v2026.10.317;
+            # replacement: the first release with document ingestion saves `documents`, each file's progress by key.
             # Handling: A missing `documents` starts empty, so every flagged file counts as new; conversation progress is kept.
             # Coverage: tests/test_knowledge_graph_ingestion.py::test_state_saved_before_documents_keeps_its_conversations_and_adds_documents.
             saved.setdefault("documents", {})

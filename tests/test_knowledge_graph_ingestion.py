@@ -20,10 +20,11 @@ from agno.run.base import RunStatus
 from agno.session.agent import AgentSession
 
 from mindroom.config.agent import AgentConfig
-from mindroom.config.knowledge import KnowledgeBaseConfig
+from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY, resolve_runtime_paths
+from mindroom.knowledge.indexing_config import knowledge_git_dir
 from mindroom.knowledge_graph import ingestion
 from mindroom.knowledge_graph.ingestion import KnowledgeGraphIngestionWorker, wake_knowledge_graph_ingestion
 from mindroom.knowledge_graph.scope import graph_scope
@@ -829,7 +830,7 @@ async def test_a_document_edited_while_a_piece_waits_starts_over(tmp_path: Path)
 
 @pytest.mark.asyncio
 async def test_documents_share_max_sessions_per_cycle_with_conversations(tmp_path: Path) -> None:
-    """Each changed file spends one unit of the pass's budget, after the conversations."""
+    """Each changed file spends one unit of the pass's budget before the conversations; unchanged files spend none."""
     config, paths, store = _with_documents(tmp_path, max_sessions_per_cycle=2), _paths(tmp_path), _FakeStore()
     _seed(config, paths, "!room:x:$t1", ["r1"])
     for name in ("a", "b", "c"):
@@ -837,10 +838,38 @@ async def test_documents_share_max_sessions_per_cycle_with_conversations(tmp_pat
     worker = _worker(config, paths, store)
 
     await worker._run_cycle(config, now=T0 + 10)
-    assert (store.sessions(), [episode.body for episode in store.documents()]) == (["!room:x:$t1"], ["Fact a."])
+    assert (store.sessions(), [episode.body for episode in store.documents()]) == ([], ["Fact a.", "Fact b."])
     await worker._run_cycle(config, now=T0 + 20)
 
     assert [episode.body for episode in store.documents()] == ["Fact a.", "Fact b.", "Fact c."]
+    assert store.sessions() == ["!room:x:$t1"]
+
+
+@pytest.mark.asyncio
+async def test_a_knowledge_base_that_cannot_be_listed_does_not_stop_the_others(tmp_path: Path) -> None:
+    """A flagged base whose Git listing fails is reported and keeps health failing, and the other base still feeds."""
+    config = _with_documents(tmp_path)
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    config.knowledge_bases["broken"] = KnowledgeBaseConfig(
+        path=str(broken),
+        knowledge_graph=True,
+        git=KnowledgeGitConfig(repo_url="https://example.com/org/broken.git"),
+    )
+    config.agents["mind"].knowledge_bases = ["broken", "facts"]
+    paths, store = _paths(tmp_path), _FakeStore()
+    git_dir = knowledge_git_dir(paths.storage_root, broken.resolve())
+    git_dir.mkdir(parents=True)
+    # A HEAD that is not a repository makes `git ls-files` fail.
+    (git_dir / "HEAD").write_text("not a repository\n", encoding="utf-8")
+    (tmp_path / "facts" / "alice.md").write_text("Sloane leads Project Juniper.\n", encoding="utf-8")
+    worker = _worker(config, paths, store)
+
+    await worker._run_cycle(config, now=T0)
+    await worker._run_cycle(config, now=T0 + 100)
+
+    assert [episode.body for episode in store.documents()] == ["Sloane leads Project Juniper."]
+    assert "RuntimeError" in (knowledge_graph_failure() or "")
 
 
 @pytest.mark.asyncio

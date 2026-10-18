@@ -117,8 +117,11 @@ Graphiti needs structured output; small local models may fail extraction, which 
 - A paused turn stops holding back its conversation once the approval it waits for has expired, counted from its newest message, which is the call waiting for approval; the conversation is looked at again then even without new messages.
 - A new graph's start is saved when it is first seen, so the backfill window stays anchored even with `backfill_days: 0`.
 - A file is extracted when its sha256 differs from the content last extracted in full, never because its modification time changed, since Git checkouts rewrite modification times.
+  A file whose size, modification time, and inode are unchanged is not read again; one whose status changed is hashed, and an unchanged hash still extracts nothing.
+- Each line is redacted before pieces are cut, so a credential crossing a cut is still caught.
 - A file's progress counts the pieces done of one version, so a retry resumes at the failed piece and an edit during a retry starts the new version from its first piece; a file deleted or changed back while a piece waits stops keeping health failing.
-- Each changed file spends one unit of `max_sessions_per_cycle` after its scope's conversations, and adds at most twenty pieces per pass.
+- Each changed file spends one unit of `max_sessions_per_cycle` before its scope's conversations, because seeded files once waited a day behind the conversation backlog; an unchanged file spends nothing, and a file adds at most twenty pieces per pass.
+- A flagged base whose path or Git listing fails is reported and keeps health failing, while the scope's other bases and conversations continue.
 - A document belongs to no conversation, so its extraction usage is recorded under `system:internal`; recording it in an agent's session storage would need a session row there.
 
 ## Exploration invariants

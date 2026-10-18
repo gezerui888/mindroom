@@ -159,8 +159,17 @@ def test_a_queued_message_notice_is_nobodys_words() -> None:
     assert [kind for kind, _, _ in _kinds(run, agent_work=True)] == ["said", "reply", "runtime", "reply"]
 
 
-def test_a_legacy_turn_without_msg_tags_keeps_only_peoples_words() -> None:
-    """A recovered turn without tags is split by the legacy layout; a tagged one and a current turn are not."""
+def _recovered(*messages: Message) -> RunOutput:
+    """A turn as releases before run metadata named its room stored it, read through the run reader."""
+    run = _run(*messages)
+    run.session_id = "!r:x:$t"
+    run.metadata = {"matrix_event_id": "$e"}
+    recover_legacy_run_metadata(run)
+    return run
+
+
+def test_a_legacy_turn_keeps_only_peoples_words() -> None:
+    """A recovered turn is read by its legacy layout, tagged or not; a current turn's prompt is read as it is."""
     prompt = (
         "Messages from other participants since your last response:\n"
         "@bob:x: [2026-03-10 09:00 PDT] Atlas ships Friday.\n\n"
@@ -170,20 +179,17 @@ def test_a_legacy_turn_without_msg_tags_keeps_only_peoples_words() -> None:
         "- Bob owns Atlas.\n\n"
         "[2026-03-10 09:05 PDT] And Bolt?"
     )
-    legacy = _run(Message(role="user", content=prompt), Message(role="assistant", content="Next week."))
-    legacy.session_id = "!r:x:$t"
-    legacy.metadata = {"matrix_event_id": "$e"}
-    recover_legacy_run_metadata(legacy)
+    memory_in_tag = (
+        "[File memory entrypoint (agent)]\n# MEMORY.md\n\n- Bob owns Atlas.\n\n" + prompt.split("Current message:\n")[1]
+    )
+    legacy = _recovered(Message(role="user", content=prompt), Message(role="assistant", content="Next week."))
+    tagged = _recovered(Message(role="user", content=render_msg_tag(sender="@bob:x", body=memory_in_tag)))
     current = _run(Message(role="user", content=prompt), room_id="!r:x", matrix_event_id="$e")
-    tagged = _run(Message(role="user", content=render_msg_tag(sender="@bob:x", body="Current message:\nhi")))
-    tagged.session_id = "!r:x:$t"
-    tagged.metadata = {"matrix_event_id": "$e"}
-    recover_legacy_run_metadata(tagged)
 
     assert _kinds(legacy) == [
         ("said", "@bob:x", "Atlas ships Friday."),
         ("said", "@alice:x", "And Bolt?"),
         ("reply", None, "Next week."),
     ]
+    assert _kinds(tagged) == [("said", "@bob:x", "And Bolt?")]
     assert _kinds(current) == [("said", "@alice:x", prompt)]
-    assert _kinds(tagged) == [("said", "@bob:x", "Current message:\nhi")]

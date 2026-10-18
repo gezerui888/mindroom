@@ -3294,6 +3294,7 @@ visibility = [
     "mindroom.execution_preparation",
     "mindroom.history.interrupted_replay",
     "mindroom.history.conversation_text",
+    "mindroom.history.legacy_stored_runs",
 ]
 
 [[modules]]
@@ -9165,7 +9166,7 @@ depends_on = [
 
 [[modules]]
 path = "mindroom.history.legacy_stored_runs"
-depends_on = ["mindroom.constants"]
+depends_on = ["mindroom.constants", "mindroom.prompt_message_tags"]
 visibility = ["mindroom.history.conversation_text", "mindroom.history.session_runs"]
 
 [[modules]]

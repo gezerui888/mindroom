@@ -13,6 +13,7 @@ from mindroom.history.legacy_stored_runs import (
     legacy_prompt_utterances,
     recover_legacy_run_metadata,
 )
+from mindroom.prompt_message_tags import render_msg_tag
 
 
 def _run(session_id: str, metadata: dict[str, Any] | None, *, parent_run_id: str | None = None) -> RunOutput:
@@ -77,26 +78,34 @@ def test_member_runs_are_left_alone() -> None:
     assert run.metadata == {"matrix_event_id": "$e"}
 
 
-CURRENT = (
-    "Messages from other participants since your last response:\n"
-    "@basnijholt:mindroom.chat: [2026-04-09 16:11 PDT] hi\n\n"
-    "Current message:\n"
-    "[File memory entrypoint (agent)]\n# MEMORY.md - Long-term Memory\n\n## Bas Nijholt\n\n- **Builder-first thinker**\n\n"
+MEMORY_FILE = "[File memory entrypoint (agent)]\n# MEMORY.md - Long-term Memory\n\n## Alice Example\n\n- **Prefers short answers**"
+MEMORY_LIST = (
     "[Automatically extracted agent file memories - may not be relevant to current context]\n"
     "Previous agent file memories that might be related:\n"
-    "- [auto_flush:!r:x:$t:1] User is debugging Mindroom.\n"
-    "- [auto_flush:!r:x:$u:2] Mindroom lacks audio tools.\n\n"
-    "What can you do?\n\n"
-    "Available attachment IDs: att_73f950d84ac762f89e60c6c2. Use tool calls to inspect or process them.\n\n"
-    "[Matrix metadata for tool calls]\nroom_id: !r:x\nthread_id: $t\nreply_to_event_id: $e\nUse these IDs when calling matrix_message."
+    "- [auto_flush:!r:x:$t:1] User is debugging Atlas.\n"
+    "- [auto_flush:!r:x:$u:2] Atlas lacks audio tools."
+)
+ATTACHMENTS = "Available attachment IDs: att_73f950d84ac762f89e60c6c2. Use tool calls to inspect or process them."
+MATRIX_METADATA = (
+    "[Matrix metadata for tool calls]\nroom_id: !r:x\nthread_id: $t\nreply_to_event_id: $e\n"
+    "Use these IDs when calling matrix_message."
+)
+INLINE_MEDIA = (
+    "[Inline media unavailable for this model] The model rejected inline attachments for this turn. "
+    "Use available attachment IDs and tools to inspect files instead."
+)
+CURRENT = (
+    "Messages from other participants since your last response:\n"
+    "@alice:example.org: [2026-04-09 16:11 PDT] hi\n\n"
+    f"Current message:\n{MEMORY_FILE}\n\n{MEMORY_LIST}\n\nWhat can you do?\n\n{ATTACHMENTS}\n\n{MATRIX_METADATA}"
 )
 
 
 def test_legacy_prompt_keeps_only_peoples_words() -> None:
     """Earlier messages are their senders' words and the current message is what follows the memories."""
-    assert legacy_prompt_utterances(CURRENT, "@basnijholt:mindroom.chat") == [
-        ("@basnijholt:mindroom.chat", "hi"),
-        ("@basnijholt:mindroom.chat", "What can you do?"),
+    assert legacy_prompt_utterances(CURRENT, "@alice:example.org") == [
+        ("@alice:example.org", "hi"),
+        ("@alice:example.org", "What can you do?"),
     ]
 
 
@@ -105,7 +114,7 @@ def test_previous_conversation_copies_are_skipped() -> None:
     prompt = (
         "Previous conversation in this thread:\n"
         "@r:x: [2026-03-10 09:00 PDT] Atlas ships Friday?\n"
-        "@mindroom_openclaw:x: It ships Friday.\n\n"
+        "@mindroom_mind:x: It ships Friday.\n\n"
         "Current message:\n"
         "[2026-03-10 09:05 PDT] And Bolt?"
     )
@@ -168,3 +177,44 @@ def test_unknown_sections_are_dropped() -> None:
 
     assert legacy_prompt_utterances(prompt, "@r:x") == [("@r:x", "hey")]
     assert legacy_prompt_utterances("Messages since your last response:\n@bob:x: hi", "@r:x") == []
+
+
+def test_a_bare_time_prefix_is_nobodys_words() -> None:
+    """A message that is only its time prefix says nothing, so it yields no utterance."""
+    assert legacy_prompt_utterances("[2026-04-13 10:53 PDT]", "@r:x") == []
+    assert legacy_prompt_utterances("Current message:\n[2026-04-13 10:53 PDT]\n\n" + ATTACHMENTS, "@r:x") == []
+
+
+def test_attachment_metadata_and_inline_media_blocks_are_dropped() -> None:
+    """The attachment line, the Matrix IDs block, and the inline media note are MindRoom's, in the order it added them."""
+    prompt = f"[2026-03-20 08:00 PDT] What is in this file?\n\n{ATTACHMENTS}\n\n{MATRIX_METADATA}\n\n{INLINE_MEDIA}"
+
+    assert legacy_prompt_utterances(prompt, "@r:x") == [("@r:x", "What is in this file?")]
+    assert legacy_prompt_utterances(f"Current message:\n{prompt}", "@r:x") == [("@r:x", "What is in this file?")]
+
+
+def test_without_a_current_message_heading_only_plain_text_is_kept() -> None:
+    """Without the heading, MindRoom's blocks are dropped, and a transcript leaves nothing that can be placed."""
+    assert legacy_prompt_utterances("Thread Context:\n@bob:x: secret\n\nhello", "@r:x") == []
+    assert legacy_prompt_utterances("@bob:x: secret\n\nhello", "@r:x") == []
+    prompt = f"{MEMORY_FILE}\n\n{MEMORY_LIST}\n\n[2026-03-20 08:00 PDT] hello\n\nsecond paragraph\n\n{ATTACHMENTS}"
+    assert legacy_prompt_utterances(prompt, "@r:x") == [("@r:x", "hello\n\nsecond paragraph")]
+
+
+def test_tagged_legacy_messages_lose_mindroom_blocks_and_drafts() -> None:
+    """Tagged releases kept MindRoom's blocks inside the requester's tag, before or after the text, and tagged drafts."""
+    through_v2026_4_198 = f"{MEMORY_FILE}\n\n{MEMORY_LIST}\n\n[2026-04-18 10:00 PDT] Ship it?\n\n{MATRIX_METADATA}"
+    from_v2026_4_199 = f"Ship it now?\n\n{MEMORY_LIST}\n\n{ATTACHMENTS}\n\n{MATRIX_METADATA}"
+    prompt = (
+        "Messages since your last response:\n<conversation>\n"
+        + render_msg_tag(sender="@bob:x", body="[2026-04-18 09:58 PDT] Bolt is late.")
+        + render_msg_tag(sender="You (interrupted reply draft)", body="I was checking")
+        + "\n</conversation>\n\nCurrent message:\n"
+        + render_msg_tag(sender="@r:x", body=through_v2026_4_198)
+    )
+
+    assert legacy_prompt_utterances(prompt, "@r:x") == [("@bob:x", "Bolt is late."), ("@r:x", "Ship it?")]
+    assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=from_v2026_4_199), "@r:x") == [
+        ("@r:x", "Ship it now?"),
+    ]
+    assert legacy_prompt_utterances(render_msg_tag(sender="@r:x", body=f"{MEMORY_FILE}\n\nhello"), "@r:x") == []

@@ -6,6 +6,7 @@ import re
 from typing import TYPE_CHECKING
 
 from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY
+from mindroom.prompt_message_tags import has_msg_tags, parse_msg_tags
 
 if TYPE_CHECKING:
     from agno.run.agent import RunOutput
@@ -13,25 +14,31 @@ if TYPE_CHECKING:
 
 # A Matrix thread session ID is the room ID and the thread root event ID joined by `:`.
 _THREAD_SEPARATOR = ":$"
-# Set on a recovered run's loaded metadata, so readers know its prompts were written in an earlier layout too.
-_RECOVERED_KEY = "room_id_from_session_id"
+# Set on a recovered run's loaded metadata only, never stored: readers learn its prompts may use an earlier layout too.
+_RECOVERED_KEY = "_mindroom_room_id_from_session_id"
 
 # Headings of the earlier messages a legacy prompt put before the current message: new ones, or a copy of the thread.
 _NEW_MESSAGES_HEADERS = (
     "Messages from other participants since your last response:",
     "Messages since your last response:",
 )
-_THREAD_COPY_HEADER = "Previous conversation in this thread:"
+_HISTORY_HEADINGS = (*_NEW_MESSAGES_HEADERS, "Previous conversation in this thread:", "Thread Context:")
 _CURRENT_MESSAGE = re.compile(r"(?:^|\n\n)Current message:\n")
 _SENDER_LINE = re.compile(r"(@[^\s:]+:\S+?): (.*)")
 _OWN_DRAFT_LINE = re.compile(r"You \([^)]*\): ")
-_TIME_PREFIX = re.compile(r"^\[(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2} [^\]]+\]\s")
-_MEMORY_LIST_HEADER = re.compile(r"^Previous .+ memories that might be related:$", re.MULTILINE)
-_MEMORY_ENTRYPOINT = "[File memory entrypoint"
-_TRAILING_BLOCK = re.compile(
-    r"\n*(?:Available attachment IDs: [^\n]*\. Use tool calls to inspect or process them\."
+_TIME_PREFIX = re.compile(r"^\[(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2} [^\]]+\](?:\s+|$)")
+# Blocks, separated by blank lines, that MindRoom added to a legacy message.
+_MEMORY_FILE = "[File memory entrypoint"
+_MEMORY_LIST = re.compile(
+    r"\[Automatically extracted [^\n]*memories - may not be relevant to current context\](?:\n|$)"
+    r"|Previous [^\n]*memories that might be related:(?:\n|$)",
+)
+_ADDED_BLOCK = re.compile(
+    r"Available attachment IDs: [^\n]*\. Use tool calls to inspect or process them\."
     r"|\[Matrix metadata for tool calls\]\nroom_id: [^\n]*\nthread_id: [^\n]*\nreply_to_event_id: [^\n]*\n"
-    r"Use these IDs when calling matrix_message\.)\s*$",
+    r"Use these IDs when calling matrix_message\."
+    r"|\[Inline media unavailable for this model\] The model rejected inline attachments for this turn\. "
+    r"Use available attachment IDs and tools to inspect files instead\.",
 )
 
 
@@ -71,43 +78,64 @@ def recover_legacy_run_metadata(run: RunOutput) -> None:
 
 
 def is_recovered_legacy_run(run: RunOutput | TeamRunOutput) -> bool:
-    """Return whether the rule above gave the run its room, as it does for runs stored before metadata named it."""
+    """Return whether the rule above gave the run its room, as it does for runs stored before metadata named it.
+
+    The mark lives only in the loaded run's metadata; stored runs never hold it.
+    """
     return (run.metadata or {}).get(_RECOVERED_KEY) is True
 
 
-# LEGACY_COMPAT: Matrix prompt text without <msg> tags.
+# LEGACY_COMPAT: Matrix prompt text without <msg> tags, and MindRoom blocks inside them.
 # Legacy format: A user message held the prompt MindRoom built as plain text: optionally a heading
 # (`Messages from other participants since your last response:`, `Messages since your last response:`, or
-# `Previous conversation in this thread:`) over `@sender:server: body` lines, then `Current message:`; the current
-# message follows memory blocks (`[File memory entrypoint (...)]` files, `Previous ... memories that might be related:`
-# lists) and ends with `Available attachment IDs:` lines and a `[Matrix metadata for tool calls]` block. The rule
-# selects a user message without `<msg>` tags in a run recovered by the rule above.
-# Last legacy release: v2026.4.174; replacement: v2026.4.175 (#645) wraps earlier messages, and the current message
-# when its sender is known, in `<msg from="..."><![CDATA[...]]></msg>` tags. Runs through v2026.5.26 are recovered
-# too, so an untagged message of theirs is read the same way.
-# Handling: New earlier messages are their senders' words (time prefix stripped, continuation lines joined); the
-# agent's own `You (...)` drafts, notes under the heading, and thread copies are dropped. The current message is the
-# requester's text after the last memory list, or nothing when a memory file has no list after it. Anything that
-# matches no known section is dropped, never attributed.
+# `Previous conversation in this thread:`; a team's `Thread Context:`) over `@sender:server: body` lines, then
+# `Current message:`. MindRoom added
+# blocks, each separated by a blank line: memory files (`[File memory entrypoint (...)]`) and memory lists
+# (`[Automatically extracted ... memories ...]` / `Previous ... memories that might be related:`) before the person's
+# text, then `Available attachment IDs:` lines, a `[Matrix metadata for tool calls]` block, and, from v2026.3.14, an
+# `[Inline media unavailable for this model]` note. The rule selects every user message of a run recovered above.
+# Last legacy release: v2026.4.174 for untagged prompts; replacement: v2026.4.175 (#645) wraps earlier messages, and
+# the current message when its sender is known, in `<msg from="..."><![CDATA[...]]></msg>` tags. From v2026.4.175
+# through v2026.4.198 the requester's tag held the whole prompt with its memory file and list; v2026.4.199 (#576)
+# moved the memory file to the system context and put the memory list after the person's text. Runs through
+# v2026.5.26 are recovered, so their tagged and untagged messages both take this rule.
+# Handling: Every message body loses the blocks above; a memory file runs until the next memory list, and a body
+# whose memory file has no list after it is nothing. The time prefix is stripped and an empty body yields nothing.
+# Tagged messages keep their senders when the sender is a Matrix ID; `You (...)` drafts are dropped, while releases
+# before v2026.3.122 (#404) listed the agent's own drafts under its Matrix ID, so those read as its words. Untagged, new
+# earlier messages under their heading are their senders' (continuation lines joined; `You (...)` drafts, notes
+# under the heading, thread copies, and unknown headings dropped) and the text after the first `Current message:` is
+# the requester's. Without that heading, the cleaned text is the requester's unless it holds a history heading or an
+# `@sender:server: ` line, which leaves no way to tell earlier messages from the current one, so nothing is kept.
 # Coverage: tests/test_legacy_stored_runs.py::test_legacy_prompt_keeps_only_peoples_words,
 # tests/test_legacy_stored_runs.py::test_previous_conversation_copies_are_skipped,
 # tests/test_legacy_stored_runs.py::test_interrupted_draft_notes_are_dropped,
 # tests/test_legacy_stored_runs.py::test_memory_entrypoint_without_bullet_list_drops_the_current_message,
 # tests/test_legacy_stored_runs.py::test_a_memory_entrypoint_after_the_last_memory_list_drops_the_current_message,
 # tests/test_legacy_stored_runs.py::test_plain_legacy_message_is_the_requesters,
-# tests/test_legacy_stored_runs.py::test_unknown_sections_are_dropped, and
-# tests/test_conversation_text.py::test_a_legacy_turn_without_msg_tags_keeps_only_peoples_words.
+# tests/test_legacy_stored_runs.py::test_a_bare_time_prefix_is_nobodys_words,
+# tests/test_legacy_stored_runs.py::test_attachment_metadata_and_inline_media_blocks_are_dropped,
+# tests/test_legacy_stored_runs.py::test_unknown_sections_are_dropped,
+# tests/test_legacy_stored_runs.py::test_without_a_current_message_heading_only_plain_text_is_kept,
+# tests/test_legacy_stored_runs.py::test_tagged_legacy_messages_lose_mindroom_blocks_and_drafts, and
+# tests/test_conversation_text.py::test_a_legacy_turn_keeps_only_peoples_words.
 def legacy_prompt_utterances(text: str, requester: str) -> list[tuple[str, str]]:
-    """Return the ``(sender, body)`` messages people wrote in a prompt stored before prompts tagged each message."""
+    """Return the ``(sender, body)`` messages people wrote in a user message of a run stored in a legacy layout."""
+    if has_msg_tags(text):
+        return [
+            (sender, body)
+            for sender, tagged in parse_msg_tags(text, default_sender=requester)
+            if sender.startswith("@") and (body := _person_text(tagged))
+        ]
+    # The first heading is the legacy writer's; one pasted into an earlier message would be read here (a known limit).
     current_heading = _CURRENT_MESSAGE.search(text)
-    if current_heading is None:
-        if text.startswith((*_NEW_MESSAGES_HEADERS, _THREAD_COPY_HEADER)):
-            return []
-        earlier: list[tuple[str, str]] = []
-        current = _current_message(text)
-    else:
+    if current_heading is not None:
         earlier = _earlier_messages(text[: current_heading.start()])
-        current = _current_message(text[current_heading.end() :])
+        current = _person_text(text[current_heading.end() :])
+    else:
+        earlier, current = [], _person_text(text)
+        if any(line in _HISTORY_HEADINGS or _SENDER_LINE.match(line) for line in current.splitlines()):
+            return []
     return [*earlier, (requester, current)] if current else earlier
 
 
@@ -119,23 +147,28 @@ def _earlier_messages(section: str) -> list[tuple[str, str]]:
     messages: list[tuple[str | None, list[str]]] = []
     for line in lines.splitlines():
         if sender_line := _SENDER_LINE.match(line):
-            messages.append((sender_line.group(1), [_TIME_PREFIX.sub("", sender_line.group(2), count=1)]))
+            messages.append((sender_line.group(1), [sender_line.group(2)]))
         elif _OWN_DRAFT_LINE.match(line):
             messages.append((None, []))
         elif messages:
             messages[-1][1].append(line)
-    return [(sender, body) for sender, body_lines in messages if sender and (body := "\n".join(body_lines).strip())]
+    return [
+        (sender, body) for sender, body_lines in messages if sender and (body := _person_text("\n".join(body_lines)))
+    ]
 
 
-def _current_message(text: str) -> str:
-    """Return what the requester typed in a legacy current message, or nothing when it cannot be told apart."""
-    while trailing := _TRAILING_BLOCK.search(text):
-        text = text[: trailing.start()]
-    memory_lists = list(_MEMORY_LIST_HEADER.finditer(text))
-    if memory_lists:
-        _, blank_line, text = text[memory_lists[-1].end() :].partition("\n\n")
-        if not blank_line:
-            return ""
-    if _MEMORY_ENTRYPOINT in text:
+def _person_text(text: str) -> str:
+    """Return a legacy message body without the blocks MindRoom added, or nothing when a memory file never ends."""
+    kept: list[str] = []
+    in_memory_file = False
+    for block in text.split("\n\n"):
+        stripped = block.strip()
+        if stripped.startswith(_MEMORY_FILE):
+            in_memory_file = True
+        elif _MEMORY_LIST.match(stripped):
+            in_memory_file = False
+        elif not in_memory_file and stripped and not _ADDED_BLOCK.fullmatch(stripped):
+            kept.append(block)
+    if in_memory_file:
         return ""
-    return _TIME_PREFIX.sub("", text.strip(), count=1).strip()
+    return _TIME_PREFIX.sub("", "\n\n".join(kept).strip(), count=1).strip()

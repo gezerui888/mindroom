@@ -222,7 +222,7 @@ Matrix sync callback
 | `history/summary_rows.py` | The conversation log's summary rows: compare-and-append of compaction chunks, the event ids each row folds, and edit and redaction cuts |
 | `history/summary_rows_schema.py` | Summary-row table layout and the shared SQL for which runs a session load returns |
 | `history/legacy_compaction_state.py` | One-time conversion, when a conversation database opens, of earlier compaction state, the compaction archive, and unpositioned run rows into the log |
-| `history/legacy_stored_runs.py` | Matrix turns older releases stored in an earlier shape, read in the current one: the room and thread of run metadata without them come from the session ID, and people's words from prompts without `<msg>` tags |
+| `history/legacy_stored_runs.py` | Matrix turns older releases stored in an earlier shape, read in the current one: the room and thread of run metadata without them come from the session ID, and people's words from their prompts, tagged or not, without the blocks MindRoom added |
 | `history/session_runs.py` | Finished Matrix turns of an agent's conversations, live and compacted, with the approval hold-back and redaction filter background workers share |
 | `skill_learning/capture.py` | The final model request of a counting response, kept for the review to fork |
 | `skill_learning/runner.py` | In-memory reply counts per conversation; starts a review when a count reaches the interval, stops it when a new response starts, and posts change notices |

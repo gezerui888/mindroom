@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from mindroom.knowledge_graph.scope import GraphScope
     from mindroom.knowledge_graph.usage import UsageTarget
 
-type EpisodeKind = Literal["conversation", "tool_results"]
+type EpisodeKind = Literal["conversation", "tool_results", "document"]
 
 _DOTENV_DISABLED = "PYTHON_DOTENV_DISABLED"
 # RediSearch rejects a fulltext query holding a word that is only a control character or an underscore, both of which

@@ -24,9 +24,9 @@ A labeled evaluation of extracted facts against their sources measures precision
 
 ## Decisions
 
-### Evidence enters only from transcripts and tool results
+### Evidence enters only from transcripts, tool results, and configured files
 
-Episodes come from stored sessions, never from a model-callable write function.
+Episodes come from stored sessions and flagged knowledge-base files, never from a model-callable write function.
 Ordinary conversations ingest user, assistant, and tool messages with speaker labels, because a person confirming or correcting the agent is evidence.
 A background job follow-up's prompt is MindRoom's instruction to collect the results, not its requester's words, so only its reply is ingested; stored runs record their turn intent so ingestion can tell.
 Exploration threads and delegated tasks ingest only tool calls and their results, because their prompts come from an agent, not a person, and their answers are the agent's own synthesis.
@@ -41,8 +41,14 @@ Graphiti records which episodes support a fact, so provenance is per episode, an
 
 - `conversation`: the run's user and assistant messages as a Graphiti `message` episode, each line prefixed with its speaker, so extraction attributes assertions to whoever made them.
 - `tool_results`: the run's tool calls and results as a `text` episode, an observation of the sources the model chose to query.
+- `document`: a piece of a file from a knowledge base flagged `knowledge_graph: true`, as a `text` episode dated by the file's modification time and described as `document: <base>/<relative path>`.
 
 Search results return the kinds and origins of each fact's episodes, so the agent can tell an observation from something it or a person said.
+
+Documents are read by code, not by a model.
+An agent that loaded `memory/facts/*.yaml` by reading it in a seeding thread spent 3.3M input tokens on 51 chunks, its episodes carried its own restatement, and they still waited a day behind 700 conversations.
+Knowledge bases already define the sources (paths, include and exclude rules, Git sync, per-agent assignment, and a listing that follows no planted link), so the flag reuses them.
+A flagged base inside an agent workspace is writable by that agent's tools, so flagging it trusts those writes as sources; each fact still names its file.
 
 Rejected: a `record_evidence` tool the agent calls during exploration.
 It lets a model paraphrase, omit, or invent evidence, and its own summaries would then return as fresh evidence on later runs.
@@ -110,6 +116,10 @@ Graphiti needs structured output; small local models may fail extraction, which 
 - A newly seen conversation starts at the backfill cutoff, and one conversation adds at most twenty completed episodes per pass, so a long history spreads over passes instead of holding up every other conversation.
 - A paused turn stops holding back its conversation once the approval it waits for has expired, counted from its newest message, which is the call waiting for approval; the conversation is looked at again then even without new messages.
 - A new graph's start is saved when it is first seen, so the backfill window stays anchored even with `backfill_days: 0`.
+- A file is extracted when its sha256 differs from the content last extracted in full, never because its modification time changed, since Git checkouts rewrite modification times.
+- A file's progress counts the pieces done of one version, so a retry resumes at the failed piece and an edit during a retry starts the new version from its first piece; a file deleted or changed back while a piece waits stops keeping health failing.
+- Each changed file spends one unit of `max_sessions_per_cycle` after its scope's conversations, and adds at most twenty pieces per pass.
+- A document belongs to no conversation, so its extraction usage is recorded under `system:internal`; recording it in an agent's session storage would need a session row there.
 
 ## Exploration invariants
 
@@ -142,6 +152,7 @@ Graphiti needs structured output; small local models may fail extraction, which 
 ## Limitations
 
 - Redacting or deleting a message does not remove facts already extracted from it; deleting the `knowledge_graph/` storage directory rebuilds the graph from the remaining conversations of the last `backfill_days`.
+- Deleting a knowledge-base file, or a line of it, does not remove the facts it already added.
 - A config reload that changes the embedder during a pass can add that pass's remaining episodes to the old graph.
 
 ## Open questions

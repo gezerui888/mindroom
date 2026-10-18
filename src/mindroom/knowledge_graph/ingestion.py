@@ -1,7 +1,8 @@
-"""Background ingestion: the finished turns of graph-enabled agents become graph episodes.
+"""Background ingestion: the finished turns of graph-enabled agents, and files of flagged knowledge bases, become episodes.
 
-Stored sessions are the source of truth; a per-graph state file records how far each conversation has been ingested,
-so a restart resumes where the last pass stopped and changing the embedder, which names a new graph, starts over.
+Stored sessions and the files are the source of truth; a per-graph state file records how far each conversation has
+been ingested and which content of each file was, so a restart resumes where the last pass stopped and changing the
+embedder, which names a new graph, starts over.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from mindroom.automations.threads import automation_threads
 from mindroom.durable_write import write_json_file_durable
 from mindroom.entity_resolution import prepared_entity_names_by_user_id
 from mindroom.history.session_runs import finished_runs, run_key, session_runs, unredacted_runs, updated_sessions
+from mindroom.knowledge_graph.documents import document_files, read_document, render_document
 from mindroom.knowledge_graph.episodes import (
     RUN_DONE,
     Progress,
@@ -39,6 +41,7 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.history.session_runs import RedactedEventIds
+    from mindroom.knowledge_graph.documents import DocumentFile
     from mindroom.knowledge_graph.scope import GraphScope
     from mindroom.knowledge_graph.store import GraphStore
 
@@ -52,32 +55,46 @@ _MAX_RETRY_SECONDS = 3600
 # cannot cost model calls forever; an outage shorter than that loses nothing.
 _MAX_BAD_OUTPUTS = 5
 _MAX_FAILING_SECONDS = 3 * 86_400
-# Episodes one conversation adds per pass, so a long backlog cannot hold up every other conversation.
+# Episodes one conversation or file adds per pass, so a long backlog cannot hold up every other one.
 _MAX_EPISODES_PER_PASS = 20
 _EPISODE_KINDS = ("conversation", "tool_results")
 _WAKE_EVENTS: set[asyncio.Event] = set()
 
 
-class _SessionState(TypedDict):
-    updated_at: int
-    # The last run each episode kind has ingested, so a failing kind never repeats the other.
-    markers: dict[str, list[int | str]]
+class _Backoff(TypedDict):
     # Consecutive failures, which set the backoff.
     failures: int
     # Consecutive failures of the current episode whose model output could not be used, which drop it.
     bad_outputs: int
     # When the current episode started failing, so one that never succeeds is dropped after a while.
     failing_since: float
+    retry_at: float
+
+
+class _SessionState(_Backoff):
+    updated_at: int
+    # The last run each episode kind has ingested, so a failing kind never repeats the other.
+    markers: dict[str, list[int | str]]
     # The failing episode, as its kind and where that kind stopped, which stays put while it fails; empty when none.
     failing_piece: list[int | str]
-    retry_at: float
     # When a turn holding the conversation back stops waiting for approval, or 0.
     recheck_at: float
+
+
+class _DocumentState(_Backoff):
+    # The content last extracted in full; a file with this hash is never extracted again.
+    sha256: str
+    # The content that `pieces_done` and the failure counts belong to, so an edit during a retry starts over.
+    pending_sha256: str
+    # Pieces of the pending content added or dropped, so a retry resumes at the failed piece.
+    pieces_done: int
 
 
 class _GraphState(TypedDict):
     started_at: float
     sessions: dict[str, _SessionState]
+    # Keyed `<base_id>/<relative path>`.
+    documents: dict[str, _DocumentState]
 
 
 @dataclass(frozen=True)
@@ -123,10 +140,35 @@ def _marker(entry: _SessionState, kind: str) -> Progress | None:
     return (int(marker[0]), str(marker[1]), int(marker[2])) if marker is not None else None
 
 
+def _new_document_state() -> _DocumentState:
+    return {
+        "sha256": "",
+        "pending_sha256": "",
+        "pieces_done": 0,
+        "failures": 0,
+        "bad_outputs": 0,
+        "failing_since": 0,
+        "retry_at": 0,
+    }
+
+
 def _report_failure(message: str, exc: Exception, **context: str) -> None:
     logger.warning(message, error=f"{type(exc).__name__}: {str(exc)[:200]}", **context)
     # Health is unauthenticated and error text can quote conversation content, so it gets only the failure's kind.
     record_knowledge_graph_failure(f"{message}: {type(exc).__name__}")
+
+
+def _back_off(entry: _Backoff, exc: Exception, now: float) -> bool:
+    """Count a failure of the entry's current episode; return whether it waits for a retry rather than being dropped."""
+    entry["failures"] += 1
+    # Only output the model got wrong counts here; a setup error such as a bad embedder waits like an outage.
+    entry["bad_outputs"] = entry["bad_outputs"] + 1 if isinstance(exc, UnusableExtractionError) else 0
+    entry["failing_since"] = entry["failing_since"] or now
+    if entry["bad_outputs"] < _MAX_BAD_OUTPUTS and now - entry["failing_since"] < _MAX_FAILING_SECONDS:
+        backoff = _FIRST_RETRY_SECONDS * 2 ** (entry["failures"] - 1)
+        entry["retry_at"] = now + min(backoff, _MAX_RETRY_SECONDS)
+        return True
+    return False
 
 
 @dataclass
@@ -163,7 +205,7 @@ class KnowledgeGraphIngestionWorker:
             _WAKE_EVENTS.discard(self._wake_event)
 
     async def _run_cycle(self, config: Config, *, now: float) -> None:
-        """Ingest up to ``max_sessions_per_cycle`` idle conversations with new turns."""
+        """Ingest up to ``max_sessions_per_cycle`` idle conversations with new turns and new or changed files."""
         budget = config.knowledge_graph.ingest.max_sessions_per_cycle
         # These read files, including every private instance's records, so they stay off the event loop.
         automation_thread_ids = await asyncio.to_thread(automation_threads, self.runtime_paths)
@@ -191,7 +233,11 @@ class KnowledgeGraphIngestionWorker:
                 # A conversation whose agent is not running is looked at again later and spends none of the budget.
                 budget -= sum(result is not None for result in results)
                 outcomes.extend(result for result in results if result is not None)
-                if any(entry["failing_piece"] for entry in state["sessions"].values()):
+                # Files come after the conversations, each new or changed one spending one unit of what is left.
+                document_outcomes, documents_failing = await self._ingest_documents(config, scope, state, now, budget)
+                budget -= len(document_outcomes)
+                outcomes.extend(document_outcomes)
+                if documents_failing or any(entry["failing_piece"] for entry in state["sessions"].values()):
                     self._failing_graphs.add(scope.graph_name)
                 else:
                     self._failing_graphs.discard(scope.graph_name)
@@ -344,14 +390,8 @@ class KnowledgeGraphIngestionWorker:
             if entry["failing_piece"] != piece:
                 # The counts belong to one episode, so another kind's successes never reset them.
                 entry.update(failures=0, bad_outputs=0, failing_since=0, failing_piece=piece)
-            entry["failures"] += 1
-            # Only output the model got wrong counts here; a setup error such as a bad embedder waits like an outage.
-            entry["bad_outputs"] = entry["bad_outputs"] + 1 if isinstance(exc, UnusableExtractionError) else 0
-            entry["failing_since"] = entry["failing_since"] or now
             _report_failure("Knowledge graph ingestion failed", exc, agent=scope.agent_name)
-            if entry["bad_outputs"] < _MAX_BAD_OUTPUTS and now - entry["failing_since"] < _MAX_FAILING_SECONDS:
-                backoff = _FIRST_RETRY_SECONDS * 2 ** (entry["failures"] - 1)
-                entry["retry_at"] = now + min(backoff, _MAX_RETRY_SECONDS)
+            if _back_off(entry, exc, now):
                 await self._persist(scope.graph_name, state)
                 return None
             logger.exception(
@@ -367,6 +407,98 @@ class KnowledgeGraphIngestionWorker:
         await self._persist(scope.graph_name, state)
         return not dropped
 
+    async def _ingest_documents(
+        self,
+        config: Config,
+        scope: GraphScope,
+        state: _GraphState,
+        now: float,
+        limit: int,
+    ) -> tuple[list[bool], bool]:
+        """Ingest up to ``limit`` new or changed files of the scope's flagged knowledge bases.
+
+        Return whether each ingested file had no piece fail or dropped, and whether a listed file waits for a retry.
+        A deleted file is left alone, and so are the facts it added.
+        """
+        # Listing and hashing read every flagged file, which must not stall the event loop.
+        files = await asyncio.to_thread(document_files, config, scope, self.runtime_paths)
+        outcomes: list[bool] = []
+        for file in files:
+            if len(outcomes) >= limit:
+                break
+            entry = state["documents"].get(file.key)
+            if entry is not None and (entry["sha256"] == file.sha256 or entry["retry_at"] > now):
+                continue
+            outcome = await self._ingest_document(config, scope, state, file, now)
+            if outcome is not None:
+                outcomes.append(outcome)
+        # A file deleted, or changed back to what was extracted, while a piece of it waited no longer keeps health failing.
+        failing = any(
+            (entry := state["documents"].get(file.key)) is not None
+            and entry["failures"] > 0
+            and entry["sha256"] != file.sha256
+            for file in files
+        )
+        return outcomes, failing
+
+    async def _ingest_document(
+        self,
+        config: Config,
+        scope: GraphScope,
+        state: _GraphState,
+        file: DocumentFile,
+        now: float,
+    ) -> bool | None:
+        """Add a bounded number of one file's pieces and return whether none failed or was dropped.
+
+        Return None when the file changed after it was listed, which leaves it for the next pass.
+        """
+        text = await asyncio.to_thread(read_document, file)
+        if text is None:
+            return None
+        # Rendering redacts every piece of the file, which must not stall the event loop.
+        episodes = await asyncio.to_thread(render_document, file, text, config.knowledge_graph.ingest)
+        entry = state["documents"].setdefault(file.key, _new_document_state())
+        if entry["pending_sha256"] != file.sha256:
+            entry.update(
+                pending_sha256=file.sha256,
+                pieces_done=0,
+                failures=0,
+                bad_outputs=0,
+                failing_since=0,
+                retry_at=0,
+            )
+        usage = UsageTarget(scope.agent_name, None, scope.execution_identity)
+        clean = True
+        for added, index in enumerate(range(entry["pieces_done"], len(episodes))):
+            # A long file spreads over passes; it stays due because its content is not recorded as extracted yet.
+            if added >= _MAX_EPISODES_PER_PASS:
+                return clean
+            try:
+                await self.store.add_episode(scope, episodes[index], usage)
+            except Exception as exc:
+                _report_failure(
+                    "Knowledge graph ingestion failed for a document",
+                    exc,
+                    agent=scope.agent_name,
+                    document=file.key,
+                )
+                if _back_off(entry, exc, now):
+                    await self._persist(scope.graph_name, state)
+                    return False
+                logger.exception(
+                    "Knowledge graph dropped a document piece it could not extract",
+                    agent=scope.agent_name,
+                    episode=episodes[index].name,
+                )
+                clean = False
+            # Every piece records its progress, added or dropped, so a retry never repeats it.
+            entry.update(pieces_done=index + 1, failures=0, bad_outputs=0, failing_since=0, retry_at=0)
+            await self._persist(scope.graph_name, state)
+        entry.update(sha256=file.sha256, pieces_done=0)
+        await self._persist(scope.graph_name, state)
+        return clean
+
     async def _persist(self, graph_name: str, state: _GraphState) -> None:
         await asyncio.to_thread(write_json_file_durable, self._state_path(graph_name), state)
 
@@ -375,13 +507,21 @@ class KnowledgeGraphIngestionWorker:
 
     def _load_state(self, graph_name: str, now: float) -> _GraphState:
         try:
-            return json.loads(self._state_path(graph_name).read_text(encoding="utf-8"))
+            saved: _GraphState = json.loads(self._state_path(graph_name).read_text(encoding="utf-8"))
         except FileNotFoundError:
             pass
         except ValueError:
             # Starting over re-extracts recent conversations, which Graphiti merges with what it already holds.
             logger.warning("Knowledge graph ingestion state was unreadable; starting over", graph=graph_name)
+        else:
+            # LEGACY_COMPAT: Ingestion state saved before knowledge-base files fed the graph.
+            # Legacy format: The state file has no `documents` key.
+            # Last legacy release: v2026.10.342; replacement: the next release saves `documents`, each file's extracted content hash.
+            # Handling: A missing `documents` starts empty, so every flagged file counts as new; conversation progress is kept.
+            # Coverage: tests/test_knowledge_graph_ingestion.py::test_state_saved_before_documents_keeps_its_conversations_and_adds_documents.
+            saved.setdefault("documents", {})
+            return saved
         # Saved at once, so the backfill window stays anchored to when the graph started.
-        state: _GraphState = {"started_at": now, "sessions": {}}
+        state: _GraphState = {"started_at": now, "sessions": {}, "documents": {}}
         write_json_file_durable(self._state_path(graph_name), state)
         return state

@@ -132,6 +132,13 @@ class KnowledgeBaseConfig(BaseModel):
         default=None,
         description="Optional Git sync configuration for this knowledge base",
     )
+    knowledge_graph: bool = Field(
+        default=False,
+        description=(
+            "Also extract this base's files into the knowledge graph of every graph-enabled agent that uses the base; "
+            "a file is extracted again only when its content changes"
+        ),
+    )
 
     @field_validator("include_patterns", "exclude_patterns")
     @classmethod

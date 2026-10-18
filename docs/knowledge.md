@@ -89,6 +89,7 @@ knowledge_bases:
 | `exclude_extensions` | list | `[]` | Extensions to exclude, applied last (semantic mode only) |
 | `skip_hidden` | bool | `true` | Skip files and folders whose names start with `.`, such as temp files from editors that write in place. Git-backed bases use `git.skip_hidden` instead |
 | `git` | object | `null` | Sync the folder from a Git repository; see [Git-Backed Knowledge Bases](#git-backed-knowledge-bases) |
+| `knowledge_graph` | bool | `false` | Also extract the base's files into the [knowledge graph](knowledge-graph.md#documents) of every graph-enabled agent that uses the base; a file is extracted again only when its content changes |
 
 Set `skip_hidden: false` if the folder intentionally contains dot-prefixed files that should be indexed.
 Use a smaller `chunk_size` when your embedding server has lower token or batch limits; chunks that are too large make indexing fail with embedder 500 errors.

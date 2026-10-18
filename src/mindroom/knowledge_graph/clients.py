@@ -23,7 +23,7 @@ from graphiti_core.llm_client.config import DEFAULT_MAX_TOKENS, ModelSize
 from pydantic import BaseModel
 
 from mindroom.embeddings.errors import EmbedderRequestError, embedder_batch_cardinality_mismatch
-from mindroom.helper_usage import HelperUsageOwner, record_helper_usage
+from mindroom.helper_usage import HelperUsageOwner, record_helper_usage, record_system_usage
 from mindroom.knowledge_graph.store import UnusableExtractionError, run_on_loop
 from mindroom.knowledge_graph.usage import current_usage_target
 from mindroom.providers import model_loading
@@ -113,22 +113,26 @@ class MindRoomLLMClient(LLMClient):
             run_id=invocation_id,
         )
         if target is not None:
-            await record_helper_usage(
-                response,
-                owner=HelperUsageOwner(
-                    storage_factory=partial(
-                        create_session_storage,
-                        target.agent_name,
-                        config,
-                        self._runtime_paths,
-                        execution_identity=identity,
+            if target.session_id is None:
+                # A document belongs to no conversation, so its extraction is internal work like routing.
+                await record_system_usage(response, runtime_paths=self._runtime_paths, kind="knowledge_graph")
+            else:
+                await record_helper_usage(
+                    response,
+                    owner=HelperUsageOwner(
+                        storage_factory=partial(
+                            create_session_storage,
+                            target.agent_name,
+                            config,
+                            self._runtime_paths,
+                            execution_identity=identity,
+                        ),
+                        session_id=target.session_id,
                     ),
-                    session_id=target.session_id,
-                ),
-                invocation_id=invocation_id,
-                kind="knowledge_graph",
-                requester_id=target.requester_id or (identity.requester_id if identity is not None else None),
-            )
+                    invocation_id=invocation_id,
+                    kind="knowledge_graph",
+                    requester_id=target.requester_id or (identity.requester_id if identity is not None else None),
+                )
         content = response.content
         if response.status == RunStatus.error:
             # Agno returns a provider failure as the run's content; report it instead of a JSON parse error.

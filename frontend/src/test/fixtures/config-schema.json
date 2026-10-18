@@ -2378,6 +2378,12 @@
           ],
           "default": null,
           "description": "Optional Git sync configuration for this knowledge base"
+        },
+        "knowledge_graph": {
+          "default": false,
+          "description": "Also extract this base's files into the knowledge graph of every graph-enabled agent that uses the base; a file is extracted again only when its content changes",
+          "title": "Knowledge Graph",
+          "type": "boolean"
         }
       },
       "title": "KnowledgeBaseConfig",

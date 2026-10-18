@@ -9175,12 +9175,25 @@ visibility = [
 ]
 
 [[modules]]
+path = "mindroom.knowledge_graph.documents"
+depends_on = [
+    "mindroom.knowledge.file_listing",
+    "mindroom.knowledge.indexing_config",
+    "mindroom.knowledge_graph.store",
+    "mindroom.logging_config",
+    "mindroom.path_confinement",
+    "mindroom.redaction",
+    "mindroom.runtime_resolution",
+]
+
+[[modules]]
 path = "mindroom.knowledge_graph.ingestion"
 depends_on = [
     "mindroom.automations.threads",
     "mindroom.durable_write",
     "mindroom.entity_resolution",
     "mindroom.history.session_runs",
+    "mindroom.knowledge_graph.documents",
     "mindroom.knowledge_graph.episodes",
     "mindroom.knowledge_graph.scope",
     "mindroom.knowledge_graph.store",

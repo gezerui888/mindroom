@@ -18,7 +18,8 @@ class UsageTarget:
     """The conversation an ingested episode came from, which its extraction tokens are charged to."""
 
     agent_name: str
-    session_id: str
+    # None for a document, which comes from no conversation; its extraction is charged as internal work.
+    session_id: str | None
     execution_identity: ToolExecutionIdentity | None
     # The person whose conversation it is; for a shared agent, the identity names no requester.
     requester_id: str | None = None

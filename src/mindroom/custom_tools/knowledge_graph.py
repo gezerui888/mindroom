@@ -55,10 +55,11 @@ class KnowledgeGraphTools(Toolkit):
         super().__init__(name="knowledge_graph", tools=[self.search_graph, self.graph_entity])
 
     async def search_graph(self, query: str, limit: int = 10) -> str:
-        """Find facts about people, projects, documents, and events that your conversations and tools revealed.
+        """Find facts about people, projects, documents, and events that your conversations, tools, and files revealed.
 
         Each fact shows when it held and its sources: "conversation" means someone said it, "tool_results" means a
-        tool returned it. Facts marked superseded were true before later evidence replaced them.
+        tool returned it, and "document" means it was read from a configured knowledge-base file, named after the
+        colon. Facts marked superseded were true before later evidence replaced them.
 
         Args:
             query: What to look up, for example "who owns Project Atlas".

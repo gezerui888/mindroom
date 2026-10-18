@@ -185,10 +185,11 @@ Matrix sync callback
 | `knowledge_graph/scope.py` | Which graph an agent or private instance owns, named in code from its state root and embedder |
 | `knowledge_graph/store.py` | The runtime's one Graphiti client and its episode, fact, and entity operations; health and the store registry |
 | `knowledge_graph/clients.py` | Graphiti's LLM, embedder, and reranker clients backed by MindRoom's model and embedder construction |
-| `knowledge_graph/usage.py` | Which conversation an extraction call's tokens are charged to |
+| `knowledge_graph/usage.py` | Which conversation an extraction call's tokens are charged to, or internal usage for a document |
 | `knowledge_graph/embedded_server.py` | The embedded FalkorDB server MindRoom starts, stops, and recovers after a crash |
 | `knowledge_graph/episodes.py` | Stored runs rendered as `conversation` and `tool_results` episodes, and thread classification |
-| `knowledge_graph/ingestion.py` | Background ingestion passes with per-kind markers, backoff, and dropped episodes |
+| `knowledge_graph/documents.py` | Files of knowledge bases flagged `knowledge_graph: true`, listed, hashed, and rendered as `document` episodes |
+| `knowledge_graph/ingestion.py` | Background ingestion passes with per-kind markers, per-file content hashes, backoff, and dropped episodes |
 | `knowledge_graph/runtime.py` | Starts and stops the store and ingestion worker as agents enable the graph |
 | `config/knowledge_graph.py` | The `knowledge_graph` section: extraction model and ingestion settings |
 | `custom_tools/knowledge_graph.py` | The read-only `knowledge_graph` tool |

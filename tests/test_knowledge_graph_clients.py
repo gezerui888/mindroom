@@ -83,6 +83,29 @@ async def test_llm_client_returns_structured_output_and_records_usage(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_llm_client_charges_a_document_to_internal_usage(tmp_path: Path) -> None:
+    """A document belongs to no conversation, so its extraction is recorded as internal work, not in a session."""
+    config = _config()
+    paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path)
+    model = _JsonModel(id="luna", provider="test", answer=json.dumps({"names": []}))
+    record, record_system = AsyncMock(), AsyncMock()
+
+    with (
+        patch("mindroom.providers.model_loading.get_model_instance", return_value=model),
+        patch.object(clients, "record_helper_usage", record),
+        patch.object(clients, "record_system_usage", record_system),
+        usage_target(UsageTarget(agent_name="mind", session_id=None, execution_identity=None)),
+    ):
+        await MindRoomLLMClient(lambda: config, paths, asyncio.get_running_loop())._generate_response(
+            [Message(role="user", content="Alice runs Atlas.")],
+            _Entities,
+        )
+
+    record.assert_not_awaited()
+    assert record_system.await_args.kwargs == {"runtime_paths": paths, "kind": "knowledge_graph"}
+
+
+@pytest.mark.asyncio
 async def test_llm_client_without_usage_target_records_nothing(tmp_path: Path) -> None:
     """A call outside ingestion, such as a search, has no conversation to charge."""
     config = _config()

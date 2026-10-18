@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -18,6 +20,7 @@ from agno.run.base import RunStatus
 from agno.session.agent import AgentSession
 
 from mindroom.config.agent import AgentConfig
+from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY, resolve_runtime_paths
@@ -52,6 +55,8 @@ class _FakeStore:
     """Records episodes; sessions in ``failing``, kinds in ``failing_kinds``, and bodies containing ``failing_text`` fail."""
 
     episodes: list[tuple[str, EpisodeInput, UsageTarget]] = field(default_factory=list)
+    # Every episode it was asked to add, including the ones that failed.
+    calls: list[EpisodeInput] = field(default_factory=list)
     failing: set[str] = field(default_factory=set)
     failing_kinds: set[str] = field(default_factory=set)
     failing_text: str | None = None
@@ -60,6 +65,7 @@ class _FakeStore:
     added: asyncio.Event = field(default_factory=asyncio.Event)
 
     async def add_episode(self, scope: GraphScope, episode: EpisodeInput, usage: UsageTarget) -> None:
+        self.calls.append(episode)
         if self.error is not None:
             raise self.error
         if (
@@ -87,6 +93,10 @@ class _FakeStore:
         """Return the conversation of each ingested conversation episode, in order."""
         return [usage.session_id for _, episode, usage in self.episodes if episode.kind == "conversation"]
 
+    def documents(self) -> list[EpisodeInput]:
+        """Return the added document episodes, in order."""
+        return [episode for _, episode, _ in self.episodes if episode.kind == "document"]
+
 
 @pytest.fixture(autouse=True)
 def _clear_health() -> Iterator[None]:
@@ -101,6 +111,22 @@ def _config(**ingest: object) -> Config:
         models={"luna": ModelConfig(provider="openai", id="gpt-6-luna")},
         knowledge_graph={"model": "luna", "ingest": {"idle_seconds": 1, **ingest}},
     )
+
+
+def _with_documents(tmp_path: Path, **ingest: object) -> Config:
+    """Return the config with a flagged knowledge base `facts` at `tmp_path / "facts"` that the agent uses."""
+    (tmp_path / "facts").mkdir(exist_ok=True)
+    return Config(
+        agents={"mind": AgentConfig(display_name="Mind", knowledge_graph=True, knowledge_bases=["facts"])},
+        models={"luna": ModelConfig(provider="openai", id="gpt-6-luna")},
+        knowledge_graph={"model": "luna", "ingest": {"idle_seconds": 1, **ingest}},
+        knowledge_bases={"facts": KnowledgeBaseConfig(path=str(tmp_path / "facts"), knowledge_graph=True)},
+    )
+
+
+def _pieces(*words: str) -> str:
+    """Return a file of one 1000-character piece per word, each piece's ten lines naming its word."""
+    return "".join(f"{word} line {index} ".ljust(98, "o") + "\n" for word in words for index in range(10))
 
 
 def _paths(tmp_path: Path) -> RuntimePaths:
@@ -735,3 +761,102 @@ async def test_episodes_are_rendered_off_the_event_loop(tmp_path: Path) -> None:
 
     assert rendered_on
     assert all(thread is not threading.main_thread() for thread in rendered_on)
+
+
+@pytest.mark.asyncio
+async def test_a_changed_document_is_extracted_once_and_an_unchanged_one_never(tmp_path: Path) -> None:
+    """A file is extracted when its content changes; a new modification time alone, as from a checkout, adds nothing."""
+    config, paths, store = _with_documents(tmp_path), _paths(tmp_path), _FakeStore()
+    (tmp_path / "facts" / "alice.md").write_text("Alice leads Project Atlas.\n", encoding="utf-8")
+    (tmp_path / "facts" / "bob.md").write_text("Bob joined in March.\n", encoding="utf-8")
+    worker = _worker(config, paths, store)
+
+    await worker._run_cycle(config, now=T0)
+    assert [episode.body for episode in store.documents()] == ["Alice leads Project Atlas.", "Bob joined in March."]
+    for file in (tmp_path / "facts").iterdir():
+        os.utime(file, (T0 + 50, T0 + 50))
+    await worker._run_cycle(config, now=T0 + 100)
+    assert len(store.documents()) == 2
+    (tmp_path / "facts" / "bob.md").write_text("Bob left in May.\n", encoding="utf-8")
+    os.utime(tmp_path / "facts" / "bob.md", (T0 + 150, T0 + 150))
+    await worker._run_cycle(config, now=T0 + 200)
+
+    assert len(store.calls) == 3
+    edited = store.documents()[-1]
+    assert (edited.body, edited.source_description) == ("Bob left in May.", "document: facts/bob.md")
+    assert edited.reference_time.timestamp() == T0 + 150
+    # A document belongs to no conversation, so its extraction is charged as internal work.
+    assert {usage.session_id for _, _, usage in store.episodes} == {None}
+
+
+@pytest.mark.asyncio
+async def test_a_failing_document_retries_with_backoff_and_is_dropped_after_five_unusable_outputs(
+    tmp_path: Path,
+) -> None:
+    """A failing piece waits out its backoff, a retry resumes at it, and five unusable outputs drop only that piece."""
+    config = _with_documents(tmp_path, max_episode_chars=1000, max_tool_result_chars=400)
+    paths, store = _paths(tmp_path), _FakeStore(failing_text="Beacon")
+    (tmp_path / "facts" / "projects.md").write_text(_pieces("Atlas", "Beacon", "Comet"), encoding="utf-8")
+    worker = _worker(config, paths, store)
+
+    await worker._run_cycle(config, now=T0)
+    await worker._run_cycle(config, now=T0 + 1)
+    assert [episode.body.split()[0] for episode in store.calls] == ["Atlas", "Beacon"]
+    assert knowledge_graph_failure() is not None
+    for attempt in range(1, 6):
+        await worker._run_cycle(config, now=T0 + attempt * 4000)
+
+    assert [episode.body.split()[0] for episode in store.calls] == ["Atlas", *["Beacon"] * 5, "Comet"]
+    assert [episode.body.split()[0] for episode in store.documents()] == ["Atlas", "Comet"]
+
+
+@pytest.mark.asyncio
+async def test_a_document_edited_while_a_piece_waits_starts_over(tmp_path: Path) -> None:
+    """Progress belongs to one version of a file, so an edit during a retry extracts the new version from its start."""
+    config = _with_documents(tmp_path, max_episode_chars=1000, max_tool_result_chars=400)
+    paths, store = _paths(tmp_path), _FakeStore(failing_text="Beacon")
+    (tmp_path / "facts" / "projects.md").write_text(_pieces("Atlas", "Beacon"), encoding="utf-8")
+    worker = _worker(config, paths, store)
+    await worker._run_cycle(config, now=T0)
+
+    store.failing_text = None
+    (tmp_path / "facts" / "projects.md").write_text(_pieces("Delta", "Echo"), encoding="utf-8")
+    await worker._run_cycle(config, now=T0 + 4000)
+
+    assert [episode.body.split()[0] for episode in store.documents()] == ["Atlas", "Delta", "Echo"]
+    assert knowledge_graph_failure() is None
+
+
+@pytest.mark.asyncio
+async def test_documents_share_max_sessions_per_cycle_with_conversations(tmp_path: Path) -> None:
+    """Each changed file spends one unit of the pass's budget, after the conversations."""
+    config, paths, store = _with_documents(tmp_path, max_sessions_per_cycle=2), _paths(tmp_path), _FakeStore()
+    _seed(config, paths, "!room:x:$t1", ["r1"])
+    for name in ("a", "b", "c"):
+        (tmp_path / "facts" / f"{name}.md").write_text(f"Fact {name}.\n", encoding="utf-8")
+    worker = _worker(config, paths, store)
+
+    await worker._run_cycle(config, now=T0 + 10)
+    assert (store.sessions(), [episode.body for episode in store.documents()]) == (["!room:x:$t1"], ["Fact a."])
+    await worker._run_cycle(config, now=T0 + 20)
+
+    assert [episode.body for episode in store.documents()] == ["Fact a.", "Fact b.", "Fact c."]
+
+
+@pytest.mark.asyncio
+async def test_state_saved_before_documents_keeps_its_conversations_and_adds_documents(tmp_path: Path) -> None:
+    """A state file from a release without documents keeps its conversation progress and gains the files."""
+    config, paths, store = _with_documents(tmp_path), _paths(tmp_path), _FakeStore()
+    _seed(config, paths, "!room:x:$t1", ["r1"])
+    worker = _worker(config, paths, store)
+    await worker._run_cycle(config, now=T0 + 10)
+    state_path = worker._state_path(graph_scope("mind", config, paths, None).graph_name)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    del state["documents"]
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    (tmp_path / "facts" / "alice.md").write_text("Alice leads Project Atlas.\n", encoding="utf-8")
+    await _worker(config, paths, store)._run_cycle(config, now=T0 + 20)
+
+    assert store.sessions() == ["!room:x:$t1"]
+    assert [episode.body for episode in store.documents()] == ["Alice leads Project Atlas."]

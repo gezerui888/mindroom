@@ -131,11 +131,10 @@ def _run(
             ),
         ],
         metadata={
-            # A turn through the OpenAI-compatible API names no room, so it is not a Matrix turn.
-            **({"room_id": "!room:x"} if matrix else {}),
+            # A turn through the OpenAI-compatible API names no room and answers no Matrix event, so it is not a Matrix turn.
+            **({"room_id": "!room:x", MATRIX_EVENT_ID_METADATA_KEY: f"$event-{run_id}"} if matrix else {}),
             "thread_id": session_id.rsplit(":", 1)[-1],
             "requester_id": "@alice:x",
-            MATRIX_EVENT_ID_METADATA_KEY: f"$event-{run_id}",
         },
         messages=[
             Message(role="user", content=f"question {run_id}", created_at=created_at),

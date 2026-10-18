@@ -312,7 +312,6 @@ async def _move_fact(driver: GraphDriver, fact: dict[str, Any], group: set[str],
     new_source = keep if fact["source"] in group else fact["source"]
     new_target = keep if fact["target"] in group else fact["target"]
     properties = dict(fact["properties"])
-    properties.pop("fact_embedding", None)
     for key in _SOURCE_KEYS:
         if key in properties:
             properties[key] = new_source

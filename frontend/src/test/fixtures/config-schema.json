@@ -2473,7 +2473,7 @@
     },
     "KnowledgeGraphConfig": {
       "additionalProperties": false,
-      "description": "The Graphiti knowledge graph that graph-enabled agents build from their conversations and exploration.",
+      "description": "The Graphiti knowledge graph that graph-enabled agents build from conversations, exploration, and flagged files.",
       "properties": {
         "model": {
           "anyOf": [
@@ -2498,7 +2498,7 @@
             "max_tool_result_chars": 4000,
             "backfill_days": 7
           },
-          "description": "Conversation ingestion settings"
+          "description": "Ingestion settings for conversations and flagged knowledge-base files"
         }
       },
       "title": "KnowledgeGraphConfig",
@@ -2506,7 +2506,7 @@
     },
     "KnowledgeGraphIngestConfig": {
       "additionalProperties": false,
-      "description": "How the background worker turns finished conversation turns into graph episodes.",
+      "description": "How the background worker turns finished turns and flagged knowledge-base files into graph episodes.",
       "properties": {
         "interval_seconds": {
           "default": 600,
@@ -2524,14 +2524,14 @@
         },
         "max_sessions_per_cycle": {
           "default": 10,
-          "description": "Conversations ingested per pass",
+          "description": "New or changed knowledge-base files, which go first, and conversations ingested per pass",
           "minimum": 1,
           "title": "Max Sessions Per Cycle",
           "type": "integer"
         },
         "max_episode_chars": {
           "default": 24000,
-          "description": "Largest episode sent for extraction, in characters; a longer turn is split into several episodes",
+          "description": "Largest episode sent for extraction, in characters; a longer turn or file is split into several episodes",
           "maximum": 60000,
           "minimum": 1000,
           "title": "Max Episode Chars",

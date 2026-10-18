@@ -7,22 +7,20 @@ path; a content hash, not the modification time a checkout rewrites, decides whe
 
 from __future__ import annotations
 
-import hashlib
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from typing import TYPE_CHECKING
 
-from mindroom.knowledge.file_listing import list_git_tracked_knowledge_files, list_knowledge_files, open_knowledge_file
+from mindroom.knowledge.file_listing import hash_knowledge_file, list_git_tracked_knowledge_files, list_knowledge_files
 from mindroom.knowledge.indexing_config import knowledge_git_dir
 from mindroom.knowledge_graph.store import EpisodeInput
 from mindroom.logging_config import get_logger
-from mindroom.path_confinement import MAX_READ_BYTES
-from mindroom.redaction import REDACTION_FAILED, redact_private_keys, redact_sensitive_text
+from mindroom.redaction import REDACTED, REDACTION_FAILED, redact_private_keys, redact_sensitive_text
 from mindroom.runtime_resolution import resolve_knowledge_binding
 
 if TYPE_CHECKING:
+    import os
     from collections.abc import Iterator, Mapping
     from pathlib import Path
 
@@ -33,7 +31,8 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-_READ_CHUNK_BYTES = 1 << 20
+# Unreadable files already logged, by key and error, so a file that stays unreadable is logged once, not every pass.
+_UNREADABLE_REPORTED: set[tuple[str, str]] = set()
 # Text before a block that redaction sees with it, so a credential named at the end of the previous block, such as a
 # secret key whose value is on the next line or "Bearer" before a token, is still caught.
 _REDACTION_CONTEXT_CHARS = 4096
@@ -90,8 +89,21 @@ def document_files(
             key = f"{base_id}/{path.relative_to(root).as_posix()}"
             try:
                 sha256, status = _signature(path, known.get(key))
-            except (OSError, ValueError):
-                # A file removed, replaced, or grown past the read cap since it was listed is looked at again next pass.
+            except FileNotFoundError:
+                # A file removed since it was listed is left alone, like a deleted one.
+                continue
+            except OSError as exc:
+                # Unreadable, or swapped for a link since it was listed; reported once per file and error, retried each pass.
+                if (report := (key, f"{type(exc).__name__}:{exc.errno}")) not in _UNREADABLE_REPORTED:
+                    _UNREADABLE_REPORTED.add(report)
+                    logger.warning(
+                        "Knowledge graph could not read a knowledge-base file",
+                        document=key,
+                        error=report[1],
+                    )
+                continue
+            except ValueError:
+                # Grown past the read cap since it was listed, which listing reports itself.
                 continue
             modified_at = _EPOCH + timedelta(microseconds=status[1] // 1000)
             files.append(DocumentFile(key, path, sha256, modified_at, status))
@@ -119,30 +131,21 @@ def _signature(
     known: tuple[_FileStat, str] | None,
     chunks: list[bytes] | None = None,
 ) -> tuple[str, _FileStat]:
-    """Return a listed file's hash and status through one descriptor that follows no link.
+    """Return a listed file's hash and status; a ``known`` status that still matches reuses its hash without reading."""
 
-    A ``known`` status that still matches reuses its hash without reading. Otherwise the file is read, refused like the
-    confined reader refuses it once it holds more than the read cap, and collected into ``chunks`` when given.
-    """
-    with open_knowledge_file(path) as descriptor:
-        status = os.fstat(descriptor)
-        stat: _FileStat = (status.st_size, status.st_mtime_ns, status.st_ino)
-        if known is not None and known[0] == stat:
-            return known[1], stat
-        if status.st_size > MAX_READ_BYTES:
-            msg = f"Knowledge file exceeds its size limit: {path}"
-            raise ValueError(msg)
-        digest = hashlib.sha256()
-        remaining = MAX_READ_BYTES + 1
-        while remaining > 0 and (chunk := os.read(descriptor, min(remaining, _READ_CHUNK_BYTES))):
-            remaining -= len(chunk)
-            digest.update(chunk)
-            if chunks is not None:
-                chunks.append(chunk)
-    if remaining <= 0:
-        msg = f"Knowledge file exceeds its size limit: {path}"
-        raise ValueError(msg)
-    return digest.hexdigest(), stat
+    def known_digest(status: os.stat_result) -> str | None:
+        return known[1] if known is not None and known[0] == _stat(status) else None
+
+    digest, status = hash_knowledge_file(
+        path,
+        known_digest=known_digest,
+        sink=chunks.append if chunks is not None else None,
+    )
+    return digest, _stat(status)
+
+
+def _stat(status: os.stat_result) -> _FileStat:
+    return status.st_size, status.st_mtime_ns, status.st_ino
 
 
 def render_document(
@@ -181,13 +184,18 @@ def _pieces(text: str, cap: int) -> Iterator[str]:
         for start in range(0, max(len(line), 1), cap):
             part = line[start : start + cap]
             if lines and size + len(part) + 1 > cap:
-                if (piece := "\n".join(lines)).strip():
+                if _has_text(piece := "\n".join(lines)):
                     yield piece
                 lines, size = [], 0
             lines.append(part)
             size += len(part) + 1
-    if (piece := "\n".join(lines)).strip():
+    if _has_text(piece := "\n".join(lines)):
         yield piece
+
+
+def _has_text(piece: str) -> bool:
+    """Return whether a piece holds anything besides whitespace and redaction placeholders, which is worth extracting."""
+    return bool(piece.replace(REDACTED, "").replace(REDACTION_FAILED, "").strip())
 
 
 def _redacted_lines(text: str, block_chars: int) -> Iterator[str]:

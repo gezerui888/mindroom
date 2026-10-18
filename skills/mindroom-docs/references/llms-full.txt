@@ -3908,6 +3908,7 @@ With the defaults, new turns reach the graph 2 to 12 minutes after a conversatio
 Facts are embedded with [`memory.embedder`](https://docs.mindroom.chat/memory/#embedder).
 The graph database runs inside MindRoom and keeps every graph in memory, so MindRoom's memory use grows with the graphs.
 Changing the embedder starts a new, empty graph that fills again from conversations active within `backfill_days`; the old graph is no longer read but keeps its memory until you stop MindRoom and delete `knowledge_graph/` in the storage directory.
+The new graph also extracts every file of the flagged [knowledge bases](#documents) again, which costs as much as their first extraction.
 
 ## What Goes Into the Graph
 
@@ -3924,6 +3925,7 @@ When later evidence contradicts a fact, the fact is marked superseded with the d
 Facts are extracted by a model, so they can be wrong; check a fact's source before relying on it.
 A message redacted before its conversation is added stays out of the graph, and so does the turn that read it.
 Redacting a message later does not remove facts already extracted from it; to forget them, stop MindRoom and delete `knowledge_graph/` in the storage directory, and the graph rebuilds from the remaining conversations of the last `backfill_days`, without redacted messages.
+Deleting `knowledge_graph/` also deletes the ingestion records, so the current files of flagged knowledge bases are read and extracted again; it is the only way to drop the facts of a deleted file.
 
 ## Documents
 
@@ -3983,7 +3985,8 @@ Use a private agent when requesters must not see each other's facts.
 
 Extraction is reported as `knowledge_graph` in [usage tracking](https://docs.mindroom.chat/usage/#token-usage), under `system:internal` for [files](#documents), and makes about 15 model calls per piece of a conversation or file.
 Each lookup makes one embedding request.
-When ingestion fails, `/api/health` includes a `knowledge_graph` block naming the kind of failure until a later pass succeeds with no conversation or file still waiting to retry a failed attempt and every flagged knowledge base listed, and the MindRoom log has the details.
+When ingestion fails, `/api/health` includes a `knowledge_graph` block naming the kind of failure, and the MindRoom log has the details.
+The block stays until a later pass succeeds while no conversation or file waits to retry a failed attempt and every flagged knowledge base can be listed.
 
 # Skills
 

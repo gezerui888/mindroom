@@ -5846,7 +5846,6 @@ depends_on = []
 [[modules]]
 path = "mindroom.knowledge.manager"
 depends_on = [
-    "mindroom.path_confinement",
     "mindroom.knowledge.chunking",
     "mindroom.constants",
     "mindroom.embeddings.errors",
@@ -9181,7 +9180,6 @@ depends_on = [
     "mindroom.knowledge.indexing_config",
     "mindroom.knowledge_graph.store",
     "mindroom.logging_config",
-    "mindroom.path_confinement",
     "mindroom.redaction",
     "mindroom.runtime_resolution",
 ]

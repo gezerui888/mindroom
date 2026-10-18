@@ -76,6 +76,7 @@ from mindroom.knowledge.embedding_batch import (
 )
 from mindroom.knowledge.file_listing import (
     git_tracked_relative_paths_from_checkout,
+    hash_knowledge_file,
     knowledge_files_from_relative_paths,
     list_knowledge_files,
     open_knowledge_file,
@@ -99,7 +100,6 @@ from mindroom.knowledge.redaction import redact_credentials_in_text
 from mindroom.knowledge.refresh_outcome import RefreshOutcome
 from mindroom.knowledge.strict_knowledge import StrictInsertKnowledge as Knowledge
 from mindroom.logging_config import get_logger
-from mindroom.path_confinement import MAX_READ_BYTES
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
@@ -401,17 +401,9 @@ def _semantic_indexing_enabled(config: Config, base_id: str) -> bool:
 
 def _file_signature(file_path: Path, snapshot: Path | None = None) -> FileSignature:
     """Stat and hash one listed file through one no-follow descriptor, copying it to ``snapshot`` when given."""
-    digest = hashlib.sha256()
-    with open_knowledge_file(file_path) as descriptor, snapshot.open("xb") if snapshot else nullcontext() as output:
-        status = os.fstat(descriptor)
-        if status.st_size > MAX_READ_BYTES:
-            msg = f"Knowledge file exceeds its size limit: {file_path}"
-            raise ValueError(msg)
-        while chunk := os.read(descriptor, 1024 * 1024):
-            digest.update(chunk)
-            if output is not None:
-                output.write(chunk)
-    return status.st_mtime_ns, status.st_size, digest.hexdigest()
+    with snapshot.open("xb") if snapshot else nullcontext() as output:
+        digest, status = hash_knowledge_file(file_path, sink=output.write if output is not None else None)
+    return status.st_mtime_ns, status.st_size, digest
 
 
 @contextmanager

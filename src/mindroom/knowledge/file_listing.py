@@ -11,6 +11,7 @@ without links, and ``open_knowledge_file`` refuses a swap made after listing.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -31,11 +32,12 @@ from mindroom.path_confinement import (
 from mindroom.path_globs import matches_root_glob
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
     from mindroom.config.main import Config
 
 _GLOB_CHARS = frozenset("*?[")
+_READ_CHUNK_BYTES = 1 << 20
 _TEXT_LIKE_EXTENSIONS = {
     ".md",
     ".markdown",
@@ -216,6 +218,38 @@ def open_knowledge_file(path: Path) -> Iterator[int]:
     """
     with open_regular_file_within_root(Path(path.anchor), path.relative_to(path.anchor)) as file_fd:
         yield file_fd
+
+
+def hash_knowledge_file(
+    path: Path,
+    *,
+    known_digest: Callable[[os.stat_result], str | None] | None = None,
+    sink: Callable[[bytes], object] | None = None,
+) -> tuple[str, os.stat_result]:
+    """Return a listed file's sha256 and status, read through one descriptor that follows no link.
+
+    ``known_digest`` may return the digest the caller already holds for this status, which skips the read. Otherwise the
+    file is read in chunks, each also passed to ``sink``, and a file above the read cap, by its status or by what
+    reading finds, is refused with ``ValueError`` as the confined reader refuses it.
+    """
+    with open_knowledge_file(path) as descriptor:
+        status = os.fstat(descriptor)
+        if known_digest is not None and (digest := known_digest(status)) is not None:
+            return digest, status
+        if status.st_size > MAX_READ_BYTES:
+            msg = f"Knowledge file exceeds its size limit: {path}"
+            raise ValueError(msg)
+        hasher = hashlib.sha256()
+        remaining = MAX_READ_BYTES + 1
+        while remaining > 0 and (chunk := os.read(descriptor, min(remaining, _READ_CHUNK_BYTES))):
+            remaining -= len(chunk)
+            hasher.update(chunk)
+            if sink is not None:
+                sink(chunk)
+    if remaining <= 0:
+        msg = f"Knowledge file exceeds its size limit: {path}"
+        raise ValueError(msg)
+    return hasher.hexdigest(), status
 
 
 def _is_regular_file_at(root_fd: int, relative_path: Path) -> bool:

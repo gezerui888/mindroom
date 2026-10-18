@@ -1,4 +1,4 @@
-"""Knowledge graph settings: the extraction model and conversation ingestion."""
+"""Knowledge graph settings: the extraction model and ingestion of conversations and flagged files."""
 
 from typing import Self
 
@@ -6,7 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class KnowledgeGraphIngestConfig(BaseModel):
-    """How the background worker turns finished conversation turns into graph episodes."""
+    """How the background worker turns finished turns and flagged knowledge-base files into graph episodes."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -17,12 +17,16 @@ class KnowledgeGraphIngestConfig(BaseModel):
         ge=1,
         description="Seconds a conversation must be idle before its new turns are ingested",
     )
-    max_sessions_per_cycle: int = Field(default=10, ge=1, description="Conversations ingested per pass")
+    max_sessions_per_cycle: int = Field(
+        default=10,
+        ge=1,
+        description="New or changed knowledge-base files, which go first, and conversations ingested per pass",
+    )
     max_episode_chars: int = Field(
         default=24000,
         ge=1000,
         le=60000,
-        description="Largest episode sent for extraction, in characters; a longer turn is split into several episodes",
+        description="Largest episode sent for extraction, in characters; a longer turn or file is split into several episodes",
     )
     max_tool_result_chars: int = Field(
         default=4000,
@@ -45,7 +49,7 @@ class KnowledgeGraphIngestConfig(BaseModel):
 
 
 class KnowledgeGraphConfig(BaseModel):
-    """The Graphiti knowledge graph that graph-enabled agents build from their conversations and exploration."""
+    """The Graphiti knowledge graph that graph-enabled agents build from conversations, exploration, and flagged files."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -55,5 +59,5 @@ class KnowledgeGraphConfig(BaseModel):
     )
     ingest: KnowledgeGraphIngestConfig = Field(
         default_factory=KnowledgeGraphIngestConfig,
-        description="Conversation ingestion settings",
+        description="Ingestion settings for conversations and flagged knowledge-base files",
     )

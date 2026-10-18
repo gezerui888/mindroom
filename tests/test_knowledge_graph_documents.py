@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from structlog.testing import capture_logs
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
@@ -18,6 +19,7 @@ from mindroom.config.knowledge_graph import KnowledgeGraphIngestConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_runtime_paths
+from mindroom.knowledge import file_listing
 from mindroom.knowledge.indexing_config import knowledge_git_dir
 from mindroom.knowledge_graph import documents
 from mindroom.knowledge_graph.documents import DocumentFile, document_files, render_document
@@ -171,8 +173,8 @@ def test_a_file_that_grows_past_the_read_cap_while_read_is_skipped(
         finally:
             os.close(read_end)
 
-    monkeypatch.setattr(documents, "MAX_READ_BYTES", 10)
-    monkeypatch.setattr(documents, "open_knowledge_file", growing_file)
+    monkeypatch.setattr(file_listing, "MAX_READ_BYTES", 10)
+    monkeypatch.setattr(file_listing, "open_knowledge_file", growing_file)
 
     assert _list(config, paths) == []
 
@@ -230,8 +232,10 @@ def test_a_credential_continued_on_the_next_line_is_still_redacted(
 
     episodes = render_document(_file(), text, SETTINGS)
 
-    assert len(episodes) == (2 if across_pieces else 1)
     assert "Zq8vT2mLx9Rk4Wp7" not in "".join(episode.body for episode in episodes)
+    if across_pieces:
+        # The value really started the next piece; a piece left with only the failure placeholder is not sent.
+        assert episodes[0].body.endswith(naming[-1])
 
 
 def test_a_private_key_spanning_several_pieces_leaks_nothing() -> None:
@@ -245,3 +249,33 @@ def test_a_private_key_spanning_several_pieces_leaks_nothing() -> None:
     assert "Qm9ndXNLZXlCb2R5" not in joined
     assert "Notes before." in joined
     assert "Notes after." in joined
+
+
+def test_a_piece_holding_only_redaction_placeholders_is_not_sent() -> None:
+    """A piece with nothing left but placeholders, such as a file holding only a private key, has nothing to extract."""
+    key = "-----BEGIN PRIVATE KEY-----\n" + "Qm9ndXNLZXlCb2R5\n" * 3 + "-----END PRIVATE KEY-----"
+
+    assert render_document(_file(), f"{key}\n", SETTINGS) == []
+    assert [episode.body for episode in render_document(_file(), f"Rotate it yearly.\n{key}\n", SETTINGS)] == [
+        "Rotate it yearly.\n***redacted***",
+    ]
+
+
+def test_an_unreadable_file_is_logged_once_and_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A listed file that cannot be read is skipped every pass, and the log says so once rather than every pass."""
+    config, paths = _facts_config(tmp_path)
+    (tmp_path / "facts").mkdir()
+    (tmp_path / "facts" / "locked.md").write_text("Fact.\n", encoding="utf-8")
+
+    def unreadable(path: Path, **kwargs: object) -> tuple[str, os.stat_result]:
+        del kwargs
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(documents, "hash_knowledge_file", unreadable)
+    monkeypatch.setattr(documents, "_UNREADABLE_REPORTED", set())
+    with capture_logs() as logs:
+        first, second = _list(config, paths), _list(config, paths)
+
+    assert first == second == []
+    warnings = [log for log in logs if log["event"] == "Knowledge graph could not read a knowledge-base file"]
+    assert [log["document"] for log in warnings] == ["facts/locked.md"]

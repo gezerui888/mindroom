@@ -19,7 +19,7 @@ from mindroom.knowledge.indexing_config import knowledge_git_dir
 from mindroom.knowledge_graph.store import EpisodeInput
 from mindroom.logging_config import get_logger
 from mindroom.path_confinement import MAX_READ_BYTES
-from mindroom.redaction import redact_sensitive_text
+from mindroom.redaction import REDACTION_FAILED, redact_sensitive_text
 from mindroom.runtime_resolution import resolve_knowledge_binding
 
 if TYPE_CHECKING:
@@ -34,6 +34,9 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _READ_CHUNK_BYTES = 1 << 20
+# Text before a block that redaction sees with it, so a credential named at the end of the previous block, such as a
+# secret key whose value is on the next line or "Bearer" before a token, is still caught.
+_REDACTION_CONTEXT_CHARS = 4096
 _EPOCH = datetime.fromtimestamp(0, UTC)
 
 # A file's size, modification time in nanoseconds, and inode; while all three are unchanged its content is assumed to be.
@@ -165,13 +168,11 @@ def render_document(
 def _pieces(text: str, cap: int) -> Iterator[str]:
     """Yield redacted text in pieces of at most ``cap`` characters, split at line boundaries, cutting only longer lines.
 
-    Each line is redacted before anything is cut, so a credential split across two pieces is still caught; a line above
-    the redaction size limit becomes the redaction-failed placeholder.
+    The text is redacted before anything is cut, so a credential split across two pieces is still caught.
     """
     lines: list[str] = []
     size = 0
-    for raw_line in text.splitlines():
-        line = redact_sensitive_text(raw_line)
+    for line in _redacted_lines(text, cap):
         for start in range(0, max(len(line), 1), cap):
             part = line[start : start + cap]
             if lines and size + len(part) + 1 > cap:
@@ -182,3 +183,41 @@ def _pieces(text: str, cap: int) -> Iterator[str]:
             size += len(part) + 1
     if (piece := "\n".join(lines)).strip():
         yield piece
+
+
+def _redacted_lines(text: str, block_chars: int) -> Iterator[str]:
+    """Yield the text's lines, redacted in blocks of whole lines each seen together with the text before it.
+
+    Redaction keeps every line break, so the block's lines follow the context's. A block whose redaction fails closed,
+    such as one holding a secret key whose value is on the next line or one too long for the redactor, becomes one
+    placeholder line, and none of it is kept.
+    """
+    lines = text.splitlines()
+    joined = "\n".join(lines)
+    for start, block in _blocks(lines, block_chars):
+        context_start = max(0, start - _REDACTION_CONTEXT_CHARS)
+        # Context starts at a line where it can, so it holds whole lines; a longer previous line gives only its end.
+        if context_start > 0 and (line_break := joined.find("\n", context_start, start - 1)) != -1:
+            context_start = line_break + 1
+        context = joined[context_start:start]
+        window = context + "\n".join(block)
+        redacted = redact_sensitive_text(window)
+        if redacted.count("\n") != window.count("\n"):
+            yield REDACTION_FAILED
+            continue
+        yield from redacted.split("\n")[context.count("\n") :]
+
+
+def _blocks(lines: list[str], block_chars: int) -> Iterator[tuple[int, list[str]]]:
+    """Yield runs of whole lines of at most ``block_chars`` characters, a longer line alone, with where each starts."""
+    block: list[str] = []
+    block_start = offset = size = 0
+    for line in lines:
+        if block and size + len(line) + 1 > block_chars:
+            yield block_start, block
+            block, block_start, size = [], offset, 0
+        block.append(line)
+        size += len(line) + 1
+        offset += len(line) + 1
+    if block:
+        yield block_start, block

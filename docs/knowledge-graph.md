@@ -82,12 +82,14 @@ agents:
 
 MindRoom reads each file itself, so a fact's evidence is the file's own text and no model spends tokens reading the files in a conversation first.
 Files are chosen by the base's own rules: include and exclude patterns, extensions, hidden files, and for a Git-backed base only tracked files.
-Every pass checks each file of the flagged bases and hashes one whose size, modification time, or inode changed; a new or changed file becomes `document` episodes: its text with credential-like values removed line by line, split between lines into pieces of at most `max_episode_chars`, dated by the file's modification time.
+Every pass checks each file of the flagged bases and hashes one whose size, modification time, or inode changed; a new or changed file becomes `document` episodes: its text with credential-like values removed, checked in blocks of whole lines together with the text before each block, split between lines into pieces of at most `max_episode_chars`, dated by the file's modification time.
 A file whose content is unchanged is not extracted again, even when a Git checkout or copy gives it a new modification time.
 Each changed file counts as one of the pass's `max_sessions_per_cycle`, before the conversations, and adds at most twenty pieces per pass; an unchanged file counts for nothing, but a newly flagged base with many files holds conversations back until it is through.
 A failed piece is retried and skipped like a part of a conversation, and a file edited while a piece waits for its retry starts over with the new version.
 Deleting a file, or a line of it, does not remove the facts it already added; a new version adds its facts, and Graphiti marks the facts it contradicts superseded.
-A file that is not UTF-8 text adds nothing, and a single line longer than 65,536 characters is replaced by a placeholder because it is too long to check for credentials.
+A deleted file's record is forgotten, so it is extracted again if it comes back, and unflagging a base forgets its files the same way.
+A file that is not UTF-8 text adds nothing.
+Text that redaction cannot check is replaced by a placeholder rather than passed on: a single line longer than about 60,000 characters, or the block of about `max_episode_chars` around a secret key whose value starts on the next line.
 A flagged base that cannot be listed, for example because its Git listing fails, is reported in health and skipped while the agent's other bases continue.
 The flag exists only on `knowledge_bases` entries; an agent's `private.knowledge` cannot feed the graph.
 

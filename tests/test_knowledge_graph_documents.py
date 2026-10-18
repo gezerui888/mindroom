@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import pytest
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
@@ -21,7 +24,7 @@ from mindroom.knowledge_graph.documents import DocumentFile, document_files, ren
 from mindroom.knowledge_graph.scope import graph_scope
 
 if TYPE_CHECKING:
-    import pytest
+    from collections.abc import Iterator
 
     from mindroom.constants import RuntimePaths
 
@@ -151,27 +154,25 @@ def test_a_file_that_grows_past_the_read_cap_while_read_is_skipped(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reading stops one byte past the cap, as the confined reader does, even when the file grew after its status."""
+    """Reading stops one byte past the cap, as the confined reader does, even when the status said the file was small."""
     config, paths = _facts_config(tmp_path)
     (tmp_path / "facts").mkdir()
-    (tmp_path / "facts" / "log.md").write_text("x" * 20, encoding="utf-8")
-    real_fstat = os.fstat
+    (tmp_path / "facts" / "log.md").write_text("small\n", encoding="utf-8")
 
-    class _StaleStatus:
-        """The status of the file taken before it grew: five bytes; everything else as it is now."""
-
-        def __init__(self, status: os.stat_result) -> None:
-            self._status = status
-
-        def __getattr__(self, name: str) -> object:
-            return 5 if name == "st_size" else getattr(self._status, name)
-
-    def stale_fstat(descriptor: int) -> os.stat_result | _StaleStatus:
-        status = real_fstat(descriptor)
-        return _StaleStatus(status) if status.st_size == 20 else status
+    @contextmanager
+    def growing_file(path: Path) -> Iterator[int]:
+        # A pipe reports a size of zero and then yields more bytes than the cap, like a file that grew after its status.
+        del path
+        read_end, write_end = os.pipe()
+        os.write(write_end, b"x" * 20)
+        os.close(write_end)
+        try:
+            yield read_end
+        finally:
+            os.close(read_end)
 
     monkeypatch.setattr(documents, "MAX_READ_BYTES", 10)
-    monkeypatch.setattr(documents.os, "fstat", stale_fstat)
+    monkeypatch.setattr(documents, "open_knowledge_file", growing_file)
 
     assert _list(config, paths) == []
 
@@ -204,3 +205,30 @@ def test_a_git_backed_base_feeds_only_its_tracked_files(tmp_path: Path) -> None:
     (root / "draft.md").write_text("Not committed.\n", encoding="utf-8")
 
     assert [file.key for file in _list(config, paths)] == ["facts/tracked.md"]
+
+
+@pytest.mark.parametrize(
+    "secret_lines",
+    [
+        pytest.param(["db:", "  password:", "    Zq8vT2mLx9Rk4Wp7"], id="secret-key-with-its-value-on-the-next-line"),
+        pytest.param(["Authorization: Bearer", "Zq8vT2mLx9Rk4Wp7abc"], id="bearer-token-on-the-next-line"),
+    ],
+)
+@pytest.mark.parametrize("across_pieces", [False, True], ids=["alone", "across-pieces"])
+def test_a_credential_continued_on_the_next_line_is_still_redacted(
+    secret_lines: list[str],
+    *,
+    across_pieces: bool,
+) -> None:
+    """Redaction sees the lines before a credential, also when the line that names it ends the previous piece."""
+    *naming, value = secret_lines
+    filler: list[str] = []
+    if across_pieces:
+        # One filler line sized so the naming lines end the first piece and the value starts the next one.
+        filler = ["o" * (SETTINGS.max_episode_chars - 10 - sum(len(line) + 1 for line in naming) - 1)]
+    text = "\n".join([*filler, *naming, value, "Closing words."]) + "\n"
+
+    episodes = render_document(_file(), text, SETTINGS)
+
+    assert len(episodes) == (2 if across_pieces else 1)
+    assert "Zq8vT2mLx9Rk4Wp7" not in "".join(episode.body for episode in episodes)

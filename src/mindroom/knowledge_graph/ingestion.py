@@ -33,7 +33,7 @@ from mindroom.logging_config import get_logger
 from mindroom.session_storage.agent_storage import create_session_storage
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
     from pathlib import Path
 
     from agno.run.agent import RunOutput
@@ -172,6 +172,33 @@ def _back_off(entry: _Backoff, exc: Exception, now: float) -> bool:
         entry["retry_at"] = now + min(backoff, _MAX_RETRY_SECONDS)
         return True
     return False
+
+
+def _record_listing(
+    documents: dict[str, _DocumentState],
+    files: list[DocumentFile],
+    *,
+    unlisted_bases: Iterable[str],
+) -> bool:
+    """Record each listed file's hash and status, forget files no longer listed, and return whether anything changed.
+
+    A forgotten file's facts stay in the graph; a file in a base that could not be listed may still exist, so it is kept.
+    """
+    listed = {file.key for file in files}
+    unlisted = tuple(f"{base_id}/" for base_id in unlisted_bases)
+    forgotten = [key for key in documents if key not in listed and not key.startswith(unlisted)]
+    for key in forgotten:
+        del documents[key]
+    changed = bool(forgotten)
+    for file in files:
+        entry = documents.setdefault(file.key, _new_document_state())
+        if entry["seen_sha256"] != file.sha256:
+            # Progress and failure counts belong to one content; a backoff still waiting keeps waiting.
+            entry.update(seen_sha256=file.sha256, pieces_done=0, failures=0, bad_outputs=0, failing_since=0)
+        if entry["seen_stat"] != list(file.stat):
+            entry["seen_stat"] = list(file.stat)
+            changed = True
+    return changed
 
 
 @dataclass
@@ -437,16 +464,7 @@ class KnowledgeGraphIngestionWorker:
                 agent=scope.agent_name,
                 base=base_id,
             )
-        seen_changed = False
-        for file in files:
-            entry = state["documents"].setdefault(file.key, _new_document_state())
-            if entry["seen_sha256"] != file.sha256:
-                # Progress and failure counts belong to one content; a backoff still waiting keeps waiting.
-                entry.update(seen_sha256=file.sha256, pieces_done=0, failures=0, bad_outputs=0, failing_since=0)
-            if entry["seen_stat"] != list(file.stat):
-                entry["seen_stat"] = list(file.stat)
-                seen_changed = True
-        if seen_changed:
+        if _record_listing(state["documents"], files, unlisted_bases=errors.keys()):
             await self._persist(scope.graph_name, state)
         outcomes: list[bool] = []
         for file in files:
@@ -475,9 +493,13 @@ class KnowledgeGraphIngestionWorker:
         Return None when the file changed after it was listed, which leaves it for the next pass.
         """
         text = await asyncio.to_thread(read_document, file)
-        if text is None:
-            return None
         entry = state["documents"][file.key]
+        if text is None:
+            # The file no longer holds the listed content; hashing it again next pass also catches a rewrite that kept
+            # its size, time, and inode on a filesystem with coarse timestamps.
+            entry["seen_stat"] = []
+            await self._persist(scope.graph_name, state)
+            return None
         # Rendering redacts the file line by line, which must not stall the event loop; it stops one piece past what
         # this pass may add, which tells whether more remain.
         episodes = await asyncio.to_thread(

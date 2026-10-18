@@ -51,7 +51,7 @@ The new graph also extracts every file of the flagged [knowledge bases](#documen
 - The files of knowledge bases flagged `knowledge_graph: true` that the agent uses; see [Documents](#documents).
 
 Not added: threads started by other automations such as `dreaming`, graph lookups, including those through a shell, the `reasoning` tool's thoughts, answers from subagents, workflows, and Claude Code, results collected from background jobs, conversations through the OpenAI-compatible API, and team conversations.
-Credential-like values are removed on a best-effort basis before anything is sent for extraction.
+Credential-like values, including PEM private keys, are removed on a best-effort basis before anything is sent for extraction.
 A turn waiting for tool approval holds back the later turns of its conversation until it finishes or its approval expires.
 
 Each fact keeps its sources: `conversation` means someone said it, `tool_results` means it came from a tool call, its arguments or what it returned, and `document: <base>/<path>` means it was read from that knowledge-base file.
@@ -88,12 +88,11 @@ Deleting a file, or a line of it, does not remove the facts it already added; a 
 A flagged base that cannot be listed is reported in health, and the agent's other bases continue.
 The flag exists only on `knowledge_bases` entries; an agent's `private.knowledge` cannot feed the graph.
 
-Credential-like values and PEM private keys are removed before extraction on a best-effort basis.
 Text that redaction cannot check is left out rather than passed on: a single line longer than about 60,000 characters, and the text near a secret key whose value starts on the next line, which is one or two pieces at the default `max_episode_chars` and a few pieces when it is small.
 A `-----BEGIN ... PRIVATE KEY-----` line without its matching END line hides the rest of the file.
 A file that is not UTF-8 text adds nothing.
 
-Each changed file costs about 15 extraction calls per piece, so a 100,000-character file costs about five pieces' worth every time its content changes, in every graph that reads it: a [private agent](https://docs.mindroom.chat/configuration/agents/#private-instances) extracts it once per requester.
+A changed file is extracted again in full, so a 100,000-character file costs about five pieces' extraction every time its content changes, in every graph that reads it: a [private agent](https://docs.mindroom.chat/configuration/agents/#private-instances) extracts it once per requester.
 Unchanged files cost almost nothing.
 Flag curated files that state facts, such as people, projects, and decisions, rather than daily notes or logs that change every day; a large file edited more often than it finishes extracting starts over each time.
 

@@ -1,4 +1,4 @@
-"""Which conversation the knowledge graph's extraction calls are charged to."""
+"""What the knowledge graph's extraction calls are charged to: a conversation, or internal usage for a document."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class UsageTarget:
-    """The conversation an ingested episode came from, which its extraction tokens are charged to."""
+    """Where an ingested episode came from, which its extraction tokens are charged to; a document has no session."""
 
     agent_name: str
     # None for a document, which comes from no conversation; its extraction is charged as internal work.

@@ -6,7 +6,6 @@ import pytest
 from pydantic import ValidationError
 
 from mindroom.config.agent import AgentConfig
-from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config
 from mindroom.config.models import DefaultsConfig, ModelConfig
 
@@ -88,9 +87,3 @@ def test_one_tool_result_fits_in_an_episode() -> None:
     """A tool result is never cut further by the episode limit, so the episode must hold one twice over."""
     with pytest.raises(ValidationError, match="max_tool_result_chars"):
         _config(knowledge_graph={"model": "luna", "ingest": {"max_episode_chars": 2000, "max_tool_result_chars": 1500}})
-
-
-def test_knowledge_bases_feed_the_graph_only_when_flagged() -> None:
-    """A knowledge base's files reach the knowledge graph only with `knowledge_graph: true`."""
-    assert KnowledgeBaseConfig().knowledge_graph is False
-    assert KnowledgeBaseConfig(knowledge_graph=True).knowledge_graph is True

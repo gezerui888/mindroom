@@ -215,7 +215,7 @@ def _record_listing(documents: dict[str, _DocumentState], files: list[DocumentFi
 
 @dataclass
 class KnowledgeGraphIngestionWorker:
-    """Periodically ingest the new finished turns of every graph-enabled agent and private instance."""
+    """Periodically ingest the new finished turns and changed flagged files of every graph-enabled agent and instance."""
 
     runtime_paths: RuntimePaths
     config_provider: Callable[[], Config | None]
@@ -223,7 +223,8 @@ class KnowledgeGraphIngestionWorker:
     redacted_event_ids: RedactedEventIds
     _wake_event: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _passes: int = field(default=0, init=False)
-    # Graphs with a conversation whose last attempt failed, or whose last pass failed, which keep health failing.
+    # Graphs with a conversation or file whose last attempt failed, a flagged base that could not be listed, or a failed
+    # last pass, which keep health failing.
     _failing_graphs: set[str] = field(default_factory=set, init=False)
 
     async def run(self) -> None:
@@ -296,8 +297,8 @@ class KnowledgeGraphIngestionWorker:
                 _report_failure("Knowledge graph ingestion failed for an agent", exc, agent=scope.agent_name)
                 self._failing_graphs.add(scope.graph_name)
                 outcomes.append(False)
-        # Health reports a failure until a pass ingests something, nothing in it fails, and no conversation's last
-        # attempt failed.
+        # Health reports a failure until a pass has a clean outcome, such as something ingested or every flagged base
+        # listed with no file waiting, nothing in it fails, and no conversation or file is still failing.
         if outcomes and all(outcomes) and not self._failing_graphs:
             record_knowledge_graph_failure(None)
 
@@ -485,16 +486,16 @@ class KnowledgeGraphIngestionWorker:
         no file waiting for a retry, or None when the agent uses no flagged base. A deleted file is left alone, and so
         are the facts it added.
         """
-        base_ids = config.resolve_entity(scope.agent_name).knowledge_base_ids
-        if not any(config.get_knowledge_base_config(base_id).knowledge_graph for base_id in base_ids):
-            return [], None
         known = {
             key: ((entry["seen_stat"][0], entry["seen_stat"][1], entry["seen_stat"][2]), entry["seen_sha256"])
             for key, entry in state["documents"].items()
             if len(entry["seen_stat"]) == 3
         }
         # Listing opens every flagged file and reads the changed ones, which must not stall the event loop.
-        files, errors = await asyncio.to_thread(document_files, config, scope, self.runtime_paths, known)
+        listing = await asyncio.to_thread(document_files, config, scope, self.runtime_paths, known)
+        if listing is None:
+            return [], None
+        files, errors = listing
         for base_id, exc in errors.items():
             _report_failure(
                 "Knowledge graph could not list a knowledge base",
@@ -538,19 +539,16 @@ class KnowledgeGraphIngestionWorker:
             entry["seen_stat"] = []
             await self._persist(scope.graph_name, state)
             return None
-        settings = config.knowledge_graph.ingest
+        # A version keeps the piece size it started with, since cutting the rest at another would skip or repeat text.
         if entry["pieces_done"] == 0:
-            entry["piece_chars"] = settings.max_episode_chars
-        elif entry["piece_chars"] != settings.max_episode_chars:
-            # The done pieces were cut at the size this content started with; another size would skip or repeat text.
-            settings = settings.model_copy(update={"max_episode_chars": entry["piece_chars"]})
+            entry["piece_chars"] = config.knowledge_graph.ingest.max_episode_chars
         # Rendering redacts the file in blocks, which must not stall the event loop; it stops one piece past what this
         # pass may add, which tells whether more remain.
         episodes = await asyncio.to_thread(
             render_document,
             file,
             text,
-            settings,
+            entry["piece_chars"],
             limit=entry["pieces_done"] + _MAX_EPISODES_PER_PASS + 1,
         )
         usage = UsageTarget(scope.agent_name, None, scope.execution_identity)

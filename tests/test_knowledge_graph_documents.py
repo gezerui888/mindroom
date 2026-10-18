@@ -15,7 +15,6 @@ from structlog.testing import capture_logs
 
 from mindroom.config.agent import AgentConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
-from mindroom.config.knowledge_graph import KnowledgeGraphIngestConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_runtime_paths
@@ -30,7 +29,7 @@ if TYPE_CHECKING:
 
     from mindroom.constants import RuntimePaths
 
-SETTINGS = KnowledgeGraphIngestConfig(max_episode_chars=1000, max_tool_result_chars=400)
+PIECE_CHARS = 1000
 MODIFIED = datetime(2026, 3, 4, 12, 30, tzinfo=UTC)
 
 
@@ -95,11 +94,11 @@ def test_render_document_splits_at_lines_and_dates_by_mtime() -> None:
     """A long file becomes pieces cut only between lines, each dated by the file's modification time."""
     lines = [f"Line {index:02d} of the notes about Project Atlas ".ljust(99, "o") for index in range(25)]
 
-    episodes = render_document(_file(), "\n".join(lines) + "\n", SETTINGS)
+    episodes = render_document(_file(), "\n".join(lines) + "\n", PIECE_CHARS)
 
     assert len(episodes) == 3
     assert {episode.kind for episode in episodes} == {"document"}
-    assert all(len(episode.body) <= SETTINGS.max_episode_chars for episode in episodes)
+    assert all(len(episode.body) <= PIECE_CHARS for episode in episodes)
     assert [line for episode in episodes for line in episode.body.splitlines()] == lines
     assert [episode.name for episode in episodes] == [f"document facts/people.md {'ab' * 6} {i}" for i in range(3)]
     assert {episode.source_description for episode in episodes} == {"document: facts/people.md"}
@@ -110,7 +109,7 @@ def test_secrets_are_redacted_from_documents() -> None:
     """Credential-like values in a file never reach extraction."""
     credential = "sk-proj-4f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c"
 
-    episodes = render_document(_file(), f"Alice owns Atlas.\nOPENAI_API_KEY={credential}\n", SETTINGS)
+    episodes = render_document(_file(), f"Alice owns Atlas.\nOPENAI_API_KEY={credential}\n", PIECE_CHARS)
 
     assert len(episodes) == 1
     assert "Alice owns Atlas." in episodes[0].body
@@ -122,10 +121,10 @@ def test_a_credential_crossing_a_cut_is_still_redacted() -> None:
     credential = "sk-proj-4f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c"
     line = "word " * 196 + f"OPENAI_API_KEY={credential} and more words after it"
 
-    episodes = render_document(_file(), line + "\n", SETTINGS)
+    episodes = render_document(_file(), line + "\n", PIECE_CHARS)
 
     assert len(episodes) == 2
-    assert all(len(episode.body) <= SETTINGS.max_episode_chars for episode in episodes)
+    assert all(len(episode.body) <= PIECE_CHARS for episode in episodes)
     joined = "".join(episode.body for episode in episodes)
     assert "4f9a8b7c" not in joined
     assert "OPENAI_API_KEY=" in joined
@@ -227,10 +226,10 @@ def test_a_credential_continued_on_the_next_line_is_still_redacted(
     filler: list[str] = []
     if across_pieces:
         # One filler line sized so the naming lines end the first piece and the value starts the next one.
-        filler = ["o" * (SETTINGS.max_episode_chars - 10 - sum(len(line) + 1 for line in naming) - 1)]
+        filler = ["o" * (PIECE_CHARS - 10 - sum(len(line) + 1 for line in naming) - 1)]
     text = "\n".join([*filler, *naming, value, "Closing words."]) + "\n"
 
-    episodes = render_document(_file(), text, SETTINGS)
+    episodes = render_document(_file(), text, PIECE_CHARS)
 
     assert "Zq8vT2mLx9Rk4Wp7" not in "".join(episode.body for episode in episodes)
     if across_pieces:
@@ -244,7 +243,7 @@ def test_a_private_key_spanning_several_pieces_leaks_nothing() -> None:
     text = f"Notes before.\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\nNotes after.\n"
     assert len(body) > 8000
 
-    joined = "\n".join(episode.body for episode in render_document(_file(), text, SETTINGS))
+    joined = "\n".join(episode.body for episode in render_document(_file(), text, PIECE_CHARS))
 
     assert "Qm9ndXNLZXlCb2R5" not in joined
     assert "Notes before." in joined
@@ -255,8 +254,8 @@ def test_a_piece_holding_only_redaction_placeholders_is_not_sent() -> None:
     """A piece with nothing left but placeholders, such as a file holding only a private key, has nothing to extract."""
     key = "-----BEGIN PRIVATE KEY-----\n" + "Qm9ndXNLZXlCb2R5\n" * 3 + "-----END PRIVATE KEY-----"
 
-    assert render_document(_file(), f"{key}\n", SETTINGS) == []
-    assert [episode.body for episode in render_document(_file(), f"Rotate it yearly.\n{key}\n", SETTINGS)] == [
+    assert render_document(_file(), f"{key}\n", PIECE_CHARS) == []
+    assert [episode.body for episode in render_document(_file(), f"Rotate it yearly.\n{key}\n", PIECE_CHARS)] == [
         "Rotate it yearly.\n***redacted***",
     ]
 

@@ -24,7 +24,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping
     from pathlib import Path
 
-    from mindroom.config.knowledge_graph import KnowledgeGraphIngestConfig
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.knowledge_graph.scope import GraphScope
@@ -58,17 +57,20 @@ def document_files(
     scope: GraphScope,
     runtime_paths: RuntimePaths,
     known: Mapping[str, tuple[_FileStat, str]],
-) -> tuple[list[DocumentFile], dict[str, Exception]]:
+) -> tuple[list[DocumentFile], dict[str, Exception]] | None:
     """Return the files of the flagged knowledge bases the scope's agent uses, and the bases that could not be listed.
 
-    ``known`` maps a file's key to the status and hash it last had; a file whose status is unchanged is not read again.
+    Return None when the agent uses no flagged base. ``known`` maps a file's key to the status and hash it last had;
+    a file whose status is unchanged is not read again.
     """
+    base_ids = config.resolve_entity(scope.agent_name).knowledge_base_ids
+    flagged = [base_id for base_id in base_ids if config.get_knowledge_base_config(base_id).knowledge_graph]
+    if not flagged:
+        return None
     files: list[DocumentFile] = []
     errors: dict[str, Exception] = {}
-    for base_id in config.resolve_entity(scope.agent_name).knowledge_base_ids:
+    for base_id in flagged:
         base_config = config.get_knowledge_base_config(base_id)
-        if not base_config.knowledge_graph:
-            continue
         # One base whose path or Git listing fails must not keep the agent's other bases out of its graph.
         try:
             root = resolve_knowledge_binding(
@@ -151,11 +153,11 @@ def _stat(status: os.stat_result) -> _FileStat:
 def render_document(
     file: DocumentFile,
     text: str,
-    settings: KnowledgeGraphIngestConfig,
+    piece_chars: int,
     *,
     limit: int | None = None,
 ) -> list[EpisodeInput]:
-    """Render a file's text as redacted episodes of at most ``max_episode_chars``, split at line boundaries.
+    """Render a file's text as redacted episodes of at most ``piece_chars`` characters, split at line boundaries.
 
     Each piece is dated by the file's modification time, so extraction resolves relative dates against when the file
     was last written, and named by the content hash, so a new version never reuses an old version's name. With
@@ -169,7 +171,7 @@ def render_document(
             source_description=f"document: {file.key}",
             reference_time=file.modified_at,
         )
-        for index, piece in enumerate(islice(_pieces(text, settings.max_episode_chars), limit))
+        for index, piece in enumerate(islice(_pieces(text, piece_chars), limit))
     ]
 
 
@@ -201,8 +203,7 @@ def _has_text(piece: str) -> bool:
 def _redacted_lines(text: str, block_chars: int) -> Iterator[str]:
     """Yield the text's lines, redacted in blocks of whole lines each seen together with the text before it.
 
-    Private keys are removed from the whole text first, since one can span blocks. Redaction otherwise keeps every
-    line break, so the block's lines follow the context's. A block whose redaction fails closed,
+    Redaction keeps every line break, so the block's lines follow the context's. A block whose redaction fails closed,
     such as one holding a secret key whose value is on the next line or one too long for the redactor, becomes one
     placeholder line, and none of it is kept.
     """

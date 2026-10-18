@@ -38,7 +38,7 @@ Extraction needs a model with reliable structured output; small local models oft
 | `knowledge_graph.ingest.interval_seconds` | `600` (min 30) | Time between ingestion passes |
 | `knowledge_graph.ingest.idle_seconds` | `120` (min 1) | How long a conversation must be quiet before its new turns are added |
 | `knowledge_graph.ingest.max_sessions_per_cycle` | `10` (min 1) | Conversations and changed [files](#documents) added per pass, across all graphs; the rest wait for the next |
-| `knowledge_graph.ingest.max_episode_chars` | `24000` (1000 to 60000) | Largest piece of a conversation or file sent for extraction at once; a single longer message or line is cut to this length |
+| `knowledge_graph.ingest.max_episode_chars` | `24000` (1000 to 60000) | Largest piece of a conversation or file sent for extraction at once; a single longer message is cut to this length, and a longer file line is split across pieces |
 | `knowledge_graph.ingest.max_tool_result_chars` | `4000` (min 100, at most half of `max_episode_chars`) | Characters kept from each tool result |
 | `knowledge_graph.ingest.backfill_days` | `7` (min 0) | A new graph starts from conversations active within this many days |
 
@@ -89,7 +89,7 @@ A file whose content did not change is not extracted again, even when a Git chec
 Files come before conversations in each pass, and each changed file counts as one of `max_sessions_per_cycle`, so a newly flagged base with many files holds conversations back until it is through.
 A failed piece is retried and skipped like a part of a conversation.
 Deleting a file, or a line of it, does not remove the facts it already added; a new version adds its facts, and Graphiti marks the facts it contradicts superseded.
-A flagged base that cannot be listed is reported in health, and the agent's other bases continue.
+A flagged base whose path cannot be resolved or whose `git ls-files` fails is reported in health, and the agent's other bases continue; a folder that cannot be read, or a Git base whose checkout is missing, lists no files without a health failure.
 The flag exists only on `knowledge_bases` entries; an agent's `private.knowledge` cannot feed the graph.
 
 Text that redaction cannot check is left out rather than passed on: a single line longer than about 60,000 characters, and the text near a secret key whose value starts on the next line, which is one or two pieces at the default `max_episode_chars` and a few pieces when it is small.
@@ -123,4 +123,4 @@ Use a private agent when requesters must not see each other's facts.
 Extraction is reported as `knowledge_graph` in [usage tracking](usage.md#token-usage), under `system:internal` for [files](#documents), and makes about 15 model calls per piece of a conversation or file.
 Each lookup makes one embedding request.
 When ingestion fails, `/api/health` includes a `knowledge_graph` block naming the kind of failure, and the MindRoom log has the details.
-The block stays until a later pass succeeds while no conversation or file waits to retry a failed attempt and every flagged knowledge base can be listed.
+The block stays until a later pass succeeds while no conversation or file waits to retry a failed attempt and no flagged knowledge base fails to resolve its path or run `git ls-files`.

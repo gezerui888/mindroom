@@ -149,7 +149,6 @@ _.markers  # TypedDict key read by subscript (src/mindroom/knowledge_graph/inges
 _.bad_outputs  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
 _.failing_since  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
 _.failing_piece  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
-_.recheck_at  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
 _.seen_sha256  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
 _.seen_stat  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
 _.pieces_done  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)

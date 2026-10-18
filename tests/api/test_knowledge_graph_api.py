@@ -221,6 +221,22 @@ def test_only_a_shared_graph_agent_can_be_maintained(
     assert store.scopes == []
 
 
+def test_a_store_that_fails_is_unavailable(test_client: TestClient) -> None:
+    """A store closing mid-request, or a database that cannot start, answers 503 with no internals."""
+
+    class _ClosingStore:
+        async def maintain(self, _scope: GraphScope, _operation: object) -> None:
+            msg = "The work was cancelled on the other event loop"
+            raise RuntimeError(msg)
+
+    set_knowledge_graph_store(_ClosingStore())
+
+    response = test_client.get("/api/knowledge-graph/mind/entities", headers=OPERATOR)
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "The knowledge graph is unavailable; see the MindRoom log"
+
+
 def test_a_stopped_store_is_unavailable(test_client: TestClient) -> None:
     """With no graph store running there is nothing to maintain."""
     response = test_client.get("/api/knowledge-graph/mind/entities", headers=OPERATOR)

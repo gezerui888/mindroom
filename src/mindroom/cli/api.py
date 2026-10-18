@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import partial
 from ipaddress import ip_address
 from typing import TYPE_CHECKING
 
 from mindroom.constants import DEFAULT_MINDROOM_URL
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
     import httpx
 
     from mindroom.constants import RuntimePaths
@@ -47,7 +50,7 @@ def resolve_api_target(runtime_paths: RuntimePaths, url: str | None, *, require_
         raise ValueError(msg)
     token = runtime_paths.env_value("MINDROOM_API_KEY")
     if require_key and not token:
-        msg = "MINDROOM_API_KEY is required for this operational check."
+        msg = "MINDROOM_API_KEY is required for this command."
         raise ValueError(msg)
     if token and parsed.scheme == "http" and not is_loopback_host(parsed.host):
         msg = "Use HTTPS when sending MINDROOM_API_KEY to a remote endpoint."
@@ -66,8 +69,38 @@ def get_api_response(
     timeout: float,
     *,
     require_key: bool = False,
+    params: Mapping[str, str | int] | None = None,
 ) -> httpx.Response:
     """Read one endpoint without redirecting or sending an operator key over remote HTTP."""
+    import httpx  # noqa: PLC0415
+
+    return _api_response(partial(httpx.get, params=params), runtime_paths, url, path, timeout, require_key=require_key)
+
+
+def post_api_response(
+    runtime_paths: RuntimePaths,
+    url: str | None,
+    path: str,
+    timeout: float,
+    *,
+    json: object,
+    require_key: bool = False,
+) -> httpx.Response:
+    """Post one JSON body under the same rules as `get_api_response`."""
+    import httpx  # noqa: PLC0415
+
+    return _api_response(partial(httpx.post, json=json), runtime_paths, url, path, timeout, require_key=require_key)
+
+
+def _api_response(
+    send: Callable[..., httpx.Response],
+    runtime_paths: RuntimePaths,
+    url: str | None,
+    path: str,
+    timeout: float,
+    *,
+    require_key: bool,
+) -> httpx.Response:
     import httpx  # noqa: PLC0415
 
     if not math.isfinite(timeout):
@@ -75,7 +108,7 @@ def get_api_response(
         raise ValueError(msg)
     target = resolve_api_target(runtime_paths, url, require_key=require_key)
     try:
-        return httpx.get(
+        return send(
             f"{target.base_url}{path}",
             headers=target.headers,
             timeout=timeout,

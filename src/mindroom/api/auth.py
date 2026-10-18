@@ -46,7 +46,7 @@ def require_operator_key(request: Request, authorization: str | None) -> None:
     runtime_paths = config_lifecycle.bind_current_request_snapshot(request).runtime_paths
     configured_key = runtime_paths.env_value("MINDROOM_API_KEY")
     if not configured_key:
-        raise HTTPException(status_code=503, detail="This operational check requires MINDROOM_API_KEY")
+        raise HTTPException(status_code=503, detail="This operator route requires MINDROOM_API_KEY")
     token = _extract_bearer_token(authorization)
     if token is None or not secrets.compare_digest(token.encode(), configured_key.encode()):
         raise HTTPException(status_code=401, detail="Missing or invalid credentials")

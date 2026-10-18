@@ -290,6 +290,18 @@ async def test_names_that_match_nothing_are_reported(graph: GraphDriver) -> None
         ("matrix:r/general:mindroom.chat", True),
         ("matrix.to/#/!room:mindroom.chat", True),
         ("#MeToo", False),
+        # Only a few extensions end product names; a capitalized file name with another is still a file.
+        ("Readme.md", True),
+        ("Config.yaml", True),
+        ("Setup.py", True),
+        ("App.tsx", True),
+        ("HelloWorld.java", True),
+        ("MyComponent.vue", True),
+        ("Notes.txt", True),
+        # Capitalized paths need two slashes and segments longer than a letter.
+        ("Users/Ann/Desktop", True),
+        ("Projects/Atlas/Docs", True),
+        ("AC/DC", False),
     ],
 )
 def test_looks_like_junk(name: str, junk: bool) -> None:

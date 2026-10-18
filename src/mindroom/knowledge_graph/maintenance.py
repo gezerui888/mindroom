@@ -137,16 +137,20 @@ _TARGET_KEYS = ("target_uuid", "target_node_uuid")
 # patterns catch the common shapes, not every one; an operator reads the dry run's list before deleting.
 _URL = re.compile(r"^(?:[a-z][a-z0-9+.-]*://|www\.)", re.IGNORECASE)
 _ABSOLUTE_PATH = re.compile(r"^(?:~|\.\.?)?/|^[a-z]:\\", re.IGNORECASE)
-# Lowercase segments with a letter: `src/mindroom`, not `TCP/IP`, `A/B/C`, or `1/2/2026`.
+# Lowercase segments with a letter (`src/mindroom`), or three or more segments of two or more characters
+# (`Users/Ann/Desktop`); not `TCP/IP`, `A/B/C`, or `1/2/2026`.
 _RELATIVE_PATH = re.compile(r"^(?=.*[a-z])[a-z0-9_.-]+(?:/[a-z0-9_.-]*)+$")
+_DEEP_PATH = re.compile(r"^(?=.*[A-Za-z])[\w.-]{2,}(?:/[\w.-]{2,}){2,}/?$")
 _FILE = re.compile(
     r"^(?P<stem>\S*)\.(?P<extension>py|pyi|ipynb|js|ts|tsx|jsx|mjs|rs|go|java|kt|swift|rb|php|lua|c|h|cpp|sh|bash|zsh"
     r"|nix|sql|css|scss|html|vue|md|rst|txt|log|json|jsonl|yaml|yml|toml|ini|cfg|conf|env|lock|csv|tsv|xml|db|sqlite"
     r"|sqlite3|parquet|pid|sock|bak|tmp|patch|diff|png|jpg|jpeg|gif|svg|webp|mp3|mp4|wav|zip|tar|gz|tgz)$",
     re.IGNORECASE,
 )
-# Product names end like files: Node.js, Tailwind.css, and domains on extensions that are also top-level domains.
+# A few extensions also end product names (Node.js, Tailwind.css, Bun.sh) or domains (docs.rs); a capitalized name
+# on any other extension (Readme.md, Setup.py) is still a file.
 _PRODUCT_STEM = re.compile(r"^[A-Z][a-z0-9]+(?:[A-Z][a-z0-9]*)*$")
+_PRODUCT_EXTENSIONS = frozenset({"js", "css", "sh", "rs"})
 _DOMAIN_STEM = re.compile(r"^[a-z]+$")
 _DOMAIN_EXTENSIONS = frozenset({"rs", "sh"})
 _ENV_VAR = re.compile(r"^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$")
@@ -159,7 +163,7 @@ _MATRIX = re.compile(r"^(?:![A-Za-z0-9]+:\S+|\$[\w+/-]{20,}|#[^\s:#]+:\S+|matrix
 
 def _looks_like_junk(name: str) -> bool:
     """Whether a name is a path, code or data file, URL, env var, hash, or Matrix room or event."""
-    if any(pattern.search(name) for pattern in (_URL, _ABSOLUTE_PATH, _RELATIVE_PATH, _ENV_VAR, _MATRIX)):
+    if any(pattern.search(name) for pattern in (_URL, _ABSOLUTE_PATH, _RELATIVE_PATH, _DEEP_PATH, _ENV_VAR, _MATRIX)):
         return True
     if _looks_like_hash(name):
         return True
@@ -167,8 +171,9 @@ def _looks_like_junk(name: str) -> bool:
     if file is None:
         return False
     stem, extension = file["stem"], file["extension"].lower()
+    product = extension in _PRODUCT_EXTENSIONS and _PRODUCT_STEM.match(stem) is not None
     domain = extension in _DOMAIN_EXTENSIONS and _DOMAIN_STEM.match(stem) is not None
-    return _PRODUCT_STEM.match(stem) is None and not domain
+    return not (product or domain)
 
 
 def _looks_like_hash(name: str) -> bool:

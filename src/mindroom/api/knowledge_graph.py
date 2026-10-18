@@ -28,8 +28,9 @@ from mindroom.knowledge_graph.store import knowledge_graph_store
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
-    from mindroom.knowledge_graph.scope import GraphScope
-    from mindroom.knowledge_graph.store import GraphStore
+    from collections.abc import Awaitable, Callable
+
+    from graphiti_core.driver.driver import GraphDriver
 
 logger = get_logger(__name__)
 
@@ -54,8 +55,8 @@ class _DeleteRequest(BaseModel):
     apply: bool = False
 
 
-def _shared_graph(request: Request, agent: str) -> tuple[GraphStore, GraphScope]:
-    """Return the running store and the graph of a shared agent that enables the knowledge graph."""
+async def _maintain[T](request: Request, agent: str, operation: Callable[[GraphDriver], Awaitable[T]]) -> T:
+    """Run ``operation`` on the graph of a shared agent that enables the knowledge graph."""
     config, runtime_paths = config_lifecycle.read_committed_runtime_config(request)
     if agent not in config.agents or not config.agent_uses_knowledge_graph(agent):
         raise HTTPException(status_code=404, detail=f"No agent named {agent!r} has the knowledge graph enabled")
@@ -67,7 +68,12 @@ def _shared_graph(request: Request, agent: str) -> tuple[GraphStore, GraphScope]
     store = knowledge_graph_store()
     if store is None:
         raise HTTPException(status_code=503, detail="The knowledge graph is not running")
-    return store, graph_scope(agent, config, runtime_paths, None)
+    try:
+        return await store.maintain(graph_scope(agent, config, runtime_paths, None), operation)
+    except (RuntimeError, OSError) as exc:
+        # The store closed mid-request, or its database could not start; the error can carry internals.
+        logger.warning("Knowledge graph maintenance failed", agent=agent, error=f"{type(exc).__name__}: {exc}")
+        raise HTTPException(status_code=503, detail="The knowledge graph is unavailable; see the MindRoom log") from exc
 
 
 @router.get("/{agent}/entities")
@@ -78,17 +84,16 @@ async def entities(
     limit: Annotated[int, Query(ge=1, le=1000)] = 50,
 ) -> list[EntityCount]:
     """List the agent's entities whose name contains ``query``, ignoring case, most facts first."""
-    store, scope = _shared_graph(request, agent)
-    return await store.maintain(scope, lambda driver: list_entities(driver, query, limit))
+    return await _maintain(request, agent, lambda driver: list_entities(driver, query, limit))
 
 
 @router.post("/{agent}/merge")
 async def merge(request: Request, agent: str, body: _MergeRequest) -> MergeReport:
     """Merge the duplicates into the entity to keep, or report what that would do."""
-    store, scope = _shared_graph(request, agent)
     try:
-        report = await store.maintain(
-            scope,
+        report = await _maintain(
+            request,
+            agent,
             lambda driver: merge_entities(driver, body.keep, body.duplicates, apply=body.apply),
         )
     except MergeInputError as exc:
@@ -107,9 +112,9 @@ async def merge(request: Request, agent: str, body: _MergeRequest) -> MergeRepor
 @router.post("/{agent}/delete")
 async def delete(request: Request, agent: str, body: _DeleteRequest) -> DeleteReport:
     """Delete the named and, with ``junk``, junk-looking entities with their facts, or report what would go."""
-    store, scope = _shared_graph(request, agent)
-    report = await store.maintain(
-        scope,
+    report = await _maintain(
+        request,
+        agent,
         lambda driver: delete_entities(driver, body.names, junk=body.junk, apply=body.apply),
     )
     if report.applied:

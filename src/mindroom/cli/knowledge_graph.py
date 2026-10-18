@@ -3,17 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path  # noqa: TC003
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from urllib.parse import quote
 
 import typer
 
-from mindroom.cli.api import resolve_api_target
+from mindroom.cli.api import get_api_response, post_api_response
 from mindroom.cli.config import activate_cli_runtime
 from mindroom.cli.help_format import examples
-
-if TYPE_CHECKING:
-    from mindroom.constants import RuntimePaths
 
 _DRY_RUN = "Dry run: nothing changed. Re-run with --apply."
 
@@ -34,63 +31,40 @@ _TIMEOUT = typer.Option(600.0, "--timeout", min=0.001, help="HTTP timeout in sec
 _APPLY = typer.Option(False, "--apply", help="Make the change; without it, only report what would change.")
 
 
-def _call(
-    runtime_paths: RuntimePaths,
-    url: str | None,
-    method: str,
-    path: str,
-    timeout: float,
-    *,
-    params: dict[str, str | int] | None = None,
-    json: dict[str, Any] | None = None,
-) -> Any:  # noqa: ANN401
-    """Send one operator request and return its JSON, or raise ValueError with what went wrong."""
-    import httpx  # noqa: PLC0415
-
-    target = resolve_api_target(runtime_paths, url, require_key=True)
-    try:
-        response = httpx.request(
-            method,
-            f"{target.base_url}{path}",
-            headers=target.headers,
-            timeout=timeout,
-            follow_redirects=False,
-            trust_env=target.trust_env,
-            params=params,
-            json=json,
-        )
-    except httpx.TimeoutException as exc:
-        msg = "MindRoom did not answer in time; a change may still finish, so run the dry run again to see the graph."
-        raise ValueError(msg) from exc
-    except httpx.HTTPError as exc:
-        msg = "Cannot reach MindRoom; check --url / MINDROOM_URL and that its API is running."
-        raise ValueError(msg) from exc
-    if response.is_error:
-        try:
-            detail = response.json()["detail"]
-        except (ValueError, KeyError, TypeError):
-            detail = response.text
-        msg = f"Request failed (HTTP {response.status_code}): {detail}"
-        raise ValueError(msg)
-    return response.json()
-
-
 def _run(
     config_path: Path | None,
     url: str | None,
-    method: str,
     path: str,
     timeout: float,
     *,
     params: dict[str, str | int] | None = None,
     json: dict[str, Any] | None = None,
 ) -> Any:  # noqa: ANN401
-    """Send one operator request for a command, or print what went wrong and exit 2."""
+    """Post ``json`` if given, else get with ``params``; return the reply's JSON, or print the error and exit 2."""
     try:
-        return _call(activate_cli_runtime(config_path), url, method, path, timeout, params=params, json=json)
+        runtime_paths = activate_cli_runtime(config_path)
+        if json is None:
+            response = get_api_response(runtime_paths, url, path, timeout, require_key=True, params=params)
+        else:
+            response = post_api_response(runtime_paths, url, path, timeout, require_key=True, json=json)
+    except TimeoutError:
+        typer.echo("MindRoom did not answer in time; a change may still finish, so run the dry run again.", err=True)
+        raise typer.Exit(2) from None
     except (ValueError, OSError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from None
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if response.is_error:
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        typer.echo(f"Request failed (HTTP {response.status_code}): {detail or response.text}", err=True)
+        raise typer.Exit(2)
+    if payload is None:
+        typer.echo("MindRoom returned an invalid response; check --url and the running version.", err=True)
+        raise typer.Exit(2)
+    return payload
 
 
 def _route(agent: str, operation: str) -> str:
@@ -117,7 +91,7 @@ def entities(
     timeout: float = _TIMEOUT,
 ) -> None:
     """List entities whose name contains QUERY, most facts first."""
-    found = _run(config_path, url, "GET", _route(agent, "entities"), timeout, params={"query": query, "limit": limit})
+    found = _run(config_path, url, _route(agent, "entities"), timeout, params={"query": query, "limit": limit})
     if not found:
         typer.echo("No entity's name contains that text.")
     for entity in found:
@@ -141,7 +115,6 @@ def merge(
     report = _run(
         config_path,
         url,
-        "POST",
         _route(agent, "merge"),
         timeout,
         json={"keep": keep, "duplicates": duplicates, "apply": apply},
@@ -173,8 +146,7 @@ def delete(
 ) -> None:
     """Delete named or junk-looking entities with their facts.
 
-    Read the dry run's list before --apply: the junk patterns are guesses, so delete by name when the list holds a
-    real entity.
+    Read the dry run's list before --apply: the patterns are guesses, so delete by name when it holds a real entity.
     """
     if not names and not junk:
         typer.echo("Name the entities to delete, or pass --junk.", err=True)
@@ -182,7 +154,6 @@ def delete(
     report = _run(
         config_path,
         url,
-        "POST",
         _route(agent, "delete"),
         timeout,
         json={"names": names or [], "junk": junk, "apply": apply},

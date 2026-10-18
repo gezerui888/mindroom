@@ -42,8 +42,12 @@ class _Api:
         self.sent: list[dict[str, object]] = []
         self.responses: list[httpx.Response] = []
 
-    def request(self, method: str, url: str, **kwargs: object) -> httpx.Response:
-        self.sent.append({"method": method, "url": url, **kwargs})
+    def get(self, url: str, **kwargs: object) -> httpx.Response:
+        self.sent.append({"method": "GET", "url": url, **kwargs})
+        return self.responses.pop(0)
+
+    def post(self, url: str, **kwargs: object) -> httpx.Response:
+        self.sent.append({"method": "POST", "url": url, **kwargs})
         return self.responses.pop(0)
 
 
@@ -52,7 +56,8 @@ def api(monkeypatch: pytest.MonkeyPatch) -> _Api:
     """The running MindRoom's API, reached with the operator key."""
     monkeypatch.setenv("MINDROOM_API_KEY", "operator-key")
     fake = _Api()
-    monkeypatch.setattr(httpx, "request", fake.request)
+    monkeypatch.setattr(httpx, "get", fake.get)
+    monkeypatch.setattr(httpx, "post", fake.post)
     return fake
 
 
@@ -71,7 +76,7 @@ def test_merge_dry_run_posts_to_the_route_and_says_nothing_changed(
     assert result.exit_code == 0, result.output
     [sent] = api.sent
     assert sent["method"] == "POST"
-    assert sent["url"] == "http://127.0.0.1:8765/api/knowledge-graph/mind/merge"
+    assert str(sent["url"]).endswith("/api/knowledge-graph/mind/merge")
     assert sent["headers"] == {"Authorization": "Bearer operator-key"}
     assert sent["json"] == {"keep": "Alice Example", "duplicates": ["Alice", "Alcie"], "apply": False}
     assert sent["follow_redirects"] is False
@@ -143,3 +148,16 @@ def test_a_refused_request_shows_the_reason(api: _Api, tmp_path: Path) -> None:
     assert result.exit_code == 2
     assert "HTTP 409" in result.output
     assert "No entity is named 'Alice N.'" in result.output
+
+
+def test_an_infinite_timeout_is_refused(api: _Api, tmp_path: Path) -> None:
+    """`--timeout inf` passes the option's minimum but no HTTP client accepts it, so it fails before any request."""
+    result = runner.invoke(
+        app,
+        ["knowledge-graph", "delete", "mind", "--junk", "--timeout", "inf", "--config", str(tmp_path / "c.yaml")],
+    )
+
+    assert result.exit_code == 2
+    assert "--timeout must be finite." in result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert api.sent == []

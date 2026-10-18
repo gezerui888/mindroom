@@ -21510,9 +21510,8 @@ Every command needs `MINDROOM_API_KEY` and is a dry run unless you add `--apply`
 
  Delete named or junk-looking entities with their facts.
 
- Read the dry run's list before --apply: the junk patterns are guesses, so delete by name
- when the list holds a
- real entity.
+ Read the dry run's list before --apply: the patterns are guesses, so delete by name when
+ it holds a real entity.
 
 ╭─ Arguments ────────────────────────────────────────────────────────────────────────────╮
 │ *    agent      TEXT        A shared agent with the knowledge graph enabled.           │

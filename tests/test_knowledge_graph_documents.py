@@ -232,3 +232,16 @@ def test_a_credential_continued_on_the_next_line_is_still_redacted(
 
     assert len(episodes) == (2 if across_pieces else 1)
     assert "Zq8vT2mLx9Rk4Wp7" not in "".join(episode.body for episode in episodes)
+
+
+def test_a_private_key_spanning_several_pieces_leaks_nothing() -> None:
+    """A PEM private key longer than a piece is removed whole before the text is split, wherever its lines fall."""
+    body = "\n".join(f"{index:04d}" + "Qm9ndXNLZXlCb2R5" * 4 for index in range(120))
+    text = f"Notes before.\n-----BEGIN PRIVATE KEY-----\n{body}\n-----END PRIVATE KEY-----\nNotes after.\n"
+    assert len(body) > 8000
+
+    joined = "\n".join(episode.body for episode in render_document(_file(), text, SETTINGS))
+
+    assert "Qm9ndXNLZXlCb2R5" not in joined
+    assert "Notes before." in joined
+    assert "Notes after." in joined

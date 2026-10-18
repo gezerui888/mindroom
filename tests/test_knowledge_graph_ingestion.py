@@ -25,7 +25,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY, resolve_runtime_paths
 from mindroom.knowledge.indexing_config import knowledge_git_dir
-from mindroom.knowledge_graph import documents, ingestion
+from mindroom.knowledge_graph import ingestion
 from mindroom.knowledge_graph.ingestion import KnowledgeGraphIngestionWorker, wake_knowledge_graph_ingestion
 from mindroom.knowledge_graph.scope import graph_scope
 from mindroom.knowledge_graph.store import (
@@ -911,20 +911,17 @@ async def test_a_rewrite_that_keeps_the_files_status_is_still_extracted(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_files_no_longer_listed_are_forgotten_unless_their_base_failed_to_list(tmp_path: Path) -> None:
-    """A deleted file's record is pruned, its facts stay; a base that cannot be listed keeps its files' records."""
+async def test_a_base_unreadable_for_one_pass_re_extracts_nothing_after_it_recovers(tmp_path: Path) -> None:
+    """Files missing from one listing, such as while their folder is moved away, keep their records and stay done."""
     config, paths, store = _with_documents(tmp_path), _paths(tmp_path), _FakeStore()
-    (tmp_path / "facts" / "kept.md").write_text("Fact kept.\n", encoding="utf-8")
-    (tmp_path / "facts" / "gone.md").write_text("Fact gone.\n", encoding="utf-8")
+    (tmp_path / "facts" / "a.md").write_text("Fact a.\n", encoding="utf-8")
+    (tmp_path / "facts" / "b.md").write_text("Fact b.\n", encoding="utf-8")
     worker = _worker(config, paths, store)
-    state_path = worker._state_path(graph_scope("mind", config, paths, None).graph_name)
     await worker._run_cycle(config, now=T0)
 
-    (tmp_path / "facts" / "gone.md").unlink()
+    (tmp_path / "facts").rename(tmp_path / "away")
     await worker._run_cycle(config, now=T0 + 100)
-    assert set(json.loads(state_path.read_text(encoding="utf-8"))["documents"]) == {"facts/kept.md"}
-    with patch.object(documents, "list_knowledge_files", side_effect=OSError("unreadable")):
-        await worker._run_cycle(config, now=T0 + 200)
+    (tmp_path / "away").rename(tmp_path / "facts")
+    await worker._run_cycle(config, now=T0 + 200)
 
-    assert set(json.loads(state_path.read_text(encoding="utf-8"))["documents"]) == {"facts/kept.md"}
-    assert len(store.documents()) == 2
+    assert len(store.calls) == 2

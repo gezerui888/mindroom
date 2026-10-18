@@ -33,7 +33,7 @@ from mindroom.logging_config import get_logger
 from mindroom.session_storage.agent_storage import create_session_storage
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Callable
     from pathlib import Path
 
     from agno.run.agent import RunOutput
@@ -174,22 +174,13 @@ def _back_off(entry: _Backoff, exc: Exception, now: float) -> bool:
     return False
 
 
-def _record_listing(
-    documents: dict[str, _DocumentState],
-    files: list[DocumentFile],
-    *,
-    unlisted_bases: Iterable[str],
-) -> bool:
-    """Record each listed file's hash and status, forget files no longer listed, and return whether anything changed.
+def _record_listing(documents: dict[str, _DocumentState], files: list[DocumentFile]) -> bool:
+    """Record each listed file's hash and status and return whether anything changed.
 
-    A forgotten file's facts stay in the graph; a file in a base that could not be listed may still exist, so it is kept.
+    Records of files missing from a listing are kept: a folder that could not be read for one pass lists nothing
+    without an error, and its unchanged files must not be extracted again once it can be.
     """
-    listed = {file.key for file in files}
-    unlisted = tuple(f"{base_id}/" for base_id in unlisted_bases)
-    forgotten = [key for key in documents if key not in listed and not key.startswith(unlisted)]
-    for key in forgotten:
-        del documents[key]
-    changed = bool(forgotten)
+    changed = False
     for file in files:
         entry = documents.setdefault(file.key, _new_document_state())
         if entry["seen_sha256"] != file.sha256:
@@ -464,7 +455,7 @@ class KnowledgeGraphIngestionWorker:
                 agent=scope.agent_name,
                 base=base_id,
             )
-        if _record_listing(state["documents"], files, unlisted_bases=errors.keys()):
+        if _record_listing(state["documents"], files):
             await self._persist(scope.graph_name, state)
         outcomes: list[bool] = []
         for file in files:

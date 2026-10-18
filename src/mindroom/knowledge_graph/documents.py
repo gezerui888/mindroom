@@ -19,7 +19,7 @@ from mindroom.knowledge.indexing_config import knowledge_git_dir
 from mindroom.knowledge_graph.store import EpisodeInput
 from mindroom.logging_config import get_logger
 from mindroom.path_confinement import MAX_READ_BYTES
-from mindroom.redaction import REDACTION_FAILED, redact_sensitive_text
+from mindroom.redaction import REDACTION_FAILED, redact_private_keys, redact_sensitive_text
 from mindroom.runtime_resolution import resolve_knowledge_binding
 
 if TYPE_CHECKING:
@@ -72,7 +72,12 @@ def document_files(
             continue
         # One base whose path or Git listing fails must not keep the agent's other bases out of its graph.
         try:
-            root = resolve_knowledge_binding(base_id, config, runtime_paths, scope.execution_identity).knowledge_path
+            root = resolve_knowledge_binding(
+                base_id,
+                config,
+                runtime_paths,
+                execution_identity=scope.execution_identity,
+            ).knowledge_path
             if base_config.git is None:
                 paths = list_knowledge_files(config, base_id, root)
             else:
@@ -188,12 +193,14 @@ def _pieces(text: str, cap: int) -> Iterator[str]:
 def _redacted_lines(text: str, block_chars: int) -> Iterator[str]:
     """Yield the text's lines, redacted in blocks of whole lines each seen together with the text before it.
 
-    Redaction keeps every line break, so the block's lines follow the context's. A block whose redaction fails closed,
+    Private keys are removed from the whole text first, since one can span blocks. Redaction otherwise keeps every
+    line break, so the block's lines follow the context's. A block whose redaction fails closed,
     such as one holding a secret key whose value is on the next line or one too long for the redactor, becomes one
     placeholder line, and none of it is kept.
     """
-    lines = text.splitlines()
-    joined = "\n".join(lines)
+    # A private key can be longer than a block and its context, so keys are removed from the whole text first.
+    joined = redact_private_keys("\n".join(text.splitlines()))
+    lines = joined.split("\n")
     for start, block in _blocks(lines, block_chars):
         context_start = max(0, start - _REDACTION_CONTEXT_CHARS)
         # Context starts at a line where it can, so it holds whole lines; a longer previous line gives only its end.

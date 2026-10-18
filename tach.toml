@@ -9163,8 +9163,14 @@ depends_on = [
 ]
 
 [[modules]]
+path = "mindroom.history.legacy_stored_runs"
+depends_on = ["mindroom.constants"]
+visibility = ["mindroom.history.session_runs"]
+
+[[modules]]
 path = "mindroom.history.session_runs"
 depends_on = [
+    "mindroom.history.legacy_stored_runs",
     "mindroom.history.storage",
 ]
 visibility = [

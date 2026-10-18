@@ -8,6 +8,7 @@ from agno.db.base import SessionType
 from agno.run.agent import RunOutput
 from agno.run.base import RunStatus
 
+from mindroom.history.legacy_stored_runs import recover_legacy_run_metadata
 from mindroom.history.storage import run_event_ids
 
 if TYPE_CHECKING:
@@ -64,6 +65,9 @@ def session_runs(storage: BaseDb, session_id: str) -> list[RunOutput]:
     """
     # A loaded session holds only the runs after the latest summary row, so the whole run log is read instead.
     runs = cast("list[RunOutput | TeamRunOutput | WorkflowRunOutput]", storage.get_runs(session_id=session_id))
+    for run in runs:
+        if isinstance(run, RunOutput):
+            recover_legacy_run_metadata(run)
     return sorted(
         (
             run

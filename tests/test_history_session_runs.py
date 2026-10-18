@@ -87,6 +87,19 @@ def test_unfinished_member_and_non_matrix_runs_are_excluded(storage: SqliteDb) -
     assert [run.run_id for run in session_runs(storage, SESSION)] == ["done"]
 
 
+def test_session_runs_returns_legacy_runs_with_their_room_and_thread(storage: SqliteDb) -> None:
+    """A turn stored before run metadata named its room is read with the room and thread of its session."""
+    legacy = _run("legacy", 100, room_id=None)
+    legacy.metadata = {MATRIX_EVENT_ID_METADATA_KEY: "$e", "matrix_seen_event_ids": ["$e"]}
+    _seed(storage, [legacy])
+
+    runs = session_runs(storage, SESSION)
+
+    assert [run.run_id for run in runs] == ["legacy"]
+    assert runs[0].metadata is not None
+    assert (runs[0].metadata["room_id"], runs[0].metadata["thread_id"]) == (ROOM, "$thread")
+
+
 def test_updated_sessions_lists_sessions_changed_after_the_cursor(storage: SqliteDb) -> None:
     """Sessions are listed with their last update, oldest first, and workflow participant sessions are skipped."""
     _seed(storage, [_run("r1", 100)], session_id="!a:x:$t1")

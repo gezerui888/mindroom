@@ -1840,6 +1840,7 @@ depends_on = [
     "mindroom.origins",
     "mindroom.api.agent_cli",
     "mindroom.api.config_reload",
+    "mindroom.api.knowledge_graph",
     "mindroom.api.response_activity",
     "mindroom.knowledge.status",
     "mindroom.knowledge.refresh_scheduler",
@@ -4615,6 +4616,7 @@ depends_on = []
 visibility = [
     "mindroom.cli.config",
     "mindroom.cli.desktop",
+    "mindroom.cli.knowledge_graph",
     "mindroom.cli.main",
     "mindroom.cli.service",
 ]
@@ -4745,6 +4747,7 @@ depends_on = [
     "mindroom.cli.config_bundle",
     "mindroom.cli.config_reload",
     "mindroom.cli.debug_report",
+    "mindroom.cli.knowledge_graph",
     "mindroom.cli.response_activity",
     "mindroom.cli.thread_export",
     "mindroom",
@@ -9192,6 +9195,24 @@ depends_on = [
 [[modules]]
 path = "mindroom.knowledge_graph.maintenance"
 depends_on = []
+visibility = ["mindroom.api.knowledge_graph"]
+
+[[modules]]
+path = "mindroom.api.knowledge_graph"
+depends_on = [
+    "mindroom.api.auth",
+    "mindroom.api.config_lifecycle",
+    "mindroom.knowledge_graph.maintenance",
+    "mindroom.knowledge_graph.scope",
+    "mindroom.knowledge_graph.store",
+    "mindroom.logging_config",
+]
+visibility = ["mindroom.api.main"]
+
+[[modules]]
+path = "mindroom.cli.knowledge_graph"
+depends_on = ["mindroom.cli.api", "mindroom.cli.config", "mindroom.cli.help_format"]
+visibility = ["mindroom.cli.main"]
 
 [[modules]]
 path = "mindroom.knowledge_graph.runtime"

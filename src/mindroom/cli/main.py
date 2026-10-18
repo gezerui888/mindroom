@@ -43,6 +43,7 @@ from .debug_report import debug_report
 from .desktop import desktop_app
 from .help_format import PanelOrderedGroup, apply_help_theme, examples
 from .interactive import confirm, section, terminal_is_interactive
+from .knowledge_graph import knowledge_graph_app
 from .local_stack import local_stack_setup
 from .migrate import config_migrate
 from .plugins import plugins_app
@@ -100,6 +101,7 @@ app.add_typer(service_app, name="service", rich_help_panel="Keep running")
 app.add_typer(desktop_app, name="desktop", rich_help_panel="Desktop")
 app.add_typer(threads_app, name="threads", rich_help_panel="Troubleshoot")
 app.add_typer(journal_app, name="journal", rich_help_panel="Troubleshoot")
+app.add_typer(knowledge_graph_app, name="knowledge-graph", rich_help_panel="Troubleshoot")
 app.add_typer(trigger_app, name="trigger", rich_help_panel="Automation")
 app.command(rich_help_panel="Automation")(check_active_responses)
 app.command("debug-report", rich_help_panel="Troubleshoot")(debug_report)

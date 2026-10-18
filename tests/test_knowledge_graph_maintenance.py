@@ -16,11 +16,11 @@ from mindroom.knowledge_graph.clients import MindRoomFalkorDriver
 from mindroom.knowledge_graph.embedded_server import start_embedded_server
 from mindroom.knowledge_graph.maintenance import (
     EntityCount,
-    MergedEntity,
     MergeInputError,
+    _looks_like_junk,
+    _MergedEntity,
     delete_entities,
     list_entities,
-    looks_like_junk,
     merge_entities,
 )
 
@@ -131,7 +131,7 @@ async def test_merge_moves_facts_and_mentions_and_drops_the_duplicate(graph: Gra
     assert (report.facts_moved, report.self_loops_dropped, report.applied) == (1, 1, False)
     assert report.keep == EntityCount(name="Bas Nijholt", uuid=kept.uuid, facts=2, mentions=0)
     assert report.merged == [
-        MergedEntity(
+        _MergedEntity(
             name="Bas",
             uuid=bas.uuid,
             facts_moved=1,
@@ -212,9 +212,9 @@ async def test_merging_several_duplicates_drops_the_facts_between_them(graph: Gr
     assert report.merged == [
         # Facts moved, self-loops dropped, mentions moved, mentions dropped. What two duplicates share counts
         # under the first: the facts between them, and the episode that mentions both.
-        MergedEntity("Bas Nijholt", same_name.uuid, 0, 0, 0, 0),
-        MergedEntity("bas@nijho.lt", email.uuid, 2, 2, 1, 0),
-        MergedEntity("Bas", bas.uuid, 0, 0, 0, 2),
+        _MergedEntity("Bas Nijholt", same_name.uuid, 0, 0, 0, 0),
+        _MergedEntity("bas@nijho.lt", email.uuid, 2, 2, 1, 0),
+        _MergedEntity("Bas", bas.uuid, 0, 0, 0, 2),
     ]
     assert dry_run.merged == report.merged
     assert (dry_run.facts_moved, dry_run.self_loops_dropped, dry_run.applied) == (2, 2, False)
@@ -294,7 +294,7 @@ async def test_names_that_match_nothing_are_reported(graph: GraphDriver) -> None
 )
 def test_looks_like_junk(name: str, junk: bool) -> None:
     """Paths, code and data files, URLs, env vars, hashes, and Matrix room links are junk; names of things are not."""
-    assert looks_like_junk(name) is junk
+    assert _looks_like_junk(name) is junk
 
 
 @pytest.mark.asyncio

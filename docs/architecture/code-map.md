@@ -191,6 +191,8 @@ Matrix sync callback
 | `knowledge_graph/ingestion.py` | Background ingestion passes with per-kind markers, backoff, and dropped episodes |
 | `knowledge_graph/runtime.py` | Starts and stops the store and ingestion worker as agents enable the graph |
 | `knowledge_graph/maintenance.py` | Operator entity listing, duplicate merging, and junk deletion in one scope's graph |
+| `api/knowledge_graph.py` | Operator routes that list, merge, and delete entities in a shared agent's graph through the store's write lock |
+| `cli/knowledge_graph.py` | `mindroom knowledge-graph` commands that call those routes, dry run unless `--apply` |
 | `config/knowledge_graph.py` | The `knowledge_graph` section: extraction model and ingestion settings |
 | `custom_tools/knowledge_graph.py` | The read-only `knowledge_graph` tool |
 | `tool_system/skills.py` | Skill integration system (OpenClaw-compatible) |

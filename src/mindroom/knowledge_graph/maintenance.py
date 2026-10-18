@@ -28,7 +28,7 @@ class EntityCount:
 
 
 @dataclass(frozen=True)
-class MergedEntity:
+class _MergedEntity:
     """A duplicate and what merging it moves to the kept entity or drops.
 
     A fact or mention shared by several duplicates is counted under the first of them in merge order, so the numbers
@@ -50,7 +50,7 @@ class MergeReport:
     """The kept entity, the duplicates merged into it, and the names that matched nothing, counted before any write."""
 
     keep: EntityCount
-    merged: list[MergedEntity]
+    merged: list[_MergedEntity]
     facts_moved: int
     self_loops_dropped: int
     unmatched: list[str]
@@ -157,7 +157,7 @@ _UUID = re.compile(r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$")
 _MATRIX = re.compile(r"^(?:![A-Za-z0-9]+:\S+|\$[\w+/-]{20,}|#[^\s:#]+:\S+|matrix:(?:r|roomid)/|matrix\.to/#/)")
 
 
-def looks_like_junk(name: str) -> bool:
+def _looks_like_junk(name: str) -> bool:
     """Whether a name is a path, code or data file, URL, env var, hash, or Matrix room or event."""
     if any(pattern.search(name) for pattern in (_URL, _ABSOLUTE_PATH, _RELATIVE_PATH, _ENV_VAR, _MATRIX)):
         return True
@@ -252,7 +252,7 @@ def _merged(
     keep: str,
     facts: list[dict[str, Any]],
     mentions: list[dict[str, Any]],
-) -> list[MergedEntity]:
+) -> list[_MergedEntity]:
     """Count what each duplicate moves and drops, giving a fact or mention two duplicates share to the first."""
     order = {entity.uuid: index for index, entity in enumerate(duplicates)}
     group = {keep, *order}
@@ -275,7 +275,7 @@ def _merged(
             moved_mentions[mention["entity"]] += 1
             mentioned.add(mention["episode"])
     return [
-        MergedEntity(
+        _MergedEntity(
             name=entity.name,
             uuid=entity.uuid,
             facts_moved=moved_facts[entity.uuid],
@@ -333,7 +333,7 @@ async def delete_entities(
     if junk:
         listed = {entity.uuid for entity in deleted}
         everything = await _records(driver, "MATCH (entity:Entity) RETURN entity.name AS name, entity.uuid AS uuid")
-        uuids = [row["uuid"] for row in everything if row["uuid"] not in listed and looks_like_junk(row["name"])]
+        uuids = [row["uuid"] for row in everything if row["uuid"] not in listed and _looks_like_junk(row["name"])]
         deleted += await _entities(driver, _WITH_UUID + _COUNTED, uuids=uuids)
     unmatched = await _unmatched(driver, names)
     if apply and deleted:

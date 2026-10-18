@@ -38,6 +38,7 @@ from mindroom.api.frontend import router as frontend_router
 from mindroom.api.homeassistant_integration import router as homeassistant_router
 from mindroom.api.integrations import router as integrations_router
 from mindroom.api.knowledge import router as knowledge_router
+from mindroom.api.knowledge_graph import router as knowledge_graph_router
 from mindroom.api.matrix_operations import router as matrix_router
 from mindroom.api.mcp_gateway import gateway_cors_origins, gateway_lifespan, install_gateway_routes
 from mindroom.api.oauth import router as oauth_router
@@ -735,6 +736,7 @@ app.include_router(matrix_router, dependencies=[Depends(verify_user)])
 app.include_router(thread_exports_router, dependencies=[Depends(verify_user)])
 app.include_router(response_activity_router)  # Aggregate operational probe, like health/readiness.
 app.include_router(config_reload_router)  # Requires its own operator bearer key.
+app.include_router(knowledge_graph_router)  # Requires its own operator bearer key.
 app.include_router(config_schema_router, dependencies=[Depends(verify_user)])
 app.include_router(oauth_router)
 app.include_router(schedules_router, dependencies=[Depends(verify_user)])

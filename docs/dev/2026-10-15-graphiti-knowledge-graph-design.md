@@ -96,6 +96,21 @@ Graphiti builds an OpenAI reranker when none is passed, which needs an OpenAI ke
 
 Graphiti needs structured output; small local models may fail extraction, which the ingestion worker reports and retries rather than hides.
 
+### Operators clean up a graph inside the runtime
+
+Graphiti has no merge, and extraction has stored one person under several names and made entities of paths, URLs, and room links.
+`knowledge_graph/maintenance.py` lists entities, merges duplicates, and deletes junk in Cypher on one scope's graph.
+A moved fact is recreated on the kept entity with every property, including its uuid, because episodes list the facts they support by uuid, and its embedding stored again as a vector.
+The copy and the deletion of the original happen in one query, so an interrupted merge loses no fact and running it again finishes it.
+The operations run inside the runtime, on the store's graph loop, under a write lock that episode ingestion also takes, so ingestion pauses between episodes while one runs.
+They cannot run in another process, which would have to start a second embedded server, and starting one stops the server already running in that directory.
+Only operator routes under `require_operator_key` (`/api/knowledge-graph/<agent>/...`) reach them, which the `mindroom knowledge-graph` CLI calls; both are dry runs unless asked to apply.
+Only shared agents' graphs can be maintained: a private agent has one graph per requester, and an operator route has no requester to choose one by.
+
+Rejected: model-callable merge or delete tools.
+Like the rejected `record_evidence` tool, they would let a model rewrite its own evidence, and a prompt injection in a tool result could merge or delete facts that every later turn reads, a persistence and deletion primitive inside the graph.
+Cleanup stays an operator decision made after reading a dry run.
+
 ## Ingestion invariants
 
 - Only finished turns are ingested, and a turn waiting for approval holds back every later turn of its conversation, because it finishes in place with its original, earlier creation time and a marker past it would skip it.

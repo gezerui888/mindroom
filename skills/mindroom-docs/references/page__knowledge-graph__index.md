@@ -69,6 +69,51 @@ The agent decides when to look facts up; ask it to search the graph, or to cite 
 Each fact comes back with its validity, for example `valid 2026-01-05 until 2026-03-09 (superseded)`, and its sources with dates.
 An agent reads only its own graph; a [private agent](https://docs.mindroom.chat/configuration/agents/#private-instances) has one graph per requester.
 
+## Cleaning Up a Graph
+
+Extraction can store one person under several names, such as a full name, a first name, an email address, and a Matrix ID, and it has turned file paths, URLs, and room links into entities.
+The `mindroom knowledge-graph` commands merge duplicates into one entity and delete junk entities in a shared agent's graph.
+They work through the running MindRoom's API and need `MINDROOM_API_KEY` both in MindRoom's environment and in the environment the command reads (`--config`).
+Only shared agents can be cleaned up, because a private agent has one graph per requester.
+Every command is a dry run that changes nothing unless you add `--apply`.
+
+1. Snapshot the graph first: stop MindRoom, copy `knowledge_graph/` from the storage directory, and start MindRoom again.
+    To undo a change, stop MindRoom and put the copy back.
+2. Find the names to merge or delete:
+
+    ```bash
+    mindroom knowledge-graph entities mind ann
+    ```
+
+3. Preview a merge, read the report, then apply it:
+
+    ```bash
+    mindroom knowledge-graph merge mind "Ann Lee" Ann ann@example.org @ann:example.org
+    mindroom knowledge-graph merge mind "Ann Lee" Ann ann@example.org @ann:example.org --apply
+    ```
+
+4. Preview deleting junk, read every name in the list, then apply it:
+
+    ```bash
+    mindroom knowledge-graph delete mind --junk
+    mindroom knowledge-graph delete mind --junk --apply
+    ```
+
+A merge matches names exactly, ignoring case, and also merges any other entity with exactly the kept name.
+Each duplicate's facts move to the kept entity with their dates and sources, the episodes that mentioned a duplicate mention the kept entity instead, and the duplicates are deleted.
+Facts between the merged entities are dropped rather than left pointing from the kept entity to itself.
+The kept entity keeps its own name and summary, and fact texts still read as extracted, for example "Ann moved to Lisbon".
+The report lists, for each duplicate, the facts and mentions that move and those dropped, and any name that matched no entity; a misspelled name is skipped, so check that list before applying.
+
+A delete removes each entity with its facts and mentions, including facts it shared with other entities.
+`--junk` adds every entity whose name looks like a file path, a file with a code or data extension, a URL, an environment variable, a commit hash or UUID, or a Matrix room ID, alias, or link.
+The patterns are guesses, and a real entity can land in the list; when it does, delete the others by name instead, for example `mindroom knowledge-graph delete mind compaction.py config.yaml --apply`.
+Email addresses and Matrix user IDs are never treated as junk; merge them into the person they belong to.
+
+While a command runs, ingestion pauses between episodes.
+A command first waits for the episode being added to finish, which can take a few minutes, so it gives up after `--timeout` seconds (600 by default); the change may still finish after that, so run the dry run again to see the graph.
+The commands call operator routes that require `MINDROOM_API_KEY` as a bearer token: `GET /api/knowledge-graph/<agent>/entities?query=&limit=`, `POST /api/knowledge-graph/<agent>/merge` with `{"keep": ..., "duplicates": [...], "apply": false}`, and `POST /api/knowledge-graph/<agent>/delete` with `{"names": [...], "junk": false, "apply": false}`.
+
 ## Privacy
 
 A shared agent's graph holds what it learned from every requester's conversations, including tool results, and anyone who can talk to that agent can query it.

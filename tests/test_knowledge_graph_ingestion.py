@@ -7,6 +7,7 @@ import json
 import os
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -25,7 +26,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import MATRIX_EVENT_ID_METADATA_KEY, resolve_runtime_paths
 from mindroom.knowledge.indexing_config import knowledge_git_dir
-from mindroom.knowledge_graph import ingestion
+from mindroom.knowledge_graph import documents, ingestion
 from mindroom.knowledge_graph.ingestion import KnowledgeGraphIngestionWorker, wake_knowledge_graph_ingestion
 from mindroom.knowledge_graph.scope import graph_scope
 from mindroom.knowledge_graph.store import (
@@ -1095,3 +1096,70 @@ async def test_a_base_unreadable_for_one_pass_re_extracts_nothing_after_it_recov
     await worker._run_cycle(config, now=T0 + 200)
 
     assert len(store.calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_size", "second_size", "projects", "restart"),
+    [
+        pytest.param(1000, 2000, 25, False, id="larger-in-the-same-worker"),
+        pytest.param(2000, 1000, 45, True, id="smaller-after-a-restart"),
+    ],
+)
+async def test_a_changed_piece_size_neither_skips_nor_repeats_a_partly_extracted_file(
+    tmp_path: Path,
+    first_size: int,
+    second_size: int,
+    projects: int,
+    *,
+    restart: bool,
+) -> None:
+    """A file part way through keeps the piece size it started with, so a settings change mid-way loses nothing."""
+    names = [f"Project{index:02d}" for index in range(projects)]
+    config = _with_documents(tmp_path, max_episode_chars=first_size, max_tool_result_chars=400)
+    paths, store = _paths(tmp_path), _FakeStore()
+    (tmp_path / "facts" / "projects.md").write_text(_pieces(*names), encoding="utf-8")
+    worker = _worker(config, paths, store)
+    await worker._run_cycle(config, now=T0)
+
+    changed = _with_documents(tmp_path, max_episode_chars=second_size, max_tool_result_chars=400)
+    if restart:
+        worker = _worker(changed, paths, store)
+    for attempt in (1, 2):
+        await worker._run_cycle(changed, now=T0 + attempt * 100)
+
+    lines = Counter(line.split()[0] for episode in store.documents() for line in episode.body.splitlines())
+    assert lines == dict.fromkeys(names, 10)
+
+
+@pytest.mark.asyncio
+async def test_health_clears_once_a_knowledge_base_can_be_listed_again(tmp_path: Path) -> None:
+    """A listing failure stops being reported once listing works, even when nothing new is extracted then."""
+    config, paths, store = _with_documents(tmp_path), _paths(tmp_path), _FakeStore()
+    (tmp_path / "facts" / "a.md").write_text("Fact a.\n", encoding="utf-8")
+    worker = _worker(config, paths, store)
+    await worker._run_cycle(config, now=T0)
+    with patch.object(documents, "list_knowledge_files", side_effect=OSError("unreadable")):
+        await worker._run_cycle(config, now=T0 + 100)
+    assert knowledge_graph_failure() is not None
+
+    await worker._run_cycle(config, now=T0 + 200)
+
+    assert knowledge_graph_failure() is None
+    assert len(store.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_health_clears_once_a_failing_document_is_removed(tmp_path: Path) -> None:
+    """A file whose piece kept failing stops being reported once it is deleted."""
+    config, paths = _with_documents(tmp_path), _paths(tmp_path)
+    store = _FakeStore(failing_text="Beacon")
+    (tmp_path / "facts" / "beacon.md").write_text("Project Beacon ships in May.\n", encoding="utf-8")
+    worker = _worker(config, paths, store)
+    await worker._run_cycle(config, now=T0)
+    assert knowledge_graph_failure() is not None
+
+    (tmp_path / "facts" / "beacon.md").unlink()
+    await worker._run_cycle(config, now=T0 + 100)
+
+    assert knowledge_graph_failure() is None

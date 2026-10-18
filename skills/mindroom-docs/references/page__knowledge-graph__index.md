@@ -77,21 +77,25 @@ agents:
 ```
 
 MindRoom reads each file itself, so a fact's evidence is the file's own text and no model spends tokens reading the files in a conversation first.
-Files are chosen by the base's own rules: include and exclude patterns, extensions, hidden files, and for a Git-backed base only tracked files.
-Every pass checks each file of the flagged bases and hashes one whose size, modification time, or inode changed; a new or changed file becomes `document` episodes: its text with PEM private keys and other credential-like values removed, checked in blocks of whole lines together with the text before each block, split between lines into pieces of at most `max_episode_chars`, dated by the file's modification time.
-A file whose content is unchanged is not extracted again, even when a Git checkout or copy gives it a new modification time.
-Each changed file counts as one of the pass's `max_sessions_per_cycle`, before the conversations, and adds at most twenty pieces per pass; an unchanged file counts for nothing, but a newly flagged base with many files holds conversations back until it is through.
-A failed piece is retried and skipped like a part of a conversation, and a file edited while a piece waits for its retry starts over with the new version.
+The base's own rules choose the files: include and exclude patterns, extensions, hidden files, and for a Git-backed base only tracked files.
+A new or changed file is extracted in pieces of at most `max_episode_chars`, dated by the file's modification time, and each fact cites it as `document: <base>/<path>`.
+A file whose content did not change is not extracted again, even when a Git checkout or copy gives it a new modification time.
+Files come before conversations in each pass, and each changed file counts as one of `max_sessions_per_cycle`, so a newly flagged base with many files holds conversations back until it is through.
+A failed piece is retried and skipped like a part of a conversation.
 Deleting a file, or a line of it, does not remove the facts it already added; a new version adds its facts, and Graphiti marks the facts it contradicts superseded.
-A file that is not UTF-8 text adds nothing.
-Text that redaction cannot check is replaced by a placeholder rather than passed on: a single line longer than about 60,000 characters, or the text near a secret key whose value starts on the next line, which is one or two pieces at the default `max_episode_chars` and up to a few pieces when it is small.
-A `-----BEGIN ... PRIVATE KEY-----` line without its matching END line hides the rest of the file.
-A flagged base that cannot be listed, for example because its Git listing fails, is reported in health and skipped while the agent's other bases continue.
+A flagged base that cannot be listed is reported in health, and the agent's other bases continue.
 The flag exists only on `knowledge_bases` entries; an agent's `private.knowledge` cannot feed the graph.
 
+Credential-like values and PEM private keys are removed before extraction on a best-effort basis.
+Text that redaction cannot check is left out rather than passed on: a single line longer than about 60,000 characters, and the text near a secret key whose value starts on the next line, which is one or two pieces at the default `max_episode_chars` and a few pieces when it is small.
+A `-----BEGIN ... PRIVATE KEY-----` line without its matching END line hides the rest of the file.
+A file that is not UTF-8 text adds nothing.
+
 Each changed file costs about 15 extraction calls per piece, so a 100,000-character file costs about five pieces' worth every time its content changes, in every graph that reads it: a [private agent](https://docs.mindroom.chat/configuration/agents/#private-instances) extracts it once per requester.
-An unchanged file costs one open and status check per pass and is read again only when its size, modification time, or inode changes.
-Flag curated files that state facts, such as people, projects, and decisions, rather than daily notes or logs that change every day.
+Unchanged files cost almost nothing.
+Flag curated files that state facts, such as people, projects, and decisions, rather than daily notes or logs that change every day; a large file edited more often than it finishes extracting starts over each time.
+
+A flagged base inside an agent's workspace, such as its memory folder, can be written by that agent's tools, so the agent can put text into its own graph; flag only sources you trust as evidence.
 
 ## The `knowledge_graph` Tool
 
@@ -113,4 +117,4 @@ Use a private agent when requesters must not see each other's facts.
 
 Extraction is reported as `knowledge_graph` in [usage tracking](https://docs.mindroom.chat/usage/#token-usage), under `system:internal` for [files](#documents), and makes about 15 model calls per piece of a conversation or file.
 Each lookup makes one embedding request.
-When ingestion fails, `/api/health` includes a `knowledge_graph` block naming the kind of failure until a later pass succeeds with no conversation still waiting to retry a failed attempt, and the MindRoom log has the details.
+When ingestion fails, `/api/health` includes a `knowledge_graph` block naming the kind of failure until a later pass succeeds with no conversation or file still waiting to retry a failed attempt and every flagged knowledge base listed, and the MindRoom log has the details.

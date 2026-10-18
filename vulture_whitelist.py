@@ -152,6 +152,7 @@ _.failing_piece  # TypedDict key read by subscript (src/mindroom/knowledge_graph
 _.seen_sha256  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
 _.seen_stat  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
 _.pieces_done  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
+_.piece_chars  # TypedDict key read by subscript (src/mindroom/knowledge_graph/ingestion.py)
 _.handle_endtag  # unused method (src/mindroom/matrix/message_builder.py)
 _._normalize_set_at  # unused method (src/mindroom/thread_tags.py)
 _._normalize_data  # unused method (src/mindroom/thread_tags.py)

@@ -90,6 +90,9 @@ class _DocumentState(_Backoff):
     seen_stat: list[int]
     # Pieces of the seen content added or dropped, so a retry resumes at the failed piece.
     pieces_done: int
+    # The `max_episode_chars` those pieces were cut at, kept until the content is done, so changing the setting part way
+    # neither skips nor repeats text.
+    piece_chars: int
 
 
 class _GraphState(TypedDict):
@@ -167,6 +170,7 @@ def _new_document_state() -> _DocumentState:
         "seen_sha256": "",
         "seen_stat": [],
         "pieces_done": 0,
+        "piece_chars": 0,
         "failures": 0,
         "bad_outputs": 0,
         "failing_since": 0,
@@ -262,9 +266,13 @@ class KnowledgeGraphIngestionWorker:
             try:
                 state = await asyncio.to_thread(self._load_state, scope.graph_name, now)
                 # Files come first, each new or changed one spending one unit; an unchanged file spends nothing.
-                document_outcomes, documents_failing = await self._ingest_documents(config, scope, state, now, budget)
+                document_outcomes, documents_clean = await self._ingest_documents(config, scope, state, now, budget)
                 budget -= len(document_outcomes)
                 outcomes.extend(document_outcomes)
+                if documents_clean:
+                    # Listing every flagged base with no file waiting is a clean outcome, so a listing failure or a
+                    # failing file that is gone stops holding health failing even when nothing new is ingested.
+                    outcomes.append(True)
                 due, changed = await asyncio.to_thread(self._due_sessions, config, scope, state, now, budget)
                 if changed:
                     await self._persist(scope.graph_name, state)
@@ -280,7 +288,7 @@ class KnowledgeGraphIngestionWorker:
                 outcomes.extend(result for result in results if result is not None)
                 # A conversation's failure is saved with it, so health stays failing until it succeeds, even across
                 # passes that do not reach it; so is a waiting file's, and a base that cannot be listed fails each pass.
-                if documents_failing or any(entry["failures"] for entry in state["sessions"].values()):
+                if documents_clean is False or any(entry["failures"] for entry in state["sessions"].values()):
                     self._failing_graphs.add(scope.graph_name)
                 else:
                     self._failing_graphs.discard(scope.graph_name)
@@ -470,12 +478,16 @@ class KnowledgeGraphIngestionWorker:
         state: _GraphState,
         now: float,
         limit: int,
-    ) -> tuple[list[bool], bool]:
+    ) -> tuple[list[bool], bool | None]:
         """Ingest up to ``limit`` new or changed files of the scope's flagged knowledge bases.
 
-        Return whether each ingested file had no piece fail or dropped, and whether a base could not be listed or a
-        listed file waits for a retry. A deleted file is left alone, and so are the facts it added.
+        Return whether each ingested file had no piece fail or dropped, and whether every flagged base was listed with
+        no file waiting for a retry, or None when the agent uses no flagged base. A deleted file is left alone, and so
+        are the facts it added.
         """
+        base_ids = config.resolve_entity(scope.agent_name).knowledge_base_ids
+        if not any(config.get_knowledge_base_config(base_id).knowledge_graph for base_id in base_ids):
+            return [], None
         known = {
             key: ((entry["seen_stat"][0], entry["seen_stat"][1], entry["seen_stat"][2]), entry["seen_sha256"])
             for key, entry in state["documents"].items()
@@ -504,7 +516,7 @@ class KnowledgeGraphIngestionWorker:
                 outcomes.append(outcome)
         # A file deleted, or changed back to what was extracted, while a piece of it waited no longer keeps health failing.
         failing = bool(errors) or any(state["documents"][file.key]["failures"] > 0 for file in files)
-        return outcomes, failing
+        return outcomes, not failing
 
     async def _ingest_document(
         self,
@@ -526,13 +538,19 @@ class KnowledgeGraphIngestionWorker:
             entry["seen_stat"] = []
             await self._persist(scope.graph_name, state)
             return None
-        # Rendering redacts the file line by line, which must not stall the event loop; it stops one piece past what
-        # this pass may add, which tells whether more remain.
+        settings = config.knowledge_graph.ingest
+        if entry["pieces_done"] == 0:
+            entry["piece_chars"] = settings.max_episode_chars
+        elif entry["piece_chars"] != settings.max_episode_chars:
+            # The done pieces were cut at the size this content started with; another size would skip or repeat text.
+            settings = settings.model_copy(update={"max_episode_chars": entry["piece_chars"]})
+        # Rendering redacts the file in blocks, which must not stall the event loop; it stops one piece past what this
+        # pass may add, which tells whether more remain.
         episodes = await asyncio.to_thread(
             render_document,
             file,
             text,
-            config.knowledge_graph.ingest,
+            settings,
             limit=entry["pieces_done"] + _MAX_EPISODES_PER_PASS + 1,
         )
         usage = UsageTarget(scope.agent_name, None, scope.execution_identity)

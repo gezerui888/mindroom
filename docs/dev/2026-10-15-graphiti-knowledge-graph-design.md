@@ -122,8 +122,10 @@ Graphiti needs structured output; small local models may fail extraction, which 
   PEM private keys are removed from the whole text first, because one can be longer than a block and its context; an unclosed `BEGIN` runs to the end of the text.
   Redaction otherwise keeps line breaks, so a block's lines are taken after the context's; a block that redaction fails closed on becomes one placeholder line.
 - A file's progress counts the pieces done of one version, so a retry resumes at the failed piece and an edit during a retry starts the new version from its first piece; a file deleted or changed back while a piece waits stops keeping health failing.
+- A version's pieces keep the `max_episode_chars` they started with until the version is done, so changing the setting part way neither skips nor repeats text, also across a restart.
 - Each changed file spends one unit of `max_sessions_per_cycle` before its scope's conversations, because seeded files once waited a day behind the conversation backlog; an unchanged file spends nothing, and a file adds at most twenty pieces per pass.
 - A flagged base whose path or Git listing fails is reported and keeps health failing, while the scope's other bases and conversations continue.
+- A pass that lists every flagged base of a scope and finds no file waiting for a retry counts as a clean outcome, so health clears once a listing failure or a failing file is gone, even when nothing new is ingested.
 - Records of files missing from a listing are kept, because a folder that cannot be read for one pass lists nothing without an error, and its unchanged files must not be extracted again; the state grows by one small record per file ever listed.
 - A file whose content no longer matches its listed hash when read has its status forgotten, so the next pass hashes it again even when a rewrite kept its size, time, and inode.
 - A document belongs to no conversation, so its extraction usage is recorded under `system:internal`; recording it in an agent's session storage would need a session row there.

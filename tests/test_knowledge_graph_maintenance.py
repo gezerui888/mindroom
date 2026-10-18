@@ -384,3 +384,20 @@ async def test_junk_deletion_keeps_aliases_for_merging(graph: GraphDriver) -> No
     assert [entity.name for entity in report.deleted] == ["compaction.py"]
     assert await _names(graph) == {"Ann Lee", "ann@example.rs", "@ann:example.sh"}
     assert len(await _stored_fact(graph, writes.uuid)) == len(await _stored_fact(graph, chats.uuid)) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_fact_without_an_embedding_moves_without_one(graph: GraphDriver) -> None:
+    """The embedding is copied inside the database, so a fact that had none gets no empty one."""
+    kept, ann, seattle = _entity("Ann Lee"), _entity("Ann"), _entity("Seattle")
+    await _ingest(graph, [kept, ann, seattle], [], [])
+    lives = _fact(ann, seattle, "Ann lives in Seattle", [0.1, 0.2, 0.3, 0.4])
+    lives.fact_embedding = None
+    await lives.save(graph)
+
+    await merge_entities(graph, "Ann Lee", ["Ann"], apply=True)
+
+    [moved] = await _stored_fact(graph, lives.uuid)
+    assert (moved["source"], moved["properties"]["fact"]) == ("Ann Lee", "Ann lives in Seattle")
+    assert "fact_embedding" not in moved["properties"]
+    assert moved["embedding_type"] == "Null"

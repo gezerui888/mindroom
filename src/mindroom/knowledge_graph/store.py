@@ -339,18 +339,21 @@ class GraphitiStore:
         return await self._run(self._maintain(scope, operation))
 
     async def _maintain[T](self, scope: GraphScope, operation: Callable[[GraphDriver], Awaitable[T]]) -> T:
-        graphiti = await self._graphiti_client()
         assert self._write_lock is not None, "maintenance runs on the graph loop, which creates the write lock"
+        # The client is taken after the wait, so a client rebuilt meanwhile is not used closed. Writers take the write
+        # lock before the client's lock, and nothing waits for the write lock while holding the client's.
         async with self._write_lock:
+            graphiti = await self._graphiti_client()
             return await operation(graphiti.driver.clone(database=scope.graph_name))
 
     async def _add_episode(self, scope: GraphScope, episode: EpisodeInput, usage: UsageTarget) -> None:
-        # The client installs and imports Graphiti first, so the imports below find it loaded.
-        graphiti = await self._graphiti_client()
-        from graphiti_core.nodes import EpisodeType  # noqa: PLC0415
-
         assert self._write_lock is not None, "episodes are added on the graph loop, which creates the write lock"
+        # Like `_maintain`, the client is taken after waiting for the write lock.
         async with self._write_lock:
+            # The client installs and imports Graphiti first, so the import below finds it loaded.
+            graphiti = await self._graphiti_client()
+            from graphiti_core.nodes import EpisodeType  # noqa: PLC0415
+
             with usage_target(usage):
                 await graphiti.add_episode(
                     name=episode.name,

@@ -91,15 +91,17 @@ RETURN wanted
 """
 # FalkorDB returns parallel edges between two nodes as one row unless the query uses the edge, so every query
 # here that lists or counts facts or mentions reads the edge itself.
-# Named `fact`, not `e`: MindRoomFalkorDriver rewrites `properties(e)` to drop the embedding a moved fact needs.
 _FACTS_MATCH = """
 MATCH (source:Entity)-[fact:RELATES_TO]->(target:Entity)
 WHERE source.uuid IN $uuids OR target.uuid IN $uuids
 """
 _FACTS_TOUCHING = _FACTS_MATCH + "RETURN source.uuid AS source, target.uuid AS target, fact.uuid AS uuid"
+# Every property but the embedding, which the move copies inside FalkorDB: reading thousands of large vectors into
+# the runtime and sending them back took seconds and hundreds of MiB.
 _FACTS_TOUCHING_WITH_PROPERTIES = (
     _FACTS_MATCH
-    + "RETURN source.uuid AS source, target.uuid AS target, fact.uuid AS uuid, properties(fact) AS properties"
+    + "RETURN source.uuid AS source, target.uuid AS target, fact.uuid AS uuid, "
+    + "fact {.*, fact_embedding: NULL} AS properties"
 )
 _MENTIONS_OF = """
 MATCH (episode:Episodic)-[mention:MENTIONS]->(entity:Entity)
@@ -108,15 +110,15 @@ RETURN episode.uuid AS episode, entity.uuid AS entity, mention.uuid AS uuid
 ORDER BY episode, uuid
 """
 # Cypher cannot change a relationship's endpoints, so a fact moves by creating its copy and deleting it in one query.
-# A property set from a parameter is a list; Graphiti's vector search needs the embedding stored as a vector, and
-# `vecf32(NULL)` leaves a fact without an embedding as it was.
+# The embedding is copied from the old edge, which keeps it a vector for Graphiti's search; a fact without one stays
+# without one.
 _MOVE_FACT = """
 MATCH (:Entity {uuid: $source})-[old:RELATES_TO {uuid: $uuid}]->(:Entity {uuid: $target})
 MATCH (new_source:Entity {uuid: $new_source})
 MATCH (new_target:Entity {uuid: $new_target})
 CREATE (new_source)-[moved:RELATES_TO]->(new_target)
 SET moved = $properties
-SET moved.fact_embedding = vecf32($embedding)
+SET moved.fact_embedding = old.fact_embedding
 DELETE old
 """
 _MOVE_MENTIONS = """
@@ -310,7 +312,7 @@ async def _move_fact(driver: GraphDriver, fact: dict[str, Any], group: set[str],
     new_source = keep if fact["source"] in group else fact["source"]
     new_target = keep if fact["target"] in group else fact["target"]
     properties = dict(fact["properties"])
-    embedding = properties.pop("fact_embedding", None)
+    properties.pop("fact_embedding", None)
     for key in _SOURCE_KEYS:
         if key in properties:
             properties[key] = new_source
@@ -325,7 +327,6 @@ async def _move_fact(driver: GraphDriver, fact: dict[str, Any], group: set[str],
         new_source=new_source,
         new_target=new_target,
         properties=properties,
-        embedding=embedding,
     )
 
 

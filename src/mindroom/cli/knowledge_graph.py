@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path  # noqa: TC003
-from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 import typer
@@ -13,9 +12,6 @@ from mindroom.cli.config import activate_cli_runtime
 from mindroom.cli.help_format import examples
 from mindroom.http_error_detail import error_detail_from_response
 from mindroom.knowledge_graph.maintenance import DeleteReport, EntityCount, MergeReport
-
-if TYPE_CHECKING:
-    from pydantic import TypeAdapter
 
 _DRY_RUN = "Dry run: nothing changed. Re-run with --apply."
 
@@ -41,12 +37,14 @@ def _run[T](
     url: str | None,
     path: str,
     timeout: float,
-    reply: TypeAdapter[T],
+    reply: type[T],
     *,
     params: dict[str, str | int] | None = None,
     json: dict[str, object] | None = None,
 ) -> T:
-    """Post ``json`` if given, else get with ``params``; return the validated reply, or print the error and exit 2."""
+    """Post ``json`` if given, else get with ``params``; return the reply as a ``reply``, or print why and exit 2."""
+    from pydantic import TypeAdapter  # noqa: PLC0415  # lazy: keeps pydantic out of every other command's start
+
     try:
         runtime_paths = activate_cli_runtime(config_path)
         if json is None:
@@ -63,7 +61,7 @@ def _run[T](
         typer.echo(f"Request failed (HTTP {response.status_code}): {error_detail_from_response(response)}", err=True)
         raise typer.Exit(2)
     try:
-        return reply.validate_json(response.content)
+        return TypeAdapter(reply).validate_json(response.content)
     except ValueError:
         typer.echo("MindRoom returned an invalid response; check --url and the running version.", err=True)
         raise typer.Exit(2) from None
@@ -93,14 +91,12 @@ def entities(
     timeout: float = _TIMEOUT,
 ) -> None:
     """List entities whose name contains QUERY, most facts first."""
-    from pydantic import TypeAdapter  # noqa: PLC0415  # lazy: keeps pydantic out of every other command's start
-
     found = _run(
         config_path,
         url,
         _route(agent, "entities"),
         timeout,
-        TypeAdapter(list[EntityCount]),
+        list[EntityCount],
         params={"query": query, "limit": limit},
     )
     if not found:
@@ -123,14 +119,12 @@ def merge(
 
     Another entity with exactly the name to keep is merged too. Facts between the merged entities are dropped.
     """
-    from pydantic import TypeAdapter  # noqa: PLC0415  # lazy: keeps pydantic out of every other command's start
-
     report = _run(
         config_path,
         url,
         _route(agent, "merge"),
         timeout,
-        TypeAdapter(MergeReport),
+        MergeReport,
         json={"keep": keep, "duplicates": duplicates, "apply": apply},
     )
     typer.echo(f"Keep: {_counts(report.keep)}")
@@ -161,8 +155,6 @@ def delete(
 
     Read the dry run's list before --apply: the patterns are guesses, so delete by name when it holds a real entity.
     """
-    from pydantic import TypeAdapter  # noqa: PLC0415  # lazy: keeps pydantic out of every other command's start
-
     if not names and not junk:
         typer.echo("Name the entities to delete, or pass --junk.", err=True)
         raise typer.Exit(2)
@@ -171,7 +163,7 @@ def delete(
         url,
         _route(agent, "delete"),
         timeout,
-        TypeAdapter(DeleteReport),
+        DeleteReport,
         json={"names": names or [], "junk": junk, "apply": apply},
     )
     for entity in report.deleted:

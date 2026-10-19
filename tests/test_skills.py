@@ -535,9 +535,7 @@ def test_workspace_skill_script_read_allowed_but_execute_names_the_shell_path(
     shell_storage_root: str | None,
 ) -> None:
     """Workspace skill scripts are read through skill tools, and a refused run names where the agent's shell finds it."""
-    storage = tmp_path / "storage"
-    workspace_skills = agent_workspace_root_path(storage, "code") / "skills"
-    workspace_skills.mkdir(parents=True)
+    storage, workspace_skills = _workspace_skills(tmp_path)
     skill_path = _write_skill(workspace_skills, "scripted", "Scripted workspace skill")
     marker = tmp_path / "script-ran"
     _write_skill_script(skill_path.parent, "hello.sh", f"#!/bin/sh\ntouch {marker}\n")
@@ -565,19 +563,10 @@ def test_workspace_skill_script_read_allowed_but_execute_names_the_shell_path(
 
 def test_running_a_script_a_workspace_skill_does_not_list_names_its_scripts(tmp_path: Path) -> None:
     """A run of a script the skill does not list points at the scripts it has instead of a path that does not exist."""
-    storage = tmp_path / "storage"
-    workspace_skills = agent_workspace_root_path(storage, "code") / "skills"
-    workspace_skills.mkdir(parents=True)
+    storage, workspace_skills = _workspace_skills(tmp_path)
     _write_skill_script(_write_skill(workspace_skills, "scripted", "Scripted skill").parent, "hello.sh", "echo hi\n")
 
-    skills = build_agent_skills(
-        "code",
-        _base_config([]),
-        _runtime_paths(storage),
-        skill_roots=[tmp_path / "global"],
-        env_vars={},
-        credential_keys=set(),
-    )
+    skills = _load_workspace_only(tmp_path, storage)
     assert skills is not None
 
     execute_result = _get_skill_script(skills, "scripted", "missing.sh", execute=True)

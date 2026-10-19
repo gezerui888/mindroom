@@ -2231,7 +2231,8 @@ def create_agent(  # noqa: PLR0915
             config,
             runtime_paths,
             workspace_root=workspace.root if workspace is not None else None,
-            # Looked up only when needed, so a worker backend's config is never read to build an agent.
+            # Looked up only when get_skill_script refuses to run a workspace skill script and names its path,
+            # so an incomplete worker backend config fails that call instead of agent creation.
             shell_storage_root=(
                 partial(worker_visible_storage_root, runtime_paths)
                 if "shell" in tool_assembly.worker_routed_tool_names

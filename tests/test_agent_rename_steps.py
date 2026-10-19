@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import sqlite3
 from contextlib import closing
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from mindroom.agent_rename import steps as steps_module
 from mindroom.agent_rename.steps import (
     ApplyResult,
     DropPath,
@@ -36,6 +38,7 @@ def _create_database(path: Path, *, wal: bool = False) -> None:
         connection.execute("CREATE TABLE accounts (name TEXT PRIMARY KEY, user_id TEXT)")
         connection.execute("INSERT INTO accounts VALUES ('harry', '@old:x')")
         connection.commit()
+    path.chmod(0o600)
 
 
 def _rows(path: Path) -> list[tuple[str, str]]:
@@ -107,6 +110,8 @@ def test_apply_runs_steps_and_writes_manifest(tmp_path: Path) -> None:
     assert json.loads((storage / "accounts.json").read_text()) == {"user_id": "@new:x"}
     assert (storage / "accounts.json").stat().st_mode & 0o777 == 0o640
     assert _rows(storage / "journal.db") == [("harry", "@new:x")]
+    assert (storage / "journal.db").stat().st_mode & 0o777 == 0o600
+    assert (result.backup_dir / "002" / "journal.db").stat().st_mode & 0o777 == 0o600
     assert not (storage / "legacy.txt").exists()
     assert (result.backup_dir / "003" / "legacy.txt").read_text() == "legacy"
     assert json.loads((result.backup_dir / "001" / "accounts.json").read_text()) == {"user_id": "@old:x"}
@@ -199,6 +204,14 @@ def test_failure_undoes_every_step_kind(tmp_path: Path, wal: bool) -> None:
     # The SQLite backup API restores the same content but not the same header bytes, so compare rows instead.
     original = tree_snapshot(storage)
     original.pop("journal.db")
+
+    def leave_stale_wal_files_then_fail(content: bytes) -> bytes:  # noqa: ARG001
+        # Closing the last connection already removes these, so a later step has to recreate them.
+        (storage / "journal.db-wal").write_bytes(b"stale wal")
+        (storage / "journal.db-shm").write_bytes(b"stale shm")
+        msg = "boom"
+        raise RuntimeError(msg)
+
     plan = RenamePlan(
         storage_root=storage,
         steps=(
@@ -206,7 +219,7 @@ def test_failure_undoes_every_step_kind(tmp_path: Path, wal: bool) -> None:
             FileRewrite(storage / "accounts.json", _rewrite_user_id, "rewrite accounts"),
             SqliteEdit(storage / "journal.db", _set_user_id, "update journal"),
             DropPath(storage / "legacy.txt", "drop legacy file"),
-            FileRewrite(storage / "agents" / "new" / "state.txt", _fail_rewrite, "rewrite state"),
+            FileRewrite(storage / "agents" / "new" / "state.txt", leave_stale_wal_files_then_fail, "rewrite state"),
         ),
         reports=(),
     )
@@ -217,8 +230,77 @@ def test_failure_undoes_every_step_kind(tmp_path: Path, wal: bool) -> None:
     assert caught.value.step == "rewrite state"
     assert not list(storage.glob("journal.db-*"))
     assert _rows(storage / "journal.db") == [("harry", "@old:x")]
+    assert (storage / "journal.db").stat().st_mode & 0o777 == 0o600
     restored = _without_backups(tree_snapshot(storage))
     assert restored.pop("journal.db")
+    assert restored == original
+
+
+@pytest.mark.parametrize("first_failing_write", [2, 3, 4])
+def test_manifest_write_failure_still_undoes_steps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_failing_write: int,
+) -> None:
+    """A manifest that cannot be written, whether after a step or after a failure, never strands applied steps."""
+    storage = _make_storage(tmp_path)
+    original = tree_snapshot(storage)
+    original.pop("journal.db")
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            FileRewrite(storage / "accounts.json", _rewrite_user_id, "rewrite accounts"),
+            MovePath(storage / "agents" / "old", storage / "agents" / "new", "move agent dir"),
+            FileRewrite(storage / "legacy.txt", _fail_rewrite, "rewrite legacy"),
+        ),
+        reports=(),
+    )
+    # Write 1 precedes the first step, writes 2 and 3 follow steps 1 and 2, and write 4 follows the failure.
+    real_write_manifest = steps_module._write_manifest
+    writes: list[None] = []
+
+    def write_manifest(*args: object, **kwargs: object) -> None:
+        writes.append(None)
+        if len(writes) >= first_failing_write:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real_write_manifest(*args, **kwargs)
+
+    monkeypatch.setattr(steps_module, "_write_manifest", write_manifest)
+
+    with pytest.raises(RenameApplyError) as caught:
+        apply_plan(plan, kind="rename-account", now=NOW)
+
+    expected_step = {2: "rewrite accounts", 3: "move agent dir", 4: "rewrite legacy"}[first_failing_write]
+    assert caught.value.step == expected_step
+    restored = _without_backups(tree_snapshot(storage))
+    restored.pop("journal.db")
+    assert restored == original
+
+
+def test_keyboard_interrupt_undoes_completed_steps(tmp_path: Path) -> None:
+    """An interrupt during a step undoes the completed steps and then propagates unchanged."""
+    storage = _make_storage(tmp_path)
+    original = tree_snapshot(storage)
+    original.pop("journal.db")
+
+    def interrupt(content: bytes) -> bytes:  # noqa: ARG001
+        raise KeyboardInterrupt
+
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            MovePath(storage / "agents" / "old", storage / "agents" / "new", "move agent dir"),
+            FileRewrite(storage / "accounts.json", _rewrite_user_id, "rewrite accounts"),
+            FileRewrite(storage / "legacy.txt", interrupt, "rewrite legacy"),
+        ),
+        reports=(),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        apply_plan(plan, kind="rename-account", now=NOW)
+
+    restored = _without_backups(tree_snapshot(storage))
+    restored.pop("journal.db")
     assert restored == original
 
 

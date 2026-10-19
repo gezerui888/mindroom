@@ -15,7 +15,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
-from contextlib import closing
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import UTC
 from pathlib import Path
@@ -129,6 +129,8 @@ class SqliteEdit:
             closing(sqlite3.connect(backup / self.database.name)) as saved,
         ):
             source.backup(saved)
+            # The backup is created with the umask mode; undo copies this mode back, so keep the original's.
+            shutil.copymode(self.database, backup / self.database.name)
             # Closing the connection without COMMIT rolls back, so a failing edit changes nothing.
             source.execute("BEGIN IMMEDIATE")
             self.edit(source)
@@ -256,7 +258,7 @@ def _undo_completed(
     *,
     backup_dir: Path,
     failed: Step,
-    failure: Exception,
+    failure: BaseException,
 ) -> None:
     """Undo completed steps in reverse order, stopping at the first undo that fails."""
     for index, step in reversed(completed):
@@ -296,15 +298,20 @@ def apply_plan(plan: RenamePlan, *, kind: str, now: datetime) -> ApplyResult:
     for index, step in reversible:
         try:
             step.apply(_step_backup(backup_dir, index))
-        except Exception as failure:
+            completed.append((index, step))
+            # A manifest that cannot be written counts as this step failing, so the step is undone too.
             _write_manifest(plan, kind=kind, now=now, backup_dir=backup_dir)
-            _undo_completed(completed, backup_dir=backup_dir, failed=step, failure=failure)
-            if isinstance(failure, RenameRefusedError):
+        except BaseException as failure:
+            try:
+                _undo_completed(completed, backup_dir=backup_dir, failed=step, failure=failure)
+            finally:
+                # Record the failed step's backup, but never let a manifest that cannot be written hide the failure.
+                with suppress(OSError):
+                    _write_manifest(plan, kind=kind, now=now, backup_dir=backup_dir)
+            if isinstance(failure, RenameRefusedError) or not isinstance(failure, Exception):
                 raise
             msg = f"{step.description} failed: {failure}. The completed steps were undone."
             raise RenameApplyError(step.description, msg) from failure
-        completed.append((index, step))
-        _write_manifest(plan, kind=kind, now=now, backup_dir=backup_dir)
 
     warnings: list[str] = []
     for index, step in final:

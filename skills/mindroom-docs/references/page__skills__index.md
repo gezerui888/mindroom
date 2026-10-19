@@ -118,14 +118,14 @@ Agents see their available skills in the system prompt and load details with the
 
 - `get_skill_instructions(skill_name)` loads the full instructions for a skill
 - `get_skill_reference(skill_name, reference_path)` reads a reference document
-- `get_skill_script(skill_name, script_path, execute=False, args=None, timeout=30)` reads or executes a script
+- `get_skill_script(skill_name, script_path, execute=False, args=None, timeout=30)` reads a script, or returns the command that runs it
 
-`get_skill_script` with `execute=True` runs the script as a command of the agent's own `shell` tool, so it runs where the agent's shell commands run, such as its worker, in its workspace, with the shell's environment, tool hooks, and output limits, and stops after `timeout` seconds.
+`get_skill_script` never runs a script itself.
+With `execute=True` it returns the shell command that runs the script, with `args` and `timeout`, and the agent runs that command with its own `shell` tool, so the script runs where the agent's shell commands run, such as its worker, in its workspace, with the shell's environment, approval, tool hooks, and output limits.
 The script's `#!` line picks its interpreter, so a script needs no executable bit.
-An agent without the `shell` tool can read skill scripts but not run them.
-While the agent's shell commands need [approval](https://docs.mindroom.chat/tool-approval/), `get_skill_script` runs nothing and returns the command, which the agent can run with its shell tool to ask for approval.
-Dedicated Docker and Kubernetes workers mount the directory of each plugin or user skill with scripts that their agents list, read-only, so those scripts run in the worker like workspace skill scripts, and bundled skills ship in the worker image.
-A skill directory outside the storage root cannot be mounted, and a `static_runner` runner sees no plugin or user skill directories, so there `get_skill_script` refuses to run the script and the agent can still read it.
+An agent without the `shell` tool loaded can read skill scripts but gets no command for them.
+Dedicated Docker and Kubernetes workers mount the directory of each plugin or user skill with scripts that their agents list, read-only, at the path the command names, and bundled skills ship in the worker image.
+A skill directory outside the storage root cannot be mounted, and a `static_runner` runner sees no plugin or user skill directories, so there `get_skill_script` gives no command and the agent can still read the script.
 
 Added, removed, or edited `SKILL.md` files take effect on the agent's next request, within about a second.
 A workspace skill created during a turn becomes available on the next agent run, not in the same response.

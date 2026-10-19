@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 from agno.knowledge.knowledge import Knowledge
 from agno.learn import LearningMachine, LearningMode, UserMemoryConfig, UserProfileConfig
-from agno.tools.toolkit import Toolkit
 
 import mindroom.tools  # noqa: F401
 from mindroom import constants
@@ -74,12 +73,7 @@ from mindroom.tool_system.catalog import (
     ensure_tool_registry_loaded,
     get_tool_by_name,
 )
-from mindroom.tool_system.construction import (
-    ToolConstruction,
-    bind_toolkit_construction,
-    get_toolkit_construction,
-    tool_config_signature,
-)
+from mindroom.tool_system.construction import ToolConstruction, bind_toolkit_construction, tool_config_signature
 from mindroom.tool_system.declarations import (
     MATRIX_ROOM_RUNTIME_APPROVAL_TYPE,
     MATRIX_ROOM_RUNTIME_TOOL_NAMES,
@@ -97,8 +91,12 @@ from mindroom.tool_system.output_files import ToolOutputFilePolicy, wrap_toolkit
 from mindroom.tool_system.plugins import load_plugins
 from mindroom.tool_system.runtime_context import ToolDispatchContext
 from mindroom.tool_system.sandbox_proxy import sandbox_proxy_enabled_for_tool
-from mindroom.tool_system.skill_scripts import SkillScriptShell
-from mindroom.tool_system.skills import SKILL_FUNCTION_NAMES, agent_workspace_skills_root, build_agent_skills
+from mindroom.tool_system.skills import (
+    SKILL_FUNCTION_NAMES,
+    SkillScriptLocation,
+    agent_workspace_skills_root,
+    build_agent_skills,
+)
 from mindroom.tool_system.tool_hooks import build_tool_hook_bridge, prepend_tool_hook_bridge
 from mindroom.tool_system.worker_routing import (
     agent_workspace_root_path,
@@ -119,6 +117,7 @@ if TYPE_CHECKING:
     from agno.skills import Skills
     from agno.team import Team
     from agno.tools.function import Function
+    from agno.tools.toolkit import Toolkit
 
     from mindroom.agent_knowledge_descriptions import KnowledgeSourceDescription
     from mindroom.agent_modes import AgentMode
@@ -1444,7 +1443,7 @@ def _load_agent_skills(
     runtime_paths: constants.RuntimePaths,
     *,
     workspace_root: Path | None = None,
-    script_shell: Callable[[object], SkillScriptShell | None] | None = None,
+    script_location: SkillScriptLocation | None = None,
     output_file_policy: ToolOutputFilePolicy | None = None,
     only: tuple[str, ...] | None = None,
     refused: list[RefusedWorkspaceSkill] | None = None,
@@ -1454,49 +1453,39 @@ def _load_agent_skills(
         config,
         runtime_paths,
         workspace_root=workspace_root,
-        script_shell=script_shell,
+        script_location=script_location,
         output_file_policy=output_file_policy,
         only=only,
         refused=refused,
     )
 
 
-def _skill_script_shell(
+def _skill_script_location(
     agent_name: str,
     config: Config,
     runtime_paths: constants.RuntimePaths,
-) -> Callable[[object], SkillScriptShell | None]:
-    """Return a lookup of the running agent's shell tool, as routing built it, through which its skill scripts run.
+    tool_assembly: _AgentToolAssembly,
+) -> SkillScriptLocation | None:
+    """Return where the agent's shell tool finds skill scripts, or None when the agent has no shell tool.
 
-    The lookup runs with each script, because a minimal agent may load a deferred shell after its skills.
+    A shell that the agent loads later, in minimal mode or by tool search, counts as its shell too.
     """
-    worker_storage_root = (
-        partial(worker_visible_storage_root, runtime_paths)
-        if sandbox_proxy_enabled_for_tool(
-            "shell",
-            runtime_paths=runtime_paths,
-            worker_tools_override=config.get_agent_worker_tools(agent_name),
-        )
-        else None
-    )
-
-    def agent_shell(agent: object) -> SkillScriptShell | None:
-        tools = agent.tools if isinstance(agent, Agent) and isinstance(agent.tools, list) else []
-        for toolkit in tools:
-            if not isinstance(toolkit, Toolkit):
-                continue
-            construction = get_toolkit_construction(toolkit)
-            function = toolkit.get_async_functions().get("run_shell_command")
-            if construction is None or construction.name != "shell" or function is None:
-                continue
-            return SkillScriptShell(
-                function=function,
-                storage_root=runtime_paths.storage_root,
-                worker_storage_root=worker_storage_root,
-            )
+    tool_names = {
+        *tool_assembly.local_tool_names,
+        *tool_assembly.worker_routed_tool_names,
+        *(deferred.name for deferred in tool_assembly.cli_deferred),
+    }
+    if "shell" not in tool_names:
         return None
-
-    return agent_shell
+    worker_routed = sandbox_proxy_enabled_for_tool(
+        "shell",
+        runtime_paths=runtime_paths,
+        worker_tools_override=config.get_agent_worker_tools(agent_name),
+    )
+    return SkillScriptLocation(
+        storage_root=runtime_paths.storage_root,
+        worker_storage_root=partial(worker_visible_storage_root, runtime_paths) if worker_routed else None,
+    )
 
 
 @timed("system_prompt_assembly.agent_create.agent_init")
@@ -2293,7 +2282,7 @@ def create_agent(  # noqa: PLR0915
             config,
             runtime_paths,
             workspace_root=workspace.root if workspace is not None else None,
-            script_shell=_skill_script_shell(agent_name, config, runtime_paths),
+            script_location=_skill_script_location(agent_name, config, runtime_paths, tool_assembly),
             output_file_policy=_agent_tool_output_file_policy(
                 agent_runtime,
                 runtime_paths,

@@ -12,8 +12,6 @@ if TYPE_CHECKING:
 
 _ShellOperationName = Literal["run_shell_command"]
 SHELL_OPERATION_NAMES: tuple[_ShellOperationName, ...] = get_args(_ShellOperationName)
-# The agent's generated skill function, which runs a skill's script as one of these shell operations.
-SKILL_SCRIPT_FUNCTION_NAME = "get_skill_script"
 AGENT_CLI_URL_ENV = "MINDROOM_AGENT_CLI_URL"
 AGENT_CLI_TOKEN_ENV = "MINDROOM_AGENT_CLI_TOKEN"  # noqa: S105 - environment variable name
 AGENT_CLI_WINDOW_ENV = "MINDROOM_AGENT_CLI_WINDOW"

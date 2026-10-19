@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import json5
 from agno.skills import LocalSkills, Skills
@@ -28,11 +28,7 @@ from mindroom.constants import runtime_env_values
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.logging_config import get_logger
 from mindroom.path_confinement import open_directory_within_root, read_regular_file_within_root
-from mindroom.tool_system.output_files import (
-    ToolOutputFileHandled,
-    ToolOutputFilePolicy,
-    wrap_function_for_output_files,
-)
+from mindroom.tool_system.output_files import ToolOutputFilePolicy, wrap_function_for_output_files
 from mindroom.tool_system.skill_usage import record_skill_use
 from mindroom.tool_system.worker_routing import agent_workspace_root_path
 
@@ -43,7 +39,6 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
-    from mindroom.tool_system.skill_scripts import SkillOrigin, SkillScriptShell
 
 logger = get_logger(__name__)
 
@@ -68,9 +63,9 @@ _NO_SHELL_ERROR = (
     "Skill scripts run as commands of your shell tool, which you do not have loaded; "
     "read the script with execute=false instead."
 )
-_SHELL_APPROVAL_ERROR = (
-    "Your shell commands can need approval, which get_skill_script cannot wait for; "
-    "run this command with your shell tool instead:"
+_RUN_WITH_SHELL = (
+    "get_skill_script does not run scripts itself: run this command with your shell tool (run_shell_command), "
+    "with this timeout."
 )
 _UNSEEN_SCRIPT_ERROR = (
     "Your shell runs in a worker that cannot see this skill's directory, so its scripts cannot run there; "
@@ -162,6 +157,39 @@ class _WorkspaceSkillsLoader(_MindroomSkillsLoader):
         return _load_workspace_skills(self.workspace_root, self.refused)
 
 
+# Bundled skills ship with MindRoom, workspace skills live in the agent's workspace,
+# and configured skills come from plugins and the user skills directory.
+_SkillOrigin = Literal["bundled", "workspace", "configured"]
+
+
+@dataclass(frozen=True)
+class SkillScriptLocation:
+    """Where the agent's shell tool, which runs its skill scripts, finds them."""
+
+    storage_root: Path
+    # Where the shell's worker sees ``storage_root``: None when the shell runs in this process, and a lookup
+    # returning None for a shared runner. Looked up on each use, so an incomplete worker backend config fails
+    # that call instead of agent creation.
+    worker_storage_root: Callable[[], Path | None] | None = None
+
+    def visible_path(self, path: Path, origin: _SkillOrigin) -> Path | None:
+        """Return where the shell finds ``path``, or None when its worker cannot see it.
+
+        Worker images ship the bundled skills where this process has them. Dedicated workers mount
+        workspaces, and the directories of the configured skills with scripts that their agents list,
+        at their place below the storage mount, and a shared runner sees workspaces where this process
+        does but no configured skill directory.
+        """
+        if self.worker_storage_root is None or origin == "bundled":
+            return path
+        if not path.is_relative_to(self.storage_root):
+            return None
+        worker_root = self.worker_storage_root()
+        if worker_root is None:
+            return path if origin == "workspace" else None
+        return worker_root / path.relative_to(self.storage_root)
+
+
 class _MindroomSkills(Skills):
     """MindRoom-specific Skills wrapper for workspace skill access policy."""
 
@@ -169,12 +197,12 @@ class _MindroomSkills(Skills):
         self,
         *,
         loaders: list[SkillLoader],
-        script_shell: Callable[[object], SkillScriptShell | None] | None = None,
+        script_location: SkillScriptLocation | None = None,
         output_file_policy: ToolOutputFilePolicy | None = None,
         only: Collection[str] | None = None,
     ) -> None:
         self._workspace_roots_by_skill: dict[str, Path] = {}
-        self._script_shell = script_shell
+        self._script_location = script_location
         self._output_file_policy = output_file_policy
         self._only = None if only is None else frozenset(only)
         super().__init__(loaders=loaders)
@@ -259,17 +287,15 @@ class _MindroomSkills(Skills):
 
     # AGNO_COMPAT: Skills runs a skill script in the process that holds the Skills object.
     # Reason: Agno 3.0.9 Skills._get_skill_script runs a script as a subprocess of the primary process and has no hook
-    #   to run it elsewhere, so every script runs as a command of the agent's own shell tool instead, which takes it
-    #   wherever the agent's shell commands go, with their hooks and limits; Agno's ``_agno_agent`` injection names
-    #   the running agent whose shell that is.
+    #   to run it elsewhere, so it returns the command that runs the script instead, for the agent to run with its own
+    #   shell tool, which takes it wherever the agent's shell commands go, with their approval, hooks, and limits.
     # Upstream issue: Tracking gap; no issue for choosing where skill scripts run has been identified.
     # Upstream PR: None identified.
     # Remove when: Skills lets an application supply how a script runs; refusing to run one without a shell tool,
-    #   while shell commands need approval, or from a skill directory the shell's worker cannot see remains MindRoom
-    #   policy.
-    # Coverage: tests/test_skill_scripts.py::test_skill_scripts_run_in_the_worker_from_its_own_mounts;
-    #   tests/test_skill_scripts.py::test_skill_scripts_need_the_agents_shell;
-    #   tests/test_minimal_agent_parity.py::test_skill_script_run_through_the_cli_calls_other_tools_through_it.
+    #   or from a skill directory the shell's worker cannot see, remains MindRoom policy.
+    # Coverage: tests/test_skill_scripts.py::test_skill_scripts_get_a_command_for_the_worker_that_mounts_them;
+    #   tests/test_skill_scripts.py::test_a_local_shell_runs_the_command_on_this_host;
+    #   tests/test_skill_scripts.py::test_skill_scripts_need_the_agents_shell.
     async def _get_skill_script(  # ty: ignore[invalid-method-override]  # Agno awaits async tools
         self,
         skill_name: str,
@@ -277,16 +303,14 @@ class _MindroomSkills(Skills):
         execute: bool = False,
         args: list[str] | None = None,
         timeout: int = 30,  # noqa: ASYNC109 - the script's own time limit, which the shell enforces
-        # Agno passes the agent running the call, whose shell a minimal agent may load only after its skills.
-        _agno_agent: object = None,
-    ) -> object:
+    ) -> str:
         skill = self.get_skill(skill_name)
         if skill is None or script_path not in skill.scripts:
             # Agno reports a missing skill or script, and what the skill has, without reading or running anything.
             return super()._get_skill_script(skill_name=skill_name, script_path=script_path)
-        if execute:
-            return await self._run_script(skill, script_path, args or [], timeout, _agno_agent)
         # Skill directories can be on network storage, so reads stay off the event loop.
+        if execute:
+            return await asyncio.to_thread(self._script_command, skill, script_path, args or [], timeout)
         return await asyncio.to_thread(self._read_script, skill_name, script_path)
 
     def _read_script(self, skill_name: str, script_path: str) -> str:
@@ -295,45 +319,30 @@ class _MindroomSkills(Skills):
             return json.dumps({"skill_name": skill_name, "script_path": script_path, **content})
         return super()._get_skill_script(skill_name=skill_name, script_path=script_path)
 
-    async def _run_script(
-        self,
-        skill: Skill,
-        script_path: str,
-        args: list[str],
-        timeout: int,  # noqa: ASYNC109 - the script's own time limit, which the shell enforces
-        agent: object,
-    ) -> object:
-        """Run one listed script as a command of the agent's shell tool, or say why it cannot run."""
+    def _script_command(self, skill: Skill, script_path: str, args: list[str], timeout: int) -> str:
+        """Return the command that runs one listed script where the agent's shell runs, or say why there is none."""
         reply = {"skill_name": skill.name, "script_path": script_path}
-        shell = None if self._script_shell is None else self._script_shell(agent)
-        if shell is None:
+        if self._script_location is None:
             return json.dumps({"error": _NO_SHELL_ERROR, **reply})
         script = Path(skill.source_path) / "scripts" / script_path
-        origin: SkillOrigin = (
+        origin: _SkillOrigin = (
             "workspace"
             if skill.name in self._workspace_roots_by_skill
             else "bundled"
             if script.is_relative_to(_get_bundled_skills_dir().resolve())
             else "configured"
         )
-        visible_script = shell.visible_path(script, origin)
+        visible_script = self._script_location.visible_path(script, origin)
         if visible_script is None:
             return json.dumps({"error": _UNSEEN_SCRIPT_ERROR, **reply})
         try:
-            head = await asyncio.to_thread(self._script_head, skill.name, script)
+            head = self._script_head(skill.name, script)
         except (OSError, ValueError) as exc:
             logger.warning("Refused a skill script", path=str(script), error=str(exc))
             return json.dumps({"error": f"Error reading skill script {script_path}: {type(exc).__name__}", **reply})
-        command = shlex.join([*_script_interpreter(head), str(visible_script), *args])
-        if shell.needs_approval:
-            return json.dumps({"error": f"{_SHELL_APPROVAL_ERROR} {command}", **reply})
         self._record_use(skill.name)
-        execution = await shell.run(command, timeout=timeout)
-        if execution.status == "failure":
-            return json.dumps({"error": execution.error or "The shell tool failed", **reply})
-        result = execution.result
-        # Anything but text is the shell's receipt for an output file it already wrote, which must not be saved again.
-        return result if isinstance(result, str) or self._output_file_policy is None else ToolOutputFileHandled(result)
+        command = shlex.join([*_script_interpreter(head), str(visible_script), *args])
+        return json.dumps({**reply, "command": command, "timeout": timeout, "instructions": _RUN_WITH_SHELL})
 
     def _script_head(self, skill_name: str, script: Path) -> bytes:
         """Read the start of a listed script, which names its interpreter, never following links in a workspace."""
@@ -391,7 +400,7 @@ def build_agent_skills(
     *,
     skill_roots: Sequence[Path] | None = None,
     workspace_root: Path | None = None,
-    script_shell: Callable[[object], SkillScriptShell | None] | None = None,
+    script_location: SkillScriptLocation | None = None,
     env_vars: Mapping[str, str] | None = None,
     credential_keys: set[str] | None = None,
     output_file_policy: ToolOutputFilePolicy | None = None,
@@ -400,8 +409,9 @@ def build_agent_skills(
 ) -> Skills | None:
     """Build an Agno Skills object for a specific agent, narrowed to the skill names in ``only`` when set.
 
-    ``script_shell`` returns the shell tool of the agent running a skill function, which runs its skill scripts;
-    without it none run. ``refused`` collects the workspace skills that did not load, also when no skill loads.
+    ``script_location`` says where the agent's shell tool finds skill scripts, which get_skill_script gives the agent
+    commands for; without it the agent has no shell and gets none. ``refused`` collects the workspace skills that did
+    not load, also when no skill loads.
     """
     if only is not None and not only:
         return None
@@ -442,7 +452,7 @@ def build_agent_skills(
 
     skills = _MindroomSkills(
         loaders=loaders,
-        script_shell=script_shell,
+        script_location=script_location,
         output_file_policy=output_file_policy,
         only=only,
     )

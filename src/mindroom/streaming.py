@@ -30,7 +30,7 @@ from mindroom.logging_config import get_logger
 from mindroom.matrix.client_delivery import build_edit_event_content, edit_message_result, send_message_result
 from mindroom.matrix.large_messages import should_send_oversized_nonterminal_streaming_edit
 from mindroom.matrix.mentions import format_message_with_mentions
-from mindroom.matrix.message_builder import markdown_to_html
+from mindroom.matrix.message_builder import close_partial_markdown, markdown_to_html
 from mindroom.orchestration.runtime import (
     SYNC_RESTART_CANCEL_MSG,
     USER_STOP_CANCEL_MSG,
@@ -438,6 +438,15 @@ def _progress_state(committed: _CommittedDeliveryState) -> ProgressState:
     )
 
 
+def _partial_markdown_renderer(render: Callable[[str], str]) -> Callable[[str], str]:
+    """Render a reply still streaming as it will look once its open Markdown closes.
+
+    Only the formatted body changes; the plain body, which shows Markdown as written, and the
+    reply's recorded text keep the streamed text.
+    """
+    return lambda text: render(close_partial_markdown(text) or _PROGRESS_PLACEHOLDER)
+
+
 def _prepare_delivery_from_snapshot(snapshot: _StreamingDeliverySnapshot) -> _PreparedStreamingDelivery:
     """Format one outbound payload from immutable stream state."""
     text_to_send = snapshot.accumulated_text if snapshot.accumulated_text.strip() else _PROGRESS_PLACEHOLDER
@@ -450,9 +459,11 @@ def _prepare_delivery_from_snapshot(snapshot: _StreamingDeliverySnapshot) -> _Pr
         warn_unparsed=not in_progress,
     )
     display_text = response.formatted_text
+    markdown_renderer = snapshot.markdown_renderer
     if in_progress:
         # An interactive block still arriving is raw JSON; its question renders once the block closes.
         display_text = interactive.hide_unfinished_interactive(display_text) or _PROGRESS_PLACEHOLDER
+        markdown_renderer = _partial_markdown_renderer(snapshot.markdown_renderer)
 
     latest_for_message = (
         snapshot.latest_thread_event_id if snapshot.event_id is None and not snapshot.room_mode else None
@@ -483,7 +494,7 @@ def _prepare_delivery_from_snapshot(snapshot: _StreamingDeliverySnapshot) -> _Pr
         latest_thread_event_id=latest_for_message,
         tool_trace=tool_trace if snapshot.show_tool_calls else None,
         extra_content=extra_content,
-        markdown_renderer=snapshot.markdown_renderer,
+        markdown_renderer=markdown_renderer,
     )
     if in_progress:
         # Matrix suppresses m.notice before evaluating mention rules. Streaming

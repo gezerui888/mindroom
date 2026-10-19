@@ -41,7 +41,8 @@ dependencies = [
   "jinja2>=3.1",
   "json5>=0.13",
   "jsonschema>=4.26",
-  "markdown-it-py>=4",
+  # Closing partial Markdown while streaming reads markdown-it-py internals (inline delimiters).
+  "markdown-it-py>=4,<5",
   "mcp[cli]>=2.3,<3",
   "mdit-py-plugins>=0.5",
   "mem0ai>=0.1.115",

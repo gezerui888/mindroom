@@ -4,10 +4,12 @@ import re
 from collections.abc import Callable, Mapping
 from html import escape, unescape
 from html.parser import HTMLParser
+from os.path import commonprefix
 from typing import Any
 from urllib.parse import urlsplit
 
 from markdown_it import MarkdownIt
+from markdown_it.rules_inline import StateInline, backtick, link, link_pairs
 from markdown_it.token import Token
 from mdit_py_plugins.dollarmath import dollarmath_plugin
 from pygments import highlight
@@ -118,6 +120,7 @@ _ALLOWED_STYLE_PROPERTIES = frozenset(
 )
 _SAFE_STYLE_VALUE_PATTERN = re.compile(r"[#(),.%\s0-9A-Za-z-]+")
 _HTML_FRAGMENT_OPENER_PATTERN = re.compile(r"<(?:!--|\?|![A-Za-z]|/?[A-Za-z])")
+_PIPE_TABLE_LINE_PATTERN = re.compile(r" {0,3}\|")
 _HTML_LINE_PATTERN = re.compile(r"[^\r\n]+")
 _RAW_HTML_TAG_LINE_START_PATTERN = re.compile(
     r"^([ ]{0,3})(</?([A-Za-z][A-Za-z0-9-]*)(?:\s[^<>]*)?/?>)",
@@ -483,6 +486,95 @@ def opens_with_markdown_block(text: str) -> bool:
     """
     tokens = _MARKDOWN_RENDERER.parse("\n".join(text.lstrip().split("\n", 2)[:2]))
     return bool(tokens) and tokens[0].type != "paragraph_open"
+
+
+def close_partial_markdown(text: str) -> str:
+    """Shape Markdown cut off mid-stream so it renders the way it will once the rest arrives.
+
+    Cut off, Markdown shows open syntax literally: ``**`` before bold text, ``[`` before a link label,
+    or the pipes of a table whose separator row has not arrived.
+    In the block the text ends in, open emphasis, strikethrough, and code spans are closed, an unfinished
+    link shows its label, and table lines wait until they form a table.
+    Finished blocks, code blocks, and code spans are left as written.
+    """
+    text = _normalize_input_line_endings(text).rstrip()
+    lines = text.split("\n")
+    blocks = [token for token in _PARTIAL_MARKDOWN_PARSER.parse(text) if token.map]
+    if not blocks or blocks[-1].type != "inline":
+        # The text ends in code, math, HTML, or a rule, which already render as they stream.
+        return text
+    if blocks[-2].type == "paragraph_open" and _PIPE_TABLE_LINE_PATTERN.match(lines[-1]):
+        table_start = len(lines) - 1
+        while table_start and _PIPE_TABLE_LINE_PATTERN.match(lines[table_start - 1]):
+            table_start -= 1
+        return "\n".join(lines[:table_start]).rstrip()
+    # Only the last block's inline text is still arriving, after any list or quote marker or the row's earlier
+    # cells. A table pads a row still arriving with empty cells, so the cell being written is the last with text.
+    inline_lines = next(
+        (token.content for token in reversed(blocks) if token.type == "inline" and token.content),
+        "",
+    ).split("\n")
+    if not lines[-1].endswith(inline_lines[-1]):
+        # A setext underline or the row's closing pipe follows the text, so there is nothing still open to close.
+        return text
+    # Each of its lines ends a source line, after the quote marker or indent that line may start with.
+    first_line, *later_lines = lines[-len(inline_lines) :]
+    first_line_text = commonprefix([first_line[::-1], inline_lines[0][::-1]])
+    inline_start = len(text) - len("\n".join([first_line_text, *later_lines]))
+    return text[:inline_start] + _close_partial_inline(text[inline_start:])
+
+
+def _stop_at_unfinished_markup(state: StateInline, silent: bool) -> bool:
+    """Parse code spans and links, stopping at one whose code or URL is still arriving and noting an open label.
+
+    It runs before markdown-it's own inline rules, which parse everything else, and stops at ``env["end"]``.
+    """
+    start, src, env = state.pos, state.src, state.env
+    if silent or state.level:  # A lookahead, or the label of a finished link, which leaves nothing open.
+        return False
+    if src[start] == "`":
+        backtick(state, silent)
+        if not src[start : state.pos].strip("`"):  # No run of its length closes it.
+            env["end"], env["code_span"] = start, src[start : state.pos]
+    elif src[start] == "[" and not link(state, silent):
+        if start > env["last_bracket"]:  # No `]` follows, so its label is still arriving.
+            env["open_label"] = start
+        else:
+            label_end = state.md.helpers.parseLinkLabel(state, start, True)
+            if label_end > env["last_paren"] and src.startswith("(", label_end + 1):  # Its URL is still arriving.
+                env["open_label"], env["end"] = start, label_end
+    if start == env["end"]:
+        state.pos = state.posMax
+    return state.pos > start
+
+
+# Parses blocks, and the last block's inline text on request, which is far cheaper than parsing all of it.
+_PARTIAL_MARKDOWN_PARSER = _build_markdown_renderer().disable("inline")
+_PARTIAL_MARKDOWN_PARSER.inline.ruler.before("text", "unfinished_markup", _stop_at_unfinished_markup)
+
+
+def _close_partial_inline(text: str) -> str:
+    """Close the emphasis and code span left open at the end of inline text, and show an unfinished link as its label."""
+    # Markup after a space at the very end closes nothing and only opens text still to come.
+    unmarked = text.rstrip("*_[")
+    end = len(unmarked) if not unmarked or unmarked[-1].isspace() else len(text)
+    env: dict[str, Any] = {"end": end, "last_bracket": text.rfind("]"), "last_paren": text.rfind(")")}
+    state = StateInline(text, _PARTIAL_MARKDOWN_PARSER, env, [])
+    _PARTIAL_MARKDOWN_PARSER.inline.tokenize(state)
+    link_pairs(state)  # Match emphasis and strikethrough delimiters the way rendering will.
+    end = env["end"]
+    shown = text[:end]
+    if run := env.get("code_span"):
+        if not text[end + len(run) :].strip():  # A code span with nothing in it yet is dropped.
+            return _close_partial_inline(shown)
+        shown = text + run
+    if (label := env.get("open_label")) is not None:
+        shown = shown[:label] + shown[label + 1 :]
+    # Openers nothing closed yet, innermost first; one that could also close, like the `*` of `2*3`, may be literal.
+    pending = reversed(state.delimiters)
+    return shown.rstrip() + "".join(
+        state.tokens[d.token].content for d in pending if d.open and not d.close and d.end < 0
+    )
 
 
 def build_thread_relation(

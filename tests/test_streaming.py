@@ -821,6 +821,37 @@ def test_only_in_progress_edits_hide_an_unfinished_interactive_block(config: Con
     assert "```interactive" in streaming_mod._prepare_delivery_from_snapshot(final).display_text
 
 
+def test_only_in_progress_edits_close_partial_markdown_in_the_formatted_body(config: Config) -> None:
+    """Open Markdown renders as formatting while streaming; the plain body and the final edit keep the text."""
+    streaming = StreamingResponse(
+        target=MessageTarget.resolve("!test:localhost", "$thread", "$reply"),
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+    )
+    streaming.accumulated_text = "**Lisbon is on both your"
+    progress = streaming._delivery_snapshot(is_final=False, allow_empty_progress=False, stream_status=None)
+    final = streaming._delivery_snapshot(
+        is_final=True,
+        allow_empty_progress=False,
+        stream_status=STREAM_STATUS_COMPLETED,
+    )
+    assert progress is not None
+    assert final is not None
+
+    in_progress = streaming_mod._prepare_delivery_from_snapshot(progress)
+    assert in_progress.content["formatted_body"] == "<p><strong>Lisbon is on both your</strong></p>\n"
+    assert in_progress.content["body"] == "**Lisbon is on both your"
+    assert in_progress.committed_state.rendered_body == "**Lisbon is on both your"
+    final_content = streaming_mod._prepare_delivery_from_snapshot(final).content
+    assert final_content["formatted_body"] == "<p>**Lisbon is on both your</p>\n"
+
+    streaming.accumulated_text = "| Rule | Vantr"
+    table_progress = streaming._delivery_snapshot(is_final=False, allow_empty_progress=False, stream_status=None)
+    assert table_progress is not None
+    table_content = streaming_mod._prepare_delivery_from_snapshot(table_progress).content
+    assert table_content["formatted_body"] == "<p>Thinking...</p>\n"
+
+
 def test_only_a_final_edit_warns_about_an_unfinished_interactive_block(config: Config) -> None:
     """A block still arriving is not malformed yet; only a final reply that never closes it logs a warning."""
     streaming = StreamingResponse(

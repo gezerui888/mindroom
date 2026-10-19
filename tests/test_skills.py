@@ -7,6 +7,7 @@ import os
 import platform
 import threading
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
@@ -32,8 +33,6 @@ from tests.conftest import SETTLE_TIMEOUT_SECONDS, make_conversation_reader_mock
 from tests.cpu_budget_helpers import cpu_budget
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from agno.skills import Skills
 
 
@@ -530,13 +529,46 @@ def test_malformed_workspace_skill_is_skipped(tmp_path: Path) -> None:
     assert _skill_names(skills) == ["good"]
 
 
-def test_workspace_skill_script_read_allowed_but_execute_blocked(tmp_path: Path) -> None:
-    """Workspace skill scripts can be read but not executed through skill tools."""
+@pytest.mark.parametrize("shell_storage_root", [None, "/app/worker"])
+def test_workspace_skill_script_read_allowed_but_execute_names_the_shell_path(
+    tmp_path: Path,
+    shell_storage_root: str | None,
+) -> None:
+    """Workspace skill scripts are read through skill tools, and a refused run names where the agent's shell finds it."""
     storage = tmp_path / "storage"
     workspace_skills = agent_workspace_root_path(storage, "code") / "skills"
     workspace_skills.mkdir(parents=True)
     skill_path = _write_skill(workspace_skills, "scripted", "Scripted workspace skill")
-    _write_skill_script(skill_path.parent, "hello.sh", "#!/bin/sh\necho workspace\n")
+    marker = tmp_path / "script-ran"
+    _write_skill_script(skill_path.parent, "hello.sh", f"#!/bin/sh\ntouch {marker}\n")
+
+    skills = build_agent_skills(
+        "code",
+        _base_config([]),
+        _runtime_paths(storage),
+        skill_roots=[tmp_path / "global"],
+        env_vars={},
+        credential_keys=set(),
+        shell_storage_root=None if shell_storage_root is None else lambda: Path(shell_storage_root),
+    )
+    assert skills is not None
+
+    read_result = _get_skill_script(skills, "scripted", "hello.sh", execute=False)
+    assert read_result["content"] == f"#!/bin/sh\ntouch {marker}\n"
+
+    execute_result = _get_skill_script(skills, "scripted", "hello.sh", execute=True)
+    shell_root = storage.resolve() if shell_storage_root is None else Path(shell_storage_root)
+    assert str(shell_root / "agents/code/workspace/skills/scripted/scripts/hello.sh") in execute_result["error"]
+    assert "shell tool" in execute_result["error"]
+    assert not marker.exists()
+
+
+def test_running_a_script_a_workspace_skill_does_not_list_names_its_scripts(tmp_path: Path) -> None:
+    """A run of a script the skill does not list points at the scripts it has instead of a path that does not exist."""
+    storage = tmp_path / "storage"
+    workspace_skills = agent_workspace_root_path(storage, "code") / "skills"
+    workspace_skills.mkdir(parents=True)
+    _write_skill_script(_write_skill(workspace_skills, "scripted", "Scripted skill").parent, "hello.sh", "echo hi\n")
 
     skills = build_agent_skills(
         "code",
@@ -548,11 +580,10 @@ def test_workspace_skill_script_read_allowed_but_execute_blocked(tmp_path: Path)
     )
     assert skills is not None
 
-    read_result = _get_skill_script(skills, "scripted", "hello.sh", execute=False)
-    assert read_result["content"] == "#!/bin/sh\necho workspace\n"
-
-    execute_result = _get_skill_script(skills, "scripted", "hello.sh", execute=True)
-    assert execute_result["error"] == "Workspace skill scripts cannot be executed through get_skill_script"
+    execute_result = _get_skill_script(skills, "scripted", "missing.sh", execute=True)
+    assert "missing.sh" in execute_result["error"]
+    assert execute_result["available_scripts"] == ["hello.sh"]
+    assert "scripts/missing.sh" not in execute_result["error"]
 
 
 def _workspace_skills(tmp_path: Path) -> tuple[Path, Path]:

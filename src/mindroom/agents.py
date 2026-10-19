@@ -99,7 +99,7 @@ from mindroom.tool_system.worker_routing import (
     resolve_agent_owned_path,
     shared_storage_root,
 )
-from mindroom.workers.runtime import primary_worker_backend_name
+from mindroom.workers.runtime import primary_worker_backend_name, worker_visible_storage_root
 from mindroom.workspaces import ensure_workspace_template
 
 if TYPE_CHECKING:
@@ -1437,6 +1437,7 @@ def _load_agent_skills(
     runtime_paths: constants.RuntimePaths,
     *,
     workspace_root: Path | None = None,
+    shell_storage_root: Callable[[], Path | None] | None = None,
     output_file_policy: ToolOutputFilePolicy | None = None,
     only: tuple[str, ...] | None = None,
 ) -> Skills | None:
@@ -1445,6 +1446,7 @@ def _load_agent_skills(
         config,
         runtime_paths,
         workspace_root=workspace_root,
+        shell_storage_root=shell_storage_root,
         output_file_policy=output_file_policy,
         only=only,
     )
@@ -2229,6 +2231,12 @@ def create_agent(  # noqa: PLR0915
             config,
             runtime_paths,
             workspace_root=workspace.root if workspace is not None else None,
+            # Looked up only when needed, so a worker backend's config is never read to build an agent.
+            shell_storage_root=(
+                partial(worker_visible_storage_root, runtime_paths)
+                if "shell" in tool_assembly.worker_routed_tool_names
+                else None
+            ),
             output_file_policy=_agent_tool_output_file_policy(
                 agent_runtime,
                 runtime_paths,

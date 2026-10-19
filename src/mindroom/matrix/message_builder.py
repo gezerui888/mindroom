@@ -513,8 +513,14 @@ def close_partial_markdown(text: str) -> str:
         return "\n".join(lines[:table_start]).rstrip()
     # Only the last block's inline text is still arriving, after any list or quote marker or the row's earlier
     # cells. A table pads a row still arriving with empty cells, so the cell being written is the last with text.
-    inline_text = next((token.content for token in reversed(blocks) if token.content), "")
-    inline_start = len(text) - len(commonprefix([text[::-1], inline_text[::-1]]))
+    inline_lines = next((token.content for token in reversed(blocks) if token.content), "").split("\n")
+    if not lines[-1].endswith(inline_lines[-1]):
+        # A setext underline or the row's closing pipe follows the text, so there is nothing still open to close.
+        return text
+    # Each of its lines ends a source line, after the quote marker or indent that line may start with.
+    first_line, *later_lines = lines[-len(inline_lines) :]
+    first_line_text = commonprefix([first_line[::-1], inline_lines[0][::-1]])
+    inline_start = len(text) - len("\n".join([first_line_text, *later_lines]))
     return text[:inline_start] + _close_partial_inline(text[inline_start:])
 
 
@@ -576,9 +582,12 @@ def _match_emphasis_run(openers: _EmphasisOpeners, text: str, start: int, end: i
         can_close = right_flanking and (not left_flanking or after_is_punctuation)
     run, stack = text[start:end], openers[text[start]]
     if can_close and stack:
-        opened_at, opener, surely_opens = stack.pop()
-        if len(opener) > len(run):  # A closing ``*`` of ``**`` still leaves one ``*`` open.
-            stack.append((opened_at, opener[len(run) :], surely_opens))
+        unmatched = len(run)  # A closing ``***`` closes an inner ``*`` and then an outer ``**``.
+        while unmatched > 0 and stack:
+            opened_at, opener, surely_opens = stack.pop()
+            if len(opener) > unmatched:  # A closing ``*`` of ``**`` still leaves one ``*`` open.
+                stack.append((opened_at, opener[unmatched:], surely_opens))
+            unmatched -= len(opener)
         # Runs opened inside the span this run closes stay literal, as CommonMark leaves them.
         for other in openers.values():
             while other and other[-1][0] > opened_at:

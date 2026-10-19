@@ -40,6 +40,7 @@ from tests.cpu_budget_helpers import cpu_budget
         ("**Not closed\n\nNext *one", "**Not closed\n\nNext *one*"),
         ("- **First**\n- Second **is", "- **First**\n- Second **is**"),
         ("> Quoted **text", "> Quoted **text**"),
+        ("> **Quoted\n> text", "> **Quoted\n> text**"),
         ("## The **plan", "## The **plan**"),
         # A table waits for its separator row, then streams row by row.
         ("Three rules differ:\n\n| Rule | Vantr", "Three rules differ:"),
@@ -68,6 +69,13 @@ def test_partial_markdown_is_shown_as_it_will_render(streamed: str, shown: str) 
         "[@Quill](https://matrix.to/#/@mindroom_quill:localhost) has the **draft**",
         "🔧 `web_search` [1]",
         "Done \\*not bold",
+        # Nested emphasis closed by one run, spans across quote or list item lines, and a setext heading.
+        "**Bold *italic*** more text",
+        "*a **b*** more text",
+        "> **first\n> second**",
+        "- **first\n  second**",
+        "> Use `a\n> b` and",
+        "Title **a\n**a\n===",
         # Tables that already render.
         "| Rule | Vantrell |\n|---|---|\n| Hotels | $250",
         "| Rule | Vantrell |\n|---|---|",

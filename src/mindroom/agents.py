@@ -73,7 +73,12 @@ from mindroom.tool_system.catalog import (
     ensure_tool_registry_loaded,
     get_tool_by_name,
 )
-from mindroom.tool_system.construction import ToolConstruction, bind_toolkit_construction, tool_config_signature
+from mindroom.tool_system.construction import (
+    ToolConstruction,
+    bind_toolkit_construction,
+    get_toolkit_construction,
+    tool_config_signature,
+)
 from mindroom.tool_system.declarations import (
     MATRIX_ROOM_RUNTIME_APPROVAL_TYPE,
     MATRIX_ROOM_RUNTIME_TOOL_NAMES,
@@ -91,6 +96,7 @@ from mindroom.tool_system.output_files import ToolOutputFilePolicy, wrap_toolkit
 from mindroom.tool_system.plugins import load_plugins
 from mindroom.tool_system.runtime_context import ToolDispatchContext
 from mindroom.tool_system.sandbox_proxy import sandbox_proxy_enabled_for_tool
+from mindroom.tool_system.skill_scripts import SkillScriptShell
 from mindroom.tool_system.skills import SKILL_FUNCTION_NAMES, agent_workspace_skills_root, build_agent_skills
 from mindroom.tool_system.tool_hooks import build_tool_hook_bridge, prepend_tool_hook_bridge
 from mindroom.tool_system.worker_routing import (
@@ -1437,7 +1443,7 @@ def _load_agent_skills(
     runtime_paths: constants.RuntimePaths,
     *,
     workspace_root: Path | None = None,
-    shell_storage_root: Callable[[], Path | None] | None = None,
+    script_shell: SkillScriptShell | None = None,
     output_file_policy: ToolOutputFilePolicy | None = None,
     only: tuple[str, ...] | None = None,
 ) -> Skills | None:
@@ -1446,10 +1452,32 @@ def _load_agent_skills(
         config,
         runtime_paths,
         workspace_root=workspace_root,
-        shell_storage_root=shell_storage_root,
+        script_shell=script_shell,
         output_file_policy=output_file_policy,
         only=only,
     )
+
+
+def _skill_script_shell(
+    tool_assembly: _AgentToolAssembly,
+    runtime_paths: constants.RuntimePaths,
+) -> SkillScriptShell | None:
+    """Return the agent's shell tool, as routing built it, for its skill scripts to run through; None without one."""
+    for toolkit in tool_assembly.tools:
+        construction = get_toolkit_construction(toolkit)
+        function = toolkit.get_async_functions().get("run_shell_command")
+        if construction is None or construction.name != "shell" or function is None:
+            continue
+        return SkillScriptShell(
+            function=function,
+            storage_root=runtime_paths.storage_root,
+            worker_storage_root=(
+                partial(worker_visible_storage_root, runtime_paths)
+                if "shell" in tool_assembly.worker_routed_tool_names
+                else None
+            ),
+        )
+    return None
 
 
 @timed("system_prompt_assembly.agent_create.agent_init")
@@ -2231,13 +2259,7 @@ def create_agent(  # noqa: PLR0915
             config,
             runtime_paths,
             workspace_root=workspace.root if workspace is not None else None,
-            # Looked up only when get_skill_script refuses to run a workspace skill script and names its path,
-            # so an incomplete worker backend config fails that call instead of agent creation.
-            shell_storage_root=(
-                partial(worker_visible_storage_root, runtime_paths)
-                if "shell" in tool_assembly.worker_routed_tool_names
-                else None
-            ),
+            script_shell=_skill_script_shell(tool_assembly, runtime_paths),
             output_file_policy=_agent_tool_output_file_policy(
                 agent_runtime,
                 runtime_paths,

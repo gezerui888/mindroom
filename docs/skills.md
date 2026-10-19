@@ -123,8 +123,12 @@ Agents see their available skills in the system prompt and load details with the
 - `get_skill_reference(skill_name, reference_path)` reads a reference document
 - `get_skill_script(skill_name, script_path, execute=False, args=None, timeout=30)` reads or executes a script
 
-Workspace skill scripts can be read with `get_skill_script`, but not executed through it.
-Agents with shell or file execution tools can still run workspace files through those tools.
+`get_skill_script` with `execute=True` runs the script as a command of the agent's own `shell` tool, so it runs where the agent's shell commands run, such as its worker, in its workspace, with the shell's environment, tool hooks, and output limits, and stops after `timeout` seconds.
+The script's `#!` line picks its interpreter, so a script needs no executable bit.
+An agent without the `shell` tool can read skill scripts but not run them.
+While the agent's shell commands need [approval](tool-approval.md), `get_skill_script` runs nothing and returns the command, which the agent can run with its shell tool to ask for approval.
+A script runs in a worker only when the worker can see the skill's directory, as dedicated workers see the agent's workspace skills.
+A bundled, plugin, or user skill's directory must be mounted or installed in the worker, at the matching path below the worker's storage mount when it lies below the storage root, or at the same path otherwise.
 
 Added, removed, or edited `SKILL.md` files take effect on the agent's next request, within about a second.
 A workspace skill created during a turn becomes available on the next agent run, not in the same response.

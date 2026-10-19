@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import platform
 import threading
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
@@ -33,6 +33,8 @@ from tests.conftest import SETTLE_TIMEOUT_SECONDS, make_conversation_reader_mock
 from tests.cpu_budget_helpers import cpu_budget
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from agno.skills import Skills
 
 
@@ -105,7 +107,7 @@ def _skill_names(skills: Skills | None) -> list[str]:
 def _get_skill_script(skills: Skills, skill_name: str, script_path: str, *, execute: bool) -> dict[str, object]:
     script_tool = next(tool for tool in skills.get_tools() if tool.name == "get_skill_script")
     assert script_tool.entrypoint is not None
-    return json.loads(script_tool.entrypoint(skill_name, script_path, execute=execute))
+    return json.loads(asyncio.run(script_tool.entrypoint(skill_name, script_path, execute=execute)))
 
 
 def test_bundled_mindroom_docs_skill_is_discoverable() -> None:
@@ -529,25 +531,22 @@ def test_malformed_workspace_skill_is_skipped(tmp_path: Path) -> None:
     assert _skill_names(skills) == ["good"]
 
 
-@pytest.mark.parametrize("shell_storage_root", [None, "/app/worker"])
-def test_workspace_skill_script_read_allowed_but_execute_names_the_shell_path(
-    tmp_path: Path,
-    shell_storage_root: str | None,
-) -> None:
-    """Workspace skill scripts are read through skill tools, and a refused run names where the agent's shell finds it."""
+@pytest.mark.parametrize("workspace_skill", [True, False], ids=["workspace", "configured"])
+def test_skill_script_read_allowed_but_execute_needs_a_shell(tmp_path: Path, workspace_skill: bool) -> None:
+    """Without the agent's shell tool, skill tools read a script but never run it, whichever root the skill is in."""
     storage, workspace_skills = _workspace_skills(tmp_path)
-    skill_path = _write_skill(workspace_skills, "scripted", "Scripted workspace skill")
+    skills_root = workspace_skills if workspace_skill else tmp_path / "global"
+    skill_path = _write_skill(skills_root, "scripted", "Scripted skill")
     marker = tmp_path / "script-ran"
     _write_skill_script(skill_path.parent, "hello.sh", f"#!/bin/sh\ntouch {marker}\n")
 
     skills = build_agent_skills(
         "code",
-        _base_config([]),
+        _base_config([] if workspace_skill else ["scripted"]),
         _runtime_paths(storage),
         skill_roots=[tmp_path / "global"],
         env_vars={},
         credential_keys=set(),
-        shell_storage_root=None if shell_storage_root is None else lambda: Path(shell_storage_root),
     )
     assert skills is not None
 
@@ -555,24 +554,9 @@ def test_workspace_skill_script_read_allowed_but_execute_names_the_shell_path(
     assert read_result["content"] == f"#!/bin/sh\ntouch {marker}\n"
 
     execute_result = _get_skill_script(skills, "scripted", "hello.sh", execute=True)
-    shell_root = storage.resolve() if shell_storage_root is None else Path(shell_storage_root)
-    assert str(shell_root / "agents/code/workspace/skills/scripted/scripts/hello.sh") in execute_result["error"]
     assert "shell tool" in execute_result["error"]
+    assert "execute=false" in execute_result["error"]
     assert not marker.exists()
-
-
-def test_running_a_script_a_workspace_skill_does_not_list_names_its_scripts(tmp_path: Path) -> None:
-    """A run of a script the skill does not list points at the scripts it has instead of a path that does not exist."""
-    storage, workspace_skills = _workspace_skills(tmp_path)
-    _write_skill_script(_write_skill(workspace_skills, "scripted", "Scripted skill").parent, "hello.sh", "echo hi\n")
-
-    skills = _load_workspace_only(tmp_path, storage)
-    assert skills is not None
-
-    execute_result = _get_skill_script(skills, "scripted", "missing.sh", execute=True)
-    assert "missing.sh" in execute_result["error"]
-    assert execute_result["available_scripts"] == ["hello.sh"]
-    assert "scripts/missing.sh" not in execute_result["error"]
 
 
 def _workspace_skills(tmp_path: Path) -> tuple[Path, Path]:
@@ -682,28 +666,6 @@ def test_workspace_skill_references_are_read_without_following_links(tmp_path: P
     assert "victim-only note" not in json.dumps(swapped)
     assert "error" in swapped
     assert "error" in _get_skill_reference(skills, "docs", "planted.md")
-
-
-def test_non_workspace_skill_script_execute_unchanged(tmp_path: Path) -> None:
-    """Configured non-workspace skill scripts keep Agno execute behavior."""
-    global_root = tmp_path / "global"
-    global_root.mkdir()
-    skill_path = _write_skill(global_root, "scripted", "Scripted global skill")
-    _write_skill_script(skill_path.parent, "hello.sh", "#!/bin/sh\necho global\n")
-
-    skills = build_agent_skills(
-        "code",
-        _base_config(["scripted"]),
-        _runtime_paths(tmp_path / "storage"),
-        skill_roots=[global_root],
-        env_vars={},
-        credential_keys=set(),
-    )
-    assert skills is not None
-
-    execute_result = _get_skill_script(skills, "scripted", "hello.sh", execute=True)
-    assert execute_result["stdout"] == "global\n"
-    assert execute_result["returncode"] == 0
 
 
 def test_workspace_skills_reload_after_dir_created_late(tmp_path: Path) -> None:

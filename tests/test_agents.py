@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
 import re
 import shutil
@@ -4356,47 +4355,6 @@ async def test_create_agent_prompts_omit_skill_and_knowledge_functions_approval_
     assert message is not None
     for advertised in ("<skills_system>", "get_skill_instructions", "get_skill_script", "search_knowledge_base"):
         assert advertised not in str(message.content)
-
-
-@pytest.mark.parametrize("shell_in_worker", [False, True])
-@pytest.mark.asyncio
-async def test_refused_workspace_skill_script_names_the_path_the_agents_shell_sees(
-    tmp_path: Path,
-    shell_in_worker: bool,
-) -> None:
-    """An agent whose shell runs in a dedicated worker is pointed at the worker's mount of its workspace skill script."""
-    runtime_paths = resolve_runtime_paths(
-        config_path=tmp_path / "config.yaml",
-        storage_path=tmp_path / "storage",
-        process_env={
-            "MINDROOM_WORKER_BACKEND": "docker",
-            "MINDROOM_DOCKER_WORKER_IMAGE": "mindroom-worker:test",
-            "MINDROOM_DOCKER_WORKER_STORAGE_MOUNT_PATH": "/srv/worker-storage",
-            "MINDROOM_SANDBOX_PROXY_TOKEN": "test-token",
-        },
-    )
-    config = _test_config()
-    config.agents["general"].tools = ["shell"]
-    config.agents["general"].include_default_tools = False
-    config.agents["general"].worker_tools = ["shell"] if shell_in_worker else []
-    config.agents["general"].worker_scope = "shared"
-    config = _bind_runtime_paths(config, runtime_paths)
-    skill_dir = agent_workspace_root_path(runtime_paths.storage_root, "general") / "skills" / "xl_check"
-    (skill_dir / "scripts").mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text("---\nname: xl_check\ndescription: Check a workbook\n---\n\nRun check.py.\n")
-    (skill_dir / "scripts" / "check.py").write_text("print('checked')\n")
-
-    functions = await _generated_functions(_create_agent_for_test("general", config))
-    call = FunctionCall(
-        function=functions["get_skill_script"],
-        arguments={"skill_name": "xl_check", "script_path": "check.py", "execute": True},
-        call_id="call-1",
-    )
-    await call.aexecute()
-
-    shell_storage_root = Path("/srv/worker-storage") if shell_in_worker else runtime_paths.storage_root
-    expected = shell_storage_root / "agents" / "general" / "workspace" / "skills" / "xl_check" / "scripts" / "check.py"
-    assert str(expected) in json.loads(str(call.result))["error"]
 
 
 @pytest.mark.asyncio

@@ -899,6 +899,7 @@ depends_on = [
     "mindroom.tool_system.plugins",
     "mindroom.tool_system.runtime_context",
     "mindroom.tool_system.sandbox_proxy",
+    "mindroom.tool_system.skill_scripts",
     "mindroom.tool_system.skills",
     "mindroom.tool_system.tool_hooks",
     "mindroom.tool_system.worker_routing",
@@ -1371,6 +1372,7 @@ visibility = [
     "mindroom.skill_learning.reviewer",
     "mindroom.tool_jobs.agno_execution",
     "mindroom.tool_jobs.approvals",
+    "mindroom.tool_system.skill_scripts",
 ]
 
 [[modules]]
@@ -5331,6 +5333,11 @@ depends_on = [
     "mindroom.tool_system.skill_usage",
     "mindroom.tool_system.worker_routing",
 ]
+
+[[modules]]
+path = "mindroom.tool_system.skill_scripts"
+depends_on = ["mindroom.approval.tool_approval"]
+visibility = ["mindroom.agents"]
 
 [[modules]]
 path = "mindroom.tool_system.skill_usage"

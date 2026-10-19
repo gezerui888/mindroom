@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.tool_system.skill_scripts import SkillScriptShell
 
 logger = get_logger(__name__)
 
@@ -56,6 +58,16 @@ MAX_WORKSPACE_SKILL_DESCRIPTION_CHARS = 1024
 _MAX_WORKSPACE_SKILL_LISTING_ENTRIES = 256
 # Worker code can plant any number of entries, so a workspace skill listing examines only this many.
 _MAX_WORKSPACE_SKILL_SCANNED_ENTRIES = 1024
+# Linux reads at most this much of a script to find the interpreter its #! line names.
+_SCRIPT_HEAD_BYTES = 256
+_NO_SHELL_ERROR = (
+    "Skill scripts run as commands of your shell tool, which you do not have loaded; "
+    "read the script with execute=false instead."
+)
+_SHELL_APPROVAL_ERROR = (
+    "Your shell commands can need approval, which get_skill_script cannot wait for; "
+    "run this command with your shell tool instead:"
+)
 _FRONTMATTER_PATTERN = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", re.DOTALL)
 
 _OS_ALIASES = {
@@ -138,13 +150,12 @@ class _MindroomSkills(Skills):
         self,
         *,
         loaders: list[SkillLoader],
-        shell_workspace_root: Callable[[], Path],
+        script_shell: SkillScriptShell | None = None,
         output_file_policy: ToolOutputFilePolicy | None = None,
         only: Collection[str] | None = None,
     ) -> None:
         self._workspace_roots_by_skill: dict[str, Path] = {}
-        # Looks up where the agent's shell tool sees the workspace that the workspace loader reads.
-        self._shell_workspace_root = shell_workspace_root
+        self._script_shell = script_shell
         self._output_file_policy = output_file_policy
         self._only = None if only is None else frozenset(only)
         super().__init__(loaders=loaders)
@@ -227,39 +238,73 @@ class _MindroomSkills(Skills):
             return super()._get_skill_reference(skill_name, reference_path)
         return json.dumps({"skill_name": skill_name, "reference_path": reference_path, **content})
 
-    def _get_skill_script(
+    # AGNO_COMPAT: Skills runs a skill script in the process that holds the Skills object.
+    # Reason: Agno 3.0.9 Skills._get_skill_script runs a script as a subprocess of the primary process and has no hook
+    #   to run it elsewhere, so every script runs as a command of the agent's own shell tool instead, which takes it
+    #   wherever the agent's shell commands go, with their hooks and limits.
+    # Upstream issue: Tracking gap; no issue for choosing where skill scripts run has been identified.
+    # Upstream PR: None identified.
+    # Remove when: Skills lets an application supply how a script runs; refusing to run one without a shell tool, or
+    #   while shell commands need approval, remains MindRoom policy.
+    # Coverage: tests/test_skill_scripts.py::test_skill_scripts_run_in_the_worker_of_the_agents_shell;
+    #   tests/test_skill_scripts.py::test_skill_scripts_need_the_agents_shell.
+    async def _get_skill_script(  # ty: ignore[invalid-method-override]  # Agno awaits async tools
         self,
         skill_name: str,
         script_path: str | None = None,
         execute: bool = False,
         args: list[str] | None = None,
-        timeout: int = 30,
+        timeout: int = 30,  # noqa: ASYNC109 - the script's own time limit, which the shell enforces
     ) -> str:
-        if execute and (workspace_root := self._workspace_roots_by_skill.get(skill_name)) is not None:
-            skill = self.get_skill(skill_name)
-            if skill is None or script_path not in skill.scripts:
-                # Agno reports a missing or unlisted script, and the scripts the skill has, without reading any.
-                return super()._get_skill_script(skill_name=skill_name, script_path=script_path)
-            skill_dir = self._shell_workspace_root() / Path(skill.source_path).relative_to(workspace_root)
-            return json.dumps(
-                {
-                    "error": (
-                        "Workspace skill scripts cannot be executed through get_skill_script; "
-                        f"run {skill_dir / 'scripts' / script_path} with your shell tool instead, if you have one"
-                    ),
-                    "skill_name": skill_name,
-                    "script_path": script_path,
-                },
-            )
-        content = None if execute else self._read_workspace_skill_file(skill_name, "scripts", script_path)
+        skill = self.get_skill(skill_name)
+        if skill is None or script_path not in skill.scripts:
+            # Agno reports a missing skill or script, and what the skill has, without reading or running anything.
+            return super()._get_skill_script(skill_name=skill_name, script_path=script_path)
+        if execute:
+            return await self._run_script(skill, script_path, args or [], timeout)
+        content = self._read_workspace_skill_file(skill_name, "scripts", script_path)
         if content is not None:
             return json.dumps({"skill_name": skill_name, "script_path": script_path, **content})
-        return super()._get_skill_script(
-            skill_name=skill_name,
-            script_path=script_path,
-            execute=execute,
-            args=args,
-            timeout=timeout,
+        return super()._get_skill_script(skill_name=skill_name, script_path=script_path)
+
+    async def _run_script(
+        self,
+        skill: Skill,
+        script_path: str,
+        args: list[str],
+        timeout: int,  # noqa: ASYNC109 - the script's own time limit, which the shell enforces
+    ) -> str:
+        """Run one listed script as a command of the agent's shell tool, or say why it cannot run."""
+        reply = {"skill_name": skill.name, "script_path": script_path}
+        shell = self._script_shell
+        if shell is None:
+            return json.dumps({"error": _NO_SHELL_ERROR, **reply})
+        script = Path(skill.source_path) / "scripts" / script_path
+        try:
+            head = self._script_head(skill.name, script)
+        except (OSError, ValueError) as exc:
+            logger.warning("Refused a skill script", path=str(script), error=str(exc))
+            return json.dumps({"error": f"Error reading skill script {script_path}: {type(exc).__name__}", **reply})
+        command = shlex.join([*_script_interpreter(head), str(shell.visible_path(script)), *args])
+        if shell.needs_approval:
+            return json.dumps({"error": f"{_SHELL_APPROVAL_ERROR} {command}", **reply})
+        self._record_use(skill.name)
+        execution = await shell.run(command, timeout=timeout)
+        if execution.status == "failure":
+            return json.dumps({"error": execution.error or "The shell tool failed", **reply})
+        return str(execution.result)
+
+    def _script_head(self, skill_name: str, script: Path) -> bytes:
+        """Read the start of a listed script, which names its interpreter, never following links in a workspace."""
+        workspace_root = self._workspace_roots_by_skill.get(skill_name)
+        if workspace_root is None:
+            with script.open("rb") as file:
+                return file.read(_SCRIPT_HEAD_BYTES)
+        return read_regular_file_within_root(
+            workspace_root,
+            script.relative_to(workspace_root),
+            max_bytes=_SCRIPT_HEAD_BYTES,
+            truncate=True,
         )
 
     def _read_workspace_skill_file(
@@ -290,6 +335,14 @@ class _MindroomSkills(Skills):
         return {"content": content}
 
 
+def _script_interpreter(head: bytes) -> list[str]:
+    """Return the interpreter, and the one argument it may take, that a script's ``#!`` line names, as Linux splits it."""
+    line = head.split(b"\n", 1)[0]
+    if not line.startswith(b"#!"):
+        return []
+    return line[2:].decode(errors="replace").strip().split(maxsplit=1)
+
+
 def build_agent_skills(
     agent_name: str,
     config: Config,
@@ -297,7 +350,7 @@ def build_agent_skills(
     *,
     skill_roots: Sequence[Path] | None = None,
     workspace_root: Path | None = None,
-    shell_storage_root: Callable[[], Path | None] | None = None,
+    script_shell: SkillScriptShell | None = None,
     env_vars: Mapping[str, str] | None = None,
     credential_keys: set[str] | None = None,
     output_file_policy: ToolOutputFilePolicy | None = None,
@@ -305,8 +358,7 @@ def build_agent_skills(
 ) -> Skills | None:
     """Build an Agno Skills object for a specific agent, narrowed to the skill names in ``only`` when set.
 
-    ``shell_storage_root`` looks up where the agent's shell tool sees the storage root when that tool runs in a
-    worker; only a refused run of a workspace skill script calls it, to name the path the shell can run.
+    ``script_shell`` is the agent's shell tool, which runs its skill scripts; without it none run.
     """
     if only is not None and not only:
         return None
@@ -326,15 +378,17 @@ def build_agent_skills(
             credential_keys=resolved_credential_keys,
         )
 
-    if workspace_root is None:
-        workspace_root = agent_workspace_root_path(runtime_paths.storage_root, agent_name)
     workspace_loader = _WorkspaceSkillsLoader(
         roots=(),
         config=config,
         runtime_paths=runtime_paths,
         env_vars=env_vars,
         credential_keys=resolved_credential_keys,
-        workspace_root=workspace_root,
+        workspace_root=(
+            workspace_root
+            if workspace_root is not None
+            else agent_workspace_root_path(runtime_paths.storage_root, agent_name)
+        ),
     )
 
     loaders: list[SkillLoader]
@@ -345,12 +399,7 @@ def build_agent_skills(
 
     skills = _MindroomSkills(
         loaders=loaders,
-        shell_workspace_root=partial(
-            _shell_workspace_root,
-            workspace_root,
-            storage_root=runtime_paths.storage_root,
-            shell_storage_root=shell_storage_root,
-        ),
+        script_shell=script_shell,
         output_file_policy=output_file_policy,
         only=only,
     )
@@ -358,17 +407,6 @@ def build_agent_skills(
     if skills.get_skill_names() or (agent_config.skills and only is None):
         return skills
     return None
-
-
-def _shell_workspace_root(
-    workspace_root: Path,
-    *,
-    storage_root: Path,
-    shell_storage_root: Callable[[], Path | None] | None,
-) -> Path:
-    """Return where the agent's shell tool sees ``workspace_root``: a worker mounts it below its own storage root."""
-    shell_root = None if shell_storage_root is None else shell_storage_root()
-    return workspace_root if shell_root is None else shell_root / workspace_root.relative_to(storage_root)
 
 
 @dataclass(frozen=True)

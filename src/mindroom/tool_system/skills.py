@@ -545,13 +545,16 @@ def skill_directories_with_scripts(skill_names: Collection[str]) -> tuple[Path, 
     """Return the directory of each bundled, plugin, or user skill with scripts that has one of these names.
 
     A name in several skill roots returns each directory, because which one an agent loads also depends on eligibility.
+    Sorted, so worker mount layouts and pod templates do not depend on directory listing order.
     """
     return tuple(
-        dict.fromkeys(
-            Path(skill.source_path)
-            for root in _resolve_configured_skill_roots()
-            for skill in _load_root_skills(root)
-            if skill.scripts and isinstance(skill.name, str) and skill.name.strip() in skill_names
+        sorted(
+            {
+                Path(skill.source_path)
+                for root in _resolve_configured_skill_roots()
+                for skill in _load_root_skills(root)
+                if skill.scripts and isinstance(skill.name, str) and skill.name.strip() in skill_names
+            },
         ),
     )
 

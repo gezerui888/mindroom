@@ -4,6 +4,7 @@ import re
 from collections.abc import Callable, Mapping
 from html import escape, unescape
 from html.parser import HTMLParser
+from os.path import commonprefix
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -118,6 +119,9 @@ _ALLOWED_STYLE_PROPERTIES = frozenset(
 )
 _SAFE_STYLE_VALUE_PATTERN = re.compile(r"[#(),.%\s0-9A-Za-z-]+")
 _HTML_FRAGMENT_OPENER_PATTERN = re.compile(r"<(?:!--|\?|![A-Za-z]|/?[A-Za-z])")
+_PIPE_TABLE_LINE_PATTERN = re.compile(r" {0,3}\|")
+# An escape, a code span or emphasis run, or a link bracket: inline markup a cut-off reply can leave open.
+_PARTIAL_INLINE_MARKUP_PATTERN = re.compile(r"\\.|`+|\*+|_+|~~|\[|\]\(?")
 _HTML_LINE_PATTERN = re.compile(r"[^\r\n]+")
 _RAW_HTML_TAG_LINE_START_PATTERN = re.compile(
     r"^([ ]{0,3})(</?([A-Za-z][A-Za-z0-9-]*)(?:\s[^<>]*)?/?>)",
@@ -458,6 +462,8 @@ def _build_markdown_renderer() -> MarkdownIt:
 
 
 _MARKDOWN_RENDERER = _build_markdown_renderer()
+# Block structure without inline parsing, which is linear and much cheaper than a full parse.
+_MARKDOWN_BLOCK_PARSER = _build_markdown_renderer().disable("inline")
 
 
 def markdown_to_html(text: str) -> str:
@@ -483,6 +489,106 @@ def opens_with_markdown_block(text: str) -> bool:
     """
     tokens = _MARKDOWN_RENDERER.parse("\n".join(text.lstrip().split("\n", 2)[:2]))
     return bool(tokens) and tokens[0].type != "paragraph_open"
+
+
+def close_partial_markdown(text: str) -> str:
+    """Shape Markdown cut off mid-stream so it renders the way it will once the rest arrives.
+
+    Cut off, Markdown shows open syntax literally: ``**`` before bold text, ``[`` before a link label,
+    or the pipes of a table whose separator row has not arrived.
+    In the block the text ends in, open emphasis, strikethrough, and code spans are closed, an unfinished
+    link shows its label, and table lines wait until they form a table.
+    Finished blocks, code blocks, and code spans are left as written.
+    """
+    text = _normalize_input_line_endings(text).rstrip()
+    lines = text.split("\n")
+    blocks = [token for token in _MARKDOWN_BLOCK_PARSER.parse(text) if token.map]
+    if not blocks or blocks[-1].type != "inline":
+        # The text ends in code, math, HTML, or a rule, which already render as they stream.
+        return text
+    if blocks[-2].type == "paragraph_open" and _PIPE_TABLE_LINE_PATTERN.match(lines[-1]):
+        table_start = len(lines) - 1
+        while table_start and _PIPE_TABLE_LINE_PATTERN.match(lines[table_start - 1]):
+            table_start -= 1
+        return "\n".join(lines[:table_start]).rstrip()
+    # Only the last block's inline text is still arriving, after any list or quote marker or the row's earlier
+    # cells. A table pads a row still arriving with empty cells, so the cell being written is the last with text.
+    inline_text = next((token.content for token in reversed(blocks) if token.content), "")
+    inline_start = len(text) - len(commonprefix([text[::-1], inline_text[::-1]]))
+    return text[:inline_start] + _close_partial_inline(text[inline_start:])
+
+
+# Open emphasis runs per delimiter character: where each starts, its run, and whether it surely opens.
+type _EmphasisOpeners = dict[str, list[tuple[int, str, bool]]]
+
+
+def _close_partial_inline(text: str) -> str:
+    """Close the emphasis and code span left open at the end of inline text, and show an unfinished link as its label."""
+    openers: _EmphasisOpeners = {"*": [], "_": [], "~": []}
+    link_start: int | None = None
+    end = len(text)
+    open_code_span = ""
+    position = 0
+    while (markup := _PARTIAL_INLINE_MARKUP_PATTERN.search(text, position)) is not None:
+        run, position = markup.group(), markup.end()
+        if run[0] == "`":
+            closing = re.compile(f"(?<!`){run}(?!`)").search(text, position)
+            if closing is None:
+                # The text ends inside this code span; an opener with nothing after it yet is dropped.
+                end = markup.start()
+                open_code_span = text[end:] + run if text[position:].strip() else ""
+                break
+            position = closing.end()
+        elif run == "[":
+            link_start = markup.start()
+        elif run == "](" and link_start is not None:
+            url_end = text.find(")", position)
+            if url_end < 0:
+                end = markup.start()
+                break
+            link_start, position = None, url_end + 1
+        elif run[0] == "]":
+            link_start = None
+        elif run[0] in openers and not _match_emphasis_run(openers, text, markup.start(), markup.end()):
+            end = markup.start()
+    shown = text[:end]
+    if link_start is not None:
+        shown = shown[:link_start] + shown[link_start + 1 :]
+    pending = sorted((opener for stack in openers.values() for opener in stack), reverse=True)
+    closers = "".join(run for _, run, surely_opens in pending if surely_opens)
+    return (shown + open_code_span if open_code_span else shown.rstrip()) + closers
+
+
+def _match_emphasis_run(openers: _EmphasisOpeners, text: str, start: int, end: int) -> bool:
+    """Match the run ``text[start:end]`` against the open runs by CommonMark's flanking rules.
+
+    Returns False for a run that ends the text and closes nothing, which can only open text still to come.
+    """
+    before = text[start - 1] if start else " "
+    after = text[end] if end < len(text) else " "
+    before_is_punctuation = not before.isalnum() and not before.isspace()
+    after_is_punctuation = not after.isalnum() and not after.isspace()
+    left_flanking = not after.isspace() and (not after_is_punctuation or not before.isalnum())
+    right_flanking = not before.isspace() and (not before_is_punctuation or not after.isalnum())
+    can_open, can_close = left_flanking, right_flanking
+    if text[start] == "_":
+        can_open = left_flanking and (not right_flanking or before_is_punctuation)
+        can_close = right_flanking and (not left_flanking or after_is_punctuation)
+    run, stack = text[start:end], openers[text[start]]
+    if can_close and stack:
+        opened_at, opener, surely_opens = stack.pop()
+        if len(opener) > len(run):  # A closing ``*`` of ``**`` still leaves one ``*`` open.
+            stack.append((opened_at, opener[len(run) :], surely_opens))
+        # Runs opened inside the span this run closes stay literal, as CommonMark leaves them.
+        for other in openers.values():
+            while other and other[-1][0] > opened_at:
+                other.pop()
+    elif end == len(text):
+        return False
+    elif can_open:
+        # A run inside a word may also close, so only the text after it can tell; it is not closed here.
+        stack.append((start, run, not can_close))
+    return True
 
 
 def build_thread_relation(

@@ -20,7 +20,7 @@ from agno.tools.function import Function
 from agno.tools.toolkit import Toolkit
 
 from mindroom.agent_cli.agno_compat_cli_checkpoint import inner_cli_dispatch
-from mindroom.agent_cli.shell_contract import SHELL_OPERATION_NAMES
+from mindroom.agent_cli.shell_contract import SHELL_OPERATION_NAMES, SKILL_SCRIPT_FUNCTION_NAME
 from mindroom.agno_compat_prepared_tools import OwnedAgentFunctionCall, prepare_agent_tools, temporary_tool_instructions
 from mindroom.background_tasks import wait_for_future_until_complete
 from mindroom.tool_jobs.control import job_owns_execution
@@ -369,9 +369,10 @@ async def execute_agent_shell_call(
     """Keep canonical hooks and pauses; release mutation only around the shell's own IO.
 
     Only the response owner supplies this leaf, which runs the binding's own shell
-    function, so CLI calls from inside the command can use the catalog meanwhile.
+    function, or the skill function that runs a script through it, so CLI calls from
+    inside the command can use the catalog meanwhile.
     """
-    if binding.key.function not in SHELL_OPERATION_NAMES:
+    if binding.key.function not in (*SHELL_OPERATION_NAMES, SKILL_SCRIPT_FUNCTION_NAME):
         msg = "Shell leaf replacement requires a canonical shell operation"
         raise ValueError(msg)
     stream = _execute_agent_tool_call(

@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shlex
 import time
 from collections.abc import AsyncIterator, Iterator  # noqa: TC003 - Agno evaluates tool annotations
 from contextlib import asynccontextmanager
@@ -58,7 +59,7 @@ from mindroom.tool_system.runtime_context import (
     get_tool_runtime_context,
     tool_runtime_context,
 )
-from mindroom.tool_system.worker_routing import get_tool_execution_identity
+from mindroom.tool_system.worker_routing import agent_workspace_root_path, get_tool_execution_identity
 from tests.access_schema_support import with_responder_access
 from tests.identity_helpers import persist_entity_accounts
 from tests.minimal_agent_fixtures import (  # noqa: F401 - agent_cli_api is a pytest fixture
@@ -464,6 +465,59 @@ async def test_generated_tools_actual_minimal_response(response_harness, monkeyp
     assert all([tool["function"]["name"] for tool in request["tools"]] == ["bash"] for request in h.provider.requests)
     if generated == "learning":
         assert writes == [("helper", h.runtime.requester_id, h.runtime.session_id, "lesson")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shell", ["shell", {"shell": {"defer": True}}], ids=["loaded", "deferred"])
+async def test_skill_script_run_through_the_cli_calls_other_tools_through_it(
+    response_harness,
+    monkeypatch,
+    shell,
+) -> None:
+    """A script that get_skill_script runs is one of the agent's shell commands, so it reaches the CLI as Bash does."""
+    h = response_harness
+    h.runtime.config.agents["helper"] = AgentConfig(
+        display_name="Helper",
+        learning=False,
+        memory_backend="file",
+        tools=[shell, "calculator"],
+    )
+    skill = agent_workspace_root_path(h.runtime.runtime_paths.storage_root, "helper") / "skills" / "xl_check"
+    (skill / "scripts").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: xl_check\ndescription: Check a workbook\n---\n\nRun check.sh.\n")
+    script = skill / "scripts" / "check.sh"
+    script.write_text("#!/bin/sh\nmindroom-agent call calculator add a=2 b=3\n")
+    scripts = []
+
+    async def run_shell_command(args: str, timeout: int = 120, tail: int = 100) -> str:  # noqa: ASYNC109
+        if args.startswith("["):
+            return await h.shell.run_shell_command(args, timeout, tail)
+        # The skill script, whose own CLI call uses the grant and window its shell command was given.
+        scripts.append(args)
+        owner = shell_cli_owner(h.runtime.orchestrator.agent_cli_registry)
+        call_id = uuid4()
+        await owner.operation(
+            window=cli_window(),
+            operation=ToolCallOperation(
+                operation="tools.call",
+                toolkit="calculator",
+                function="add",
+                arguments={"a": 2, "b": 3},
+                call_id=call_id,
+            ),
+        )
+        while (receipt := await owner.get_call(str(call_id)))["status"] in {"queued", "running"}:  # noqa: ASYNC110
+            await asyncio.sleep(0)
+        return "script added: " + str(receipt["outcome"])
+
+    install_scripted_shell(monkeypatch, run_shell_command)
+    arguments = {"skill_name": "xl_check", "script_path": "check.sh", "execute": True}
+
+    result = await h.respond([_bash_call("agent", "get_skill_script", arguments), "done"])
+
+    assert "done" in str(result)
+    assert scripts == [shlex.join(["/bin/sh", str(script)])]
+    assert '"result": 5' in h.shell.receipts[-1]["outcome"]
 
 
 @pytest.mark.asyncio

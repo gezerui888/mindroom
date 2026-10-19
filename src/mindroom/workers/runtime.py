@@ -193,6 +193,7 @@ def serialized_kubernetes_worker_config_snapshot(runtime_config: Config) -> dict
                 "private": (agent_config.private.model_dump(mode="json") if agent_config.private is not None else None),
                 "worker_scope": agent_config.worker_scope,
                 "knowledge_bases": list(agent_config.knowledge_bases),
+                "skills": list(agent_config.skills),
             }
             for agent_name, agent_config in sorted(runtime_config.agents.items())
         },

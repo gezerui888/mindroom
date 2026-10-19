@@ -37,7 +37,7 @@ from mindroom.agent_cli.session import (
     CliOperationError,
     TurnToolBridge,
 )
-from mindroom.agent_cli.shell_contract import bound_agent_cli_shell_env
+from mindroom.agent_cli.shell_contract import SKILL_SCRIPT_FUNCTION_NAME, bound_agent_cli_shell_env
 from mindroom.agno_compat_prepared_tools import stop_function_call
 from mindroom.background_tasks import wait_for_future_until_complete
 from mindroom.cancellation import current_task_is_process_shutdown, request_task_cancel, task_is_process_shutdown
@@ -72,6 +72,8 @@ if TYPE_CHECKING:
 # The catalog separately refuses calls past the agent's per-turn tool-call budget.
 _MAX_CALL_RECEIPTS = 1024
 _MAX_ACTIVE_OPERATIONS = 64
+# Runs a skill's script as a command of the agent's shell, so a CLI call of it runs like one of the shell.
+_SKILL_SCRIPT_KEY = ToolKey("agent", SKILL_SCRIPT_FUNCTION_NAME)
 
 
 class _StaleAttemptError(ValueError):
@@ -491,7 +493,7 @@ class LiveTurnTools(TurnToolBridge):
         *,
         window: str,
     ) -> object:
-        """Run the agent's own shell function, wherever it runs, with the CLI environment of ``window``."""
+        """Run the agent's own shell function, or a skill script through it, with the CLI environment of ``window``."""
         self._check_live()
         if self.shell_env is None:
             msg = "Minimal Bash has no CLI environment"
@@ -746,7 +748,11 @@ class LiveTurnTools(TurnToolBridge):
                 call_id,
                 arguments,
                 parent=window,
-                shell_leaf=partial(self._invoke_shell, binding, window=window) if key.toolkit == "shell" else None,
+                shell_leaf=(
+                    partial(self._invoke_shell, binding, window=window)
+                    if key.toolkit == "shell" or key == _SKILL_SCRIPT_KEY
+                    else None
+                ),
                 authorize=authorize,
             )
             async with closing_async_stream(events):

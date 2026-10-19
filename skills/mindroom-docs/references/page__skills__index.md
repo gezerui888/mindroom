@@ -123,8 +123,8 @@ Agents see their available skills in the system prompt and load details with the
 The script's `#!` line picks its interpreter, so a script needs no executable bit.
 An agent without the `shell` tool can read skill scripts but not run them.
 While the agent's shell commands need [approval](https://docs.mindroom.chat/tool-approval/), `get_skill_script` runs nothing and returns the command, which the agent can run with its shell tool to ask for approval.
-A script runs in a worker only when the worker can see the skill's directory, as dedicated workers see the agent's workspace skills.
-A bundled, plugin, or user skill's directory must be mounted or installed in the worker, at the matching path below the worker's storage mount when it lies below the storage root, or at the same path otherwise.
+Dedicated Docker and Kubernetes workers mount the directory of each plugin or user skill with scripts that their agents list, read-only, so those scripts run in the worker like workspace skill scripts, and bundled skills ship in the worker image.
+A skill directory outside the storage root cannot be mounted, and a `static_runner` runner sees no plugin or user skill directories, so there `get_skill_script` refuses to run the script and the agent can still read it.
 
 Added, removed, or edited `SKILL.md` files take effect on the agent's next request, within about a second.
 A workspace skill created during a turn becomes available on the next agent run, not in the same response.

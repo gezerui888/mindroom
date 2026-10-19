@@ -54,7 +54,9 @@ from mindroom.workers.backends._dedicated_worker_common import (
     build_dedicated_worker_runtime_paths,
     plan_scoped_workspace_mounts,
     plan_shared_directory_mounts,
+    plan_skill_directory_mounts,
     resolve_state_scope_worker_key,
+    resolved_agent_policies_from_config_data,
     validate_dedicated_worker_extra_env,
     validate_unique_worker_visible_paths,
 )
@@ -1533,7 +1535,8 @@ class DockerWorkerBackend:
         private_agent_names: frozenset[str] | None,
         state_scope_worker_key: str | None = None,
     ) -> list[tuple[Path, str, bool]]:
-        resolved_agent_policies = self._projection_manager.current_resolved_agent_policies()
+        config_data = self._projection_manager.current_config_data()
+        resolved_agent_policies = resolved_agent_policies_from_config_data(config_data)
         state_scope_key = resolve_state_scope_worker_key(worker_key, state_scope_worker_key)
         mount_specs = [
             (workspace_mount.local_path, str(workspace_mount.worker_visible_path), False)
@@ -1547,11 +1550,20 @@ class DockerWorkerBackend:
         ]
         mount_specs.extend(
             (shared_mount.local_path, str(shared_mount.worker_visible_path), shared_mount.read_only)
-            for shared_mount in plan_shared_directory_mounts(
-                worker_key=state_scope_key,
-                runtime_paths=self._runtime_paths,
-                worker_visible_shared_storage_root=Path(self.config.storage_mount_path),
-                resolved_agent_policies=resolved_agent_policies,
+            for shared_mount in (
+                *plan_shared_directory_mounts(
+                    worker_key=state_scope_key,
+                    runtime_paths=self._runtime_paths,
+                    worker_visible_shared_storage_root=Path(self.config.storage_mount_path),
+                    resolved_agent_policies=resolved_agent_policies,
+                ),
+                *plan_skill_directory_mounts(
+                    worker_key=state_scope_key,
+                    runtime_paths=self._runtime_paths,
+                    worker_visible_shared_storage_root=Path(self.config.storage_mount_path),
+                    resolved_agent_policies=resolved_agent_policies,
+                    config_data=config_data,
+                ),
             )
         )
         validate_unique_worker_visible_paths(

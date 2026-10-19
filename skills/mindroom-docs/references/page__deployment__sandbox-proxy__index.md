@@ -317,7 +317,7 @@ What a worker can see depends on the backend:
 
 - **Local execution** shares the primary process filesystem.
 - **The Kubernetes chart's `static_runner` sidecar** sees every agent's state directory, including the whole `private_instances` directory, and every shared directory; a Compose or host-container runner sees only what you mount into it, so the examples above see only scratch storage.
-- **Dedicated Docker and Kubernetes workers** mount only the workspaces listed in the [scope table](#worker-scopes), the shared directories of the agents they serve, their own scratch space, and read-only assigned knowledge, never the sessions, memory, or learning data beside the workspaces.
+- **Dedicated Docker and Kubernetes workers** mount only the workspaces listed in the [scope table](#worker-scopes), the shared directories of the agents they serve, their own scratch space, read-only assigned knowledge, and the read-only directories of the plugin and user skills with scripts that those agents list, never the sessions, memory, or learning data beside the workspaces.
   For private agents they mount only the private root (`private.root`), never the state root around it.
 
 When an agent has a workspace (the `file` memory backend or `private`), `shell`, `file`, `python`, and `coding` use it as their default working directory (`base_dir`); this is a convenience, not a boundary.

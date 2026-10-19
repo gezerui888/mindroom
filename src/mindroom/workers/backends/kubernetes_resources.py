@@ -53,6 +53,7 @@ from mindroom.workers.backends._dedicated_worker_common import (
     agent_names_addressed_by_worker_key,
     plan_scoped_workspace_mounts,
     plan_shared_directory_mounts,
+    plan_skill_directory_mounts,
     resolve_state_scope_worker_key,
     resolved_agent_policies_from_config_data,
     validate_unique_worker_visible_paths,
@@ -1845,12 +1846,24 @@ class KubernetesResourceManager:
         *,
         state_scope_worker_key: str | None,
     ) -> tuple[SharedDirectoryMount, ...]:
-        """Return the shared directories one worker mounts from the storage volume."""
-        return plan_shared_directory_mounts(
-            worker_key=resolve_state_scope_worker_key(worker_key, state_scope_worker_key),
-            runtime_paths=runtime_paths_with_storage_root(self.runtime_paths, self.storage_root),
-            worker_visible_shared_storage_root=Path(self.config.storage_mount_path),
-            resolved_agent_policies=self.resolved_agent_policies,
+        """Return the shared directories and skill directories one worker mounts from the storage volume."""
+        state_scope_key = resolve_state_scope_worker_key(worker_key, state_scope_worker_key)
+        runtime_paths = runtime_paths_with_storage_root(self.runtime_paths, self.storage_root)
+        worker_visible_storage_root = Path(self.config.storage_mount_path)
+        return (
+            *plan_shared_directory_mounts(
+                worker_key=state_scope_key,
+                runtime_paths=runtime_paths,
+                worker_visible_shared_storage_root=worker_visible_storage_root,
+                resolved_agent_policies=self.resolved_agent_policies,
+            ),
+            *plan_skill_directory_mounts(
+                worker_key=state_scope_key,
+                runtime_paths=runtime_paths,
+                worker_visible_shared_storage_root=worker_visible_storage_root,
+                resolved_agent_policies=self.resolved_agent_policies,
+                config_data=self.config_snapshot,
+            ),
         )
 
     def _workspace_storage_mounts(

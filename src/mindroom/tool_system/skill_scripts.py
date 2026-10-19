@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from agno.tools.function import FunctionCall
 
@@ -15,6 +15,10 @@ if TYPE_CHECKING:
 
     from agno.tools.function import Function, FunctionExecutionResult
 
+# Bundled skills ship with MindRoom, workspace skills live in the agent's workspace,
+# and configured skills come from plugins and the user skills directory.
+SkillOrigin = Literal["bundled", "workspace", "configured"]
+
 
 @dataclass(frozen=True)
 class SkillScriptShell:
@@ -22,8 +26,9 @@ class SkillScriptShell:
 
     function: Function
     storage_root: Path
-    # Where the shell's worker sees ``storage_root``, or None when the shell sees this process's paths.
-    # Called on first use, so an incomplete worker backend config fails that call instead of agent creation.
+    # Where the shell's worker sees ``storage_root``: None when the shell runs in this process, and a lookup
+    # returning None for a shared runner. Looked up on each use, so an incomplete worker backend config fails
+    # that call instead of agent creation.
     worker_storage_root: Callable[[], Path | None] | None = None
 
     @property
@@ -31,11 +36,21 @@ class SkillScriptShell:
         """Whether the shell's calls wait for approval, which a skill function cannot wait for."""
         return approval_gated(self.function)
 
-    def visible_path(self, path: Path) -> Path:
-        """Return where the shell finds ``path``: a worker mounts the storage root at its own path."""
-        worker_root = None if self.worker_storage_root is None else self.worker_storage_root()
-        if worker_root is None or not path.is_relative_to(self.storage_root):
+    def visible_path(self, path: Path, origin: SkillOrigin) -> Path | None:
+        """Return where the shell finds ``path``, or None when its worker cannot see it.
+
+        Worker images ship the bundled skills where this process has them. Dedicated workers mount
+        workspaces, and the directories of the configured skills with scripts that their agents list,
+        at their place below the storage mount, and a shared runner sees workspaces where this process
+        does but no configured skill directory.
+        """
+        if self.worker_storage_root is None or origin == "bundled":
             return path
+        if not path.is_relative_to(self.storage_root):
+            return None
+        worker_root = self.worker_storage_root()
+        if worker_root is None:
+            return path if origin == "workspace" else None
         return worker_root / path.relative_to(self.storage_root)
 
     async def run(

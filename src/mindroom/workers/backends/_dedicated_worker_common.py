@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
@@ -32,7 +33,7 @@ from mindroom.tool_system.worker_routing import (
 from mindroom.workers.backend import WorkerBackendError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable
     from pathlib import Path
 
     from mindroom.agent_policy import ResolvedAgentPolicy
@@ -46,6 +47,7 @@ __all__ = [
     "build_dedicated_worker_runtime_paths",
     "plan_scoped_workspace_mounts",
     "plan_shared_directory_mounts",
+    "plan_skill_directory_mounts",
     "resolve_state_scope_worker_key",
     "resolved_agent_policies_from_config_data",
     "stable_signature_json",
@@ -391,7 +393,7 @@ def agent_names_addressed_by_worker_key(
 
 @dataclass(frozen=True, slots=True)
 class SharedDirectoryMount:
-    """One shared directory a dedicated worker mounts at its canonical path."""
+    """One shared or skill directory a dedicated worker mounts at its canonical path."""
 
     local_path: Path
     worker_visible_path: Path
@@ -440,6 +442,60 @@ def plan_shared_directory_mounts(
                 local_path=storage_root / relative_path,
                 worker_visible_path=worker_visible_shared_storage_root / relative_path,
                 read_only=not writable,
+            ),
+        )
+    return tuple(mounts)
+
+
+def plan_skill_directory_mounts(
+    *,
+    worker_key: str,
+    runtime_paths: RuntimePaths,
+    worker_visible_shared_storage_root: Path,
+    resolved_agent_policies: Mapping[str, ResolvedAgentPolicy],
+    config_data: Mapping[str, object],
+) -> tuple[SharedDirectoryMount, ...]:
+    """Return read-only mounts of the skill directories with scripts that the agents one dedicated worker serves list.
+
+    Their scripts then run in the worker at their path below its storage mount. A skill
+    directory outside the storage root cannot be mounted, and one below it is mounted
+    only when it is a real directory reached without links, because container
+    runtimes follow links in mount sources.
+    """
+    # Skill loading is heavy, and the slim tool registry imports the worker backends.
+    from mindroom.tool_system.skills import skill_directories_with_scripts  # noqa: PLC0415
+
+    raw_agents = config_data.get("agents")
+    agents = cast("Mapping[str, object]", raw_agents) if isinstance(raw_agents, Mapping) else {}
+    skill_names: set[str] = set()
+    for agent_name in agent_names_addressed_by_worker_key(worker_key, resolved_agent_policies):
+        raw_agent = agents.get(agent_name)
+        raw_skills = cast("Mapping[str, object]", raw_agent).get("skills") if isinstance(raw_agent, Mapping) else None
+        if isinstance(raw_skills, list):
+            skill_names.update(name for name in raw_skills if isinstance(name, str))
+    if not skill_names:
+        return ()
+    storage_root = runtime_paths.storage_root
+    mounts: list[SharedDirectoryMount] = []
+    for directory in skill_directories_with_scripts(skill_names):
+        if not directory.is_relative_to(storage_root):
+            continue
+        relative_path = directory.relative_to(storage_root)
+        try:
+            with open_directory_within_root(storage_root, relative_path):
+                pass
+        except OSError:
+            logger.warning(
+                "Not mounting a skill directory that is missing or reached through a link",
+                worker=worker_log_id(worker_key),
+                directory=str(relative_path),
+            )
+            continue
+        mounts.append(
+            SharedDirectoryMount(
+                local_path=directory,
+                worker_visible_path=worker_visible_shared_storage_root / relative_path,
+                read_only=True,
             ),
         )
     return tuple(mounts)

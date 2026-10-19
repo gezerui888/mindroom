@@ -30,6 +30,7 @@ Runners and dedicated workers never receive the primary's config file, its direc
 The config sent to runners with each request, and the config file projected into each Docker worker, hold only the fields runners resolve; models, MCP servers, plugin settings, and every other section stay in the primary, and a worker-routed call carries only the called tool's own inline overrides.
 
 Of the agents' data, dedicated Docker and Kubernetes workers mount only workspaces and shared directories, never the agent state roots around them, so sessions, memory, learning, Mem0 data, and private-instance identity records stay out of every worker.
+They also mount, read-only, the directory of each plugin or user skill with scripts that their agents list when it is a real directory below the storage root, never a whole plugin directory, so `get_skill_script` can run those scripts there.
 The Kubernetes `static_runner` sidecar still mounts `agents`, `private_instances`, and `shared_directories` read-write, so records the primary treats as authority live below the primary-only `tracking/` directory instead: the invited-room and pending-invite ledgers, personal-room records, conversation modes, the shared-directory membership ledger, and the primary's copy of each private-instance owner record, together with their locks.
 The thread exporter writes into a private instance only for the requester that the primary's owner record names, so an owner record planted in `private_instances` gets no export.
 Automations likewise run for a private instance only as the requester that record names, and post only in that requester's personal room, so their replies quoting private files never reach another room.
@@ -157,7 +158,7 @@ Every tool, including plugin tools, must declare one of these file access classe
 
 MCP servers on the local `stdio` transport are unconfined too, because they are operator-launched programs; remote `sse` and `streamable-http` servers take no local file paths.
 Whether a tool executes code is a separate metadata flag from its file access class; only the code-execution tools above carry it.
-`get_skill_script` runs a skill script only as a command of the agent's own `shell`, so a script runs where that shell runs, with its hooks, never while its commands need approval, and never for an agent without `shell`.
+`get_skill_script` runs a skill script only as a command of the agent's own `shell`, so a script runs where that shell runs, with its hooks, never while its commands need approval, never for an agent without `shell`, and never from a skill directory that shell's worker does not see.
 A worker isolates the unconfined tools that support worker routing (`shell`, `python`, `docker`, `csv`, `postgres`, `redshift`).
 The rest require the primary runtime and cannot run in a worker (`claude_agent`, `script`, `duckdb`, `pandas`, `sql`, `composio`, `browserbase`, `slack`), so enable them only for agents trusted with everything the primary runtime can reach.
 MindRoom logs a warning when an agent routes code-execution tools to a worker while primary-process tools stay unconfined, meaning unconfined tools or path tools under `file_access: unrestricted`, because those tools can then read runtime secrets the worker was meant to keep away.

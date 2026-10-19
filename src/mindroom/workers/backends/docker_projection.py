@@ -365,12 +365,16 @@ class DockerProjectionManager:
         """Return the directory containing one worker root's projected config snapshots."""
         return self._projected_configs_root / paths.root.name
 
-    def current_resolved_agent_policies(self) -> dict[str, ResolvedAgentPolicy]:
-        """Return the current agent-policy view derived from the host config."""
+    def current_config_data(self) -> dict[str, object]:
+        """Return the current host config data, empty without a host config."""
         host_config_path = self.config.host_config_path
         if host_config_path is None:
             return {}
-        return resolved_agent_policies_from_config_data(self._load_host_config_data(host_config_path))
+        return self._load_host_config_data(host_config_path)
+
+    def current_resolved_agent_policies(self) -> dict[str, ResolvedAgentPolicy]:
+        """Return the current agent-policy view derived from the host config."""
+        return resolved_agent_policies_from_config_data(self.current_config_data())
 
     def retire_worker_projection(self, worker_name: str) -> None:
         """Remove every projected config snapshot owned by one exact worker root."""

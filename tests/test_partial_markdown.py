@@ -14,7 +14,6 @@ from tests.cpu_budget_helpers import cpu_budget
         # Prefixes seen while recorded replies streamed.
         ("**Lisbon is on both your", "**Lisbon is on both your**"),
         ("| Rule | Vantr", ""),
-        ("[Open the draf", "Open the draf"),
         ("| Candidate | Role | Waiting on", ""),
         # Emphasis, strikethrough, and code spans still open.
         ("Both *agree", "Both *agree*"),
@@ -32,14 +31,14 @@ from tests.cpu_budget_helpers import cpu_budget
         ("Run `", "Run"),
         ("Fares ~~", "Fares"),
         ("Then **~~", "Then"),
-        # A link whose label is still arriving shows its label; one whose URL is still arriving keeps its brackets.
+        # A link whose URL is still arriving shows its bracketed label.
         ("[Open the draft]", "[Open the draft]"),
         ("[Open the draft](", "[Open the draft]"),
         ("[Open the draft](https://docs.example/dra", "[Open the draft]"),
         ("See [the **draft**](https://docs.example/a_b", "See [the **draft**]"),
         ("__Result__[source](https://example.org/paper", "__Result__[source]"),
         ("- [1. Introduction](https://example.org/intro", "- [1. Introduction]"),
-        ("[**Open the draf", "**Open the draf**"),
+        ("[**Open the draf", "[**Open the draf**"),
         ("Open [`notes.md`](https://docs.example/no", "Open [`notes.md`]"),
         # Only the block still streaming changes; a finished one renders as written.
         ("**Not closed\n\nNext *one", "**Not closed\n\nNext *one*"),
@@ -90,6 +89,10 @@ def test_partial_markdown_is_shown_as_it_will_render(streamed: str, shown: str) 
         "[@Quill](https://matrix.to/#/@mindroom_quill:localhost) has the **draft**",
         "🔧 `web_search` [1]",
         "Done \\*not bold",
+        # A label still arriving keeps its bracket, since hiding it can change how the text around it parses.
+        "[Open the draf",
+        "__Result__[sour",
+        "- [1. Intro",
         # A trailing backslash would escape a closer.
         "Open **C:\\",
         # Nested emphasis closed by one run, an opener inside a closed pair, spans across quote or list item lines,

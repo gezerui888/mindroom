@@ -492,10 +492,10 @@ def opens_with_markdown_block(text: str) -> bool:
 def close_partial_markdown(text: str) -> str:
     """Shape Markdown cut off mid-stream so it renders the way it will once the rest arrives.
 
-    Cut off, Markdown shows open syntax literally: ``**`` before bold text, ``[`` before a link label,
+    Cut off, Markdown shows open syntax literally: ``**`` before bold text, ``](`` before a link URL,
     or the pipes of a table whose separator row has not arrived.
-    In the block the text ends in, open emphasis, strikethrough, and code spans are closed, an unfinished
-    link shows its label, and table lines wait until they form a table.
+    In the block the text ends in, open emphasis, strikethrough, and code spans are closed, a link whose
+    URL is still arriving shows its bracketed label, and table lines wait until they form a table.
     Finished blocks, code blocks, and code spans are left as written.
     """
     normalized = _normalize_input_line_endings(text)
@@ -534,7 +534,7 @@ def close_partial_markdown(text: str) -> str:
 
 
 def _stop_at_unfinished_markup(state: StateInline, silent: bool) -> bool:
-    """Parse code spans and links, stopping at one whose code or URL is still arriving and noting an open label.
+    """Parse code spans and links, stopping at one whose code or URL is still arriving.
 
     It runs before markdown-it's own inline rules, which parse everything else, and stops at ``env["end"]``.
     """
@@ -546,14 +546,11 @@ def _stop_at_unfinished_markup(state: StateInline, silent: bool) -> bool:
         backtick(state, silent)
         if not src[start : state.pos].strip("`"):  # No run of its length closes it.
             env["end"], env["code_span"] = start, src[start : state.pos]
-    elif src[start] == "[" and not link(state, silent):
-        if start > env["last_bracket"]:  # No `]` follows, so its label is still arriving.
-            env["open_label"] = start
-        else:
-            label_end = state.md.helpers.parseLinkLabel(state, start, True)
-            # Its URL is still arriving: the label keeps its brackets, so the text around it parses as it will.
-            if label_end > env["last_paren"] and src.startswith("(", label_end + 1):
-                env["end"] = label_end + 1
+    elif src[start] == "[" and start < env["last_bracket"] and not link(state, silent):
+        label_end = state.md.helpers.parseLinkLabel(state, start, True)
+        # Its URL is still arriving: the label keeps its brackets, so the text around it parses as it will.
+        if label_end > env["last_paren"] and src.startswith("(", label_end + 1):
+            env["end"] = label_end + 1
     if start == env["end"]:
         state.pos = state.posMax
     return state.pos > start
@@ -565,7 +562,7 @@ _PARTIAL_MARKDOWN_PARSER.inline.ruler.before("text", "unfinished_markup", _stop_
 
 
 def _close_partial_inline(text: str) -> str:
-    """Close the emphasis and code span left open at the end of inline text, and show an unfinished link as its label."""
+    """Close the emphasis and code span left open at the end of inline text, and drop a link URL still arriving."""
     # Markup after a space at the very end closes nothing and only opens text still to come.
     unmarked = text.rstrip("*_[~")
     end = len(unmarked) if not unmarked or unmarked[-1].isspace() else len(text)
@@ -580,8 +577,6 @@ def _close_partial_inline(text: str) -> str:
             return _close_partial_inline(shown)
         # A space keeps the closer from joining a backtick the code ends in into a longer run.
         shown = f"{text} {run}" if text.endswith("`") else text + run
-    if (label := env.get("open_label")) is not None:
-        shown = shown[:label] + shown[label + 1 :]
     # Openers nothing closed yet, innermost first, except those inside a closed pair, which stay literal.
     # One that could also close, like the `*` of `2*3`, may be literal. `reach` is the furthest closer matched before each.
     reach = list(accumulate((d.end for d in state.delimiters), max, initial=-1))

@@ -42,7 +42,8 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
   Worker keys write a name without leading and trailing `_`.
   Agno ids lowercase a name, turn `_` into `-`, and split camel case, so `MyAgent` and `my_agent` both become `my-agent`.
   The worker key check includes the agent's own old name, so `harry` cannot become `_harry`.
-  The Agno id check compares with the other agents only, so `Harry` collides with another agent `harry`.
+  The Agno id check skips the agent being renamed, so it only refuses a new name whose id another agent already has.
+  With agents `harry` and `crew`, renaming `crew` to `Harry` is refused.
   Colliding names would share workers or confuse team runs.
 
 ## Procedure
@@ -295,7 +296,8 @@ It is where state the command did not know about shows up.
 
 ## Refusals and limits
 
-Every refusal exits 1 with the reason.
+Every refusal exits 1 with the reason, unless undoing the completed steps fails too.
+Then the command exits 2 with `Undo failed:`, see [When a step fails](#when-a-step-fails).
 A refusal in a dry run, or before `--apply` takes its locks, changes nothing.
 A refusal after that leaves the lock files in `tracking/`, and one raised while a step runs also leaves the backup directory.
 The completed steps are undone first.
@@ -405,7 +407,9 @@ Neither does restoring one that never took effect, because `source` still holds 
 One entry needs a check first: the last one with a numbered directory after a kill or a failed step.
 The command may have stopped while it copied the original into that directory, for example because the disk was full.
 A copy cut short must not replace a good `source`.
-Check that the copy is whole before you use it, for example `sqlite3 <copy> .tables` for a database.
+Check that the copy is whole before you use it.
+For a database, `sqlite3 <copy> 'PRAGMA integrity_check'` must print `ok`, and `sqlite3 <copy> .tables` must list the tables, because an empty file also passes the first check.
+For a text file, open the copy and check that it ends where a whole one would, for example that JSON or YAML still parses.
 If you cannot tell, restore your snapshot instead.
 
 Restore each remaining entry like this:

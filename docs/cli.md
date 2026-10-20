@@ -1184,9 +1184,11 @@ See [Renaming an Agent's Matrix Account](deployment/rename-agent-account.md) bef
 │                                               only printed.                            │
 │ --yes                    -y                   Apply without asking for confirmation.   │
 │ --discard-new-principal                       Delete what MindRoom created under the   │
-│                                               new ID when it ran after the server      │
-│                                               rename: its event journal rows and       │
-│                                               new-ID state that holds no credentials.  │
+│                                               new ID before its state was moved: the   │
+│                                               new principal's event journal rows, only │
+│                                               while the old principal still has rows   │
+│                                               to move, and new-ID state that holds no  │
+│                                               credentials.                             │
 │ --skip-login-check                            Apply without first logging in as the    │
 │                                               new ID with the stored password.         │
 │ --config                 -c      PATH         Use this config file path.               │

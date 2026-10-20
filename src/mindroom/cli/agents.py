@@ -56,8 +56,9 @@ def rename_account(
         False,
         "--discard-new-principal",
         help=(
-            "Delete what MindRoom created under the new ID when it ran after the server rename: "
-            "its event journal rows and new-ID state that holds no credentials."
+            "Delete what MindRoom created under the new ID before its state was moved: "
+            "the new principal's event journal rows, only while the old principal still has rows to move, "
+            "and new-ID state that holds no credentials."
         ),
     ),
     skip_login_check: bool = typer.Option(
@@ -166,7 +167,11 @@ def _rename_account(
     require_supported_backends(config, runtime_paths)
     if not apply:
         # Taking MindRoom's locks would create lock files, so a dry run plans without them.
-        _print_plan(_plan(runtime_paths, config, adoption, discard_new_principal=discard_new_principal), adoption)
+        plan = _plan(runtime_paths, config, adoption, discard_new_principal=discard_new_principal)
+        _print_plan(plan, adoption)
+        if not plan.steps:
+            _say(f"Nothing left to move from {adoption.old_user_id}; nothing was changed.")
+            return
         _say("Dry run: nothing was changed. Rerun with --apply to make these changes.")
         _say(
             "--apply plans again under MindRoom's locks. Event journal collisions in tables other than "
@@ -179,6 +184,10 @@ def _rename_account(
             _check_login(runtime_paths, adoption)
         plan = _plan(runtime_paths, config, adoption, discard_new_principal=discard_new_principal)
         _print_plan(plan, adoption)
+        if not plan.steps:
+            # Only with --from: otherwise the stored username still needs its step.
+            _say(f"Nothing left to move from {adoption.old_user_id}; nothing was changed.")
+            return
         if not yes and not typer.confirm("Apply this plan?"):
             _say("Nothing was changed.")
             raise typer.Exit(1)
@@ -313,9 +322,17 @@ def _refuse_journal_under_other_ids(runtime_paths: RuntimePaths, *, agent: str, 
     from mindroom.agent_rename.journal import other_principal_user_ids  # noqa: PLC0415
     from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
     from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415
+    from mindroom.matrix.identity import MatrixID, try_parse_historical_matrix_user_id  # noqa: PLC0415
 
     database = event_journal_sqlite_path(runtime_paths.storage_root)
-    others = other_principal_user_ids(database, agent=agent, user_id=new_user_id)
+    server = MatrixID.parse(new_user_id).domain
+    # Only an ID on the new ID's server can have been renamed in place, and --from refuses any other.
+    others = {
+        user_id: counts
+        for user_id, counts in other_principal_user_ids(database, agent=agent, user_id=new_user_id).items()
+        if (parsed := try_parse_historical_matrix_user_id(user_id)) is not None
+        and MatrixID.parse(parsed).domain == server
+    }
     if not others:
         return
     found = "; ".join(f"{agent}@{user_id} ({counts})" for user_id, counts in others.items())
@@ -406,7 +423,7 @@ def _plan(
     from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415
 
     old_user_id, new_user_id = adoption.old_user_id, adoption.new_user_id
-    journal_steps = journal_account_steps(
+    journal_steps, journal_reports = journal_account_steps(
         event_journal_sqlite_path(runtime_paths.storage_root),
         agent=adoption.agent,
         old_user_id=old_user_id,
@@ -438,7 +455,7 @@ def _plan(
     return RenamePlan(
         storage_root=runtime_paths.storage_root,
         steps=steps,
-        reports=(*account_reports, *reports),
+        reports=(*journal_reports, *account_reports, *reports),
     )
 
 

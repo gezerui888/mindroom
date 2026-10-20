@@ -17,6 +17,7 @@ from mindroom.agent_rename import account_files
 from mindroom.agent_rename import steps as steps_module
 from mindroom.agent_rename.guard import stopped_runtime
 from mindroom.agent_rename.steps import RenameUndoError
+from mindroom.cli import agents as cli_agents
 from mindroom.cli.config import activate_cli_runtime
 from mindroom.cli.main import app
 from mindroom.constants import matrix_state_file, tracking_dir
@@ -541,6 +542,119 @@ def test_from_must_match_a_stored_account_not_yet_renamed(
     assert f"--from @other:x does not match the stored account {OLD} of agent_{AGENT}" in result.output
     assert tree_snapshot(tmp_path) == before
     assert server.requests == []
+
+
+def _commit_journal_step_only(runtime_paths: RuntimePaths, *, stored_user_id: str, discard: bool) -> None:
+    """Leave the install the way a run killed right after its journal step does: journal moved, nothing else."""
+    config = cli_agents._load_config_or_exit(runtime_paths)
+    adoption = cli_agents._Adoption(AGENT, OLD, NEW, stored_user_id, PASSWORD)
+    journal_step = cli_agents._plan(runtime_paths, config, adoption, discard_new_principal=discard).steps[0]
+    assert journal_step.description.startswith("Rewrite the event journal")
+    journal_step.apply(runtime_paths.storage_root.parent / "killed-run-backup")
+
+
+def _journal_events(runtime_paths: RuntimePaths) -> list[tuple[object, ...]]:
+    return _journal_rows(runtime_paths, "SELECT principal_id, sender FROM journal_events ORDER BY principal_id")
+
+
+def test_rerun_after_a_killed_run_keeps_the_moved_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """After a run killed past its journal step, the rows under the new principal are the agent's moved history.
+
+    Rerunning, even with --discard-new-principal, leaves them and finishes the files.
+    """
+    runtime_paths = _install(tmp_path, monkeypatch)
+    _commit_journal_step_only(runtime_paths, stored_user_id=OLD, discard=False)
+    moved = [(NEW_PRINCIPAL, NEW), (ROUTER, NEW)]
+    assert _journal_events(runtime_paths) == moved
+
+    result = _invoke(runtime_paths, "--discard-new-principal", "--apply", "--yes", "--skip-login-check")
+
+    assert result.exit_code == 0, result.output
+    assert _journal_events(runtime_paths) == moved
+    assert f"has no rows for {OLD_PRINCIPAL}, so it stays as it is" in result.output
+    account = safe_load(matrix_state_file(runtime_paths).read_bytes())["accounts"][f"agent_{AGENT}"]
+    assert account["username"] == "new"
+    assert _stored_worker_key(_oauth_path(runtime_paths.storage_root, NEW)) == _key("user_agent", NEW)
+    assert f"Leftover scan: nothing in {runtime_paths.storage_root} names {OLD} any more." in result.output
+    assert server.requests == []
+
+
+def test_rerun_after_a_killed_from_run_keeps_the_moved_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """A killed --from run leaves the journal moved; rerunning without --from changes nothing, with it finishes the files."""
+    runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
+    _adopt_by_hand(runtime_paths)
+    _commit_journal_step_only(runtime_paths, stored_user_id=NEW, discard=True)
+    moved = [(NEW_PRINCIPAL, NEW), (ROUTER, NEW)]
+    assert _journal_events(runtime_paths) == moved
+
+    without_from = _invoke(runtime_paths)
+
+    assert without_from.exit_code == 0, without_from.output
+    assert "Already adopted; nothing to do." in without_from.output
+
+    result = _invoke(runtime_paths, "--from", OLD, "--discard-new-principal", "--apply", "--yes", "--skip-login-check")
+
+    assert result.exit_code == 0, result.output
+    assert _journal_events(runtime_paths) == moved
+    assert _stored_worker_key(_oauth_path(runtime_paths.storage_root, NEW)) == _key("user_agent", NEW)
+    assert f"Leftover scan: nothing in {runtime_paths.storage_root} names {OLD} any more." in result.output
+    assert server.requests == []
+
+
+def test_repeating_a_successful_from_run_changes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """The same --from --discard-new-principal --apply run a second time finds nothing to move and writes nothing."""
+    runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
+    _adopt_by_hand(runtime_paths)
+    command = ("--from", OLD, "--discard-new-principal", "--apply", "--yes", "--skip-login-check")
+    assert _invoke(runtime_paths, *command).exit_code == 0
+    after_first = tree_snapshot(tmp_path)
+
+    again = _invoke(runtime_paths, *command)
+
+    assert again.exit_code == 0, again.output
+    assert f"Nothing left to move from {OLD}; nothing was changed." in again.output
+    assert tree_snapshot(tmp_path) == after_first
+    assert _journal_events(runtime_paths) == [(NEW_PRINCIPAL, NEW), (ROUTER, NEW)]
+    assert server.requests == []
+
+
+def test_adoption_check_only_offers_ids_on_the_new_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """Principals under another server cannot be adopted in place, so they never trigger the --from refusal."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    assert _invoke(runtime_paths, "--apply", "--yes").exit_code == 0
+    with closing(sqlite3.connect(event_journal_sqlite_path(runtime_paths.storage_root))) as connection, connection:
+        _event(connection, "harry@@old:y", sender="@old:y")
+
+    other_server = _invoke(runtime_paths)
+
+    assert other_server.exit_code == 0, other_server.output
+    assert "Already adopted; nothing to do." in other_server.output
+
+    with closing(sqlite3.connect(event_journal_sqlite_path(runtime_paths.storage_root))) as connection, connection:
+        _event(connection, "harry@@older:x", sender="@older:x")
+
+    same_server = _invoke(runtime_paths)
+
+    assert same_server.exit_code == 1, same_server.output
+    assert "--from @older:x" in same_server.output
+    assert "@old:y" not in same_server.output
+    assert len(server.requests) == 2
 
 
 def test_declining_the_confirmation_changes_nothing(

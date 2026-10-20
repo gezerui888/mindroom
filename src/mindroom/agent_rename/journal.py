@@ -35,42 +35,67 @@ def journal_account_steps(
     old_user_id: str,
     new_user_id: str,
     discard_new_principal: bool,
-) -> list[SqliteEdit]:
-    """Return the one edit that moves ``agent``'s journal state from ``old_user_id`` to ``new_user_id``.
+) -> tuple[list[SqliteEdit], list[str]]:
+    """Return the one edit that moves ``agent``'s journal state from ``old_user_id`` to ``new_user_id``, and reports.
 
-    Refuses when rows under the new principal exist (MindRoom ran after the server rename)
-    unless ``discard_new_principal`` is set, and always when they include replies already sent.
-    The edit checks this again in its transaction, renames the principal, replaces the old ID in every text cell,
-    drops the principal's sync consumer and approval grants, and refuses if a rewritten row would collide.
+    When the old principal has rows, the edit moves them: it renames the principal, replaces the old ID in every
+    text cell, and drops the principal's sync consumer and approval grants. Rows the new principal has as well mean
+    MindRoom ran under the new ID before the journal was moved; that refuses unless ``discard_new_principal``
+    is set, and always when they include replies already sent.
+
+    When the old principal has no rows there is nothing to move, and the new principal's rows are the agent's own
+    history: moved by an earlier run that was killed or is repeated, or written since. They are never deleted,
+    whatever ``discard_new_principal`` says. Text cells that still hold the old ID, such as the agent's messages
+    as other principals saw them, are still rewritten; when there are none, the journal is left alone.
+
+    The edit checks the old principal again in its transaction and refuses if a rewritten row would collide.
     A journal that was never created needs no edit.
     """
     if not database.exists():
-        return []
+        return [], []
     old_principal = f"{agent}@{old_user_id}"
     new_principal = f"{agent}@{new_user_id}"
     try:
         with read_only_connection(database) as connection:
-            new_rows = _principal_row_counts(connection, text_columns(connection), new_principal)
+            columns = text_columns(connection)
+            old_rows = _principal_row_counts(connection, columns, old_principal)
+            new_rows = _principal_row_counts(connection, columns, new_principal)
+            old_cells = [] if old_rows else _cells_holding(connection, columns, old_user_id)
     except (sqlite3.Error, OSError) as exc:
         msg = f"Cannot read the event journal {database}: {exc}"
         raise RenameRefusedError(msg) from exc
-    _refuse_new_principal_rows(new_rows, new_principal=new_principal, discard=discard_new_principal)
-
-    discarded = f"delete the rows already under {new_principal} ({_format_counts(new_rows)}), " if new_rows else ""
-    description = (
-        f"Rewrite the event journal {database}: {discarded}rename principal {old_principal} to {new_principal}, "
-        f"replace {old_user_id} with {new_user_id} in every text cell, "
-        "and drop the principal's sync consumer and approval grants"
-    )
+    if old_rows:
+        _refuse_new_principal_rows(
+            old_rows,
+            new_rows,
+            old_principal=old_principal,
+            new_principal=new_principal,
+            discard=discard_new_principal,
+        )
+        discarded = f"delete the rows already under {new_principal} ({_format_counts(new_rows)}), " if new_rows else ""
+        description = (
+            f"Rewrite the event journal {database}: {discarded}rename principal {old_principal} to {new_principal}, "
+            f"replace {old_user_id} with {new_user_id} in every text cell, "
+            "and drop the principal's sync consumer and approval grants"
+        )
+    elif old_cells:
+        description = (
+            f"Rewrite the event journal {database}: replace {old_user_id} with {new_user_id} in {', '.join(old_cells)}; "
+            f"{old_principal} has no rows, so the rows of {new_principal} stay"
+        )
+    else:
+        kept = f"; its rows for {new_principal} ({_format_counts(new_rows)}) are kept" if new_rows else ""
+        return [], [f"The event journal {database} has no rows for {old_principal}, so it stays as it is{kept}."]
     edit = partial(
         _rewrite,
         old_user_id=old_user_id,
         new_user_id=new_user_id,
         old_principal=old_principal,
         new_principal=new_principal,
+        move_principal=bool(old_rows),
         discard_new_principal=discard_new_principal,
     )
-    return [SqliteEdit(database=database, edit=edit, description=description)]
+    return [SqliteEdit(database=database, edit=edit, description=description)], []
 
 
 def other_principal_user_ids(database: Path, *, agent: str, user_id: str) -> dict[str, str]:
@@ -148,22 +173,42 @@ def _format_counts(counts: dict[str, int]) -> str:
     return ", ".join(f"{table}: {count}" for table, count in sorted(counts.items()))
 
 
-def _refuse_new_principal_rows(counts: dict[str, int], *, new_principal: str, discard: bool) -> None:
-    if not counts:
+def _refuse_new_principal_rows(
+    old_counts: dict[str, int],
+    new_counts: dict[str, int],
+    *,
+    old_principal: str,
+    new_principal: str,
+    discard: bool,
+) -> None:
+    """Refuse when the new principal has rows besides the old one's, unless they may be discarded.
+
+    Only called while the old principal has rows: without them the new principal's rows are the agent's history.
+    """
+    if not new_counts:
         return
-    if any(table in counts for table in _SENT_REPLY_TABLES):
+    both = (
+        f"The event journal has rows for both {old_principal} ({_format_counts(old_counts)}) "
+        f"and {new_principal} ({_format_counts(new_counts)}), "
+        "because MindRoom ran under the new ID before the journal was moved"
+    )
+    if any(table in new_counts for table in _SENT_REPLY_TABLES):
         msg = (
-            f"The event journal already has rows for {new_principal} ({_format_counts(counts)}), "
-            "including replies MindRoom already sent under the new ID, "
+            f"{both}. The {new_principal} rows include replies MindRoom already sent under the new ID, "
             "which --discard-new-principal does not delete."
         )
         raise RenameRefusedError(msg)
     if not discard:
         msg = (
-            f"The event journal already has rows for {new_principal} because MindRoom ran after the server rename "
-            f"({_format_counts(counts)}). Rerun with --discard-new-principal to delete them."
+            f"{both}. Rerun with --discard-new-principal to delete the {new_principal} rows "
+            f"and move the {old_principal} rows in their place."
         )
         raise RenameRefusedError(msg)
+
+
+def _register_matchers(connection: sqlite3.Connection) -> None:
+    connection.create_function("contains_user_id", 2, _sql_contains_user_id, deterministic=True)
+    connection.create_function("replace_user_id", 3, _sql_replace_user_id, deterministic=True)
 
 
 def _rewrite(
@@ -173,15 +218,35 @@ def _rewrite(
     new_user_id: str,
     old_principal: str,
     new_principal: str,
+    move_principal: bool,
     discard_new_principal: bool,
 ) -> None:
-    """Move the journal to the new ID inside the caller's transaction; raising rolls everything back."""
-    connection.create_function("contains_user_id", 2, _sql_contains_user_id, deterministic=True)
-    connection.create_function("replace_user_id", 3, _sql_replace_user_id, deterministic=True)
+    """Move the journal to the new ID inside the caller's transaction; raising rolls everything back.
+
+    Without ``move_principal`` the old principal had no rows when planned, so only text cells change
+    and nothing of the new principal is deleted.
+    """
+    _register_matchers(connection)
     columns = text_columns(connection)
-    new_rows = _principal_row_counts(connection, columns, new_principal)
-    _refuse_new_principal_rows(new_rows, new_principal=new_principal, discard=discard_new_principal)
-    _delete_principal_rows(connection, columns, tables=tuple(new_rows), principal=new_principal)
+    old_rows = _principal_row_counts(connection, columns, old_principal)
+    if bool(old_rows) != move_principal:
+        # Never decide about deleting the new principal's rows on a journal the plan did not see.
+        change = "no longer has" if move_principal else "now has"
+        msg = (
+            f"The event journal {change} rows for {old_principal}, unlike when the plan was made. "
+            "The event journal was left unchanged; run the command again to plan anew."
+        )
+        raise RenameRefusedError(msg)
+    if move_principal:
+        new_rows = _principal_row_counts(connection, columns, new_principal)
+        _refuse_new_principal_rows(
+            old_rows,
+            new_rows,
+            old_principal=old_principal,
+            new_principal=new_principal,
+            discard=discard_new_principal,
+        )
+        _delete_principal_rows(connection, columns, tables=tuple(new_rows), principal=new_principal)
     _replace_identity(
         connection,
         columns,
@@ -190,10 +255,11 @@ def _rewrite(
     if "room_member_joins" in columns:
         # Any old-ID row left here collided with a row the bot already recorded for the new ID.
         connection.execute("DELETE FROM room_member_joins WHERE user_id = ?", (old_user_id,))
-    if "matrix_sync_consumers" in columns:
-        # The consumer binds a sync stream to the old login's device; the new device must bind a fresh one.
-        connection.execute("DELETE FROM matrix_sync_consumers WHERE principal_id = ?", (new_principal,))
-    _delete_principal_rows(connection, columns, tables=_GRANT_TABLES, principal=new_principal)
+    if move_principal:
+        if "matrix_sync_consumers" in columns:
+            # The consumer binds a sync stream to the old login's device; the new device must bind a fresh one.
+            connection.execute("DELETE FROM matrix_sync_consumers WHERE principal_id = ?", (new_principal,))
+        _delete_principal_rows(connection, columns, tables=_GRANT_TABLES, principal=new_principal)
     _refuse_leftovers(connection, columns, old_user_id=old_user_id, new_user_id=new_user_id)
 
 
@@ -235,6 +301,21 @@ def _replace_identity(
         connection.execute(statement, names)
 
 
+def _cells_holding(connection: sqlite3.Connection, columns: dict[str, tuple[str, ...]], user_id: str) -> list[str]:
+    """Return ``table.column (count)`` for every text column with cells that hold ``user_id`` as a whole user ID."""
+    _register_matchers(connection)
+    cells: list[str] = []
+    for table, table_columns in columns.items():
+        if not table_columns:
+            continue
+        sums = ", ".join(f"sum({_holds_user_id(quote_identifier(column))})" for column in table_columns)
+        counts = connection.execute(f"SELECT {sums} FROM {quote_identifier(table)}", {"old": user_id}).fetchone()  # noqa: S608 - quoted schema identifiers
+        cells.extend(
+            f"{table}.{column} ({count})" for column, count in zip(table_columns, counts, strict=True) if count
+        )
+    return cells
+
+
 def _refuse_leftovers(
     connection: sqlite3.Connection,
     columns: dict[str, tuple[str, ...]],
@@ -243,15 +324,7 @@ def _refuse_leftovers(
     new_user_id: str,
 ) -> None:
     """Refuse when any text cell still holds the old ID as a whole user ID, naming each table and column."""
-    leftovers: list[str] = []
-    for table, table_columns in columns.items():
-        if not table_columns:
-            continue
-        sums = ", ".join(f"sum({_holds_user_id(quote_identifier(column))})" for column in table_columns)
-        counts = connection.execute(f"SELECT {sums} FROM {quote_identifier(table)}", {"old": old_user_id}).fetchone()  # noqa: S608 - quoted schema identifiers
-        leftovers.extend(
-            f"{table}.{column} ({count})" for column, count in zip(table_columns, counts, strict=True) if count
-        )
+    leftovers = _cells_holding(connection, columns, old_user_id)
     if leftovers:
         msg = (
             f"Rewriting the event journal would leave {old_user_id} in {', '.join(leftovers)}, "

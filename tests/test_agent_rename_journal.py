@@ -198,13 +198,14 @@ async def _journal(storage_root: Path) -> Path:
 
 
 def _steps(database: Path, *, new_user_id: str = NEW, discard_new_principal: bool = False) -> list[SqliteEdit]:
-    return journal_account_steps(
+    steps, _reports = journal_account_steps(
         database,
         agent=AGENT,
         old_user_id=OLD,
         new_user_id=new_user_id,
         discard_new_principal=discard_new_principal,
     )
+    return steps
 
 
 def _apply(steps: list[SqliteEdit], storage_root: Path) -> None:
@@ -310,7 +311,8 @@ async def test_existing_new_principal_refused_without_flag(tmp_path: Path) -> No
         _steps(database)
 
     message = str(refused.value)
-    assert NEW_PRINCIPAL in message
+    assert f"rows for both {OLD_PRINCIPAL} (" in message
+    assert f"Rerun with --discard-new-principal to delete the {NEW_PRINCIPAL} rows" in message
     assert "journal_events: 1" in message
     assert "room_membership: 1" in message
     assert "--discard-new-principal" in message
@@ -534,3 +536,116 @@ async def test_other_principal_user_ids_lists_ids_the_agent_was_keyed_by(tmp_pat
     }
     assert tree_snapshot(tmp_path) == before
     assert other_principal_user_ids(event_journal_sqlite_path(tmp_path / "none"), agent=AGENT, user_id=NEW) == {}
+
+
+def _drop_principal(database: Path, principal: str) -> None:
+    """Delete every row that names ``principal`` in a principal column."""
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for table in [row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]:
+            columns = {row[0] for row in connection.execute("SELECT name FROM pragma_table_info(?)", (table,))}
+            for column in columns & {"principal_id", "responder_principal_id"}:
+                connection.execute(f'DELETE FROM "{table}" WHERE "{column}" = ?', (principal,))  # noqa: S608
+
+
+@pytest.mark.asyncio
+async def test_moved_journal_is_left_alone_even_with_the_flag(tmp_path: Path) -> None:
+    """Once the old principal has no rows, the new principal's rows are the agent's own history and are never deleted.
+
+    That is the journal after a run killed past its journal step, or after a successful run that is repeated.
+    """
+    database = await _journal(tmp_path)
+    _apply(_steps(database), tmp_path)
+    moved = _rows(database)
+
+    for discard in (False, True):
+        steps, reports = journal_account_steps(
+            database,
+            agent=AGENT,
+            old_user_id=OLD,
+            new_user_id=NEW,
+            discard_new_principal=discard,
+        )
+        assert steps == []
+        assert reports == [
+            f"The event journal {database} has no rows for {OLD_PRINCIPAL}, so it stays as it is; its rows for "
+            f"{NEW_PRINCIPAL} (journal_events: 1, matrix_delivery_outbox: 1, "
+            "room_member_joins: 1) are kept.",
+        ]
+    assert _rows(database) == moved
+
+
+@pytest.mark.asyncio
+async def test_mistyped_old_id_deletes_nothing(tmp_path: Path) -> None:
+    """An old ID with no rows under its principal leaves the journal alone, even with the flag."""
+    database = await _journal(tmp_path)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        _event(connection, NEW_PRINCIPAL, "$seen-after-rename", sender="@alice:x")
+    before = _rows(database)
+
+    steps, reports = journal_account_steps(
+        database,
+        agent=AGENT,
+        old_user_id="@typo:x",
+        new_user_id=NEW,
+        discard_new_principal=True,
+    )
+
+    assert steps == []
+    assert reports == [
+        f"The event journal {database} has no rows for harry@@typo:x, so it stays as it is; "
+        f"its rows for {NEW_PRINCIPAL} (journal_events: 1) are kept.",
+    ]
+    assert _rows(database) == before
+
+
+@pytest.mark.asyncio
+async def test_old_principal_gone_at_apply_refuses_and_keeps_new_rows(tmp_path: Path) -> None:
+    """The edit checks the old principal again in its transaction and never discards when it has no rows."""
+    database = await _journal(tmp_path)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        _event(connection, NEW_PRINCIPAL, "$seen-after-rename", sender="@alice:x")
+    steps = _steps(database, discard_new_principal=True)
+    _drop_principal(database, OLD_PRINCIPAL)
+    before = _rows(database)
+
+    with pytest.raises(RenameRefusedError, match=f"no longer has rows for {OLD_PRINCIPAL}"):
+        _apply(steps, tmp_path)
+
+    assert _rows(database) == before
+
+
+@pytest.mark.asyncio
+async def test_old_id_text_is_rewritten_without_touching_the_new_principal(tmp_path: Path) -> None:
+    """Without old-principal rows, the old ID left in other principals' cells is still replaced.
+
+    Nothing of the new principal is deleted, not even with the flag: its rows, sync consumer and grants stay.
+    """
+    database = await _journal(tmp_path)
+    _drop_principal(database, OLD_PRINCIPAL)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        _event(connection, NEW_PRINCIPAL, "$seen-after-rename", sender="@alice:x")
+        _insert(
+            connection,
+            "matrix_sync_consumers",
+            principal_id=NEW_PRINCIPAL,
+            consumer_generation="generation-new",
+            stream_id="stream-new",
+            next_sequence=2,
+        )
+        _grant(connection, NEW_PRINCIPAL, "new-grant", responder=NEW_PRINCIPAL)
+
+    (step,) = _steps(database, discard_new_principal=True)
+    assert f"{OLD_PRINCIPAL} has no rows, so the rows of {NEW_PRINCIPAL} stay" in step.description
+    _apply([step], tmp_path)
+
+    assert _cells_containing(database, OLD) == []
+    assert _query(database, "SELECT sender FROM journal_events WHERE principal_id = ?", ROUTER) == [(NEW,)]
+    assert _query(database, "SELECT event_id FROM journal_events WHERE principal_id = ?", NEW_PRINCIPAL) == [
+        ("$seen-after-rename",),
+    ]
+    assert _query(database, "SELECT stream_id FROM matrix_sync_consumers WHERE principal_id = ?", NEW_PRINCIPAL) == [
+        ("stream-new",),
+    ]
+    assert _query(database, "SELECT grant_id FROM approval_grants WHERE principal_id = ?", NEW_PRINCIPAL) == [
+        ("new-grant",),
+    ]

@@ -78,7 +78,7 @@ Before it says so, it checks the event journal: when `matrix_state.yaml` names t
 If you set the agent's `username` in `matrix_state.yaml` to the new localpart yourself, the stored account names the new ID, but the event journal, OAuth stores, workers, and config are still under the old one.
 On its next start MindRoom syncs as the new ID and fails on the old journal rows with `IngestionBatchIntegrityError`.
 The command does not treat the username alone as proof of an adoption.
-When the journal still has rows for `<name>@<old ID>`, it refuses, names them, and prints the command to run, with `--from <old ID>`:
+When the journal still has rows for `<name>@<old ID>` with an old ID on the new ID's server, it refuses, names them, and prints the command to run, with `--from <old ID>`:
 
 ```bash
 mindroom agents rename-account harry @mindroom_harry:example.org \
@@ -89,6 +89,7 @@ With `--from`, the old ID comes from the option instead of `matrix_state.yaml`.
 The journal and files move from it and the config values are replaced, as in a normal run.
 `matrix_state.yaml` stays as it is, because its device and access token already belong to the new ID; a `report:` line in the plan says so.
 If MindRoom started after your edit, add `--discard-new-principal` for the state it wrote under the new ID.
+Running the same `--from` command again finds nothing left to move, prints `Nothing left to move from <old ID>; nothing was changed.`, and writes nothing, not even a backup directory.
 
 `--from` must be a Matrix user ID on the new ID's server, differ from the new ID, and not be another stored account.
 While `matrix_state.yaml` still names the old ID, `--from` may only repeat that ID.
@@ -101,7 +102,7 @@ Run it with `--from` in that case too.
 | Where | Change |
 | --- | --- |
 | `matrix_state.yaml`, account `agent_<name>` | The `username` becomes the new localpart. The old `device_id` and `access_token` are cleared so the next start logs in on a fresh device. The password stays. An account whose `username` already is the new localpart is left alone (see [After a manual username change](#after-a-manual-username-change)). |
-| Event journal, `tracking/event_journal.db` | In one transaction: the principal `<name>@<old ID>` becomes `<name>@<new ID>`, the old ID is replaced in every other text column, the principal's sync consumer and approval grants are deleted, and leftover old-ID `room_member_joins` rows are deleted. |
+| Event journal, `tracking/event_journal.db` | In one transaction: the principal `<name>@<old ID>` becomes `<name>@<new ID>`, the old ID is replaced in every other text column, the principal's sync consumer and approval grants are deleted, and leftover old-ID `room_member_joins` rows are deleted. When `<name>@<old ID>` has no rows, there is nothing to move: only text cells that still hold the old ID are replaced, nothing of `<name>@<new ID>` is deleted, and a journal without such cells is left as it is. |
 | `private_oauth/` | The directory of the old ID moves to the directory of the new ID. The worker key inside each OAuth credential store is rewritten. |
 | `workers/` | Each worker whose key names the old ID as requester moves to the directory of its new key. Its `metadata/worker.json` and OAuth stores are rewritten. Its `venv/` is moved into the backup, because the scripts in it name the old path; MindRoom builds a new one on the worker's next use, and packages installed into the old one must be installed again. Docker control records and config projections of the old key are removed. |
 | `private_instances/` and `tracking/private_instances/` | Private scopes owned by the old ID move to the scope of the new ID, and their owner record is rewritten. |
@@ -138,13 +139,19 @@ These stay on purpose, and the plan lists them as `report:` lines.
 
 ### New-ID state
 
-When MindRoom ran after the server rename, it already wrote state under the new ID.
-Without `--discard-new-principal` the command refuses and names it, either the journal tables with their row counts or the path that already exists.
+When MindRoom ran under the new ID before its state was moved, it already wrote state there.
+For the journal that means rows under both `<name>@<old ID>` and `<name>@<new ID>`.
+Without `--discard-new-principal` the command refuses and names it, either both principals' tables with their row counts or the path that already exists.
 
 With `--discard-new-principal`:
 
-- The journal rows under `<name>@<new ID>` are deleted first.
+- The journal rows under `<name>@<new ID>` are deleted first, then the rows of `<name>@<old ID>` move in their place.
 - A destination path that holds only OAuth stores without credentials, lock files, and empty directories is moved into the backup directory, then the old path moves in.
+
+The flag only deletes journal rows while `<name>@<old ID>` still has rows.
+Once it has none, the rows under `<name>@<new ID>` are the agent's history, moved there by an earlier run, so they are kept with or without the flag.
+This is what makes a rerun after a killed run, or a repeated `--from` run, safe for the journal.
+A mistyped old ID has no rows either, so the flag deletes nothing then.
 
 It still refuses, and changes nothing, when the new principal has rows in `reply_messages` or `matrix_delivery_outbox`, because those are replies MindRoom already sent under the new ID.
 It also refuses when a destination holds credentials or any other file.
@@ -209,8 +216,9 @@ Ctrl-C is ignored while the command undoes steps, because restoring a large jour
 
 If the command itself is killed during `--apply`, for example by `kill -9`, an out-of-memory kill, or a power loss, nothing is undone.
 `matrix_state.yaml` is written after every other reversible step, so after a kill it still names the old ID and a rerun does not report `Already adopted`.
-Restore from the manifest as described below, or restore your snapshot, before you run the command again.
-Do not add `--discard-new-principal` to get past the refusal the rerun prints: it would delete the journal rows the killed run had already moved to the new principal.
+Restoring from the manifest as described below, or restoring your snapshot, and then running the command again is the safe way back.
+Running the same command again directly also keeps the journal: once `<name>@<old ID>` has no rows, the rerun leaves the rows under `<name>@<new ID>` alone, with or without `--discard-new-principal`, and moves what the killed run had not moved yet.
+It does not redo a rewrite inside a directory the killed run had already moved, such as the worker key of a moved OAuth store, so restore from the manifest if the kill may have come between a move and the rewrite after it.
 
 ## Restoring from `agent-rename-backups`
 

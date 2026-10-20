@@ -520,13 +520,11 @@ def test_from_adopts_a_manually_renamed_account(
     assert "Already adopted; nothing to do." in rerun.output
 
 
-def test_from_drops_the_old_device_of_a_username_changed_alone(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    server: _MatrixServer,
-) -> None:
-    """A manual edit of only the username leaves the old login's device, which MindRoom cannot start with; --from drops it."""
-    runtime_paths = _install(tmp_path, monkeypatch)
+def _change_only_the_username(runtime_paths: RuntimePaths) -> Path:
+    """Set the stored username to the new localpart but keep the old login's device, whose crypto store is the old ID's.
+
+    Returns that crypto store.
+    """
     old_store = olm_store_dir(OLD, runtime_paths) / f"{OLD}_OLDDEVICE.db"
     old_store.parent.mkdir(parents=True)
     old_store.write_bytes(b"")
@@ -534,6 +532,18 @@ def test_from_drops_the_old_device_of_a_username_changed_alone(
     state = safe_load(path.read_bytes())
     state["accounts"][f"agent_{AGENT}"]["username"] = "new"
     path.write_bytes(safe_dump(state, default_flow_style=False, sort_keys=False).encode())
+    return old_store
+
+
+def test_from_drops_the_old_device_of_a_username_changed_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """A manual edit of only the username leaves the old login's device, which MindRoom cannot start with; --from drops it."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    old_store = _change_only_the_username(runtime_paths)
+    path = matrix_state_file(runtime_paths)
 
     result = _invoke(runtime_paths, "--from", OLD, "--apply", "--yes", "--skip-login-check")
 
@@ -544,6 +554,29 @@ def test_from_drops_the_old_device_of_a_username_changed_alone(
     # No device continues the old stream, so the next start binds a fresh one.
     assert _journal_rows(runtime_paths, "SELECT principal_id FROM matrix_sync_consumers") == []
     assert old_store.is_file()
+    assert server.requests == []
+
+
+def test_from_that_drops_the_device_keeps_no_new_stream_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """When --from drops the stored device, the new principal's sync stream state is deleted with its other rows.
+
+    The username already names the new ID, but the next start logs in on a fresh device that binds a fresh stream,
+    so no device continues the stream the new principal's consumer and producer rows describe.
+    """
+    runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
+    _change_only_the_username(runtime_paths)
+
+    result = _invoke(runtime_paths, "--from", OLD, "--discard-new-principal", "--apply", "--yes", "--skip-login-check")
+
+    assert result.exit_code == 0, result.output
+    account = safe_load(matrix_state_file(runtime_paths).read_bytes())["accounts"][f"agent_{AGENT}"]
+    assert (account["device_id"], account["access_token"]) == (None, None)
+    assert _journal_rows(runtime_paths, "SELECT principal_id FROM matrix_sync_consumers") == []
+    assert _journal_rows(runtime_paths, "SELECT principal_id FROM matrix_ingestion_membership") == []
     assert server.requests == []
 
 

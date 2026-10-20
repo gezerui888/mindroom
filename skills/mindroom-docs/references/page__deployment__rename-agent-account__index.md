@@ -90,7 +90,8 @@ With `--from`, the old ID comes from the option instead of `matrix_state.yaml`.
 The journal and files move from it and the config values are replaced, as in a normal run.
 `matrix_state.yaml` keeps the device and access token MindRoom logged in with under the new ID; a `report:` line in the plan says so.
 If you changed only the username and left the old `device_id` and `access_token`, they still belong to the old ID, and MindRoom refuses to start with them under the new one.
-The command then drops them, as a normal run does, and the next start logs in on a fresh device.
+When that device's crypto store is still the old ID's under `encryption_keys/`, the command drops them, as a normal run does, and the next start logs in on a fresh device.
+Without that store the command keeps them, so clear both fields by hand.
 If MindRoom started after your edit, add `--discard-new-principal` for the state it wrote under the new ID.
 
 `--from` must be a Matrix user ID on the new ID's server, differ from the new ID, and not be another stored account.

@@ -4780,6 +4780,7 @@ depends_on = [
     "mindroom.desktop.native_config",
     "mindroom.event_journal.opening",
     "mindroom.matrix.state",
+    "mindroom.matrix_identifiers",
 ]
 visibility = ["mindroom.cli.main"]
 

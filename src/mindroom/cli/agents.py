@@ -270,6 +270,8 @@ def _adoption(
     if owner is not None:
         msg = f"--from {old_user_id} is the stored account {owner} in {state_path}, not a former ID of {account_key}."
         raise RenameRefusedError(msg)
+    if old_user_id != stored_user_id:
+        _require_former_user_id(runtime_paths, agent=agent, from_user_id=old_user_id, new_user_id=new_user_id)
     return _Adoption(agent, old_user_id, new_user_id, stored_user_id, accounts[account_key].password)
 
 
@@ -304,6 +306,38 @@ def _old_user_id(
         )
         raise RenameRefusedError(msg)
     return from_user_id
+
+
+def _require_former_user_id(runtime_paths: RuntimePaths, *, agent: str, from_user_id: str, new_user_id: str) -> None:
+    """Refuse a ``--from`` that nothing shows to be a former Matrix ID of ``agent``.
+
+    ``--from`` moves whatever is stored under that ID, so a wrong one, such as a person's, would hand their
+    OAuth credentials and journal mentions to the agent. Accepted are an ID the journal keys the agent's rows by,
+    and the ID MindRoom generates for the agent on the new ID's server, which lets a killed run resume.
+    """
+    from mindroom.agent_rename.journal import other_principal_user_ids  # noqa: PLC0415
+    from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
+    from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415
+    from mindroom.matrix.identity import MatrixID  # noqa: PLC0415
+    from mindroom.matrix_identifiers import agent_username_localpart  # noqa: PLC0415
+
+    database = event_journal_sqlite_path(runtime_paths.storage_root)
+    if from_user_id in other_principal_user_ids(database, agent=agent, user_id=new_user_id):
+        return
+    generated = MatrixID.from_username(
+        agent_username_localpart(agent, runtime_paths),
+        MatrixID.parse(new_user_id).domain,
+    ).full_id
+    if from_user_id == generated:
+        return
+    msg = (
+        f"--from {from_user_id} must be a former Matrix ID of agent {agent}, and nothing shows that it is: "
+        f"the event journal {database} has no rows for {agent}@{from_user_id}, "
+        f"and it is not {generated}, the ID MindRoom generates for {agent}. "
+        "If an earlier run with this --from was killed after its journal step, restore from its backup manifest "
+        "before running again."
+    )
+    raise RenameRefusedError(msg)
 
 
 def _other_owner(user_ids: dict[str, str], account_key: str, user_id: str) -> str | None:

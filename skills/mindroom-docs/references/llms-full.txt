@@ -19767,13 +19767,19 @@ With `--from`, the old ID comes from the option instead of `matrix_state.yaml`.
 The journal and files move from it and the config values are replaced, as in a normal run.
 `matrix_state.yaml` stays as it is, because its device and access token already belong to the new ID; a `report:` line in the plan says so.
 If MindRoom started after your edit, add `--discard-new-principal` for the state it wrote under the new ID.
-Running the same `--from` command again finds nothing left to move, prints `Nothing left to move from <old ID>; nothing was changed.`, and writes nothing, not even a backup directory.
 
 `--from` must be a Matrix user ID on the new ID's server, differ from the new ID, and not be another stored account.
 While `matrix_state.yaml` still names the old ID, `--from` may only repeat that ID.
-The check only looks at the journal.
+Otherwise it must also be a former Matrix ID of this agent, because the command moves whatever is stored under it: a person's ID would hand their OAuth credentials and journal mentions to the agent.
+The command accepts it when the event journal has rows for `<name>@<old ID>`, or when it is the ID MindRoom generates for the agent on that server, `@mindroom_<name>:<server>`, or `@mindroom_<name>_<namespace>:<server>` when `MINDROOM_NAMESPACE` is set.
+Anything else is refused before anything changes, dry run included, with `--from <old ID> must be a former Matrix ID of agent <name>`.
+
+Once a `--from` run has moved the journal, the journal no longer has rows for the old ID.
+Running the same command again is then refused, unless the old ID is the generated one; in that case the rerun moves what is left, or prints `Nothing left to move from <old ID>; nothing was changed.` and writes nothing, not even a backup directory.
+
+The "Already adopted" check only looks at the journal too.
 If the journal holds no rows for the old ID, for example because you fixed it by hand, the command prints `Already adopted; nothing to do.` even when OAuth stores or workers are still under the old ID.
-Run it with `--from` in that case too.
+To finish such an install with `--from`, restore the journal from before your fix, so that it holds `<name>@<old ID>` again, and run the command with `--from`.
 
 ## What changes
 
@@ -19828,8 +19834,8 @@ With `--discard-new-principal`:
 
 The flag only deletes journal rows while `<name>@<old ID>` still has rows.
 Once it has none, the rows under `<name>@<new ID>` are the agent's history, moved there by an earlier run, so they are kept with or without the flag.
-This is what makes a rerun after a killed run, or a repeated `--from` run, safe for the journal.
-A mistyped old ID has no rows either, so the flag deletes nothing then.
+This is what makes a rerun after a killed run safe for the journal.
+A `--from` without rows in the journal is refused before anything changes, unless it is the generated ID (see [After a manual username change](#after-a-manual-username-change)).
 
 It still refuses, and changes nothing, when the new principal has rows in `reply_messages` or `matrix_delivery_outbox`, because those are replies MindRoom already sent under the new ID.
 It also refuses when a destination holds credentials or any other file.
@@ -19897,6 +19903,7 @@ If the command itself is killed during `--apply`, for example by `kill -9`, an o
 Restoring from the manifest as described below, or restoring your snapshot, and then running the command again is the safe way back.
 Running the same command again directly also keeps the journal: once `<name>@<old ID>` has no rows, the rerun leaves the rows under `<name>@<new ID>` alone, with or without `--discard-new-principal`, and moves what the killed run had not moved yet.
 It does not redo a rewrite inside a directory the killed run had already moved, such as the worker key of a moved OAuth store, so restore from the manifest if the kill may have come between a move and the rewrite after it.
+After a killed `--from` run, the rerun with `--from` is refused unless the old ID is the generated one, because the journal no longer shows the old ID as the agent's; restore from the manifest then.
 
 ## Restoring from `agent-rename-backups`
 

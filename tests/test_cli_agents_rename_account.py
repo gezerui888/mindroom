@@ -588,12 +588,17 @@ def test_rerun_after_a_killed_from_run_keeps_the_moved_journal(
     monkeypatch: pytest.MonkeyPatch,
     server: _MatrixServer,
 ) -> None:
-    """A killed --from run leaves the journal moved; rerunning without --from changes nothing, with it finishes the files."""
+    """A killed --from run leaves the journal moved, and no rerun deletes those rows.
+
+    Without --from the journal shows no other ID. With --from @old:x nothing shows any more that it was harry's,
+    because @old:x is not the ID MindRoom generates for harry, so the rerun refuses and the manifest is the way back.
+    """
     runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
     _adopt_by_hand(runtime_paths)
     _commit_journal_step_only(runtime_paths, stored_user_id=NEW, discard=True)
     moved = [(NEW_PRINCIPAL, NEW), (ROUTER, NEW)]
     assert _journal_events(runtime_paths) == moved
+    before = tree_snapshot(tmp_path)
 
     without_from = _invoke(runtime_paths)
 
@@ -602,10 +607,11 @@ def test_rerun_after_a_killed_from_run_keeps_the_moved_journal(
 
     result = _invoke(runtime_paths, "--from", OLD, "--discard-new-principal", "--apply", "--yes", "--skip-login-check")
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
+    assert f"--from {OLD} must be a former Matrix ID of agent {AGENT}" in result.output
+    assert "restore from its backup manifest" in result.output
     assert _journal_events(runtime_paths) == moved
-    assert _stored_worker_key(_oauth_path(runtime_paths.storage_root, NEW)) == _key("user_agent", NEW)
-    assert f"Leftover scan: nothing in {runtime_paths.storage_root} names {OLD} any more." in result.output
+    assert tree_snapshot(tmp_path) == before
     assert server.requests == []
 
 
@@ -614,7 +620,10 @@ def test_repeating_a_successful_from_run_changes_nothing(
     monkeypatch: pytest.MonkeyPatch,
     server: _MatrixServer,
 ) -> None:
-    """The same --from --discard-new-principal --apply run a second time finds nothing to move and writes nothing."""
+    """The same --from --discard-new-principal --apply run a second time writes nothing and keeps the journal.
+
+    The first run moved harry's journal rows away from @old:x, so nothing shows any more that @old:x was his.
+    """
     runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
     _adopt_by_hand(runtime_paths)
     command = ("--from", OLD, "--discard-new-principal", "--apply", "--yes", "--skip-login-check")
@@ -623,10 +632,70 @@ def test_repeating_a_successful_from_run_changes_nothing(
 
     again = _invoke(runtime_paths, *command)
 
-    assert again.exit_code == 0, again.output
-    assert f"Nothing left to move from {OLD}; nothing was changed." in again.output
+    assert again.exit_code == 1, again.output
+    assert f"--from {OLD} must be a former Matrix ID of agent {AGENT}" in again.output
     assert tree_snapshot(tmp_path) == after_first
     assert _journal_events(runtime_paths) == [(NEW_PRINCIPAL, NEW), (ROUTER, NEW)]
+    assert server.requests == []
+
+
+def test_from_naming_someone_else_is_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """A --from that nothing shows to be harry's refuses, so a person's credentials and mentions never move to him."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    _adopt_by_hand(runtime_paths)
+    alice = "@alice:x"
+    _oauth_store(_oauth_path(runtime_paths.storage_root, alice), _key("user_agent", alice))
+    with closing(sqlite3.connect(event_journal_sqlite_path(runtime_paths.storage_root))) as connection, connection:
+        _event(connection, "code@@code:x", sender=alice)
+    before = tree_snapshot(tmp_path)
+
+    for args in ((), ("--discard-new-principal", "--apply", "--yes", "--skip-login-check")):
+        result = _invoke(runtime_paths, "--from", alice, *args)
+
+        assert result.exit_code == 1, result.output
+        assert f"--from {alice} must be a former Matrix ID of agent {AGENT}" in result.output
+        assert f"has no rows for {AGENT}@{alice}" in result.output
+        assert "is not @mindroom_harry:x, the ID MindRoom generates for harry" in result.output
+    assert tree_snapshot(tmp_path) == before
+    assert server.requests == []
+
+
+@pytest.mark.parametrize(("namespace", "generated"), [("", "@mindroom_harry:x"), ("ab12", "@mindroom_harry_ab12:x")])
+def test_from_with_the_generated_id_needs_no_journal_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+    namespace: str,
+    generated: str,
+) -> None:
+    """The ID MindRoom generates for the agent, namespace included, is accepted without journal rows.
+
+    That lets a run killed after its journal step resume; once everything moved, a rerun finds nothing to do.
+    """
+    runtime_paths = _install(tmp_path, monkeypatch)
+    _adopt_by_hand(runtime_paths)
+    monkeypatch.setenv("MINDROOM_NAMESPACE", namespace)
+    storage = runtime_paths.storage_root
+    _oauth_store(_oauth_path(storage, generated), _key("user_agent", generated))
+    if namespace:
+        unnamespaced = _invoke(runtime_paths, "--from", "@mindroom_harry:x")
+        assert unnamespaced.exit_code == 1, unnamespaced.output
+        assert "must be a former Matrix ID" in unnamespaced.output
+
+    result = _invoke(runtime_paths, "--from", generated, "--apply", "--yes", "--skip-login-check")
+
+    assert result.exit_code == 0, result.output
+    assert not _oauth_path(storage, generated).exists()
+    assert _stored_worker_key(_oauth_path(storage, NEW)) == _key("user_agent", NEW)
+
+    again = _invoke(runtime_paths, "--from", generated, "--apply", "--yes", "--skip-login-check")
+
+    assert again.exit_code == 0, again.output
+    assert f"Nothing left to move from {generated}; nothing was changed." in again.output
     assert server.requests == []
 
 

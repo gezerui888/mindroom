@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import signal
 import sqlite3
 from contextlib import closing
@@ -152,6 +153,22 @@ def test_apply_runs_steps_and_writes_manifest(tmp_path: Path) -> None:
             "backup": str(result.backup_dir / "003"),
         },
     ]
+
+
+def test_backups_are_private_whatever_the_umask(tmp_path: Path) -> None:
+    """Backups hold the Matrix password and OAuth stores, so only their owner may read them, even with umask 000."""
+    storage = _make_storage(tmp_path)
+    previous_umask = os.umask(0)
+    try:
+        result = apply_plan(_four_step_plan(storage), kind="rename-account", now=NOW)
+    finally:
+        os.umask(previous_umask)
+
+    private_directories = [storage / BACKUPS, result.backup_dir, *(result.backup_dir / f"00{i}" for i in (1, 2, 3))]
+    assert {path.name: path.stat().st_mode & 0o777 for path in private_directories} == {
+        path.name: 0o700 for path in private_directories
+    }
+    assert (result.backup_dir / "manifest.json").stat().st_mode & 0o777 == 0o600
 
 
 def test_backup_dir_name_uses_utc(tmp_path: Path) -> None:

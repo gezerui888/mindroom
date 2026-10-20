@@ -320,10 +320,21 @@ def _rewrite_worker_metadata(content: bytes, *, old_key: str, new_key: str) -> b
 
 
 def _worker_state_steps(old_root: Path, new_root: Path, rename: _AccountRename) -> list[Step]:
-    """Move one worker root and rewrite the metadata and OAuth stores inside it at their new place."""
+    """Move one worker root, drop its venv, and rewrite the metadata and OAuth stores inside it at their new place."""
     if not os.path.lexists(old_root):
         return []
     steps = _move(old_root, new_root, "the worker", rename)
+    # The venv's console scripts name the old root in their shebangs, so the moved copy is dropped.
+    # MindRoom rebuilds a missing venv on the worker's next use (workers/backends/local.py's venv_dir).
+    if os.path.lexists(old_root / "venv"):
+        venv = new_root / "venv"
+        steps.append(
+            DropPath(
+                venv,
+                f"Drop the moved worker's virtual environment {venv}; MindRoom rebuilds it on the worker's next use, "
+                "so packages installed into it must be installed again",
+            ),
+        )
     metadata_key = _metadata_worker_key(old_root / "metadata" / "worker.json")
     new_metadata_key = None if metadata_key is None else rename.worker_key(metadata_key)
     if metadata_key is not None and new_metadata_key is not None:

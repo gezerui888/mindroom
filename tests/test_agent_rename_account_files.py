@@ -376,6 +376,47 @@ def test_worker_dir_moved_metadata_rewritten_and_oauth_store_rewritten(tmp_path:
     assert (workers / worker_dir_name(other_key) / "metadata" / "worker.json").exists()
 
 
+def test_moved_worker_venv_is_dropped_into_the_backup(tmp_path: Path) -> None:
+    """A moved worker's venv is dropped right after the move, because its scripts' shebangs name the old root.
+
+    MindRoom rebuilds a missing venv on the worker's next use; the old one stays in the backup.
+    """
+    runtime_paths = _install(tmp_path)
+    workers = runtime_paths.storage_root / "workers"
+    old_key, new_key = _key("user", OLD), _key("user", NEW)
+    old_root, new_root = workers / worker_dir_name(old_key), workers / worker_dir_name(new_key)
+    _write_json(old_root / "metadata" / "worker.json", {"worker_key": old_key})
+    (old_root / "venv" / "bin").mkdir(parents=True)
+    (old_root / "venv" / "bin" / "pip").write_text(f"#!{old_root}/venv/bin/python\n", encoding="utf-8")
+
+    steps, _reports = _steps(runtime_paths)
+    move = next(index for index, step in enumerate(steps) if isinstance(step, MovePath) and step.source == old_root)
+    assert steps[move + 1] == DropPath(
+        new_root / "venv",
+        f"Drop the moved worker's virtual environment {new_root / 'venv'}; MindRoom rebuilds it on the worker's "
+        "next use, so packages installed into it must be installed again",
+    )
+
+    _apply(runtime_paths)
+
+    assert not (new_root / "venv").exists()
+    (backup,) = (runtime_paths.storage_root / "agent-rename-backups").iterdir()
+    assert (backup / f"{move + 1:03d}" / "venv" / "bin" / "pip").read_text() == f"#!{old_root}/venv/bin/python\n"
+
+
+def test_worker_without_venv_gets_no_drop(tmp_path: Path) -> None:
+    """Only a venv that exists is dropped."""
+    runtime_paths = _install(tmp_path)
+    old_key = _key("user", OLD)
+    old_root = runtime_paths.storage_root / "workers" / worker_dir_name(old_key)
+    _write_json(old_root / "metadata" / "worker.json", {"worker_key": old_key})
+
+    steps, _reports = _steps(runtime_paths)
+
+    assert [step.source for step in steps if isinstance(step, MovePath)] == [old_root]
+    assert not [step for step in steps if isinstance(step, DropPath)]
+
+
 def test_other_users_workers_are_neither_moved_nor_reported(tmp_path: Path) -> None:
     """Workers of users whose IDs start like the old one stay put and unreported; only possible old-ID roots report."""
     runtime_paths = _install(tmp_path)

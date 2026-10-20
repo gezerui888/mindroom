@@ -33,7 +33,10 @@ Any other setup is refused with `not supported yet`.
 ## Procedure
 
 1. Rename the account on the homeserver and confirm the new ID can log in with the agent's old password.
-2. Stop MindRoom.
+2. Stop MindRoom, and keep it from starting by itself until step 6.
+   Disable its systemd unit (`systemctl disable --now <unit>`) or set its container's restart policy to `no` (`docker update --restart=no <container>`).
+   If the unit comes from a NixOS configuration, also pause automatic deployments such as comin, which would start it again, and do not reboot.
+   A MindRoom that starts after a killed run finds the agent half-renamed, see [When a step fails](#when-a-step-fails).
 3. Take a snapshot or copy of the storage directory, the config directory, and the homeserver's database.
    Include the directories that `MINDROOM_CONTROL_STATE_PATH` and `MINDROOM_SESSION_STORAGE_PATH` point to when they are outside the storage directory, because the command changes files there too.
    The command keeps its own backups, but a snapshot is the only rollback that also covers the homeserver.
@@ -59,7 +62,7 @@ Any other setup is refused with `not supported yet`.
      --config config.yaml --storage-path mindroom_data --apply
    ```
 
-6. Start MindRoom.
+6. Turn auto-start back on and start MindRoom.
    The agent logs in with its stored password on a new device and syncs under the new ID.
 
 A dry run neither contacts the homeserver nor checks that MindRoom is stopped.
@@ -236,6 +239,8 @@ Ctrl-C is ignored while the command undoes steps, because restoring a large jour
 
 If the command itself is killed during `--apply`, for example by `kill -9`, an out-of-memory kill, or a power loss, nothing is undone.
 `matrix_state.yaml` is written after every other reversible step, so after a kill it still names the old ID and a rerun does not report `Already adopted`.
+Do not start MindRoom until a rerun has finished or you have restored from the manifest or your snapshot.
+Until then, part of the agent's state is under the new ID while `matrix_state.yaml` still names the old ID, which the homeserver no longer knows.
 Restoring from the manifest as described below, or restoring your snapshot, and then running the command again is the safe way back.
 Running the same command again directly also keeps the journal: once `<name>@<old ID>` has no rows, the rerun leaves the rows under `<name>@<new ID>` alone, with or without `--discard-new-principal`, and moves what the killed run had not moved yet.
 It does not redo a rewrite inside a directory the killed run had already moved, such as the worker key of a moved OAuth store, so restore from the manifest if the kill may have come between a move and the rewrite after it.

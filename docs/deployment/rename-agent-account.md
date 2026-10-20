@@ -16,10 +16,14 @@ The command moves them, rewrites what holds the old ID, and tells you what it le
 
 Run it after the homeserver renamed the account, and before MindRoom starts for the first time under the new ID.
 
-- The MindRoom fork of Tuwunel renames a local user in place with the admin command `query user-id-rewrite` ([mindroom-tuwunel#109](https://github.com/mindroom-ai/mindroom-tuwunel/pull/109)). Its operator guide is `docs/user-id-rewrite.md` in that repository. The account keeps its password, rooms, and history.
+- The MindRoom fork of Tuwunel renames a local user in place with the admin command `query user-id-rewrite` ([mindroom-tuwunel#109](https://github.com/mindroom-ai/mindroom-tuwunel/pull/109)).
+  Its operator guide is `docs/user-id-rewrite.md` in that repository.
+  The account keeps its password, rooms, and history.
 - Synapse has no equivalent admin command, so this page does not apply to a Synapse server.
-- The new ID must be on the same server as the old one. A rename in place keeps the server, and the command refuses another one.
-- An in-place rename is only safe for an account whose rooms are not shared with other servers. The rewritten events no longer match their hashes and signatures, so a federated server that already holds them would reject them.
+- The new ID must be on the same server as the old one.
+  A rename in place keeps the server, and the command refuses another one.
+- An in-place rename is only safe for an account whose rooms are not shared with other servers.
+  The rewritten events no longer match their hashes and signatures, so a federated server that already holds them would reject them.
 
 MindRoom takes an agent's Matrix ID from the `username` stored in `matrix_state.yaml`.
 If you already changed that username to the new localpart by hand, see [After a manual username change](#after-a-manual-username-change).
@@ -35,9 +39,10 @@ Any other setup is refused with `not supported yet`.
 1. Rename the account on the homeserver and confirm the new ID can log in with the agent's old password.
 2. Stop MindRoom.
 3. Take a snapshot or copy of the storage directory, the config directory, and the homeserver's database.
+   Include the directories that `MINDROOM_CONTROL_STATE_PATH` and `MINDROOM_SESSION_STORAGE_PATH` point to when they are outside the storage directory, because the command changes files there too.
    The command keeps its own backups, but a snapshot is the only rollback that also covers the homeserver.
 4. Run a dry run as the OS user the service runs as, with the service's environment and the same `--config` and `--storage-path`.
-   Variables such as `MATRIX_HOMESERVER`, `MINDROOM_STORAGE_PATH`, `MINDROOM_CONFIG_PATH`, `MINDROOM_WORKER_BACKEND`, and `MINDROOM_CONTROL_STATE_PATH` decide which server the login check asks, which files the command reads, and whether it retires Docker workers.
+   Variables such as `MATRIX_HOMESERVER`, `MINDROOM_STORAGE_PATH`, `MINDROOM_CONFIG_PATH`, `MINDROOM_WORKER_BACKEND`, `MINDROOM_CONTROL_STATE_PATH`, and `MINDROOM_SESSION_STORAGE_PATH` decide which server the login check asks, which files the command reads, and whether it retires Docker workers.
    For a systemd service, `systemctl show <unit> -p User -p Environment -p EnvironmentFiles` lists them.
    A file the command rewrites keeps its mode but becomes owned by whoever ran the command, so a run as root can leave files the service can no longer write.
    The dry run prints the plan and changes nothing.
@@ -103,7 +108,10 @@ Running the same command again is then refused, unless the old ID is the generat
 
 The "Already adopted" check only looks at the journal too.
 If the journal holds no rows for the old ID, for example because you fixed it by hand, the command prints `Already adopted; nothing to do.` even when OAuth stores or workers are still under the old ID.
-To finish such an install with `--from`, restore the journal from before your fix, so that it holds `<name>@<old ID>` again, and run the command with `--from`.
+When the old ID is the one MindRoom generates for the agent, run the command with `--from <old ID>` to move what is left.
+For any other old ID, `--from` needs `<name>@<old ID>` rows in the journal.
+Restore the journal from before your fix to get them back only if MindRoom has not run since: a restored journal loses every row written after it, such as the record of replies MindRoom sent.
+Otherwise move the remaining OAuth stores and workers by hand, as listed in [What changes](#what-changes).
 
 ## What changes
 
@@ -122,7 +130,6 @@ The event journal rewrite, the personal-room records, and the leftover scan matc
 `@harry:example.org` is found in `ask @harry:example.org.`, in `@harry:example.org:DEVICEID`, and in `@harry:example.org:12AB`, whose device ID starts with digits.
 It is not found in `@harry:example.org.uk`, `@harry:example.org:8448`, or `@harry:example.org:1234`, which name other users or servers.
 Digits after a `:` count as a port unless a letter follows them, so an all-digit suffix is never matched.
-This is the rule of mindroom-tuwunel#109 since its commit `875f009`; earlier builds of that pull request treated every `:` followed by a digit as a port.
 Worker keys and private-instance owners are compared as whole IDs too.
 Config values are different: only a value that equals the old ID exactly is replaced.
 
@@ -140,8 +147,12 @@ If that fails, the command prints a warning and you remove the container by hand
 
 These stay on purpose, and the plan lists them as `report:` lines.
 
-- The old crypto store stays. It is the directory under `encryption_keys/` named after the old ID without the `@` and with each `:` replaced by `_`, for example `encryption_keys/mindroom_openclaw_example.org/`. Only that store decrypts the old encrypted history, and the new device starts its own store. It cannot read encrypted history from before the rename.
-- A desktop bridge pinned to the old ID stays pinned. Pair it again.
+- The old crypto store stays.
+  It is the directory under `encryption_keys/` named after the old ID without the `@` and with each `:` replaced by `_`, for example `encryption_keys/mindroom_openclaw_example.org/`.
+  Only that store decrypts the old encrypted history, and the new device starts its own store.
+  It cannot read encrypted history from before the rename.
+- A desktop bridge pinned to the old ID stays pinned.
+  Pair it again.
 - Records of past tool jobs and scheduled runs outside the event journal keep the old ID as history.
 - A worker directory that looks like it belonged to the old ID, but whose worker key cannot be found, stays in place and is reported with its path.
 
@@ -178,7 +189,9 @@ Event journal collisions are the one refusal that only shows up while `--apply` 
 - With `--from`, the old ID passes the same checks, differs from the new ID, and matches the stored account unless that already names the new ID.
 - The journal backend and worker backend are supported.
 - MindRoom is stopped: `Stop MindRoom first: another process holds <lock file>`.
-- The login check passes (`--apply` only). The command logs in at `/_matrix/client/v3/login` on the configured homeserver as the new ID with the stored password, then logs out. A rejected login means the server rename has not happened, and the command refuses with `The server does not accept <new ID> with the stored password`.
+- The login check passes (`--apply` only).
+  The command logs in at `/_matrix/client/v3/login` on the configured homeserver as the new ID with the stored password, then logs out.
+  A rejected login means the server rename has not happened, and the command refuses with `The server does not accept <new ID> with the stored password`.
 - Event journal rows and paths under the new ID are dealt with as described in [New-ID state](#new-id-state).
 
 The login check sends its requests straight to the configured homeserver, with the TLS settings MindRoom is configured to use, instead of going through MindRoom's Matrix client.

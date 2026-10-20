@@ -153,6 +153,71 @@ def test_renames_storage_paths_in_every_spelling(tmp_path: Path, monkeypatch: py
     assert config.read_text() == before.format(name="claw", storage=storage)
 
 
+def test_renames_storage_paths_spelled_with_placeholders(tmp_path: Path) -> None:
+    """The documented `${MINDROOM_STORAGE_PATH}` spelling, and the others MindRoom expands, keep their placeholder."""
+    before = (
+        "agents:\n"
+        "  {name}:\n"
+        "    display_name: OpenClaw\n"
+        "knowledge_bases:\n"
+        "  source_docs:\n"
+        "    mode: files\n"
+        "    path: ${{MINDROOM_STORAGE_PATH}}/agents/{name}/workspace/source_docs\n"
+        "  bare:\n"
+        "    path: $MINDROOM_STORAGE_PATH/agents/{name}/workspace/bare\n"
+        "  from_config:\n"
+        "    path: ${{MINDROOM_CONFIG_PATH}}/../mindroom_data/agents/{name}/workspace/docs\n"
+        "  flow: [$MINDROOM_STORAGE_PATH/agents/{name}/f, '${{MINDROOM_STORAGE_PATH}}/agents/{name}/g']\n"
+        "  unsupported:\n"
+        "    path: ${{HOME}}/agents/openclaw/workspace\n"
+    )
+    config = _write(tmp_path / "config.yaml", before.format(name="openclaw"))
+
+    _rename(config)
+
+    assert config.read_text() == before.format(name="claw")
+
+
+def test_prose_starting_with_a_state_path_is_left_alone(tmp_path: Path) -> None:
+    """A value is a path only when nothing but path characters follow the state root, on one line."""
+    text = (
+        "    instructions:\n"
+        "      - ./mindroom_data/agents/openclaw/notes.md holds your notes, read it first\n"
+        "    role: |\n"
+        "      ./mindroom_data/agents/openclaw/notes.md holds your notes.\n"
+        "      Read it first.\n"
+    )
+    config = _write(tmp_path / "config.yaml", "agents:\n  openclaw:\n" + text)
+
+    _rename(config)
+
+    assert config.read_text() == "agents:\n  claw:\n" + text
+
+
+def test_candidate_path_with_a_nul_is_skipped(tmp_path: Path) -> None:
+    """A value that cannot be a path, such as one holding a NUL, is left alone instead of crashing the plan."""
+    text = 'notes: "./mind\\0room/agents/openclaw/x"\nkb: "\\0/agents/openclaw/y"\n'
+    config = _write(tmp_path / "config.yaml", "agents:\n  openclaw: {display_name: C}\n" + text)
+
+    _rename(config)
+
+    assert config.read_text() == "agents:\n  claw: {display_name: C}\n" + text
+
+
+def test_agent_key_reused_as_a_value_through_an_alias_refuses(tmp_path: Path) -> None:
+    """A node that is both a mapping key and a value cannot be judged by one edit, so the plan refuses."""
+    config = _write(
+        tmp_path / "config.yaml",
+        "agents:\n  &name openclaw:\n    display_name: C\npersonal_rooms:\n  agent: *name\n  onboarding_rooms: [lobby]\n",
+    )
+
+    with pytest.raises(
+        RenameRefusedError,
+        match=r"config\.yaml \(line 2\) is used both as a mapping key and as a value",
+    ):
+        _steps(config)
+
+
 def test_prefix_names_are_left_alone(tmp_path: Path) -> None:
     """Renaming `code` changes nothing that belongs to `code_team`."""
     before = (
@@ -310,7 +375,7 @@ def test_value_shared_by_an_alias_with_a_non_reference_refuses(tmp_path: Path) -
         "teams:\n  squad:\n    display_name: S\n    role: S\n    agents: [*name]\n",
     )
 
-    with pytest.raises(RenameRefusedError, match=r"alias.*config\.yaml.*line 3"):
+    with pytest.raises(RenameRefusedError, match=r"config\.yaml \(line 3\) is shared through an alias"):
         _steps(config)
 
 
@@ -373,7 +438,7 @@ def test_unverifiable_edit_refuses_at_plan_time_and_at_apply(tmp_path: Path, mon
     config = _write(tmp_path / "config.yaml", "agents:\n  openclaw:\n    display_name: C\n")
     steps = _steps(config)
     before = tree_snapshot(tmp_path)
-    monkeypatch.setattr(config_edit, "_render_scalar", lambda _value, _style: "wrong")
+    monkeypatch.setattr(config_edit, "_render_scalar", lambda *_args, **_kwargs: "wrong")
 
     with pytest.raises(RenameRefusedError, match=r"could not be verified in .*config\.yaml"):
         _steps(config)

@@ -51,6 +51,10 @@ _BOM = "\ufeff"
 _ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}
 # The mappings whose keys are agent names.
 _AGENT_KEYED_MAPPINGS = frozenset({("agents",), ("calls", "agents")})
+# The placeholders MindRoom expands in configured paths, matched as `mindroom.constants` matches them.
+_PATH_PLACEHOLDER = re.compile(r"\$(?:\{(?P<braced>[A-Z0-9_]+)\}|(?P<bare>[A-Z0-9_]+))")
+# What may follow `agents/<old>` in a value that is a path: nothing, or more path components without whitespace.
+_PATH_REST = re.compile(r"(?:/\S*)?")
 
 # Where a node sits in the merged config: the mapping keys above it, with None for a list item or a non-scalar key.
 type _Place = tuple[str | None, ...]
@@ -88,7 +92,7 @@ def config_value_steps(config_path: Path, *, old_value: str, new_value: str) -> 
         if path in unparsable:
             msg = f"Cannot read the config file {path}: {unparsable[path]}"
             raise RenameRefusedError(msg)
-        changes = partial(_value_changes, old_value=old_value, new_value=new_value)
+        changes = partial(_value_changes, path=path, old_value=old_value, new_value=new_value)
         rewrite = partial(_rewrite, path=path, changes=changes)
         if rewrite(content) != content:
             description = f"Replace {old_value} with {new_value} in {path}"
@@ -103,15 +107,16 @@ def config_entity_steps(config_path: Path, *, old_name: str, new_name: str, stor
     The step renames the keys ``agents.<old_name>`` and ``calls.agents.<old_name>``, the items equal to ``old_name``
     in ``teams.*.agents`` and ``agents.*.delegate_to``, and ``personal_rooms.agent`` when it equals ``old_name``.
     It also renames the ``agents/<old_name>`` component of every string value that is a path in the agent's
-    state root ``<storage_root>/agents/<old_name>``, spelled absolute, ``~``-prefixed, or relative to the config
-    directory. Prose that mentions the agent is not edited.
+    state root ``<storage_root>/agents/<old_name>``, spelled absolute, ``~``-prefixed, relative to the config
+    directory, or with a path placeholder such as ``${MINDROOM_STORAGE_PATH}``. Prose that mentions the agent,
+    even prose starting with such a path, is not edited.
     Building the steps already runs every edit through its verification, so a dry run refuses what an apply would.
     """
     files = _config_files(config_path)
     rename = _AgentRename(
         old=old_name,
         new=new_name,
-        config_dir=config_path.resolve().parent,
+        config_path=config_path.resolve(),
         storage_root=storage_root.expanduser().resolve(),
     )
     steps: list[FileRewrite] = []
@@ -161,7 +166,7 @@ class _AgentRename:
 
     old: str
     new: str
-    config_dir: Path
+    config_path: Path
     storage_root: Path
 
     def new_value(self, node: yaml.Node, place: _Place, *, is_key: bool) -> str | None:
@@ -175,17 +180,39 @@ class _AgentRename:
         return self._renamed_state_path(node.value)
 
     def _renamed_state_path(self, value: str) -> str | None:
-        """Return ``value`` with ``agents/<old>`` renamed when that component starts the agent's state root."""
+        """Return ``value`` with ``agents/<old>`` renamed when the value is a path in the agent's state root.
+
+        A path is one line with no whitespace after ``agents/<old>``, so prose that starts with a path is not one.
+        The part before ``agents/<old>`` is read as MindRoom reads configured paths: placeholders and ``~`` expanded,
+        relative to the config directory. Only that part is resolved: the state root moves before the config edit.
+        """
+        if value.splitlines() != [value]:
+            return None
         for match in re.finditer(rf"(?<![^/])agents/{re.escape(self.old)}(?![^/])", value):
+            if not _PATH_REST.fullmatch(value, match.end()):
+                continue
             prefix = value[: match.start()]
             try:
-                # Only the part before `agents/<old>` is resolved: the state root itself moves before the config edit.
-                root = (self.config_dir / Path(prefix).expanduser()).resolve()
-            except (OSError, RuntimeError):
+                root = (self.config_path.parent / Path(self._expand_placeholders(prefix)).expanduser()).resolve()
+            except (OSError, RuntimeError, ValueError):
+                # ValueError: a placeholder MindRoom rejects, or a NUL, which no path holds.
                 continue
             if root == self.storage_root:
                 return f"{prefix}agents/{self.new}{value[match.end() :]}"
         return None
+
+    def _expand_placeholders(self, prefix: str) -> str:
+        """Expand the path placeholders MindRoom allows; any other placeholder raises ``ValueError`` as in MindRoom."""
+        values = {"MINDROOM_CONFIG_PATH": str(self.config_path), "MINDROOM_STORAGE_PATH": str(self.storage_root)}
+
+        def replace(match: re.Match[str]) -> str:
+            name = match.group("braced") or match.group("bare")
+            if name not in values:
+                msg = f"Unsupported path placeholder {name}"
+                raise ValueError(msg)
+            return values[name]
+
+        return _PATH_PLACEHOLDER.sub(replace, prefix)
 
 
 def _names_an_agent(place: _Place) -> bool:
@@ -266,33 +293,49 @@ def _entity_changes(
 ) -> _Changes:
     """Return the scalars of one file that name the agent, judged at every place the file sits in the config."""
     changes: _Changes = {}
-    kept: dict[int, yaml.Node] = {}
+    kept: set[int] = set()
+    roles: dict[int, set[bool]] = {}
     for file_place in places:
         for node, place, is_key in _occurrences(root, file_place):
+            roles.setdefault(id(node), set()).add(is_key)
             new_value = rename.new_value(node, place, is_key=is_key)
             if new_value is None:
-                kept[id(node)] = node
+                kept.add(id(node))
             elif isinstance(node, yaml.ScalarNode):
                 changes[id(node)] = (node, new_value)
-    shared = [node for key, (node, _) in changes.items() if key in kept]
-    if shared:
-        node = shared[0]
-        where = f"{path} (line {node.start_mark.line + 1})" if node.start_mark else str(path)
-        msg = (
-            f"The value {node.value} is shared through an alias or include in {where} "
-            "by a place that names the agent and one that does not; edit it by hand."
-        )
-        raise RenameRefusedError(msg)
+    for key, (node, _) in changes.items():
+        if key in kept:
+            use = "is shared through an alias or include by a place that names the agent and one that does not"
+            raise _shared(node, path, use)
+    _refuse_keys_used_as_values(changes, roles, path=path)
     return changes
 
 
-def _value_changes(root: yaml.Node | None, *, old_value: str, new_value: str) -> _Changes:
+def _value_changes(root: yaml.Node | None, *, path: Path, old_value: str, new_value: str) -> _Changes:
     """Return every string value equal to ``old_value``; mapping keys are never changed."""
-    return {
-        id(node): (node, new_value)
-        for node, _, is_key in _occurrences(root, ())
-        if not is_key and isinstance(node, yaml.ScalarNode) and node.tag == _STR_TAG and node.value == old_value
-    }
+    changes: _Changes = {}
+    roles: dict[int, set[bool]] = {}
+    for node, _, is_key in _occurrences(root, ()):
+        roles.setdefault(id(node), set()).add(is_key)
+        if not is_key and isinstance(node, yaml.ScalarNode) and node.tag == _STR_TAG and node.value == old_value:
+            changes[id(node)] = (node, new_value)
+    _refuse_keys_used_as_values(changes, roles, path=path)
+    return changes
+
+
+def _refuse_keys_used_as_values(changes: _Changes, roles: Mapping[int, set[bool]], *, path: Path) -> None:
+    """Refuse a picked scalar that an alias uses both as a mapping key and as a value.
+
+    Its one span cannot be right in both roles, and the reparse compares nodes, so it would not notice.
+    """
+    for key, (node, _) in changes.items():
+        if roles[key] == {True, False}:
+            raise _shared(node, path, "is used both as a mapping key and as a value through an alias")
+
+
+def _shared(node: yaml.ScalarNode, path: Path, use: str) -> RenameRefusedError:
+    where = f"{path} (line {node.start_mark.line + 1})" if node.start_mark else str(path)
+    return RenameRefusedError(f"The value {node.value} in {where} {use}; edit it by hand.")
 
 
 def _rewrite(content: bytes, *, path: Path, changes: Callable[[yaml.Node | None], _Changes]) -> bytes:
@@ -396,7 +439,9 @@ def _edits(text: str, picked: Iterable[tuple[yaml.ScalarNode, str]], *, path: Pa
             raise RenameRefusedError(msg)
         properties = _PROPERTIES.match(text, start_mark.index)
         start = properties.end() if properties else start_mark.index
-        edits.append((start, end_mark.index, _render_scalar(new_value, node.style)))
+        # A plain scalar holding a flow indicator can only sit in block context, where the new value may hold one too.
+        block_context = not node.style and any(character in node.value for character in _FLOW_INDICATORS)
+        edits.append((start, end_mark.index, _render_scalar(new_value, node.style, block_context=block_context)))
     return edits
 
 
@@ -407,21 +452,21 @@ def _splice(text: str, edits: list[tuple[int, int, str]]) -> str:
     return text
 
 
-def _render_scalar(value: str, style: str | None) -> str:
+def _render_scalar(value: str, style: str | None, *, block_context: bool = False) -> str:
     """Write ``value`` in the original scalar ``style`` when that keeps its meaning, else double-quoted.
 
     The libyaml loader reports a plain scalar's style as ``""``, the pure-Python one as ``None``.
     """
-    if not style and _can_be_plain(value):
+    if not style and _can_be_plain(value, block_context=block_context):
         return value
     if style == "'" and value.isprintable():
         return "'" + value.replace("'", "''") + "'"
     return _double_quoted(value)
 
 
-def _can_be_plain(value: str) -> bool:
-    """Return whether ``value`` reads back as the same plain string in block and flow context."""
-    if not value.isprintable() or any(character in value for character in _FLOW_INDICATORS):
+def _can_be_plain(value: str, *, block_context: bool) -> bool:
+    """Return whether ``value`` reads back as the same plain string in block context, and in flow context unless known."""
+    if not value.isprintable() or (not block_context and any(character in value for character in _FLOW_INDICATORS)):
         return False
     try:
         node = _compose(value)

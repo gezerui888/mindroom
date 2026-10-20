@@ -12,45 +12,25 @@ Building the steps only reads; every refusal happens here, before anything is wr
 
 from __future__ import annotations
 
-import json
 import os
-import re
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
 from mindroom import yaml_io
-from mindroom.agent_rename.sqlite_read import quote_identifier
-from mindroom.agent_rename.steps import FileRewrite, MovePath, RenameRefusedError, SqliteEdit
-from mindroom.agent_rename.workers import DestinationExistsError, move_steps
-from mindroom.constants import (
-    MINDROOM_COMPACTION_METADATA_KEY,
-    MINDROOM_MATRIX_HISTORY_METADATA_KEY,
-    PENDING_COMPACTION_SCOPE_KEYS_SESSION_STATE_KEY,
-    matrix_state_file,
-    resolve_session_state_root,
-)
+from mindroom.agent_rename.session_store import StoreRename, database_steps, rename_session_database
+from mindroom.agent_rename.steps import FileRewrite, RenameRefusedError
+from mindroom.agent_rename.workers import move_steps
+from mindroom.constants import matrix_state_file, resolve_session_state_root
+from mindroom.history.types import HistoryScope
 from mindroom.matrix.identity import managed_account_key
 from mindroom.tool_system.worker_routing import agent_state_root_path
 
 if TYPE_CHECKING:
-    import sqlite3
-    from collections.abc import Callable, Iterable
-    from pathlib import Path
-
     from mindroom.agent_rename.steps import Step
     from mindroom.constants import RuntimePaths
 
-# A crashed writer can leave commits or a rollback journal beside a database; SQLite finds them by name.
-_SQLITE_SIDE_FILES = ("-journal", "-wal", "-shm")
-# Agno's default schema-version table (agno/db/base.py), which MindRoom does not rename.
-_SCHEMA_VERSIONS_TABLE = "agno_schema_versions"
 # The learning store's own table (agno/db/base.py's learnings_table default).
 _LEARNINGS_TABLE = "agno_learnings"
-# The stored head of a CREATE INDEX statement and the index name it names.
-_INDEX_HEAD = re.compile(
-    r'CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?("(?:[^"]|"")*"|\[[^\]]*\]|`(?:[^`]|``)*`|[^\s(]+)',
-    re.IGNORECASE,
-)
 
 
 def entity_state_steps(runtime_paths: RuntimePaths, *, old_name: str, new_name: str) -> list[Step]:
@@ -76,267 +56,43 @@ def entity_state_steps(runtime_paths: RuntimePaths, *, old_name: str, new_name: 
             f"the sessions of agent {old_name}",
             discard_new_state=False,
         )
-    steps += _database_steps(
+    rename = StoreRename(
+        old_name,
+        new_name,
+        old_scope=HistoryScope(kind="agent", scope_id=old_name),
+        new_scope=HistoryScope(kind="agent", scope_id=new_name),
+    )
+    edit_label = f"Rename agent {old_name} to {new_name} in the tables, agent ids and history scopes of"
+    steps += database_steps(
         old_session_root / "sessions",
         new_session_root / "sessions",
-        old_name=old_name,
-        new_name=new_name,
-        label="session database",
+        old_stem=old_name,
+        new_stem=new_name,
         edit=partial(
-            _rename_agent_in_database,
+            rename_session_database,
             old_table=f"{old_name}_sessions",
             new_table=f"{new_name}_sessions",
-            old_name=old_name,
-            new_name=new_name,
-            other_tables=(),
+            rename=rename,
         ),
+        edit_label=edit_label,
+        move_label=f"the session database of agent {old_name}",
     )
-    steps += _database_steps(
+    steps += database_steps(
         old_root / "learning",
         new_root / "learning",
-        old_name=old_name,
-        new_name=new_name,
-        label="learning database",
+        old_stem=old_name,
+        new_stem=new_name,
         edit=partial(
-            _rename_agent_in_database,
+            rename_session_database,
             old_table=f"{old_name}_learning_sessions",
             new_table=f"{new_name}_learning_sessions",
-            old_name=old_name,
-            new_name=new_name,
+            rename=rename,
             other_tables=(_LEARNINGS_TABLE,),
         ),
+        edit_label=edit_label,
+        move_label=f"the learning database of agent {old_name}",
     )
     return steps
-
-
-def _database_steps(
-    old_directory: Path,
-    new_directory: Path,
-    *,
-    old_name: str,
-    new_name: str,
-    label: str,
-    edit: Callable[[sqlite3.Connection], None],
-) -> list[Step]:
-    """Edit ``<OLD>.db`` in the moved directory, then rename it to ``<NEW>.db``.
-
-    A crashed writer can leave a ``-wal`` file with commits or a hot ``-journal`` beside the database.
-    The edit's own connection replays or rolls back and removes them, so only the database file is renamed,
-    and undoing the edit restores a backup that already holds what they held.
-    A stale side file under the new name would be read as the renamed database's, so it refuses.
-    """
-    old_file, new_file = f"{old_name}.db", f"{new_name}.db"
-    if not os.path.lexists(old_directory / old_file):
-        return []
-    for suffix in ("", *_SQLITE_SIDE_FILES):
-        if os.path.lexists(old_directory / f"{new_file}{suffix}"):
-            msg = f"Cannot rename {old_directory / old_file}: {old_directory / f'{new_file}{suffix}'} already exists."
-            raise DestinationExistsError(msg)
-    source, destination = new_directory / old_file, new_directory / new_file
-    return [
-        SqliteEdit(
-            source,
-            edit,
-            f"Rename agent {old_name} to {new_name} in the tables, agent ids and history scopes of {source}",
-        ),
-        MovePath(source, destination, f"Move the {label} of agent {old_name} {source} to {destination}"),
-    ]
-
-
-def _rename_agent_in_database(
-    connection: sqlite3.Connection,
-    *,
-    old_table: str,
-    new_table: str,
-    old_name: str,
-    new_name: str,
-    other_tables: tuple[str, ...],
-) -> None:
-    """Rename the tables named ``old_table`` or ``old_table_*`` with their indexes, then the agent inside them.
-
-    ``other_tables`` are tables whose names stay but whose rows name the agent too.
-    """
-    # Renaming a table then also renames it in other tables' foreign keys, indexes and triggers.
-    connection.execute("PRAGMA legacy_alter_table = OFF")
-    tables = [
-        name
-        for (name,) in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-        if name == old_table or name.startswith(f"{old_table}_")
-    ]
-    renamed = {name: new_table + name.removeprefix(old_table) for name in tables}
-    for old, new in renamed.items():
-        connection.execute(f"ALTER TABLE {quote_identifier(old)} RENAME TO {quote_identifier(new)}")
-    _rename_indexes(connection, renamed.values(), old_table=old_table, new_table=new_table)
-    if _table_exists(connection, _SCHEMA_VERSIONS_TABLE):
-        for old, new in renamed.items():
-            connection.execute(
-                f"UPDATE {_SCHEMA_VERSIONS_TABLE} SET table_name = ? WHERE table_name = ?",  # noqa: S608
-                (new, old),
-            )
-    for table in (*renamed.values(), *(name for name in other_tables if _table_exists(connection, name))):
-        _rename_agent_in_table(connection, table, old_name=old_name, new_name=new_name)
-
-
-def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
-    query = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?"
-    return connection.execute(query, (name,)).fetchone() is not None
-
-
-def _rename_indexes(connection: sqlite3.Connection, tables: Iterable[str], *, old_table: str, new_table: str) -> None:
-    """Recreate the indexes of ``tables`` whose names start with the old table name under the new one.
-
-    Agno names indexes ``idx_<table>_<columns>`` and ``<table>_<name>``, MindRoom ``<table>_<name>``.
-    SQLite's own indexes have no SQL and take the new name with their table.
-    """
-    rows = connection.execute(
-        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL "
-        "AND tbl_name IN (SELECT value FROM json_each(?))",
-        (json.dumps(list(tables)),),
-    ).fetchall()
-    for name, sql in rows:
-        new_name = next(
-            (
-                head + new_table + name.removeprefix(head + old_table)
-                for head in ("idx_", "")
-                if name.startswith(head + old_table)
-            ),
-            None,
-        )
-        if new_name is None:
-            continue
-        connection.execute(f"DROP INDEX {quote_identifier(name)}")
-        connection.execute(_with_index_name(sql, name, new_name))
-
-
-def _with_index_name(sql: str, name: str, new_name: str) -> str:
-    """Return the stored ``CREATE INDEX`` statement of index ``name`` creating ``new_name`` instead."""
-    match = _INDEX_HEAD.match(sql)
-    token = match.group(1) if match is not None else ""
-    if token[:1] in {'"', "`"}:
-        token = token[1:-1].replace(token[0] * 2, token[0])
-    elif token[:1] == "[":
-        token = token[1:-1]
-    if match is None or token != name:
-        msg = f"Cannot read the definition of index {name}: {sql}"
-        raise RuntimeError(msg)
-    return sql[: match.start(1)] + quote_identifier(new_name) + sql[match.end(1) :]
-
-
-def _rename_agent_in_table(connection: sqlite3.Connection, table: str, *, old_name: str, new_name: str) -> None:
-    """Set the agent id columns, history scope keys and the agent fields of JSON columns from OLD to NEW."""
-    quoted = quote_identifier(table)
-    columns = {name for (name,) in connection.execute("SELECT name FROM pragma_table_info(?)", (table,))}
-    old_scope, new_scope = f"agent:{old_name}", f"agent:{new_name}"
-    if "agent_id" in columns:
-        connection.execute(f"UPDATE {quoted} SET agent_id = ? WHERE agent_id = ?", (new_name, old_name))  # noqa: S608
-    if "scope_key" in columns:
-        connection.execute(f"UPDATE {quoted} SET scope_key = ? WHERE scope_key = ?", (new_scope, old_scope))  # noqa: S608
-    renames: dict[str, Callable[[object], object]] = {
-        "agent_data": partial(_renamed_field, field="agent_id", old=old_name, new=new_name),
-        "run_data": partial(_renamed_run, old=old_name, new=new_name),
-        # The Agno 2 run list that the open-time migration turns into run rows (legacy_session_storage.py).
-        "runs": partial(_renamed_runs, old=old_name, new=new_name),
-        # MindRoom keys per-scope history state by scope key (history/storage.py).
-        "metadata": partial(_renamed_scope_states, old=old_scope, new=new_scope),
-        "session_data": partial(_renamed_pending_compactions, old=old_scope, new=new_scope),
-    }
-    for column, rename in renames.items():
-        if column not in columns:
-            continue
-        quoted_column = quote_identifier(column)
-        # Agent names hold no character JSON escapes, so a value naming the agent contains the name verbatim.
-        rows = connection.execute(
-            f"SELECT rowid, {quoted_column} FROM {quoted} WHERE instr({quoted_column}, ?) > 0",  # noqa: S608
-            (old_name,),
-        ).fetchall()
-        for rowid, raw in rows:
-            text = _renamed_json(raw, rename)
-            if text is not None:
-                connection.execute(f"UPDATE {quoted} SET {quoted_column} = ? WHERE rowid = ?", (text, rowid))  # noqa: S608
-
-
-def _renamed_json(raw: object, rename: Callable[[object], object]) -> str | None:
-    """Return the JSON text with ``rename`` applied, encoded as often as before, or ``None`` when nothing changes.
-
-    Older releases stored some session values as the JSON text of their JSON text.
-    Values that are not JSON are left alone, as MindRoom cannot read them either.
-    """
-    if not isinstance(raw, str):
-        return None
-    try:
-        value = json.loads(raw)
-        nested = isinstance(value, str)
-        if nested:
-            value = json.loads(value)
-    except (RecursionError, ValueError):
-        return None
-    renamed = rename(value)
-    if renamed == value:
-        return None
-    # Agno writes its JSON columns through SQLAlchemy's default serializer, json.dumps.
-    text = json.dumps(renamed)
-    return json.dumps(text) if nested else text
-
-
-def _renamed_field(value: object, *, field: str, old: str, new: str) -> object:
-    if isinstance(value, dict) and cast("dict[str, object]", value).get(field) == old:
-        return {**cast("dict[str, object]", value), field: new}
-    return value
-
-
-def _renamed_run(value: object, *, old: str, new: str) -> object:
-    """Rename the agent id fields Agno 3.0.9 writes into a run: its own, its events', its requirements' member."""
-    run = _renamed_field(value, field="agent_id", old=old, new=new)
-    if not isinstance(run, dict):
-        return run
-    renamed = dict(cast("dict[str, object]", run))
-    for key, field in (("events", "agent_id"), ("requirements", "member_agent_id")):
-        items = renamed.get(key)
-        if isinstance(items, list):
-            renamed[key] = [_renamed_field(item, field=field, old=old, new=new) for item in cast("list[object]", items)]
-    return renamed
-
-
-def _renamed_runs(value: object, *, old: str, new: str) -> object:
-    if not isinstance(value, list):
-        return value
-    return [_renamed_run(run, old=old, new=new) for run in cast("list[object]", value)]
-
-
-def _renamed_scope_states(value: object, *, old: str, new: str) -> object:
-    """Rename the scope ``old`` among the per-scope states MindRoom keeps in session metadata."""
-    if not isinstance(value, dict):
-        return value
-    renamed = dict(cast("dict[str, object]", value))
-    for key in (MINDROOM_COMPACTION_METADATA_KEY, MINDROOM_MATRIX_HISTORY_METADATA_KEY):
-        entry = renamed.get(key)
-        states = cast("dict[str, object]", entry).get("states") if isinstance(entry, dict) else None
-        if isinstance(states, dict):
-            renamed[key] = {
-                **cast("dict[str, object]", entry),
-                "states": {new if scope == old else scope: state for scope, state in states.items()},
-            }
-    return renamed
-
-
-def _renamed_pending_compactions(value: object, *, old: str, new: str) -> object:
-    """Rename the scope ``old`` in the compactions MindRoom queues in Agno's ``session_state``; nothing else there."""
-    session_state = cast("dict[str, object]", value).get("session_state") if isinstance(value, dict) else None
-    pending = (
-        cast("dict[str, object]", session_state).get(PENDING_COMPACTION_SCOPE_KEYS_SESSION_STATE_KEY)
-        if isinstance(session_state, dict)
-        else None
-    )
-    if not isinstance(pending, list):
-        return value
-    renamed_pending = [new if scope == old else scope for scope in cast("list[object]", pending)]
-    return {
-        **cast("dict[str, object]", value),
-        "session_state": {
-            **cast("dict[str, object]", session_state),
-            PENDING_COMPACTION_SCOPE_KEYS_SESSION_STATE_KEY: renamed_pending,
-        },
-    }
 
 
 def matrix_state_key_step(runtime_paths: RuntimePaths, *, old_name: str, new_name: str) -> FileRewrite:

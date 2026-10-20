@@ -7570,6 +7570,7 @@ depends_on = [
     "mindroom.tool_jobs.resources",
 ]
 visibility = [
+    "mindroom.agent_rename.teams",
     "mindroom.delegation.execution",
     "mindroom.ai",
     "mindroom.ai_runtime",
@@ -9367,10 +9368,26 @@ depends_on = ["mindroom.agent_rename.workers", "mindroom.tool_system.worker_rout
 expose = ["entity_credential_steps", "rewrite_worker_key_agent"]
 from = ["mindroom.agent_rename.entity_files"]
 
+# Renames an agent inside an Agno session store; shared by the agent's own stores and its team stores.
+[[modules]]
+path = "mindroom.agent_rename.session_store"
+depends_on = ["mindroom.agent_rename.workers", "mindroom.constants"]
+visibility = ["mindroom.agent_rename.entity_state", "mindroom.agent_rename.teams"]
+
+[[interfaces]]
+expose = ["StoreRename", "database_steps", "rename_session_database"]
+from = ["mindroom.agent_rename.session_store"]
+
 # Moves an agent's state root and renames its session and learning databases and its Matrix account key.
 [[modules]]
 path = "mindroom.agent_rename.entity_state"
-depends_on = ["mindroom.agent_rename.workers", "mindroom.constants", "mindroom.tool_system.worker_routing"]
+depends_on = [
+    "mindroom.agent_rename.session_store",
+    "mindroom.agent_rename.workers",
+    "mindroom.constants",
+    "mindroom.history.types",
+    "mindroom.tool_system.worker_routing",
+]
 
 [[interfaces]]
 expose = ["entity_state_steps", "matrix_state_key_step"]
@@ -9384,6 +9401,22 @@ depends_on = ["mindroom.agent_rename.workers", "mindroom.memory_scope_ids", "min
 [[interfaces]]
 expose = ["memory_steps"]
 from = ["mindroom.agent_rename.memory"]
+
+# Moves the team history scopes that include an agent and renames the agent inside them.
+[[modules]]
+path = "mindroom.agent_rename.teams"
+depends_on = [
+    "mindroom.agent_rename.session_store",
+    "mindroom.agent_rename.workers",
+    "mindroom.constants",
+    "mindroom.history.session_context",
+    "mindroom.history.team_scope",
+    "mindroom.history.types",
+]
+
+[[interfaces]]
+expose = ["team_steps"]
+from = ["mindroom.agent_rename.teams"]
 
 # Edits the config, its includes, and its `.env` as text for both rename commands.
 [[modules]]

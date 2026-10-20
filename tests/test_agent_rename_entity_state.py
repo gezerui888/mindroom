@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import shutil
 import sqlite3
 import tempfile
@@ -25,7 +24,6 @@ from agno.session.agent import AgentSession
 from mindroom import constants
 from mindroom.agent_rename.entity_state import entity_state_steps, matrix_state_key_step
 from mindroom.agent_rename.steps import (
-    BACKUPS_DIRECTORY_NAME,
     FileRewrite,
     MovePath,
     RenameApplyError,
@@ -56,6 +54,7 @@ from mindroom.session_storage.agent_storage import (
 )
 from mindroom.tool_system.worker_routing import agent_state_root_path
 from mindroom.usage.stats import collect_admin_usage
+from tests.agent_rename_helpers import SQLITE_SIDE_FILES, sqlite_schema, tree_rows
 from tests.conftest import TEST_ACCESS_TOKEN, seed_session, test_runtime_paths
 
 if TYPE_CHECKING:
@@ -194,45 +193,6 @@ def _apply(runtime_paths: RuntimePaths, steps: list[Step]) -> None:
     )
 
 
-_SIDE_FILES = ("-wal", "-shm", "-journal")
-
-
-def _dump(database: Path) -> list[str]:
-    """Return the rows a reader of ``database`` sees, recovering a copy so the original and its side files stay."""
-    with tempfile.TemporaryDirectory() as directory:
-        for suffix in ("", *_SIDE_FILES):
-            if Path(f"{database}{suffix}").exists():
-                shutil.copy(f"{database}{suffix}", Path(directory) / f"{database.name}{suffix}")
-        with closing(sqlite3.connect(Path(directory) / database.name)) as connection:
-            return list(connection.iterdump())
-
-
-def _tree(root: Path) -> dict[str, object]:
-    """Map every path under ``root`` outside the backups to its bytes, or its rows for a SQLite database.
-
-    A database's ``-wal`` and ``-journal`` files count as part of its rows, which is what SQLite reads.
-    """
-    tree: dict[str, object] = {}
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if relative.parts[0] == BACKUPS_DIRECTORY_NAME or path.name.endswith(_SIDE_FILES):
-            continue
-        if path.is_dir():
-            tree[relative.as_posix()] = "dir"
-        elif path.suffix == ".db":
-            tree[relative.as_posix()] = _dump(path)
-        else:
-            tree[relative.as_posix()] = path.read_bytes()
-    return tree
-
-
-def _schema(database: Path) -> set[tuple[str, str, str, str]]:
-    """Return every schema entry with its SQL, unquoted and with whitespace collapsed, so only real changes differ."""
-    with closing(sqlite3.connect(database)) as connection:
-        rows = connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master").fetchall()
-    return {(kind, name, table, re.sub(r"\s+", " ", (sql or "").replace('"', ""))) for kind, name, table, sql in rows}
-
-
 def _crash_copy(database: Path, suffix: str, work: Callable[[sqlite3.Connection], None]) -> None:
     """Leave ``database`` and its ``suffix`` side file as a writer killed right after ``work`` would."""
     with tempfile.TemporaryDirectory() as crashed:
@@ -326,11 +286,12 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
             "WHERE parent_run_id IS NOT NULL",
         )
     expected_sessions = {
-        tuple(part.replace("code_sessions", "coder_sessions") for part in entry) for entry in _schema(old_sessions)
+        tuple(part.replace("code_sessions", "coder_sessions") for part in entry)
+        for entry in sqlite_schema(old_sessions)
     }
     expected_learning = {
         tuple(part.replace("code_learning_sessions", "coder_learning_sessions") for part in entry)
-        for entry in _schema(old_learning)
+        for entry in sqlite_schema(old_learning)
     }
 
     steps = entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
@@ -339,7 +300,7 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
     sessions = _root(runtime_paths, NEW) / "sessions" / f"{NEW}.db"
     learning = _root(runtime_paths, NEW) / "learning" / f"{NEW}.db"
     assert [type(step) for step in steps] == [MovePath, SqliteEdit, MovePath, SqliteEdit, MovePath]
-    assert _schema(sessions) == expected_sessions
+    assert sqlite_schema(sessions) == expected_sessions
     assert {name for _type, name, _table, _sql in expected_sessions} >= {
         "coder_sessions_runs",
         "coder_sessions_usage",
@@ -350,7 +311,7 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
         "coder_sessions_removed_runs_session",
         "coder_sessions_runs_one_child",
     }
-    assert _schema(learning) == expected_learning
+    assert sqlite_schema(learning) == expected_learning
     with closing(sqlite3.connect(sessions)) as connection:
         stored_sql = connection.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL").fetchall()
         assert all("code_sessions" not in sql for (sql,) in stored_sql)
@@ -407,7 +368,7 @@ def test_prefix_agent_untouched(tmp_path: Path) -> None:
     """Renaming ``code`` plans nothing on ``code_team`` and leaves its state root as it was."""
     runtime_paths = _install(tmp_path)
     prefix_root = _root(runtime_paths, PREFIX)
-    before = _tree(prefix_root)
+    before = tree_rows(prefix_root)
 
     steps = entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
     _apply(runtime_paths, steps)
@@ -419,7 +380,7 @@ def test_prefix_agent_untouched(tmp_path: Path) -> None:
         if path is not None
     ]
     assert not any(path.is_relative_to(prefix_root) for path in touched)
-    assert _tree(prefix_root) == before
+    assert tree_rows(prefix_root) == before
 
 
 def test_matrix_state_key_renamed_username_kept(tmp_path: Path) -> None:
@@ -498,7 +459,7 @@ def test_matrix_state_changed_since_planning_fails_the_step(tmp_path: Path) -> N
 def test_existing_destination_refuses(tmp_path: Path) -> None:
     """A state root or database already under the new name refuses while planning."""
     runtime_paths = _install(tmp_path)
-    for suffix in ("", *_SIDE_FILES):
+    for suffix in ("", *SQLITE_SIDE_FILES):
         # A stale write-ahead log under the new name would be replayed onto the renamed database.
         stale = _root(runtime_paths, OLD) / "sessions" / f"{NEW}.db{suffix}"
         stale.touch()
@@ -529,13 +490,13 @@ def test_failure_after_any_step_restores_the_tree(tmp_path: Path, crash: str | N
         runtime_paths = _crashed_install(tmp_path / str(completed), crash)
         sentinel = runtime_paths.storage_root / "sentinel"
         sentinel.write_text("unchanged", encoding="utf-8")
-        before = _tree(runtime_paths.storage_root)
+        before = tree_rows(runtime_paths.storage_root)
         steps = entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)[:completed]
 
         with pytest.raises(RenameApplyError, match="injected failure"):
             _apply(runtime_paths, [*steps, FileRewrite(sentinel, _fail, "Fail on purpose")])
 
-        assert _tree(runtime_paths.storage_root) == before
+        assert tree_rows(runtime_paths.storage_root) == before
 
 
 def _legacy_install(tmp_path: Path) -> RuntimePaths:

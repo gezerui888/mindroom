@@ -400,8 +400,9 @@ Delete it once you are sure of the result.
 
 `manifest.json` lists every planned step in plan order, including steps that never ran, and is updated as steps run.
 Each entry has a `type`, a `description`, a `source`, a `destination`, and a `backup` directory.
+A `RetargetLink` entry also has `old_target` and `new_target`, the link's text before and after.
 The `backup` directories are numbered `000`, `001`, and so on, and hold the originals.
-Plain moves keep nothing there, because a move is only a rename.
+Plain moves and link retargets keep nothing there, because the manifest alone can reverse them.
 The number is the entry's position in the manifest, counting from `000`, and the directory is `<backup dir>/NNN`.
 For an entry that edits a file after an earlier move, the `source` is where the file sits after that move.
 
@@ -419,6 +420,8 @@ Skip the entries that have nothing to restore:
 - A `DropPath` entry whose numbered directory holds no item, because the drop never ran or was already undone.
 - A `MovePath` entry, unless its `destination` exists and its `source` does not.
   Otherwise the move never happened or was already undone.
+- A `RetargetLink` entry, unless the link at `source` points at `new_target` (check with `readlink <source>`).
+  Otherwise the retarget never happened or was already undone.
 
 Restoring a `SqliteEdit`, `FileRewrite`, or `DirectoryEdit` entry that was already undone does no harm.
 Neither does restoring one that never took effect, because `source` still holds the original.
@@ -443,6 +446,7 @@ Restore each remaining entry like this:
 | `FileRewrite` | Copy the file from `backup` over `source`. |
 | `DirectoryEdit` | Replace the directory at `source` with the copy in `backup`. |
 | `DropPath` | Move the item from `backup` back to `source`. |
+| `RetargetLink` | Replace the link at `source` with one pointing at `old_target`: `ln -sfn <old_target> <source>`. |
 
 A `backup` directory holds the file or directory under its original name.
 

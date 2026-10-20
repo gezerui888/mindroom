@@ -710,6 +710,47 @@ def test_interrupt_after_the_directory_swap_cannot_split_the_plan(
     assert sorted(path.name for path in store.parent.iterdir()) == ["state.txt", "store"]
 
 
+def test_interrupt_after_the_link_is_replaced_cannot_split_the_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C while the scratch directory beside a retargeted link is removed keeps the plan recording the step."""
+    storage = _make_storage(tmp_path)
+    link = storage / "agents" / "alias"
+    link.symlink_to("old")
+    (storage / "agents" / "new").mkdir()
+    remove_tree = shutil.rmtree
+
+    def ctrl_c_while_removing_the_scratch(path: Path, *args: object, **kwargs: object) -> None:
+        # A Ctrl-C raises KeyboardInterrupt in the main thread unless SIGINT is ignored.
+        scratch = Path(path)
+        if (
+            scratch.name.startswith(".alias.")
+            and scratch.exists()
+            and signal.getsignal(signal.SIGINT) is not signal.SIG_IGN
+        ):
+            raise KeyboardInterrupt
+        remove_tree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(steps_module.shutil, "rmtree", ctrl_c_while_removing_the_scratch)
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            MovePath(storage / "accounts.json", storage / "moved.json", "move accounts"),
+            RetargetLink(link, "old", "new", "retarget alias"),
+        ),
+        reports=(),
+    )
+
+    interrupted = False
+    try:
+        apply_plan(plan, kind="rename", now=NOW)
+    except KeyboardInterrupt:
+        interrupted = True
+
+    assert (interrupted, (storage / "moved.json").exists(), str(link.readlink())) == (False, True, "new")
+
+
 def test_retarget_link_points_the_link_elsewhere_and_records_both_targets(tmp_path: Path) -> None:
     """The link is replaced by one with the new text, and the manifest names the link with its old and new text."""
     storage = _make_storage(tmp_path)

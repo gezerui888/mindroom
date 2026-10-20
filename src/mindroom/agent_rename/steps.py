@@ -251,7 +251,10 @@ def _replace_link(path: Path, *, expected: str, target: str) -> None:
     with _scratch_beside(path) as scratch:
         replacement = scratch / path.name
         replacement.symlink_to(target)
-        replacement.replace(path)
+        # Once replaced, the step must also return so the plan records it as done and can undo it.
+        with _sigint_ignored():
+            replacement.replace(path)
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 @dataclass(frozen=True)

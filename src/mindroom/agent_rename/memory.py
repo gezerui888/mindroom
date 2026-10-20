@@ -52,11 +52,16 @@ def memory_steps(runtime_paths: RuntimePaths, *, config: Config, old_name: str, 
     """
     storage_root = runtime_paths.storage_root
     old_root, new_root = agent_state_root_path(storage_root, old_name), agent_state_root_path(storage_root, new_name)
-    roots = dict.fromkeys(agent_state_root_path(storage_root, name) for name in config.agents)
+    # Keyed by the resolved path: an agent whose state root is a symlink to another's shares its stores,
+    # and planning them twice would move the same scope directory twice.
+    roots: dict[Path, Path] = {}
+    for name in config.agents:
+        root = agent_state_root_path(storage_root, name)
+        roots.setdefault(root.resolve(), root)
     steps: list[Step] = []
-    for root in roots:
+    for resolved, root in roots.items():
         # The state root moves first, so steps for the agent's own stores address them under the new root.
-        destination = new_root if root == old_root else root
+        destination = new_root if resolved == old_root.resolve() else root
         steps += _chroma_steps(root / _CHROMA_DIRECTORY, destination / _CHROMA_DIRECTORY, old_name, new_name)
         steps += _file_memory_steps(
             root / _FILE_MEMORY_DIRECTORY,

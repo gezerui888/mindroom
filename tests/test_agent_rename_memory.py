@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from mindroom.agent_rename.entity_state import entity_state_steps
+from mindroom.agent_rename.links import link_steps
 from mindroom.agent_rename.memory import memory_steps
 from mindroom.agent_rename.steps import (
     BACKUPS_DIRECTORY_NAME,
@@ -20,6 +21,8 @@ from mindroom.agent_rename.steps import (
     RenameRefusedError,
     apply_plan,
 )
+from mindroom.config.agent import AgentConfig
+from mindroom.config.main import Config
 from mindroom.memory._file_backend import _search_scope_memory_entries
 from mindroom.memory._policy import (
     allowed_scope_storage_paths,
@@ -49,7 +52,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.agent_rename.steps import Step
-    from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
 NEW = "coder"
@@ -213,6 +215,28 @@ def test_prefix_agent_untouched(tmp_path: Path) -> None:
     assert visible_memories(PREFIX, memory_config(NEW), runtime_paths) == Counter(
         {("agent_code_team", "code_team reviews"): 1},
     )
+
+
+def test_agent_sharing_the_state_root_through_a_symlink_gets_each_store_renamed_once(tmp_path: Path) -> None:
+    """An agent whose state root is a symlink to the renamed agent's reads the same stores, so they are planned once."""
+    runtime_paths = install_memories(tmp_path)
+    _root(runtime_paths, "flash").symlink_to(OLD)
+    config = memory_config(OLD)
+    config = Config(agents={**config.agents, "flash": AgentConfig(display_name="Flash")}, teams=config.teams)
+    before = visible_memories(OLD, memory_config(OLD), runtime_paths)
+
+    shared = memory_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
+    alone = memory_steps(runtime_paths, config=memory_config(OLD), old_name=OLD, new_name=NEW)
+    entity_state = entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
+    _apply(runtime_paths, [*entity_state, *link_steps(runtime_paths, old_name=OLD, new_name=NEW), *shared])
+
+    expected = Counter(
+        {(agent_scope_user_id(NEW), "code prefers tabs"): 1, ("team_coder+helper", "crew ships on fridays"): 2},
+    )
+    assert [step.description for step in shared] == [step.description for step in alone]
+    assert before == Counter({("agent_code", "code prefers tabs"): 1, ("team_code+helper", "crew ships on fridays"): 2})
+    assert visible_memories(NEW, memory_config(NEW), runtime_paths) == expected
+    assert _visible_files(NEW, memory_config(NEW), runtime_paths) == expected
 
 
 def test_failure_after_any_step_restores_the_tree(tmp_path: Path) -> None:

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import typer
 
@@ -201,12 +202,40 @@ def _refuse_journal_without_account(runtime_paths: RuntimePaths, old: str) -> No
     raise RenameRefusedError(msg)
 
 
-def _newest_rename_manifest(storage_root: Path) -> Path | None:
-    """Return the manifest of the newest `agents rename` backup; backup names start with their UTC time."""
-    from mindroom.agent_rename.steps import BACKUPS_DIRECTORY_NAME  # noqa: PLC0415
+def _manifest_of_this_rename(storage_root: Path, rename: _AgentRename) -> Path | None:
+    """Return the newest backup manifest of a run that renamed ``rename.old`` to ``rename.new``, if any.
 
-    manifests = sorted((storage_root / BACKUPS_DIRECTORY_NAME).glob("*-rename/manifest.json"))
-    return manifests[-1] if manifests else None
+    ``apply_plan`` writes the manifest before the first step and lists every planned step, so a killed run's manifest
+    holds the config edit renaming the agent, and the move of its state root when it has one. A manifest of any other
+    rename is not this one's: restoring it would undo that rename. Backup names start with their UTC time.
+    """
+    from mindroom.agent_rename.steps import BACKUPS_DIRECTORY_NAME  # noqa: PLC0415
+    from mindroom.tool_system.worker_routing import agent_state_root_path  # noqa: PLC0415
+
+    # config_edit.config_entity_steps describes its edit like this.
+    config_edit = f"Rename the agent {rename.old} to {rename.new} in "
+    state_root_move = (
+        str(agent_state_root_path(storage_root, rename.old)),
+        str(agent_state_root_path(storage_root, rename.new)),
+    )
+    for manifest in sorted((storage_root / BACKUPS_DIRECTORY_NAME).glob("*-rename/manifest.json"), reverse=True):
+        try:
+            recorded = json.loads(manifest.read_bytes())
+        except (OSError, ValueError):
+            continue
+        steps = recorded.get("steps") if isinstance(recorded, dict) else None
+        if isinstance(steps, list) and any(_is_step_of(step, config_edit, state_root_move) for step in steps):
+            return manifest
+    return None
+
+
+def _is_step_of(step: object, config_edit: str, state_root_move: tuple[str, str]) -> bool:
+    """Whether a manifest step is the given config edit or state root move."""
+    if not isinstance(step, dict):
+        return False
+    entry = cast("dict[str, object]", step)
+    moved = (entry.get("source"), entry.get("destination"))
+    return moved == state_root_move or str(entry.get("description")).startswith(config_edit)
 
 
 def _unfinished_rename_hint(rename: _AgentRename, manifest: Path) -> str:
@@ -217,10 +246,11 @@ def _unfinished_rename_hint(rename: _AgentRename, manifest: Path) -> str:
 
 
 def _refuse_unfinished_rename(runtime_paths: RuntimePaths, rename: _AgentRename, *, new_account: bool) -> None:
-    """Refuse when a rename to ``rename.new`` looks killed before its config edit, naming what it left and its manifest.
+    """Refuse when this rename looks killed before its config edit, naming what it left and its manifest.
 
     Such a run leaves the old name configured while the journal principal, state root or account of the new name
-    exists already; its backup manifest lists what it changed.
+    exists already; its backup manifest lists what it changed. Without a manifest of this rename, the state under the
+    new name is someone else's, and the usual refusals name it.
     """
     from mindroom.agent_rename.journal import principal_user_ids  # noqa: PLC0415
     from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
@@ -229,7 +259,7 @@ def _refuse_unfinished_rename(runtime_paths: RuntimePaths, rename: _AgentRename,
     from mindroom.tool_system.worker_routing import agent_state_root_path  # noqa: PLC0415
 
     storage = runtime_paths.storage_root
-    manifest = _newest_rename_manifest(storage)
+    manifest = _manifest_of_this_rename(storage, rename)
     if manifest is None:
         return
     found: list[str] = []
@@ -260,14 +290,14 @@ def _rename_header(rename: _AgentRename) -> str:
 
 
 def _checked_rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRename) -> RenamePlan:
-    """Plan the rename; a destination that exists already points at the newest manifest, as a killed run leaves one."""
+    """Plan the rename; a destination that exists already points at this rename's manifest, as a killed run leaves one."""
     from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
     from mindroom.agent_rename.workers import DestinationExistsError  # noqa: PLC0415
 
     try:
         return _rename_plan(runtime_paths, config, rename)
     except DestinationExistsError as exc:
-        manifest = _newest_rename_manifest(runtime_paths.storage_root)
+        manifest = _manifest_of_this_rename(runtime_paths.storage_root, rename)
         if manifest is None:
             raise
         msg = f"{exc} {_unfinished_rename_hint(rename, manifest)}"
@@ -312,9 +342,9 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
     index, index_reports = index_steps(runtime_paths, config=config, old_name=old, new_name=new)
     account_step = matrix_state_key_step(runtime_paths, old_name=old, new_name=new)
     # The journal goes first: its edit checks again in its transaction, and a failing first step leaves nothing to undo.
-    # The state root moves before the stores inside it are edited, matrix_state.yaml follows every store, and the
-    # config goes last, so a run killed before it still has the old name configured. The providers read the config
-    # that still names the old agent.
+    # The state root moves before the stores inside it are edited, matrix_state.yaml and .env follow every store, and
+    # the config edit is the last reversible step, so a run killed before it still has the old name configured.
+    # The providers read the config that still names the old agent.
     ordered = (
         *journal_steps,
         *entity_state_steps(runtime_paths, old_name=old, new_name=new),
@@ -325,13 +355,13 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
         *worker_steps,
         *index,
         *(() if account_step is None else (account_step,)),
+        *env_value_steps(runtime_paths.env_path, variable=_CONNECTIONS_AGENT_VARIABLE, old_value=old, new_value=new),
         *config_entity_steps(
             runtime_paths.config_path.expanduser(),
             old_name=old,
             new_name=new,
             storage_root=storage,
         ),
-        *env_value_steps(runtime_paths.env_path, variable=_CONNECTIONS_AGENT_VARIABLE, old_value=old, new_value=new),
     )
     # Final actions always run after every reversible step; listing them last shows that.
     steps = (

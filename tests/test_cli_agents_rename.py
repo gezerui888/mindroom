@@ -17,6 +17,7 @@ import pytest
 from typer.testing import CliRunner
 
 from mindroom.agent_modes import resolve_agent_mode
+from mindroom.agent_rename import steps as steps_module
 from mindroom.agent_rename import workers as worker_moves
 from mindroom.agent_rename.guard import stopped_runtime
 from mindroom.agent_rename.steps import BACKUPS_DIRECTORY_NAME, RenamePlan, apply_plan
@@ -291,12 +292,12 @@ def test_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert "Dry run: nothing was changed. Rerun with --apply to make these changes." in result.output
     steps = _steps(result.output)
     config_path = runtime_paths.config_path
-    # The journal goes first, then the state root, every other store, matrix_state.yaml, and the config last.
+    # The journal goes first, then the state root, every other store, matrix_state.yaml, .env, and the config last.
     assert steps[0].startswith("Rewrite the event journal")
     assert steps[1].startswith(f"Move the state of agent {OLD} ")
     assert steps[-3].startswith(f"Rename the account agent_{OLD} in {matrix_state_file(runtime_paths)}")
-    assert steps[-2] == f"Rename the agent {OLD} to {NEW} in {config_path}"
-    assert steps[-1] == f"Set {CONNECTIONS_AGENT} from {OLD} to {NEW} in {runtime_paths.env_path}"
+    assert steps[-2] == f"Set {CONNECTIONS_AGENT} from {OLD} to {NEW} in {runtime_paths.env_path}"
+    assert steps[-1] == f"Rename the agent {OLD} to {NEW} in {config_path}"
     assert "report: These files from older MindRoom versions name agent code" in result.output
     assert "report: These config lines mention code" in result.output
     unknown = runtime_paths.storage_root / "workers" / UNKNOWN_WORKERS[OLD]
@@ -501,14 +502,31 @@ def test_rerun_after_success_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert tree_snapshot(tmp_path) == after_apply
 
 
+def _rename_plan(runtime_paths: RuntimePaths, old: str, new: str) -> RenamePlan:
+    """Plan renaming ``old`` to ``new`` the way the command does, for an agent whose account is mindroom_<old>."""
+    rename = agent_rename_command._AgentRename(old, new, f"@mindroom_{old}:x", has_account=True)
+    return agent_rename_command._rename_plan(runtime_paths, load_config_or_exit(runtime_paths), rename)
+
+
+def _write_manifest(plan: RenamePlan, when: str) -> Path:
+    """Write the manifest a rename run started at ``when`` writes before its first step, listing every step."""
+    backup_dir = plan.storage_root / BACKUPS_DIRECTORY_NAME / f"{when}-rename"
+    backup_dir.mkdir(parents=True)
+    steps_module._write_manifest(plan, kind="rename", now=NOW, backup_dir=backup_dir)
+    return backup_dir / "manifest.json"
+
+
 def _killed_run(runtime_paths: RuntimePaths, last_step: str) -> Path:
-    """Leave the install as a run killed right after the step starting with ``last_step``; return its manifest."""
-    config = load_config_or_exit(runtime_paths)
-    rename = agent_rename_command._AgentRename(OLD, NEW, OLD_USER_ID, has_account=True)
-    plan = agent_rename_command._rename_plan(runtime_paths, config, rename)
+    """Leave the install as a run killed right after the step starting with ``last_step``; return its manifest.
+
+    Like a real run, the manifest lists every planned step, not only those that ran.
+    """
+    plan = _rename_plan(runtime_paths, OLD, NEW)
     end = next(index for index, step in enumerate(plan.steps) if step.description.startswith(last_step)) + 1
     killed = RenamePlan(storage_root=plan.storage_root, steps=plan.steps[:end], reports=())
-    return apply_plan(killed, kind="rename", now=NOW).backup_dir / "manifest.json"
+    backup_dir = apply_plan(killed, kind="rename", now=NOW).backup_dir
+    steps_module._write_manifest(plan, kind="rename", now=NOW, backup_dir=backup_dir)
+    return backup_dir / "manifest.json"
 
 
 @pytest.mark.parametrize(
@@ -528,12 +546,10 @@ def test_rerun_after_a_killed_run_points_at_the_manifest(
 ) -> None:
     """A run killed before the config edit leaves OLD configured with state under NEW; a rerun names both and stops.
 
-    The newest manifest is named, not an older rename's, and nothing is changed or deleted.
+    The newest manifest of this rename is named, not an older one, and nothing is changed or deleted.
     """
     runtime_paths = _install(tmp_path, monkeypatch)
-    older = runtime_paths.storage_root / BACKUPS_DIRECTORY_NAME / "20200101T000000Z-rename" / "manifest.json"
-    older.parent.mkdir(parents=True)
-    older.write_text("{}", encoding="utf-8")
+    older = _write_manifest(_rename_plan(runtime_paths, OLD, NEW), "20200101T000000Z")
     manifest = _killed_run(runtime_paths, last_step)
     before = tree_snapshot(tmp_path)
 
@@ -548,20 +564,46 @@ def test_rerun_after_a_killed_run_points_at_the_manifest(
     assert tree_snapshot(tmp_path) == before
 
 
-@pytest.mark.parametrize("manifest", [False, True], ids=["no manifest", "manifest"])
+def test_an_unrelated_earlier_rename_is_not_taken_for_a_killed_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A finished rename of another agent leaves a manifest; a stale account of the new name refuses as itself.
+
+    Restoring that manifest would undo the other rename, so the refusal must not point at it.
+    """
+    runtime_paths = _install(tmp_path, monkeypatch)
+    assert _invoke(runtime_paths, "--apply", "--yes", old=HELPER, new="assistant").exit_code == 0
+    (other_backup,) = (runtime_paths.storage_root / BACKUPS_DIRECTORY_NAME).iterdir()
+    state = MatrixState.model_validate(safe_load(matrix_state_file(runtime_paths).read_bytes()))
+    state.add_account("agent_bob", "mindroom_bob", "secret", domain="x")
+    state.save(runtime_paths)
+    before = tree_snapshot(tmp_path)
+
+    for args in ((), ("--apply", "--yes")):
+        result = _invoke(runtime_paths, *args, new="bob")
+
+        assert result.exit_code == 1, result.output
+        assert "already holds an account agent_bob, left by an agent named bob" in result.output
+        assert "still configured" not in result.output
+        assert str(other_backup) not in result.output
+    assert tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("manifest", [None, "other rename", "this rename"])
 def test_existing_destination_refuses_and_points_at_a_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    manifest: bool,
+    manifest: str | None,
 ) -> None:
-    """A destination already under the new name refuses; when a rename left a manifest, the refusal points at it."""
+    """A destination already under the new name refuses; only a manifest of this rename is pointed at."""
     runtime_paths = _install(tmp_path, monkeypatch)
+    written = None
+    if manifest is not None:
+        old, new = (OLD, NEW) if manifest == "this rename" else (HELPER, "assistant")
+        written = _write_manifest(_rename_plan(runtime_paths, old, new), "20261019T000000Z")
     taken = runtime_paths.storage_root / "workers" / worker_dir_name(_key("shared", NEW))
     taken.mkdir()
-    newest = runtime_paths.storage_root / BACKUPS_DIRECTORY_NAME / "20261019T000000Z-rename" / "manifest.json"
-    if manifest:
-        newest.parent.mkdir(parents=True)
-        newest.write_text("{}", encoding="utf-8")
     before = tree_snapshot(tmp_path)
 
     for args in ((), ("--apply", "--yes")):
@@ -569,7 +611,9 @@ def test_existing_destination_refuses_and_points_at_a_manifest(
 
         assert result.exit_code == 1, result.output
         assert f"{taken} already exists." in result.output
-        assert (str(newest) in result.output) is manifest
+        assert ("still configured" in result.output) is (manifest == "this rename")
+        if written is not None:
+            assert (str(written) in result.output) is (manifest == "this rename")
     assert tree_snapshot(tmp_path) == before
 
 

@@ -1,0 +1,295 @@
+"""Plan dropping the derived indexes named after an agent, and report what its rename leaves as it is.
+
+Knowledge indexes are derived from files and named after the knowledge base they serve. The file-memory search index
+of the agent's scope and the index of its private knowledge base carry the agent's name, so after the rename they are
+never read again; they are dropped into the backup and rebuild under the new name on next use.
+What the rename does not change is reported: the knowledge graph and the knowledge Git directories named after paths
+in the agent's old state root, mem0's history database outside the storage root, plugin state, config lines that
+mention the agent in prose, scheduled tasks in Matrix room state, and files of older MindRoom versions.
+Names match exactly, never as substrings, so renaming ``code`` leaves ``code_team`` alone.
+Building the steps only reads.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from mindroom.agent_rename.config_edit import config_entity_steps
+from mindroom.agent_rename.sqlite_read import read_only_connection
+from mindroom.agent_rename.steps import DropPath
+from mindroom.config.yaml_includes import load_yaml_config_source
+from mindroom.constants import tracking_dir
+from mindroom.knowledge.indexing_config import knowledge_git_dir
+from mindroom.knowledge_graph.scope import graph_scope
+from mindroom.legacy_handled_turns import legacy_responses_file_path
+from mindroom.memory_scope_ids import agent_scope_user_id
+from mindroom.runtime_resolution import shared_knowledge_path
+from mindroom.tool_system.worker_routing import agent_state_root_path, private_instances_root_path
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from mindroom.agent_rename.steps import Step
+    from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
+
+# The spellings below copy names that the modules owning each store keep private; the comments say where they come from.
+# knowledge/registry.py's published_index_storage_path keeps each knowledge base's index in knowledge_db/ below the
+# binding's storage root, in a directory storage_key_for_base (knowledge/indexing_config.py) names
+# `<base id>_<8 hex digits>`, with every character of the base id but letters, digits, `_` and `-` written as `_`.
+_KNOWLEDGE_DB = "knowledge_db"
+_STORE_DIGEST = "_[0-9a-f]{8}"
+# knowledge/file_memory_knowledge.py's _memory_knowledge_base_id: `file_memory_<scope id>_<16 hex digits>`.
+_FILE_MEMORY_BASE_PREFIX = "file_memory_"
+_FILE_MEMORY_DIGEST = "_[0-9a-f]{16}"
+# knowledge_graph/ingestion.py's _state_path: a graph's ingestion progress, written when ingestion starts the graph.
+_GRAPH_INGESTION_STATE = ("knowledge_graph", "ingestion")
+# mem0/configs/base.py's default history_db_path, which memory/config.py's _get_memory_config leaves unset,
+# and mem0/memory/main.py's _build_session_scope, which keys mem0's recent messages by the memory scope.
+_MEM0_DIR_VARIABLE = "MEM0_DIR"
+_MEM0_HISTORY_DATABASE = "history.db"
+# hooks/context.py's _resolve_plugin_state_root and tool_system/runtime_context.py's get_plugin_state_root.
+_PLUGINS = "plugins"
+# Legacy files whose readers are gone: the dispatch obligations before the event journal (#1800),
+# `dispatch_obligations-<entity>-<12 hex digits>.sqlite3` in tracking/, the session databases before per-agent
+# state roots, and the file-memory search indexes before knowledge indexes (#1165), `<scope id>_<16 hex digits>`.
+_DISPATCH_OBLIGATIONS_PREFIX = "dispatch_obligations-"
+_LEGACY_SESSIONS = "sessions"
+_LEGACY_MEMORY_SEARCH = "memory_search_db"
+# Agent names are letters, digits and `_`, so a name is mentioned where neither side continues it.
+_NAME_CHARACTER = "A-Za-z0-9_"
+
+
+def index_steps(
+    runtime_paths: RuntimePaths,
+    *,
+    config: Config,
+    old_name: str,
+    new_name: str,
+) -> tuple[list[Step], list[str]]:
+    """Return the steps that drop the agent's derived indexes, and report lines for what the rename leaves as it is.
+
+    The file-memory search indexes of the scope ``agent_<OLD>`` are dropped from ``knowledge_db/``, for every
+    file-memory root they were built for. The index of the private knowledge base ``__agent_private__:<OLD>``
+    is dropped from the private-instance state roots, where MindRoom built it while the agent was private.
+    ``config`` is the config that still names the agent; the config text is read from ``runtime_paths.config_path``.
+    """
+    steps: list[Step] = [
+        *_file_memory_index_drops(runtime_paths, old_name),
+        *_private_knowledge_index_drops(runtime_paths, config, old_name),
+    ]
+    reports = [
+        *_knowledge_graph_reports(runtime_paths, config, old_name, new_name),
+        *_knowledge_git_reports(runtime_paths, config, old_name, new_name),
+        *_mem0_history_reports(runtime_paths, old_name, new_name),
+        *_plugin_state_reports(runtime_paths, old_name),
+        *_config_line_reports(runtime_paths, old_name, new_name),
+        f"Scheduled tasks are Matrix room state, which the rename neither reads nor changes; "
+        f"a task whose message mentions @{old_name} keeps that text, so edit such tasks to mention @{new_name}.",
+        *_legacy_file_reports(runtime_paths, old_name),
+    ]
+    return steps, reports
+
+
+def _entries(directory: Path, matches: Callable[[str], object]) -> list[Path]:
+    """Return the entries of ``directory`` whose names ``matches`` accepts, or none when it is no directory."""
+    if not directory.is_dir():
+        return []
+    return sorted(entry for entry in directory.iterdir() if matches(entry.name))
+
+
+def _safe_identifier(value: str) -> str:
+    """Write ``value`` as storage_key_for_base writes a base id in its store's name."""
+    return "".join(character if character.isalnum() or character in {"_", "-"} else "_" for character in value)
+
+
+def _file_memory_index_drops(runtime_paths: RuntimePaths, name: str) -> list[Step]:
+    """Drop the file-memory search indexes of the agent's scope, which are named after it and its memory root."""
+    # File-memory bases are not private, so their indexes sit below the storage root itself.
+    base_prefix = f"{_FILE_MEMORY_BASE_PREFIX}{_safe_identifier(agent_scope_user_id(name))}"
+    store = re.compile(f"{re.escape(base_prefix)}{_FILE_MEMORY_DIGEST}{_STORE_DIGEST}")
+    return [
+        DropPath(path, f"Drop the file-memory search index {path} of agent {name}; it rebuilds on next use")
+        for path in _entries(runtime_paths.storage_root / _KNOWLEDGE_DB, store.fullmatch)
+    ]
+
+
+def _private_knowledge_index_drops(runtime_paths: RuntimePaths, config: Config, name: str) -> list[Step]:
+    """Drop the private knowledge indexes of the agent, at each private-instance state root of the agent.
+
+    A private base's binding stores its index below the private agent's state root, ``<scope>/<agent>``
+    in ``private_instances/`` (runtime_resolution.py's resolve_knowledge_binding), never in ``agents/<agent>``.
+    """
+    base_id = f"{config.PRIVATE_KNOWLEDGE_BASE_ID_PREFIX}{name}"
+    store = re.compile(f"{re.escape(_safe_identifier(base_id))}{_STORE_DIGEST}")
+    return [
+        DropPath(path, f"Drop the private knowledge index {path} of agent {name}; it rebuilds on next use")
+        for state_root in sorted(private_instances_root_path(runtime_paths.storage_root).glob(f"*/{name}"))
+        for path in _entries(state_root / _KNOWLEDGE_DB, store.fullmatch)
+    ]
+
+
+def _knowledge_graph_reports(runtime_paths: RuntimePaths, config: Config, old_name: str, new_name: str) -> list[str]:
+    """Report the agent's started knowledge graph, which is named after its old state root."""
+    graph = graph_scope(old_name, config, runtime_paths, None).graph_name
+    if not runtime_paths.storage_root.joinpath(*_GRAPH_INGESTION_STATE, f"{graph}.json").exists():
+        return []
+    backfill_days = config.knowledge_graph.ingest.backfill_days
+    return [
+        f"The knowledge graph {graph} of agent {old_name} stays in the graph store unused: a graph is named after "
+        f"its agent's state root, so {new_name} starts a new graph from the conversations active within "
+        f"knowledge_graph.ingest.backfill_days ({backfill_days}) of its first start. To cover older conversations, "
+        "raise backfill_days before starting MindRoom, or later together with knowledge_graph.generation, "
+        "which starts every graph over.",
+    ]
+
+
+def _knowledge_git_reports(runtime_paths: RuntimePaths, config: Config, old_name: str, new_name: str) -> list[str]:
+    """Report the Git directories of knowledge checkouts in the agent's state root, which are named after their path.
+
+    Git sync of such a base finds no Git directory for the moved checkout and refuses to clone into it, as it is
+    not empty (knowledge/git_source.py's _initialize_repository).
+    """
+    storage = runtime_paths.storage_root
+    old_root = agent_state_root_path(storage, old_name).resolve()
+    new_root = agent_state_root_path(storage, new_name).resolve()
+    checkouts: dict[Path, list[str]] = {}
+    for base_id, base in config.knowledge_bases.items():
+        if base.git is None:
+            continue
+        try:
+            checkout = shared_knowledge_path(base.path, runtime_paths)
+        except (OSError, RuntimeError, ValueError):
+            # MindRoom cannot sync a base whose path it cannot resolve either.
+            continue
+        if checkout.is_relative_to(old_root):
+            checkouts.setdefault(checkout, []).append(base_id)
+    reports: list[str] = []
+    for checkout, base_ids in checkouts.items():
+        git_dir = knowledge_git_dir(storage, checkout)
+        if not os.path.lexists(git_dir):
+            continue
+        moved = new_root / checkout.relative_to(old_root)
+        moved_git_dir = knowledge_git_dir(storage, moved)
+        reports.append(
+            f"The Git directory {git_dir} of knowledge base {', '.join(base_ids)} is named after its checkout "
+            f"{checkout}, which moves to {moved}; Git sync looks for {moved_git_dir} and refuses to clone into the "
+            f"moved checkout, so move {git_dir} to {moved_git_dir} before starting MindRoom.",
+        )
+    return reports
+
+
+def _mem0_history_reports(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> list[str]:
+    """Report the agent's recent messages in mem0's history database, which keys them by the old scope id."""
+    mem0_dir = runtime_paths.process_env.get(_MEM0_DIR_VARIABLE) or str(Path("~").expanduser() / ".mem0")
+    database = Path(mem0_dir) / _MEM0_HISTORY_DATABASE
+    if not database.is_file():
+        return []
+    session_scope = f"user_id={agent_scope_user_id(old_name)}"
+    try:
+        with read_only_connection(database) as connection:
+            found = connection.execute(
+                "SELECT 1 FROM messages WHERE session_scope = ? LIMIT 1",
+                (session_scope,),
+            ).fetchone()
+    except sqlite3.Error:
+        # A database without mem0's messages table holds no recent messages to lose.
+        return []
+    if found is None:
+        return []
+    return [
+        f"mem0's history database {database}, outside the storage root, keeps the recent messages of agent "
+        f"{old_name} under the scope {session_scope}, which the rename does not change, so memory extraction "
+        f"for {new_name} starts without their context.",
+    ]
+
+
+def _paths_named(root: Path, names: frozenset[str]) -> list[Path]:
+    """Return the paths below ``root`` named one of ``names``, without descending into them or following links."""
+    found: list[Path] = []
+    for current, directory_names, file_names in os.walk(root):
+        found += [Path(current, name) for name in (*directory_names, *file_names) if name in names]
+        directory_names[:] = [name for name in directory_names if name not in names]
+    return found
+
+
+def _plugin_state_reports(runtime_paths: RuntimePaths, name: str) -> list[str]:
+    """Report the paths below each plugin's state root named after the agent; each plugin owns its own format."""
+    names = frozenset({name, f"{name}.json"})
+    paths = sorted(
+        path
+        for plugin in _entries(runtime_paths.storage_root / _PLUGINS, lambda _: True)
+        if plugin.is_dir() and not plugin.is_symlink()
+        for path in _paths_named(plugin, names)
+    )
+    if not paths:
+        return []
+    return [
+        f"These plugin state paths name agent {name}, and the rename leaves them as they are: "
+        f"{', '.join(str(path) for path in paths)}.",
+    ]
+
+
+def _config_line_reports(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> list[str]:
+    """Report the config lines, includes and prose files among them, that still mention the agent after the config edit."""
+    config_path = runtime_paths.config_path.expanduser()
+    rewrites = {
+        step.path: step.rewrite
+        for step in config_entity_steps(
+            config_path,
+            old_name=old_name,
+            new_name=new_name,
+            storage_root=runtime_paths.storage_root,
+        )
+    }
+    mention = re.compile(f"(?<![{_NAME_CHARACTER}]){re.escape(old_name)}(?![{_NAME_CHARACTER}])")
+    _, files = load_yaml_config_source(config_path)
+    places: list[str] = []
+    for path in sorted(files):
+        content = path.read_bytes()
+        if path in rewrites:
+            content = rewrites[path](content)
+        lines = [
+            str(number)
+            for number, line in enumerate(content.decode("utf-8", errors="replace").split("\n"), start=1)
+            if mention.search(line)
+        ]
+        if lines:
+            places.append(f"{path} (line{'s' if len(lines) > 1 else ''} {', '.join(lines)})")
+    if not places:
+        return []
+    return [
+        f"These config lines mention {old_name} and the rename does not change them, "
+        f"such as other agents' instructions: {'; '.join(places)}.",
+    ]
+
+
+def _legacy_file_reports(runtime_paths: RuntimePaths, name: str) -> list[str]:
+    """Report the files older MindRoom versions kept for the agent under its name."""
+    storage = runtime_paths.storage_root
+    tracking = tracking_dir(runtime_paths)
+    responded = legacy_responses_file_path(storage, name).name
+    memory_search = re.compile(f"{re.escape(agent_scope_user_id(name))}{_FILE_MEMORY_DIGEST}")
+
+    def session_database(entry: str) -> bool:
+        # The database and the side files SQLite keeps beside it.
+        return entry == f"{name}.db" or entry.startswith(f"{name}.db-")
+
+    paths = [
+        *_entries(tracking, lambda entry: entry.startswith(f"{_DISPATCH_OBLIGATIONS_PREFIX}{name}-")),
+        *_entries(storage / _LEGACY_SESSIONS, session_database),
+        *_entries(storage, session_database),
+        *_entries(storage / _LEGACY_MEMORY_SEARCH, memory_search.fullmatch),
+        # The pre-journal handled-turn ledger, which a start imports once under the agent's name and renames `.imported`.
+        *_entries(tracking, lambda entry: entry.startswith(responded)),
+    ]
+    if not paths:
+        return []
+    return [
+        f"These files from older MindRoom versions name agent {name} and stay as they are: "
+        f"{', '.join(str(path) for path in paths)}.",
+    ]

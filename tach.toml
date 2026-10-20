@@ -1048,6 +1048,7 @@ depends_on = [
     "mindroom.turn_record",
 ]
 visibility = [
+    "mindroom.agent_rename.indexes",
     "mindroom.bot",
     "mindroom.handled_turns",
 ]
@@ -3331,6 +3332,7 @@ visibility = [
 path = "mindroom.memory_scope_ids"
 depends_on = []
 visibility = [
+    "mindroom.agent_rename.indexes",
     "mindroom.agent_rename.memory",
     "mindroom.knowledge.file_memory_knowledge",
     "mindroom.memory._file_backend",
@@ -9470,3 +9472,22 @@ depends_on = ["mindroom.config.yaml_includes"]
 [[interfaces]]
 expose = ["config_entity_steps", "config_value_steps", "env_value_steps"]
 from = ["mindroom.agent_rename.config_edit"]
+
+# Drops the knowledge indexes named after an agent and reports the state its rename leaves as it is.
+[[modules]]
+path = "mindroom.agent_rename.indexes"
+depends_on = [
+    "mindroom.agent_rename.config_edit",
+    "mindroom.config.yaml_includes",
+    "mindroom.constants",
+    "mindroom.knowledge.indexing_config",
+    "mindroom.knowledge_graph.scope",
+    "mindroom.legacy_handled_turns",
+    "mindroom.memory_scope_ids",
+    "mindroom.runtime_resolution",
+    "mindroom.tool_system.worker_routing",
+]
+
+[[interfaces]]
+expose = ["index_steps"]
+from = ["mindroom.agent_rename.indexes"]

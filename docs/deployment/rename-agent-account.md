@@ -36,11 +36,14 @@ Any other setup is refused with `not supported yet`.
 2. Stop MindRoom.
 3. Take a snapshot or copy of the storage directory, the config directory, and the homeserver's database.
    The command keeps its own backups, but a snapshot is the only rollback that also covers the homeserver.
-4. Run a dry run with the same `--config` and `--storage-path` the service uses.
-   It prints the plan and changes nothing.
-   The one exception is a config in the legacy format, one that uses `authorization.global_users`.
-   Loading it migrates it on disk, as every MindRoom command does, and writes the original to `config.yaml.pre-membership-access` beside it.
-   Configs in the current format are not touched.
+4. Run a dry run as the OS user the service runs as, with the service's environment and the same `--config` and `--storage-path`.
+   Variables such as `MATRIX_HOMESERVER`, `MINDROOM_STORAGE_PATH`, `MINDROOM_CONFIG_PATH`, `MINDROOM_WORKER_BACKEND`, and `MINDROOM_CONTROL_STATE_PATH` decide which server the login check asks, which files the command reads, and whether it retires Docker workers.
+   For a systemd service, `systemctl show <unit> -p User -p Environment -p EnvironmentFiles` lists them.
+   A file the command rewrites keeps its mode but becomes owned by whoever ran the command, so a run as root can leave files the service can no longer write.
+   The dry run prints the plan and changes nothing.
+   The one exception is a config that still uses a retired access field: `access_model` or `matrix_room_access` at the top level, or `global_users`, `agent_reply_permissions`, `default_room_access`, or `room_permissions` under `authorization`.
+   Loading it migrates it on disk, as every MindRoom command does, and writes the original to `config.yaml.pre-membership-access` beside it (see [Membership Access Migration](upgrades.md#membership-access-migration)).
+   Configs without those fields are not touched.
 
    ```bash
    mindroom agents rename-account harry @mindroom_harry:example.org \
@@ -233,7 +236,13 @@ Skip the entries that have nothing to restore:
 - A `FinalAction` entry.
   It is only used with the Docker worker backend, to retire the old workers, and is never undone.
 - A `SqliteEdit`, `FileRewrite`, or `DropPath` entry whose `backup` is `null`, because that step never ran.
-- A `MovePath` entry whose `destination` does not exist, because that move never happened.
+- A `DropPath` entry whose `backup` directory is empty, because its item was already moved back.
+- A `MovePath` entry, unless its `destination` exists and its `source` does not.
+  Otherwise the move never happened or was already undone.
+  With `--discard-new-principal`, the `destination` of a move that never ran can still exist, because the `DropPath` before it, which would have removed it, never ran either.
+  Moving that `destination` back would put it inside `source`.
+
+Restoring a `SqliteEdit` or `FileRewrite` entry that was already undone does no harm.
 
 This matters most after `Undo failed:`, where the manifest includes steps the command never reached.
 Restore each remaining entry like this:

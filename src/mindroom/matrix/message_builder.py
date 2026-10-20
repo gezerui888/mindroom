@@ -530,7 +530,8 @@ def _stop_at_unfinished_markup(state: StateInline, silent: bool) -> bool:
     It runs before markdown-it's own inline rules, which parse everything else, and stops at ``env["end"]``.
     """
     start, src, env = state.pos, state.src, state.env
-    if silent or state.level:  # A lookahead, or the label of a finished link, which leaves nothing open.
+    # A lookahead, the label of a finished link, or an image's alt text, which leave nothing open.
+    if silent or state.level or src is not env["src"]:
         return False
     if src[start] == "`":
         backtick(state, silent)
@@ -556,9 +557,9 @@ _PARTIAL_MARKDOWN_PARSER.inline.ruler.before("text", "unfinished_markup", _stop_
 def _close_partial_inline(text: str) -> str:
     """Close the emphasis and code span left open at the end of inline text, and show an unfinished link as its label."""
     # Markup after a space at the very end closes nothing and only opens text still to come.
-    unmarked = text.rstrip("*_[")
+    unmarked = text.rstrip("*_[~")
     end = len(unmarked) if not unmarked or unmarked[-1].isspace() else len(text)
-    env: dict[str, Any] = {"end": end, "last_bracket": text.rfind("]"), "last_paren": text.rfind(")")}
+    env: dict[str, Any] = {"src": text, "end": end, "last_bracket": text.rfind("]"), "last_paren": text.rfind(")")}
     state = StateInline(text, _PARTIAL_MARKDOWN_PARSER, env, [])
     _PARTIAL_MARKDOWN_PARSER.inline.tokenize(state)
     link_pairs(state)  # Match emphasis and strikethrough delimiters the way rendering will.
@@ -567,7 +568,8 @@ def _close_partial_inline(text: str) -> str:
     if run := env.get("code_span"):
         if not text[end + len(run) :].strip():  # A code span with nothing in it yet is dropped.
             return _close_partial_inline(shown)
-        shown = text + run
+        # A space keeps the closer from joining a backtick the code ends in into a longer run.
+        shown = f"{text} {run}" if text.endswith("`") else text + run
     if (label := env.get("open_label")) is not None:
         shown = shown[:label] + shown[label + 1 :]
     # Openers nothing closed yet, innermost first; one that could also close, like the `*` of `2*3`, may be literal.

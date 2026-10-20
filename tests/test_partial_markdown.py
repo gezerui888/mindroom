@@ -26,9 +26,12 @@ from tests.cpu_budget_helpers import cpu_budget
         ("Run `ls | grep [a-z]* _x", "Run `ls | grep [a-z]* _x`"),
         ("**Then run `pip ins", "**Then run `pip ins`**"),
         ("Run ``a ` b", "Run ``a ` b``"),
+        ("Run ``a `", "Run ``a ` ``"),
         # A run with nothing after it yet, which renders literally until its text arrives.
         ("The answer is **", "The answer is"),
         ("Run `", "Run"),
+        ("Fares ~~", "Fares"),
+        ("Then **~~", "Then"),
         # A link whose label or URL is still arriving shows its label.
         ("[Open the draft]", "[Open the draft]"),
         ("[Open the draft](", "Open the draft"),
@@ -43,11 +46,15 @@ from tests.cpu_budget_helpers import cpu_budget
         ("> **Quoted\n> text", "> **Quoted\n> text**"),
         ("## The **plan", "## The **plan**"),
         ("- **First\n  second", "- **First\n  second**"),
-        # Inline math, autolinks, and links are parsed as rendering parses them.
+        # Inline math, autolinks, links, and images are parsed as rendering parses them.
         ("The interval $[0, 1)$ is **half", "The interval $[0, 1)$ is **half**"),
         ("See <https://x.example/_search> and *more", "See <https://x.example/_search> and *more*"),
         ("*See [the *draft](https://docs.example/a) now", "*See [the *draft](https://docs.example/a) now*"),
         ("- **`", "- "),
+        (
+            "See ![chart `v2](https://x.example/i.png) and **more",
+            "See ![chart `v2](https://x.example/i.png) and **more**",
+        ),
         # A table waits for its separator row, then streams row by row.
         ("Three rules differ:\n\n| Rule | Vantr", "Three rules differ:"),
         ("Three rules differ:\n| Rule | Vantrell | Kessler |\n|---|--", "Three rules differ:"),
@@ -90,9 +97,10 @@ def test_partial_markdown_is_shown_as_it_will_render(streamed: str, shown: str) 
         "**bold***italic*",
         "*foo**bar*",
         "Use the class_",
-        # Inline math and autolinks keep their content.
+        # Inline math, autolinks, and image alt text keep their content.
         "The interval $[0, 1)$",
         "See <https://x.example/_search>",
+        "See ![a `b](https://x.example/i.png) and more",
         # Tables that already render.
         "| Rule | Vantrell |\n|---|---|\n| Hotels | $250",
         "| Rule | Vantrell |\n|---|---|",
@@ -115,6 +123,7 @@ def test_closed_markdown_renders_without_raw_syntax() -> None:
         "<p><strong>Then run <code>pip ins</code></strong></p>\n"
     )
     assert markdown_to_html(close_partial_markdown("Fares ~~rose")) == "<p>Fares <s>rose</s></p>\n"
+    assert markdown_to_html(close_partial_markdown("Run ``a `")) == "<p>Run <code>a ` </code></p>\n"
     assert "<strong>$25</strong>" in markdown_to_html(
         close_partial_markdown("| Rule | Vantrell |\n|---|---|\n| Hotels | **$25"),
     )

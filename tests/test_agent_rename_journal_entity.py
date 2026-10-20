@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import closing
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -11,11 +12,16 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 import pytest
+from agno.models.response import ToolExecution
 
-from mindroom.agent_rename.journal import journal_entity_steps
+from mindroom import reply_lifecycle as rl
+from mindroom.agent_rename.journal_entity import journal_entity_steps
 from mindroom.agent_rename.steps import RenamePlan, RenameRefusedError, SqliteEdit, apply_plan
 from mindroom.delegation.state import DelegationChild
 from mindroom.event_journal import (
+    ApprovalCall,
+    ApprovalContinuation,
+    ApprovalDecision,
     DepartureSource,
     EventClass,
     EventJournalStore,
@@ -25,16 +31,25 @@ from mindroom.event_journal import (
     IngestionRecordAdmission,
     IngestionRecordDisposition,
     PrincipalStore,
+    ProjectedEvent,
     encode_thread_id,
 )
+from mindroom.event_journal.approval_continuations import approval_arguments_digest
 from mindroom.event_journal.models import IngestionConsumer
 from mindroom.event_journal.opening import event_journal_sqlite_path
+from mindroom.event_journal.replies import PreparedReplyRow, ReplyRowRequest
 from mindroom.handled_turns import HandledTurnLedger, TurnRecord, _reset_handled_turn_ledger_runtime
 from mindroom.history.types import HistoryScope
 from mindroom.message_target import MessageTarget
+from mindroom.reply_presentation import Presentation, Segment, current_answer, decode_presentation, encode_presentation
+from mindroom.response_sources import ResponseSources
+from mindroom.teams import _TeamStreamPresentation
 from mindroom.tool_jobs.runtime import BackgroundJob
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.agent_rename_helpers import tree_snapshot
+from tests.approval_continuation_helpers import approval_continuation
+from tests.conftest import message_origin
+from tests.reply_span_helpers import paused_for_approval, reply_shown_for_approval
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -55,10 +70,19 @@ UNTHREADED = encode_thread_id(None)
 NOW = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
 # The scope a requester-partitioned ad-hoc team gets when one member is private (history/team_scope.py).
 REQUESTER_SUFFIX = "_requester_0123456789ab"
+# A configured team whose name is shaped like an ad-hoc scope id of the agent alone.
+CONFIGURED_TEAM = f"team_{OLD}"
+CONFIGURED_TEAMS = frozenset({CONFIGURED_TEAM})
 
 
 def _steps(database: Path) -> list[SqliteEdit]:
-    return journal_entity_steps(database, old_name=OLD, new_name=NEW, user_id=USER_ID)
+    return journal_entity_steps(
+        database,
+        old_name=OLD,
+        new_name=NEW,
+        user_id=USER_ID,
+        configured_teams=CONFIGURED_TEAMS,
+    )
 
 
 def _apply(steps: list[SqliteEdit], storage_root: Path) -> None:
@@ -270,7 +294,7 @@ async def test_ad_hoc_team_scopes_take_the_recomputed_id(tmp_path: Path) -> None
     The member that answered keeps its own name. A configured team's own scope is its name, even one shaped like
     an ad-hoc id, and a scope naming the prefix agent is a different member set.
     """
-    team_name = f"team_{OLD}"
+    team_name = CONFIGURED_TEAM
     scopes = {
         "$team": (HELPER, f"team_{OLD}+{HELPER}"),
         "$private-team": (HELPER, f"team_{OLD}+{HELPER}{REQUESTER_SUFFIX}"),
@@ -320,52 +344,122 @@ def _bindings(*agents: str) -> dict[str, dict[str, object]]:
     return {agent: {"display_name": agent, "private": None, "worker_scope": None} for agent in agents}
 
 
-def _context(*, history_scope: dict[str, str], identity: ToolExecutionIdentity) -> str:
-    """The parts of an approval continuation's context that name agents, encoded like approval_continuations.py."""
-    context = {
-        "cli_call": {
+def _call(tool_call_id: str, agent: str) -> ApprovalCall:
+    return ApprovalCall(
+        tool_call_id=tool_call_id,
+        tool_name="shell",
+        invoking_agent=agent,
+        expires_at_ns=time.time_ns() + 60_000_000_000,
+        decision=ApprovalDecision.APPROVED,
+        human_approval_required=True,
+        arguments_digest=approval_arguments_digest({"cmd": "ls"}),
+    )
+
+
+async def _admit_source(principal: PrincipalStore, event_id: str) -> None:
+    """Admit alice's message that a paused response answers."""
+    content = {"msgtype": "m.text", "body": "run it"}
+    inbound = InboundEvent(
+        event_id=event_id,
+        room_id=ROOM,
+        thread_id=None,
+        kind=EventKind.MESSAGE,
+        event_class=EventClass.ACTIONABLE,
+        sender="@alice:x",
+        origin_server_ts=10,
+        source={"event_id": event_id, "content": content},
+    )
+    projected = ProjectedEvent(
+        event_id=event_id,
+        room_id=ROOM,
+        thread_id=None,
+        sender="@alice:x",
+        origin_server_ts=10,
+        content=content,
+        replaces_event_id=None,
+        redacts_event_id=None,
+    )
+    await principal.admit(inbound, projected)
+
+
+TEAM_MEMBERS = (OLD, PREFIX, HELPER)
+TEAM_SCOPE = f"team_{OLD}+{PREFIX}+{HELPER}"
+# `zeta` sorts after the other members, so the renamed scope lists them sorted again.
+RENAMED_TEAM_SCOPE = f"team_{PREFIX}+{HELPER}+{NEW}"
+
+
+def _team_continuation() -> ApprovalContinuation:
+    """A paused ad-hoc team answer by helper, with the agent and the prefix agent; their calls wait for approval."""
+    return approval_continuation(
+        approval_id="team-approval",
+        entity_kind="team",
+        entity_name=HELPER,
+        room_id=ROOM,
+        requester_id="@alice:x",
+        origin=message_origin(sender_id=USER_ID, requester_id="@alice:x", sender_entity_name=OLD),
+        response_event_id="$team-reply",
+        sources=ResponseSources(("$team-source",), ("$team-source",)),
+        calls=(_call("call-1", OLD), _call("call-2", PREFIX)),
+        team_member_names=TEAM_MEMBERS,
+        team_member_model_names=tuple((member, "model-a") for member in TEAM_MEMBERS),
+        team_mode="coordinate",
+        history_scope=HistoryScope(kind="team", scope_id=TEAM_SCOPE),
+        execution_identity=asdict(_identity(OLD, transport=HELPER)),
+        mentioned_agents=(OLD, PREFIX),
+        delegation_storage_bindings=_bindings(OLD, PREFIX),
+        cli_call={
             "kind": "agent_cli",
             "requirements": [{"member_agent_id": OLD}, {"member_agent_id": PREFIX}],
             "external_requirement": {"member_agent_id": OLD},
         },
-        "delegation_storage_bindings": _bindings(OLD, PREFIX),
-        "entity_kind": "team",
-        "execution_identity": asdict(identity),
-        "history_scope": history_scope,
-        "mentioned_agents": [OLD, PREFIX],
-        "origin": {"requester_entity_name": None, "requester_id": "@alice:x", "sender_entity_name": OLD},
-        "request_body": f"ask {OLD} and {PREFIX}",
-        "team_member_model_names": [[OLD, "model-a"], [PREFIX, "model-b"]],
-        "team_member_names": [OLD, HELPER, PREFIX],
-    }
-    return json.dumps(context, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-
-
-def _continuation(connection: sqlite3.Connection, principal: str, approval_id: str, context_json: str) -> None:
-    _insert(
-        connection,
-        "approval_continuations",
-        principal_id=principal,
-        approval_id=approval_id,
-        state="waiting",
-        context_json=context_json,
-        created_at_ns=1,
+        show_tool_calls=False,
+        request_body=f"ask {OLD} and {PREFIX}",
     )
 
 
-def _continuation_call(connection: sqlite3.Connection, principal: str, approval_id: str, invoking_agent: str) -> None:
-    _insert(
-        connection,
-        "approval_continuation_calls",
-        principal_id=principal,
-        approval_id=approval_id,
-        generation=0,
-        tool_call_id=f"call-{invoking_agent}",
-        call_ordinal={OLD: 0, PREFIX: 1}.get(invoking_agent, 2),
-        tool_name="shell",
-        invoking_agent=invoking_agent,
-        expires_at_ns=1,
+def _team_presentation(span_id: str) -> str:
+    """The team document a paused team reply shows, written by MindRoom's team stream with hidden tool calls."""
+    team = _TeamStreamPresentation.new(TEAM_MEMBERS, ["Code", "Code Team", "Helper"], show_tool_calls=False)
+    for member_id in team.member_ids:
+        team.append_member(member_id, f"{member_id} thinks")
+    team.start_member_tool("code", ToolExecution(tool_call_id="call-1", tool_name="shell", tool_args={"cmd": "ls"}))
+    team.start_member_tool(
+        "code-team",
+        ToolExecution(tool_call_id="call-2", tool_name="shell", tool_args={"cmd": "ls"}),
     )
+    segment = Segment(
+        kind="answer",
+        text=team.render_body(),
+        span_id=span_id,
+        tool_trace=tuple(team.tool_trace),
+        team_state=team.to_state(),
+    )
+    return encode_presentation(Presentation(segments=(segment,), show_tool_calls=False))
+
+
+async def _pause_team_reply(principal: PrincipalStore, continuation: ApprovalContinuation) -> str:
+    """Pause the team's reply for approval the way a response does, showing its team document; return the reply id."""
+    span = await reply_shown_for_approval(principal, continuation)
+    assert span is not None
+    shown = _team_presentation(span.span_id)
+    enqueued = await principal.pause_for_approval(
+        continuation,
+        ReplyRowRequest(
+            reply_id=span.reply_id,
+            span_id=span.span_id,
+            decide=lambda reply, held: rl.pause(
+                reply,
+                held,
+                rl.PauseWrite(shown=shown, prepared_revision=reply.revision, stage=rl.WriteStage.EDIT),
+                in_place=False,
+                now_ns=time.time_ns(),
+            ),
+        ),
+        PreparedReplyRow(payload={"msgtype": "m.text", "body": "waiting"}),
+    )
+    assert enqueued is not None
+    assert enqueued.transition.applied
+    return span.reply_id
 
 
 def _grant(connection: sqlite3.Connection, principal: str, grant_id: str, *, agent: str, responder: str) -> None:
@@ -391,23 +485,23 @@ def _grant(connection: sqlite3.Connection, principal: str, grant_id: str, *, age
     )
 
 
-def _grant_card(connection: sqlite3.Connection, principal: str, agent: str) -> None:
+def _grant_card(connection: sqlite3.Connection, principal: str, *, entity: str, invoking: str, responder: str) -> None:
     _insert(
         connection,
         "approval_grant_cards",
         principal_id=principal,
         continuation_id="continuation-1",
         continuation_generation=0,
-        tool_call_id="call-1",
-        delivery_id=f"$card-delivery-{agent}",
-        scope_key=f"scope-card-{agent}",
+        tool_call_id=f"call-{invoking}",
+        delivery_id=f"$card-delivery-{invoking}",
+        scope_key=f"scope-card-{invoking}",
         room_id=ROOM,
         thread_id="$thread",
         requester_id="@alice:x",
-        entity_name=agent,
-        invoking_agent=agent,
+        entity_name=entity,
+        invoking_agent=invoking,
         operation="shell:run",
-        responder_principal_id=principal,
+        responder_principal_id=responder,
         responder_epoch=0,
         membership_epoch=0,
     )
@@ -484,25 +578,65 @@ def _delegation_job(job_id: str, *, caller: str, child: str) -> BackgroundJob:
 
 
 async def _approval_journal(storage_root: Path) -> Path:
-    """Build a journal with the real schema holding approval, reply and job rows for the agent and the prefix agent."""
+    """Build a journal with paused approvals, replies, grants and jobs naming the agent and the prefix agent.
+
+    The paused approvals are written through the journal store as a pausing response writes them.
+    """
     database = event_journal_sqlite_path(storage_root)
-    await EventJournalStore.open_sqlite(database).close()
-    agent_scope = {"kind": "agent", "scope_id": OLD}
-    team_scope = {"kind": "team", "scope_id": f"team_{OLD}+{HELPER}"}
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        own = store.principal(OLD_PRINCIPAL)
+        await _admit_source(own, "$own-source")
+        own_continuation = approval_continuation(
+            approval_id="own-approval",
+            entity_name=OLD,
+            room_id=ROOM,
+            requester_id="@alice:x",
+            response_event_id="$own-reply",
+            sources=ResponseSources(("$own-source",), ("$own-source",)),
+            calls=(_call("call-own", OLD),),
+            history_scope=HistoryScope(kind="agent", scope_id=OLD),
+            execution_identity=asdict(_identity(OLD)),
+        )
+        assert await paused_for_approval(own, own_continuation, text="waiting") is not None
+        helper = store.principal(HELPER_PRINCIPAL)
+        await _admit_source(helper, "$team-source")
+        await _pause_team_reply(helper, _team_continuation())
+    finally:
+        await store.close()
     with closing(sqlite3.connect(database)) as connection, connection:
-        _continuation(connection, OLD_PRINCIPAL, "own", _context(history_scope=agent_scope, identity=_identity(OLD)))
-        # helper answered for an ad-hoc team with the agent, and the agent's team call waits for approval.
-        team_identity = _identity(OLD, transport=HELPER)
-        _continuation(connection, HELPER_PRINCIPAL, "team", _context(history_scope=team_scope, identity=team_identity))
-        _continuation_call(connection, HELPER_PRINCIPAL, "team", OLD)
-        _continuation_call(connection, HELPER_PRINCIPAL, "team", PREFIX)
-        prefix_scope = {"kind": "agent", "scope_id": PREFIX}
-        prefix_context = _context(history_scope=prefix_scope, identity=_identity(PREFIX)).replace(f'"{OLD}"', '"x"')
-        _continuation(connection, PREFIX_PRINCIPAL, "prefix", prefix_context)
+        # A regeneration span of a finished team reply keeps the document to restore if it fails.
+        rollback = {"presentation": _team_presentation("regenerated-span"), "state": "completed"}
+        _insert(
+            connection,
+            "reply_spans",
+            principal_id=HELPER_PRINCIPAL,
+            span_id="regeneration-span",
+            reply_id="finished-team-reply",
+            kind="regeneration",
+            delivery_id="$team-source",
+            bot_generation="gen-old",
+            base_sequence=0,
+            # Encoded like event_journal/reply_spans.py's _rollback_json.
+            rollback_json=json.dumps(rollback, separators=(",", ":"), sort_keys=True),
+            claimed_at_ns=1,
+        )
+        for role in ("pending", "logical"):
+            _insert(
+                connection,
+                "reply_span_sources",
+                principal_id=HELPER_PRINCIPAL,
+                span_id="regeneration-span",
+                event_id="$team-source",
+                role=role,
+                ordinal=0,
+            )
+        _reply(connection, PREFIX_PRINCIPAL, PREFIX)
         for principal, agent in ((OLD_PRINCIPAL, OLD), (PREFIX_PRINCIPAL, PREFIX)):
-            _reply(connection, principal, agent)
             _scheduled_call(connection, principal, agent)
-            _grant_card(connection, principal, agent)
+            _grant_card(connection, principal, entity=agent, invoking=agent, responder=principal)
+        # helper's card for the agent's call in their team: its invoking agent and responder are the agent.
+        _grant_card(connection, HELPER_PRINCIPAL, entity=HELPER, invoking=OLD, responder=OLD_PRINCIPAL)
         _grant(connection, OLD_PRINCIPAL, "own-grant", agent=OLD, responder=OLD_PRINCIPAL)
         _grant(connection, HELPER_PRINCIPAL, "team-grant-for-code", agent=OLD, responder=HELPER_PRINCIPAL)
         _grant(connection, HELPER_PRINCIPAL, "helper-grant", agent=HELPER, responder=HELPER_PRINCIPAL)
@@ -523,10 +657,65 @@ def _without_times(job: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in job.items() if key not in {"created_at", "updated_at"}}
 
 
-def _json_column(database: Path, sql: str, *params: object) -> dict[str, object]:
-    ((text,),) = _query(database, sql, *params)
-    assert isinstance(text, str)
-    return json.loads(text)
+def _restore_team_document(stored: str, member_names: tuple[str, ...]) -> _TeamStreamPresentation:
+    """Restore a stored team document the way an approval resume does (teams.py's continue_paused_team_run)."""
+    segment = current_answer(decode_presentation(stored), None)
+    assert segment is not None
+    return _TeamStreamPresentation.restore(
+        config_names=member_names,
+        show_tool_calls=False,
+        state=segment.team_state,
+        tool_trace=segment.tool_trace,
+    )
+
+
+@pytest.mark.asyncio
+async def test_paused_team_approval_with_the_agent_resumes_under_the_new_name(tmp_path: Path) -> None:
+    """The continuation, its reply's team document and its tool scopes all name the new member, so resume restores.
+
+    Renaming only the continuation's member names made the frozen document disagree with them, and the resume
+    failed with "Team continuation presentation snapshot is invalid".
+    """
+    database = await _approval_journal(tmp_path)
+
+    _apply(_steps(database), tmp_path)
+
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        helper = store.principal(HELPER_PRINCIPAL)
+        continuation = await helper.approval_continuation("team-approval")
+        assert continuation is not None
+        assert continuation.span_id is not None
+        paused_span = await helper.replies.span(continuation.span_id)
+        assert paused_span is not None
+        reply = await helper.replies.load(paused_span.reply_id)
+        regeneration = await helper.replies.span("regeneration-span")
+    finally:
+        await store.close()
+    assert continuation.team_member_names == (NEW, PREFIX, HELPER)
+    assert continuation.team_member_model_names == ((NEW, "model-a"), (PREFIX, "model-a"), (HELPER, "model-a"))
+    assert continuation.history_scope == HistoryScope(kind="team", scope_id=RENAMED_TEAM_SCOPE)
+    assert [call.invoking_agent for call in continuation.calls] == [NEW, PREFIX]
+    assert continuation.execution_identity == asdict(_identity(NEW, transport=HELPER))
+    assert continuation.mentioned_agents == (NEW, PREFIX)
+    assert continuation.delegation_storage_bindings == {**_bindings(NEW), **_bindings(PREFIX)}
+    assert continuation.cli_call == {
+        "kind": "agent_cli",
+        "requirements": [{"member_agent_id": NEW}, {"member_agent_id": PREFIX}],
+        "external_requirement": {"member_agent_id": NEW},
+    }
+    assert continuation.origin.sender_entity_name == NEW
+    assert continuation.request_body == f"ask {OLD} and {PREFIX}"
+    assert reply is not None
+    assert reply.possibly_shown is not None
+    assert regeneration is not None
+    assert regeneration.rollback is not None
+    for stored in (reply.presentation, reply.possibly_shown, regeneration.rollback.presentation):
+        restored = _restore_team_document(stored, continuation.team_member_names)
+        assert restored.config_names_by_id == {NEW: NEW, "code-team": PREFIX, HELPER: HELPER}
+        assert restored.per_member[NEW] == "code thinks"
+        assert [entry.scope_key for entry in restored.tool_trace] == [f"agent:{NEW}", "agent:code-team"]
+        assert restored.separate_next_scopes == {f"agent:{NEW}", "agent:code-team"}
 
 
 @pytest.mark.asyncio
@@ -535,29 +724,37 @@ async def test_approval_reply_and_job_rows_follow_the_agent(tmp_path: Path) -> N
     database = await _approval_journal(tmp_path)
     # Rows naming the agent as well change; every other row naming the prefix agent stays exactly as it is.
     prefix_rows = _rows_holding(database, PREFIX, PREFIX_PRINCIPAL, without=(OLD, OLD_PRINCIPAL))
-    assert len(prefix_rows) == 7
+    assert len(prefix_rows) == 6
 
     _apply(_steps(database), tmp_path)
 
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        own = await store.principal(NEW_PRINCIPAL).approval_continuation("own-approval")
+    finally:
+        await store.close()
+    assert own is not None
+    assert own.entity_name == NEW
+    assert own.history_scope == HistoryScope(kind="agent", scope_id=NEW)
+    assert own.execution_identity == asdict(_identity(NEW))
+    assert [call.invoking_agent for call in own.calls] == [NEW]
     assert _query(database, "SELECT principal_id, entity_name FROM reply_messages ORDER BY entity_name") == [
         (PREFIX_PRINCIPAL, PREFIX),
+        (HELPER_PRINCIPAL, HELPER),
         (NEW_PRINCIPAL, NEW),
     ]
     assert _query(database, "SELECT principal_id, agent_name FROM scheduled_call_approvals ORDER BY agent_name") == [
         (PREFIX_PRINCIPAL, PREFIX),
         (NEW_PRINCIPAL, NEW),
     ]
-    assert _query(database, "SELECT invoking_agent FROM approval_continuation_calls ORDER BY call_ordinal") == [
-        (NEW,),
-        (PREFIX,),
-    ]
-    # The card keeps its scope key: the grant a click on it creates still covers the calls it was posted for.
+    # A card keeps its scope key: the grant a click on it creates still covers the calls it was posted for.
     card = (
-        "SELECT principal_id, responder_principal_id, entity_name, invoking_agent, scope_key FROM approval_grant_cards"
+        "SELECT principal_id, entity_name, invoking_agent, responder_principal_id, scope_key FROM approval_grant_cards"
     )
     assert sorted(_query(database, card)) == [
-        (PREFIX_PRINCIPAL, PREFIX_PRINCIPAL, PREFIX, PREFIX, f"scope-card-{PREFIX}"),
-        (NEW_PRINCIPAL, NEW_PRINCIPAL, NEW, NEW, f"scope-card-{OLD}"),
+        (PREFIX_PRINCIPAL, PREFIX, PREFIX, PREFIX_PRINCIPAL, f"scope-card-{PREFIX}"),
+        (HELPER_PRINCIPAL, HELPER, NEW, NEW_PRINCIPAL, f"scope-card-{OLD}"),
+        (NEW_PRINCIPAL, NEW, NEW, NEW_PRINCIPAL, f"scope-card-{OLD}"),
     ]
     # A grant's scope key hashes the invoking agent and the responder principal, so no grant naming either matches again.
     assert _query(database, "SELECT grant_id FROM approval_grants ORDER BY grant_id") == [
@@ -565,30 +762,6 @@ async def test_approval_reply_and_job_rows_follow_the_agent(tmp_path: Path) -> N
         ("prefix-grant",),
     ]
     assert _query(database, "SELECT principal_id FROM approval_grant_locks") == [(NEW_PRINCIPAL,)]
-
-    own = _json_column(
-        database,
-        "SELECT context_json FROM approval_continuations WHERE principal_id = ?",
-        NEW_PRINCIPAL,
-    )
-    assert own["history_scope"] == {"kind": "agent", "scope_id": NEW}
-    team = _json_column(database, "SELECT context_json FROM approval_continuations WHERE approval_id = 'team'")
-    assert team == {
-        "cli_call": {
-            "kind": "agent_cli",
-            "requirements": [{"member_agent_id": NEW}, {"member_agent_id": PREFIX}],
-            "external_requirement": {"member_agent_id": NEW},
-        },
-        "delegation_storage_bindings": {**_bindings(NEW), **_bindings(PREFIX)},
-        "entity_kind": "team",
-        "execution_identity": asdict(_identity(NEW, transport=HELPER)),
-        "history_scope": {"kind": "team", "scope_id": f"team_{HELPER}+{NEW}"},
-        "mentioned_agents": [NEW, PREFIX],
-        "origin": {"requester_entity_name": None, "requester_id": "@alice:x", "sender_entity_name": NEW},
-        "request_body": f"ask {OLD} and {PREFIX}",
-        "team_member_model_names": [[NEW, "model-a"], [PREFIX, "model-b"]],
-        "team_member_names": [NEW, HELPER, PREFIX],
-    }
 
     jobs = {
         job_id: _without_times(json.loads(str(text)))
@@ -601,7 +774,10 @@ async def test_approval_reply_and_job_rows_follow_the_agent(tmp_path: Path) -> N
     delegation["adapter"]["child"]["task"] = f"ask {OLD}"
     assert jobs["delegation-job"] == delegation
 
-    assert _rows_holding(database, OLD, OLD_PRINCIPAL) == []
+    # Only the rows of payloads Matrix already holds keep the delivery identity they were sent with; the outbox
+    # matches a sent event by its event or transaction ID when that identity names another principal.
+    leftovers = _rows_holding(database, OLD, OLD_PRINCIPAL)
+    assert [(table, row[0]) for table, row in leftovers] == [("matrix_delivery_outbox", NEW_PRINCIPAL)] * 2
     assert set(prefix_rows) <= set(_rows_holding(database, PREFIX, PREFIX_PRINCIPAL))
 
 
@@ -636,6 +812,8 @@ async def test_planning_writes_nothing_and_describes_the_rename(tmp_path: Path) 
     # The principal's grants are dropped, not renamed.
     assert "approval_grants:" not in step.description
     assert "approval_continuations.context_json (2)" in step.description
+    assert "reply_messages.presentation_json (1)" in step.description
+    assert "reply_spans.rollback_json (1)" in step.description
     assert "drop the approval grants bound to agent code (2)" in step.description
 
 

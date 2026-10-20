@@ -9438,14 +9438,29 @@ depends_on = [
 expose = ["renamed_ad_hoc_scope_id", "team_steps"]
 from = ["mindroom.agent_rename.teams"]
 
-# Rewrites the event journal for both rename commands.
+# Rewrites the event journal after a server-side account rename; its principal helpers serve the agent rename too.
 [[modules]]
 path = "mindroom.agent_rename.journal"
-depends_on = ["mindroom.agent_rename.teams"]
+depends_on = []
 
 [[interfaces]]
-expose = ["journal_account_steps", "journal_entity_steps", "other_principal_user_ids"]
+expose = [
+    "PRINCIPAL_COLUMNS",
+    "format_counts",
+    "journal_account_steps",
+    "other_principal_user_ids",
+    "principal_row_counts",
+]
 from = ["mindroom.agent_rename.journal"]
+
+# Renames an agent's journal principal and every journal value keyed by its config name.
+[[modules]]
+path = "mindroom.agent_rename.journal_entity"
+depends_on = ["mindroom.agent_rename.journal", "mindroom.agent_rename.teams"]
+
+[[interfaces]]
+expose = ["journal_entity_steps"]
+from = ["mindroom.agent_rename.journal_entity"]
 
 # Edits the config, its includes, and its `.env` as text for both rename commands.
 [[modules]]

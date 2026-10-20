@@ -95,23 +95,25 @@ def entity_state_steps(runtime_paths: RuntimePaths, *, old_name: str, new_name: 
     return steps
 
 
-def matrix_state_key_step(runtime_paths: RuntimePaths, *, old_name: str, new_name: str) -> FileRewrite:
+def matrix_state_key_step(runtime_paths: RuntimePaths, *, old_name: str, new_name: str) -> FileRewrite | None:
     """Return the step that moves the agent's stored Matrix account to the new name's key in ``matrix_state.yaml``.
 
     MindRoom finds an agent's account under ``agent_<name>``; the username, password, device and token stay,
     so the agent keeps its Matrix ID and device.
-    Refuses when the file holds no account for the old name or already holds one for the new name.
+    Returns ``None`` when the file holds no account for the old name: the agent never logged in, so there is
+    no account to keep. Refuses when the file already holds an account for the new name.
     """
     path = matrix_state_file(runtime_paths)
     old_key, new_key = managed_account_key(old_name), managed_account_key(new_name)
     state = yaml_io.safe_load(path.read_bytes()) if path.exists() else None
     accounts = cast("dict[str, object]", state).get("accounts") if isinstance(state, dict) else None
-    if not isinstance(accounts, dict) or old_key not in accounts:
-        msg = f"{path} holds no account {old_key}, so agent {old_name} has no Matrix account to keep."
-        raise RenameRefusedError(msg)
+    if not isinstance(accounts, dict):
+        return None
     if new_key in accounts:
         msg = f"{path} already holds an account {new_key}."
         raise RenameRefusedError(msg)
+    if old_key not in accounts:
+        return None
     return FileRewrite(
         path,
         partial(_rename_account_key, old_key=old_key, new_key=new_key),

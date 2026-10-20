@@ -10,13 +10,14 @@ Building the steps only reads; every refusal happens here, before anything is wr
 from __future__ import annotations
 
 import os
+import re
 from functools import partial
 from typing import TYPE_CHECKING
 
 from mindroom.agent_rename.steps import SqliteEdit
-from mindroom.agent_rename.workers import move_steps, oauth_worker_keys, rewrite_oauth_worker_keys
+from mindroom.agent_rename.workers import known_worker_keys, move_steps, oauth_worker_keys, rewrite_oauth_worker_keys
 from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME, scoped_credentials_dir_part
-from mindroom.tool_system.worker_routing import normalize_worker_key_part
+from mindroom.tool_system.worker_routing import normalize_worker_key_part, worker_dir_name
 
 if TYPE_CHECKING:
     import sqlite3
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
 
 _AGENT_SCOPES = frozenset({"shared", "unscoped"})
+# worker_dir_name ends a root's name with worker_log_id's 16 hex digits, after the key's last component.
+_WORKER_DIGEST = "-[0-9a-f]{16}"
 
 
 def rewrite_worker_key_agent(worker_key: str, *, old_name: str, new_name: str) -> str | None:
@@ -86,3 +89,24 @@ def entity_credential_steps(runtime_paths: RuntimePaths, *, old_name: str, new_n
                 ),
             )
     return steps
+
+
+def unknown_worker_reports(runtime_paths: RuntimePaths, *, old_name: str) -> list[str]:
+    """Report the worker roots named like a worker of agent ``old_name`` whose worker key nothing records.
+
+    ``worker_move_steps`` moves the roots of known worker keys only. A root without readable metadata that no OAuth
+    store names may still be the agent's, as its name ends with the agent's key component and the key's digest;
+    it stays where it is. A root of another agent whose name ends with ``_<old_name>`` looks the same.
+    """
+    workers = runtime_paths.storage_root / "workers"
+    if not workers.is_dir():
+        return []
+    known = {worker_dir_name(key) for key in known_worker_keys(runtime_paths.storage_root)}
+    named = re.compile(f".*_{re.escape(normalize_worker_key_part(old_name))}{_WORKER_DIGEST}")
+    roots = [entry for entry in sorted(workers.iterdir()) if named.fullmatch(entry.name) and entry.name not in known]
+    if not roots:
+        return []
+    return [
+        f"These worker roots are named like workers of agent {old_name}, but nothing records their worker keys, "
+        f"so they stay as they are: {', '.join(str(root) for root in roots)}.",
+    ]

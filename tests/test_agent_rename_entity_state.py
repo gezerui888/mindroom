@@ -414,7 +414,9 @@ def test_matrix_state_key_renamed_username_kept(tmp_path: Path) -> None:
     state.add_room("lobby", "!lobby:x", "#lobby:x", "Lobby")
     state.save(runtime_paths)
 
-    _apply(runtime_paths, [matrix_state_key_step(runtime_paths, old_name=OLD, new_name=NEW)])
+    step = matrix_state_key_step(runtime_paths, old_name=OLD, new_name=NEW)
+    assert step is not None
+    _apply(runtime_paths, [step])
 
     expected = state.model_copy(deep=True)
     expected.accounts = {
@@ -427,17 +429,30 @@ def test_matrix_state_key_renamed_username_kept(tmp_path: Path) -> None:
     assert matrix_state_file(runtime_paths).read_bytes() == matrix_state_file(expected_paths).read_bytes()
 
 
-@pytest.mark.parametrize("accounts", [(), (f"agent_{OLD}", f"agent_{NEW}")])
-def test_matrix_state_key_refuses_without_old_or_with_new_account(tmp_path: Path, accounts: tuple[str, ...]) -> None:
-    """A missing old account or an existing new one refuses before any write."""
+@pytest.mark.parametrize("accounts", [(f"agent_{NEW}",), (f"agent_{OLD}", f"agent_{NEW}")])
+def test_matrix_state_key_refuses_with_new_account(tmp_path: Path, accounts: tuple[str, ...]) -> None:
+    """An account already stored for the new name refuses before any write, with or without the old one."""
     runtime_paths = test_runtime_paths(tmp_path)
     state = MatrixState()
     for key in accounts:
         state.add_account(key, key, "secret", domain="x")
     state.save(runtime_paths)
 
-    with pytest.raises(RenameRefusedError, match="agent_"):
+    with pytest.raises(RenameRefusedError, match=f"already holds an account agent_{NEW}"):
         matrix_state_key_step(runtime_paths, old_name=OLD, new_name=NEW)
+
+
+@pytest.mark.parametrize("accounts", [None, (), (f"agent_{PREFIX}",)], ids=["no file", "no accounts", "other"])
+def test_matrix_state_key_needs_no_step_without_old_account(tmp_path: Path, accounts: tuple[str, ...] | None) -> None:
+    """An agent that never logged in has no stored account, so its key needs no step."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    if accounts is not None:
+        state = MatrixState()
+        for key in accounts:
+            state.add_account(key, key, "secret", domain="x")
+        state.save(runtime_paths)
+
+    assert matrix_state_key_step(runtime_paths, old_name=OLD, new_name=NEW) is None
 
 
 def test_matrix_state_changed_since_planning_fails_the_step(tmp_path: Path) -> None:
@@ -447,6 +462,7 @@ def test_matrix_state_changed_since_planning_fails_the_step(tmp_path: Path) -> N
     state.add_account(f"agent_{OLD}", "mindroom_code", "secret", domain="x")
     state.save(runtime_paths)
     step = matrix_state_key_step(runtime_paths, old_name=OLD, new_name=NEW)
+    assert step is not None
     path = matrix_state_file(runtime_paths)
     path.write_text("rooms: {}\n", encoding="utf-8")
 

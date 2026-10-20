@@ -4778,7 +4778,15 @@ depends_on = [
     # Mostly deferred imports, so `mindroom --help` does not load the rename engine.
     "mindroom.agent_rename.account_files",
     "mindroom.agent_rename.config_edit",
+    "mindroom.agent_rename.entity_files",
+    "mindroom.agent_rename.entity_state",
+    "mindroom.agent_rename.indexes",
     "mindroom.agent_rename.journal",
+    "mindroom.agent_rename.journal_entity",
+    "mindroom.agent_rename.memory",
+    "mindroom.agent_rename.side_stores",
+    "mindroom.agent_rename.teams",
+    "mindroom.agent_rename.workers",
     "mindroom.cli.config",
     "mindroom.config.main",
     "mindroom.constants",
@@ -4786,6 +4794,7 @@ depends_on = [
     "mindroom.event_journal.opening",
     "mindroom.matrix.state",
     "mindroom.matrix_identifiers",
+    "mindroom.tool_system.worker_routing",
 ]
 visibility = ["mindroom.cli.main"]
 
@@ -9369,7 +9378,7 @@ depends_on = ["mindroom.agent_rename.workers", "mindroom.tool_system.worker_rout
 
 # The providers `mindroom agents rename` plans with.
 [[interfaces]]
-expose = ["entity_credential_steps", "rewrite_worker_key_agent"]
+expose = ["entity_credential_steps", "rewrite_worker_key_agent", "unknown_worker_reports"]
 from = ["mindroom.agent_rename.entity_files"]
 
 # Moves the tracking records and side stores keyed by an agent's config name when the agent is renamed.

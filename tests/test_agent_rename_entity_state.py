@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
+import tempfile
 import time
 from contextlib import closing
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -40,6 +43,8 @@ from mindroom.history.storage import (
     add_pending_force_compaction_scope,
     has_queued_force_compaction,
     read_scope_seen_event_ids,
+    read_scope_state,
+    set_force_compaction_state,
     update_scope_seen_event_ids,
 )
 from mindroom.history.types import HistoryScope
@@ -54,7 +59,7 @@ from mindroom.usage.stats import collect_admin_usage
 from tests.conftest import TEST_ACCESS_TOKEN, seed_session, test_runtime_paths
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Callable
 
     from agno.db.base import BaseDb
 
@@ -133,11 +138,13 @@ def _seed_agent(runtime_paths: RuntimePaths, agent: str) -> None:
         user_id=ALICE,
         # Written like agno/agent/_storage.py's get_agent_data.
         agent_data={"name": agent.title(), "agent_id": agent},
-        session_data={"session_state": add_pending_force_compaction_scope(None, scope)},
+        # An agent's own session state may hold any value, even one spelled like a scope key.
+        session_data={"session_state": add_pending_force_compaction_scope({"target": f"agent:{agent}"}, scope)},
         metadata={},
         runs=[_run(agent, "r1"), _run(agent, "r2")],
     )
     update_scope_seen_event_ids(session, scope, ["$preserved"])
+    set_force_compaction_state(session, scope, read_scope_state(session, scope), force=True)
     # Another scope whose name extends this agent's keeps its own state.
     update_scope_seen_event_ids(session, HistoryScope(kind="agent", scope_id=f"{agent}_team"), ["$other"])
     storage = _sessions(runtime_paths, agent)
@@ -187,17 +194,28 @@ def _apply(runtime_paths: RuntimePaths, steps: list[Step]) -> None:
     )
 
 
+_SIDE_FILES = ("-wal", "-shm", "-journal")
+
+
 def _dump(database: Path) -> list[str]:
-    with closing(sqlite3.connect(f"{database.absolute().as_uri()}?mode=ro", uri=True)) as connection:
-        return list(connection.iterdump())
+    """Return the rows a reader of ``database`` sees, recovering a copy so the original and its side files stay."""
+    with tempfile.TemporaryDirectory() as directory:
+        for suffix in ("", *_SIDE_FILES):
+            if Path(f"{database}{suffix}").exists():
+                shutil.copy(f"{database}{suffix}", Path(directory) / f"{database.name}{suffix}")
+        with closing(sqlite3.connect(Path(directory) / database.name)) as connection:
+            return list(connection.iterdump())
 
 
 def _tree(root: Path) -> dict[str, object]:
-    """Map every path under ``root`` outside the backups to its bytes, or its rows for a SQLite database."""
+    """Map every path under ``root`` outside the backups to its bytes, or its rows for a SQLite database.
+
+    A database's ``-wal`` and ``-journal`` files count as part of its rows, which is what SQLite reads.
+    """
     tree: dict[str, object] = {}
     for path in root.rglob("*"):
         relative = path.relative_to(root)
-        if relative.parts[0] == BACKUPS_DIRECTORY_NAME:
+        if relative.parts[0] == BACKUPS_DIRECTORY_NAME or path.name.endswith(_SIDE_FILES):
             continue
         if path.is_dir():
             tree[relative.as_posix()] = "dir"
@@ -208,9 +226,59 @@ def _tree(root: Path) -> dict[str, object]:
     return tree
 
 
-def _schema(database: Path) -> set[tuple[str, str, str]]:
+def _schema(database: Path) -> set[tuple[str, str, str, str]]:
+    """Return every schema entry with its SQL, unquoted and with whitespace collapsed, so only real changes differ."""
     with closing(sqlite3.connect(database)) as connection:
-        return set(connection.execute("SELECT type, name, tbl_name FROM sqlite_master"))
+        rows = connection.execute("SELECT type, name, tbl_name, sql FROM sqlite_master").fetchall()
+    return {(kind, name, table, re.sub(r"\s+", " ", (sql or "").replace('"', ""))) for kind, name, table, sql in rows}
+
+
+def _crash_copy(database: Path, suffix: str, work: Callable[[sqlite3.Connection], None]) -> None:
+    """Leave ``database`` and its ``suffix`` side file as a writer killed right after ``work`` would."""
+    with tempfile.TemporaryDirectory() as crashed:
+        connection = sqlite3.connect(database, isolation_level=None)
+        try:
+            work(connection)
+            for name in (database.name, f"{database.name}{suffix}"):
+                shutil.copy(database.parent / name, Path(crashed) / name)
+        finally:
+            connection.close()
+        for name in (database.name, f"{database.name}{suffix}"):
+            shutil.copy(Path(crashed) / name, database.parent / name)
+
+
+def _commit_to_wal(connection: sqlite3.Connection) -> None:
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA wal_autocheckpoint = 0")
+    connection.execute("UPDATE code_sessions SET user_id = '@wal:x'")
+
+
+def _write_half_a_transaction(connection: sqlite3.Connection) -> None:
+    # A small page cache makes SQLite write changed pages into the file, journaling the originals.
+    connection.execute("PRAGMA cache_size = 2")
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute("UPDATE code_sessions SET user_id = '@uncommitted:x'")
+    connection.execute("CREATE TABLE filler (b BLOB)")
+    for _ in range(50):
+        connection.execute("INSERT INTO filler VALUES (randomblob(4000))")
+
+
+# What a writer killed mid-way leaves beside the session database: committed rows only in its write-ahead log,
+# or a hot rollback journal holding the pages a half-written transaction overwrote.
+_CRASHES: dict[str, tuple[str, Callable[[sqlite3.Connection], None]]] = {
+    "wal": ("-wal", _commit_to_wal),
+    "journal": ("-journal", _write_half_a_transaction),
+}
+
+
+def _crashed_install(tmp_path: Path, crash: str | None) -> RuntimePaths:
+    runtime_paths = _install(tmp_path)
+    if crash is not None:
+        suffix, work = _CRASHES[crash]
+        database = _root(runtime_paths, OLD) / "sessions" / f"{OLD}.db"
+        _crash_copy(database, suffix, work)
+        assert Path(f"{database}{suffix}").exists()
+    return runtime_paths
 
 
 def _config() -> Config:
@@ -251,6 +319,12 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
     runtime_paths = _install(tmp_path)
     old_sessions = _root(runtime_paths, OLD) / "sessions" / f"{OLD}.db"
     old_learning = _root(runtime_paths, OLD) / "learning" / f"{OLD}.db"
+    with closing(sqlite3.connect(old_sessions)) as connection:
+        # Agno also writes partial unique indexes named ``<table>_<name>``; one must keep its clauses.
+        connection.execute(
+            "CREATE UNIQUE INDEX code_sessions_runs_one_child ON code_sessions_runs (parent_run_id) "
+            "WHERE parent_run_id IS NOT NULL",
+        )
     expected_sessions = {
         tuple(part.replace("code_sessions", "coder_sessions") for part in entry) for entry in _schema(old_sessions)
     }
@@ -264,9 +338,9 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
 
     sessions = _root(runtime_paths, NEW) / "sessions" / f"{NEW}.db"
     learning = _root(runtime_paths, NEW) / "learning" / f"{NEW}.db"
-    assert [type(step) for step in steps] == [MovePath, MovePath, SqliteEdit, MovePath, SqliteEdit]
+    assert [type(step) for step in steps] == [MovePath, SqliteEdit, MovePath, SqliteEdit, MovePath]
     assert _schema(sessions) == expected_sessions
-    assert {name for _type, name, _table in expected_sessions} >= {
+    assert {name for _type, name, _table, _sql in expected_sessions} >= {
         "coder_sessions_runs",
         "coder_sessions_usage",
         "coder_sessions_summaries",
@@ -274,6 +348,7 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
         "idx_coder_sessions_runs_session_id_run_index",
         "coder_sessions_summaries_scope",
         "coder_sessions_removed_runs_session",
+        "coder_sessions_runs_one_child",
     }
     assert _schema(learning) == expected_learning
     with closing(sqlite3.connect(sessions)) as connection:
@@ -288,13 +363,18 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
         }
         assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
-        ((agent_id, agent_data, metadata),) = connection.execute(
-            "SELECT agent_id, agent_data, metadata FROM coder_sessions",
+        ((agent_id, agent_data, metadata, session_data),) = connection.execute(
+            "SELECT agent_id, agent_data, metadata, session_data FROM coder_sessions",
         )
         assert (agent_id, json.loads(agent_data)) == (NEW, {"name": "Code", "agent_id": NEW})
+        assert set(json.loads(metadata)[constants.MINDROOM_COMPACTION_METADATA_KEY]["states"]) == {f"agent:{NEW}"}
         assert set(json.loads(metadata)[constants.MINDROOM_MATRIX_HISTORY_METADATA_KEY]["states"]) == {
             f"agent:{NEW}",
             f"agent:{PREFIX}",
+        }
+        assert json.loads(session_data)["session_state"] == {
+            "target": f"agent:{OLD}",
+            constants.PENDING_COMPACTION_SCOPE_KEYS_SESSION_STATE_KEY: [f"agent:{NEW}"],
         }
         runs = connection.execute("SELECT agent_id, run_data FROM coder_sessions_runs ORDER BY run_index").fetchall()
         assert [(agent_id, json.loads(run_data)["agent_id"]) for agent_id, run_data in runs] == [(NEW, NEW), (NEW, NEW)]
@@ -399,14 +479,32 @@ def test_matrix_state_key_refuses_without_old_or_with_new_account(tmp_path: Path
         matrix_state_key_step(runtime_paths, old_name=OLD, new_name=NEW)
 
 
+def test_matrix_state_changed_since_planning_fails_the_step(tmp_path: Path) -> None:
+    """The rewrite refuses a file whose accounts vanished after planning, and the failed step changes nothing."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    state = MatrixState()
+    state.add_account(f"agent_{OLD}", "mindroom_code", "secret", domain="x")
+    state.save(runtime_paths)
+    step = matrix_state_key_step(runtime_paths, old_name=OLD, new_name=NEW)
+    path = matrix_state_file(runtime_paths)
+    path.write_text("rooms: {}\n", encoding="utf-8")
+
+    with pytest.raises(RenameApplyError, match="changed since planning"):
+        _apply(runtime_paths, [step])
+
+    assert path.read_text(encoding="utf-8") == "rooms: {}\n"
+
+
 def test_existing_destination_refuses(tmp_path: Path) -> None:
     """A state root or database already under the new name refuses while planning."""
     runtime_paths = _install(tmp_path)
-    stale = _root(runtime_paths, OLD) / "sessions" / f"{NEW}.db"
-    stale.touch()
-    with pytest.raises(RenameRefusedError, match=str(stale)):
-        entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
-    stale.unlink()
+    for suffix in ("", *_SIDE_FILES):
+        # A stale write-ahead log under the new name would be replayed onto the renamed database.
+        stale = _root(runtime_paths, OLD) / "sessions" / f"{NEW}.db{suffix}"
+        stale.touch()
+        with pytest.raises(RenameRefusedError, match=str(stale)):
+            entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
+        stale.unlink()
 
     _root(runtime_paths, NEW).mkdir()
     with pytest.raises(RenameRefusedError, match=str(_root(runtime_paths, NEW))):
@@ -423,11 +521,12 @@ def _fail(_content: bytes) -> bytes:
     raise RuntimeError(msg)
 
 
-def test_failure_after_any_step_restores_the_tree(tmp_path: Path) -> None:
-    """A failure after any number of completed steps undoes them, leaving every file and database row as before."""
-    step_count = len(entity_state_steps(_install(tmp_path / "count"), old_name=OLD, new_name=NEW))
+@pytest.mark.parametrize("crash", [None, *_CRASHES])
+def test_failure_after_any_step_restores_the_tree(tmp_path: Path, crash: str | None) -> None:
+    """A failure after any number of completed steps, the last included, undoes them, leaving every row as before."""
+    step_count = len(entity_state_steps(_crashed_install(tmp_path / "count", crash), old_name=OLD, new_name=NEW))
     for completed in range(step_count + 1):
-        runtime_paths = _install(tmp_path / str(completed))
+        runtime_paths = _crashed_install(tmp_path / str(completed), crash)
         sentinel = runtime_paths.storage_root / "sentinel"
         sentinel.write_text("unchanged", encoding="utf-8")
         before = _tree(runtime_paths.storage_root)
@@ -517,24 +616,15 @@ def test_separate_session_storage_moves_too(tmp_path: Path) -> None:
     assert not (session_root / "agents" / OLD).exists()
 
 
-def test_uncheckpointed_wal_moves_with_its_database(tmp_path: Path) -> None:
-    """Commits a crashed writer left in the ``-wal`` file stay with the renamed database."""
-    runtime_paths = _install(tmp_path)
-    database = _root(runtime_paths, OLD) / "sessions" / f"{OLD}.db"
-    crashed = tmp_path / "crashed"
-    crashed.mkdir()
-    with closing(sqlite3.connect(database)) as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA wal_autocheckpoint = 0")
-        connection.execute("UPDATE code_sessions SET user_id = '@wal:x'")
-        connection.commit()
-        # Copied while the connection is open, as a writer killed now would leave them.
-        shutil.copy(database, crashed / database.name)
-        shutil.copy(f"{database}-wal", crashed / f"{database.name}-wal")
-    shutil.copy(crashed / database.name, database)
-    shutil.copy(crashed / f"{database.name}-wal", f"{database}-wal")
+@pytest.mark.parametrize(("crash", "user_id"), [("wal", "@wal:x"), ("journal", ALICE)])
+def test_crash_left_side_files_are_resolved_before_the_rename(tmp_path: Path, crash: str, user_id: str) -> None:
+    """A crashed writer's committed WAL rows survive the rename and its half-written transaction rolls back."""
+    runtime_paths = _crashed_install(tmp_path, crash)
 
     _apply(runtime_paths, entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW))
 
-    with closing(sqlite3.connect(_root(runtime_paths, NEW) / "sessions" / f"{NEW}.db")) as connection:
-        assert connection.execute("SELECT agent_id, user_id FROM coder_sessions").fetchall() == [(NEW, "@wal:x")]
+    sessions = _root(runtime_paths, NEW) / "sessions"
+    with closing(sqlite3.connect(sessions / f"{NEW}.db")) as connection:
+        assert connection.execute("SELECT agent_id, user_id FROM coder_sessions").fetchall() == [(NEW, user_id)]
+        assert ("filler",) not in connection.execute("SELECT name FROM sqlite_master").fetchall()
+    assert sorted(path.name for path in sessions.iterdir()) == [f"{NEW}.db"]

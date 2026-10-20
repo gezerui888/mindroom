@@ -22,7 +22,13 @@ from mindroom import yaml_io
 from mindroom.agent_rename.sqlite_read import quote_identifier
 from mindroom.agent_rename.steps import FileRewrite, MovePath, RenameRefusedError, SqliteEdit
 from mindroom.agent_rename.workers import DestinationExistsError, move_steps
-from mindroom.constants import matrix_state_file, resolve_session_state_root
+from mindroom.constants import (
+    MINDROOM_COMPACTION_METADATA_KEY,
+    MINDROOM_MATRIX_HISTORY_METADATA_KEY,
+    PENDING_COMPACTION_SCOPE_KEYS_SESSION_STATE_KEY,
+    matrix_state_file,
+    resolve_session_state_root,
+)
 from mindroom.matrix.identity import managed_account_key
 from mindroom.tool_system.worker_routing import agent_state_root_path
 
@@ -52,8 +58,8 @@ def entity_state_steps(runtime_paths: RuntimePaths, *, old_name: str, new_name: 
 
     The state root ``agents/<OLD>`` moves to ``agents/<NEW>`` first, so the database steps address paths below
     the new root. With ``MINDROOM_SESSION_STORAGE_PATH`` set, the agent's root in that session root moves too.
-    ``sessions/<OLD>.db`` and ``learning/<OLD>.db`` become ``<NEW>.db``, with their tables, indexes,
-    schema-version rows, agent ids and history scope keys renamed in one transaction each.
+    ``sessions/<OLD>.db`` and ``learning/<OLD>.db`` get their tables, indexes, schema-version rows, agent ids
+    and history scope keys renamed in one transaction each, then become ``<NEW>.db``.
     An agent without a state root never ran and gets no steps. Refuses when a destination already exists.
     """
     storage_root = runtime_paths.storage_root
@@ -112,28 +118,29 @@ def _database_steps(
     label: str,
     edit: Callable[[sqlite3.Connection], None],
 ) -> list[Step]:
-    """Rename ``<OLD>.db`` and its side files in the moved directory to ``<NEW>.db``, then edit it there."""
+    """Edit ``<OLD>.db`` in the moved directory, then rename it to ``<NEW>.db``.
+
+    A crashed writer can leave a ``-wal`` file with commits or a hot ``-journal`` beside the database.
+    The edit's own connection replays or rolls back and removes them, so only the database file is renamed,
+    and undoing the edit restores a backup that already holds what they held.
+    A stale side file under the new name would be read as the renamed database's, so it refuses.
+    """
     old_file, new_file = f"{old_name}.db", f"{new_name}.db"
     if not os.path.lexists(old_directory / old_file):
         return []
-    steps: list[Step] = []
     for suffix in ("", *_SQLITE_SIDE_FILES):
-        if suffix and not os.path.lexists(old_directory / f"{old_file}{suffix}"):
-            continue
         if os.path.lexists(old_directory / f"{new_file}{suffix}"):
             msg = f"Cannot rename {old_directory / old_file}: {old_directory / f'{new_file}{suffix}'} already exists."
             raise DestinationExistsError(msg)
-        source, destination = new_directory / f"{old_file}{suffix}", new_directory / f"{new_file}{suffix}"
-        steps.append(MovePath(source, destination, f"Move the {label} of agent {old_name} {source} to {destination}"))
-    database = new_directory / new_file
-    steps.append(
+    source, destination = new_directory / old_file, new_directory / new_file
+    return [
         SqliteEdit(
-            database,
+            source,
             edit,
-            f"Rename agent {old_name} to {new_name} in the tables, agent ids and history scopes of {database}",
+            f"Rename agent {old_name} to {new_name} in the tables, agent ids and history scopes of {source}",
         ),
-    )
-    return steps
+        MovePath(source, destination, f"Move the {label} of agent {old_name} {source} to {destination}"),
+    ]
 
 
 def _rename_agent_in_database(
@@ -230,8 +237,8 @@ def _rename_agent_in_table(connection: sqlite3.Connection, table: str, *, old_na
         # The Agno 2 run list that the open-time migration turns into run rows (legacy_session_storage.py).
         "runs": partial(_renamed_runs, old=old_name, new=new_name),
         # MindRoom keys per-scope history state by scope key (history/storage.py).
-        "metadata": partial(_renamed_scope_keys, old=old_scope, new=new_scope),
-        "session_data": partial(_renamed_scope_keys, old=old_scope, new=new_scope),
+        "metadata": partial(_renamed_scope_states, old=old_scope, new=new_scope),
+        "session_data": partial(_renamed_pending_compactions, old=old_scope, new=new_scope),
     }
     for column, rename in renames.items():
         if column not in columns:
@@ -296,18 +303,40 @@ def _renamed_runs(value: object, *, old: str, new: str) -> object:
     return [_renamed_run(run, old=old, new=new) for run in cast("list[object]", value)]
 
 
-def _renamed_scope_keys(value: object, *, old: str, new: str) -> object:
-    """Replace every key and string equal to the scope key ``old``, however deep."""
-    if value == old:
-        return new
-    if isinstance(value, list):
-        return [_renamed_scope_keys(item, old=old, new=new) for item in cast("list[object]", value)]
-    if isinstance(value, dict):
-        return {
-            new if key == old else key: _renamed_scope_keys(item, old=old, new=new)
-            for key, item in cast("dict[str, object]", value).items()
-        }
-    return value
+def _renamed_scope_states(value: object, *, old: str, new: str) -> object:
+    """Rename the scope ``old`` among the per-scope states MindRoom keeps in session metadata."""
+    if not isinstance(value, dict):
+        return value
+    renamed = dict(cast("dict[str, object]", value))
+    for key in (MINDROOM_COMPACTION_METADATA_KEY, MINDROOM_MATRIX_HISTORY_METADATA_KEY):
+        entry = renamed.get(key)
+        states = cast("dict[str, object]", entry).get("states") if isinstance(entry, dict) else None
+        if isinstance(states, dict):
+            renamed[key] = {
+                **cast("dict[str, object]", entry),
+                "states": {new if scope == old else scope: state for scope, state in states.items()},
+            }
+    return renamed
+
+
+def _renamed_pending_compactions(value: object, *, old: str, new: str) -> object:
+    """Rename the scope ``old`` in the compactions MindRoom queues in Agno's ``session_state``; nothing else there."""
+    session_state = cast("dict[str, object]", value).get("session_state") if isinstance(value, dict) else None
+    pending = (
+        cast("dict[str, object]", session_state).get(PENDING_COMPACTION_SCOPE_KEYS_SESSION_STATE_KEY)
+        if isinstance(session_state, dict)
+        else None
+    )
+    if not isinstance(pending, list):
+        return value
+    renamed_pending = [new if scope == old else scope for scope in cast("list[object]", pending)]
+    return {
+        **cast("dict[str, object]", value),
+        "session_state": {
+            **cast("dict[str, object]", session_state),
+            PENDING_COMPACTION_SCOPE_KEYS_SESSION_STATE_KEY: renamed_pending,
+        },
+    }
 
 
 def matrix_state_key_step(runtime_paths: RuntimePaths, *, old_name: str, new_name: str) -> FileRewrite:
@@ -336,8 +365,8 @@ def matrix_state_key_step(runtime_paths: RuntimePaths, *, old_name: str, new_nam
 
 def _rename_account_key(content: bytes, *, old_key: str, new_key: str) -> bytes:
     state = yaml_io.safe_load(content)
-    accounts = state["accounts"]
-    if old_key not in accounts or new_key in accounts:
+    accounts = state.get("accounts") if isinstance(state, dict) else None
+    if not isinstance(accounts, dict) or old_key not in accounts or new_key in accounts:
         msg = f"the accounts changed since planning: expected {old_key} and no {new_key}"
         raise RuntimeError(msg)
     # The account keeps its place among the others.

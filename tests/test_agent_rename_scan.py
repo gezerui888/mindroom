@@ -65,7 +65,7 @@ def _event(
     *,
     sender: str,
     source: dict[str, str],
-    principal: str = f"harry@{NEW}",
+    principal: str = f"nova@{NEW}",
 ) -> None:
     connection.execute(
         "INSERT INTO journal_events (principal_id, event_id, room_id, thread_id, kind, sender, origin_server_ts, "
@@ -417,7 +417,7 @@ def test_dangling_links_into_the_old_state_root_are_unexpected(tmp_path: Path) -
     """
     agents = tmp_path / "agents"
     (agents / "coder" / "workspace").mkdir(parents=True)
-    (agents / "mind_flash").symlink_to("code")
+    (agents / "sidekick").symlink_to("code")
     (agents / "live").symlink_to("coder")
     (agents / "other").symlink_to("code_team")
     _write(tmp_path, "plugins/ping/notes.txt", "")
@@ -426,7 +426,7 @@ def test_dangling_links_into_the_old_state_root_are_unexpected(tmp_path: Path) -
 
     assert _scan_names(tmp_path, tmp_path / "plugins" / "ping") == _LeftoverReport(
         unexpected=(
-            "agents/mind_flash: dangling symlink to code",
+            "agents/sidekick: dangling symlink to code",
             f"plugins/ping/absolute: dangling symlink to {agents / 'code' / 'workspace' / 'notes.md'}",
             "plugins/ping/workspace: dangling symlink to ../../agents/code/workspace",
         ),
@@ -589,9 +589,9 @@ def _principal_events(database: Path, *principals: str) -> None:
 
 @pytest.mark.asyncio
 async def test_journal_principals_of_the_agent_are_found(tmp_path: Path) -> None:
-    """A journal cell that starts with ``<name>@`` is the agent's principal; ``code_team``'s and ``harry``'s are not."""
+    """A journal cell that starts with ``<name>@`` is the agent's principal; ``code_team``'s and ``nova``'s are not."""
     database = await _journal(tmp_path)
-    _principal_events(database, f"code@{NEW}", f"code@{OLD}", f"code_team@{NEW}", f"harry@{NEW}", "codex@@x:y")
+    _principal_events(database, f"code@{NEW}", f"code@{OLD}", f"code_team@{NEW}", f"nova@{NEW}", "codex@@x:y")
 
     report = _scan_names(tmp_path)
 
@@ -613,7 +613,7 @@ async def test_journal_cells_holding_the_name_are_found(tmp_path: Path) -> None:
                 "operation, responder_principal_id, responder_epoch, membership_epoch) "
                 "VALUES (?, ?, 0, 'call', ?, 'scope', ?, ?, ?, ?, ?, 'run', ?, 0, 0)",
                 (
-                    f"harry@{NEW}",
+                    f"nova@{NEW}",
                     continuation,
                     continuation,
                     ROOM,
@@ -621,7 +621,7 @@ async def test_journal_cells_holding_the_name_are_found(tmp_path: Path) -> None:
                     NEW,
                     entity,
                     invoking,
-                    f"harry@{NEW}",
+                    f"nova@{NEW}",
                 ),
             )
 
@@ -634,7 +634,7 @@ async def test_journal_is_scanned_for_names_and_ids_together(tmp_path: Path) -> 
     database = await _journal(tmp_path)
     _principal_events(database, f"code@{NEW}")
     with closing(sqlite3.connect(database)) as connection, connection:
-        _event(connection, "$id", sender=OLD, source={"sender": NEW}, principal=f"harry@{NEW}")
+        _event(connection, "$id", sender=OLD, source={"sender": NEW}, principal=f"nova@{NEW}")
 
     report = scan_leftovers(tmp_path, needles=NEEDLES, expected=frozenset(), names=(NAME,))
 

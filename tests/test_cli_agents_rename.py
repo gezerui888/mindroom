@@ -71,8 +71,8 @@ NEW = "coder"
 PREFIX = "code_team"
 HELPER = "helper"
 DIARY = "diary"
-# Shares the renamed agent's state root through the link agents/mind_flash -> code.
-SHARER = "mind_flash"
+# Shares the renamed agent's state root through the link agents/sidekick -> code.
+SHARER = "sidekick"
 OLD_USER_ID = "@mindroom_code:x"
 OLD_PRINCIPAL = f"{OLD}@{OLD_USER_ID}"
 NEW_PRINCIPAL = f"{NEW}@{OLD_USER_ID}"

@@ -1,8 +1,8 @@
 """Plan pointing the symlinks into an agent's state root at the root's new place.
 
-An operator can share one agent's state root with another agent through a link such as ``agents/mind_flash -> openclaw``.
-Once ``agents/openclaw`` moves to ``agents/harry`` that link dangles, and MindRoom resolves it at its next start and
-creates an empty ``agents/openclaw``, so the other agent loses its history. Every such link in the storage root or
+An operator can share one agent's state root with another agent through a link such as ``agents/sidekick -> atlas``.
+Once ``agents/atlas`` moves to ``agents/nova`` that link dangles, and MindRoom resolves it at its next start and
+creates an empty ``agents/atlas``, so the other agent loses its history. Every such link in the storage root or
 directly in the config directory is pointed at the moved root.
 A link's target is worked out from its text the way ``os.path.normpath`` does, without following any link,
 so a link into ``agents/code_team`` never counts as one into ``agents/code``.

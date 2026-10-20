@@ -359,7 +359,7 @@ def test_account_rename_behavior_unchanged(tmp_path: Path) -> None:
 
     steps, reports = account_file_steps(
         runtime_paths,
-        agent="harry",
+        agent="nova",
         old_user_id=old_user,
         new_user_id=new_user,
         config=Config(),

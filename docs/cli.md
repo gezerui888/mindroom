@@ -1185,8 +1185,8 @@ See [Renaming an Agent](deployment/rename-agent.md) before running it.
 ╰────────────────────────────────────────────────────────────────────────────────────────╯
 
  Examples
- mindroom agents rename openclaw harry          Show the plan
- mindroom agents rename openclaw harry --apply  Apply it
+ mindroom agents rename atlas nova          Show the plan
+ mindroom agents rename atlas nova --apply  Apply it
 
 
 
@@ -1195,8 +1195,8 @@ See [Renaming an Agent](deployment/rename-agent.md) before running it.
 <!-- OUTPUT:END -->
 
 ```bash
-mindroom agents rename openclaw harry --storage-path mindroom_data
-mindroom agents rename openclaw harry --storage-path mindroom_data --apply
+mindroom agents rename atlas nova --storage-path mindroom_data
+mindroom agents rename atlas nova --storage-path mindroom_data --apply
 ```
 
 ### agents rename-account

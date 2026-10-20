@@ -93,8 +93,8 @@ agents_app = typer.Typer(help="Manage agents.")
 agents_app.command(
     "rename",
     epilog=examples(
-        ("mindroom agents rename openclaw harry", "Show the plan"),
-        ("mindroom agents rename openclaw harry --apply", "Apply it"),
+        ("mindroom agents rename atlas nova", "Show the plan"),
+        ("mindroom agents rename atlas nova --apply", "Apply it"),
     ),
 )(rename)
 agents_app.command(

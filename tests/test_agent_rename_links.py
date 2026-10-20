@@ -35,11 +35,11 @@ if TYPE_CHECKING:
     from mindroom.agent_rename.steps import Step
     from mindroom.constants import RuntimePaths
 
-OLD = "openclaw"
-NEW = "harry"
-# Shares the renamed agent's state root through the link agents/mind_flash -> openclaw, as a real install does.
-SHARER = "mind_flash"
-SHARER_CONFIG = Config(agents={OLD: AgentConfig(display_name="OpenClaw"), SHARER: AgentConfig(display_name="Flash")})
+OLD = "atlas"
+NEW = "nova"
+# Shares the renamed agent's state root through the link agents/sidekick -> atlas, as a real install does.
+SHARER = "sidekick"
+SHARER_CONFIG = Config(agents={OLD: AgentConfig(display_name="Atlas"), SHARER: AgentConfig(display_name="Flash")})
 NOW = datetime(2026, 10, 20, 9, 30, 0, tzinfo=UTC)
 
 
@@ -83,7 +83,7 @@ def _fail(content: bytes) -> bytes:  # noqa: ARG001
 
 
 def test_a_sibling_link_follows_the_moved_state_root(tmp_path: Path) -> None:
-    """agents/mind_flash -> openclaw becomes -> harry, so mind_flash still finds its history in the moved root."""
+    """agents/sidekick -> atlas becomes -> nova, so sidekick still finds its history in the moved root."""
     runtime_paths = _install(tmp_path)
     storage = runtime_paths.storage_root
     link = storage / "agents" / SHARER
@@ -96,7 +96,7 @@ def test_a_sibling_link_follows_the_moved_state_root(tmp_path: Path) -> None:
     sessions = agent_state_root_path(storage, SHARER).resolve() / "sessions" / f"{SHARER}.db"
     assert sessions == storage / "agents" / NEW / "sessions" / f"{SHARER}.db"
     assert sessions.is_file()
-    # MindRoom's own resolution opens the same database and finds mind_flash's history in it.
+    # MindRoom's own resolution opens the same database and finds sidekick's history in it.
     database = create_session_storage(SHARER, SHARER_CONFIG, runtime_paths, execution_identity=None)
     try:
         assert getattr(database, "db_file", None) == str(sessions)
@@ -108,7 +108,7 @@ def test_a_sibling_link_follows_the_moved_state_root(tmp_path: Path) -> None:
         ]
     finally:
         database.close()
-    # Opening mind_flash's store went through the retargeted link, so nothing recreated the old root.
+    # Opening sidekick's store went through the retargeted link, so nothing recreated the old root.
     assert not os.path.lexists(storage / "agents" / OLD)
 
 
@@ -118,12 +118,12 @@ def test_nested_absolute_and_config_directory_links_keep_their_form(tmp_path: Pa
     storage = runtime_paths.storage_root
     old_root = storage / "agents" / OLD
     links = {
-        storage / "workers" / "w1" / "workspace": "../../agents/openclaw/workspace",
+        storage / "workers" / "w1" / "workspace": "../../agents/atlas/workspace",
         storage / "plugins" / "demo" / "notes.md": f"{old_root}/workspace/notes.md",
-        storage / "agents" / "alias": "./openclaw/",
-        runtime_paths.config_dir / "openclaw-workspace": "mindroom_data/agents/openclaw/workspace",
+        storage / "agents" / "alias": "./atlas/",
+        runtime_paths.config_dir / "atlas-workspace": "mindroom_data/agents/atlas/workspace",
         # Inside the moved root: one link steps out of it and back in, the other stays inside and keeps working.
-        old_root / "sessions" / "back": "../../openclaw/workspace",
+        old_root / "sessions" / "back": "../../atlas/workspace",
         old_root / "inner": "workspace/notes.md",
     }
     for link, text in links.items():
@@ -137,28 +137,28 @@ def test_nested_absolute_and_config_directory_links_keep_their_form(tmp_path: Pa
     assert planned == {
         storage / "agents" / SHARER: (OLD, NEW),
         storage / "workers" / "w1" / "workspace": (
-            "../../agents/openclaw/workspace",
-            "../../agents/harry/workspace",
+            "../../agents/atlas/workspace",
+            "../../agents/nova/workspace",
         ),
         storage / "plugins" / "demo" / "notes.md": (
             f"{old_root}/workspace/notes.md",
             f"{new_root}/workspace/notes.md",
         ),
-        storage / "agents" / "alias": ("./openclaw/", "./harry/"),
-        runtime_paths.config_dir / "openclaw-workspace": (
-            "mindroom_data/agents/openclaw/workspace",
-            "mindroom_data/agents/harry/workspace",
+        storage / "agents" / "alias": ("./atlas/", "./nova/"),
+        runtime_paths.config_dir / "atlas-workspace": (
+            "mindroom_data/agents/atlas/workspace",
+            "mindroom_data/agents/nova/workspace",
         ),
-        new_root / "sessions" / "back": ("../../openclaw/workspace", "../../harry/workspace"),
+        new_root / "sessions" / "back": ("../../atlas/workspace", "../../nova/workspace"),
     }
     moved = {(new_root / link.relative_to(old_root) if link.is_relative_to(old_root) else link) for link in links}
     # Exact texts, which Path.readlink would normalize.
     assert {link: os.readlink(link) for link in moved} == {  # noqa: PTH115
-        storage / "workers" / "w1" / "workspace": "../../agents/harry/workspace",
+        storage / "workers" / "w1" / "workspace": "../../agents/nova/workspace",
         storage / "plugins" / "demo" / "notes.md": f"{new_root}/workspace/notes.md",
-        storage / "agents" / "alias": "./harry/",
-        runtime_paths.config_dir / "openclaw-workspace": "mindroom_data/agents/harry/workspace",
-        new_root / "sessions" / "back": "../../harry/workspace",
+        storage / "agents" / "alias": "./nova/",
+        runtime_paths.config_dir / "atlas-workspace": "mindroom_data/agents/nova/workspace",
+        new_root / "sessions" / "back": "../../nova/workspace",
         new_root / "inner": "workspace/notes.md",
     }
     assert all(link.exists() for link in moved)

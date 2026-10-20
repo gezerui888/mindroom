@@ -2,7 +2,7 @@
 
 `mindroom agents rename OLD NEW` renames an agent's key in `config.yaml` and carries over everything MindRoom keeps under that name.
 The agent keeps its Matrix account, its Matrix ID, its device, and its rooms.
-Only the name MindRoom uses for it changes, for example from `openclaw` to `harry`.
+Only the name MindRoom uses for it changes, for example from `atlas` to `nova`.
 
 MindRoom keeps sessions, memory, workers, credentials, tracking records, and journal rows under the agent's name.
 If you only edit the key in `config.yaml`, MindRoom looks for all of them under the new name and finds nothing.
@@ -37,9 +37,9 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
 - It does not collide after normalization.
   Worker keys write a name without leading and trailing `_`.
   Agno ids lowercase a name, turn `_` into `-`, and split camel case, so `MyAgent` and `my_agent` both become `my-agent`.
-  The worker key check includes the agent's own old name, so `harry` cannot become `_harry`.
+  The worker key check includes the agent's own old name, so `nova` cannot become `_nova`.
   The Agno id check skips the agent being renamed, so it only refuses a new name whose id another agent already has.
-  With agents `harry` and `crew`, renaming `crew` to `Harry` is refused.
+  With agents `nova` and `crew`, renaming `crew` to `Nova` is refused.
   Colliding names would share workers or confuse team runs.
 
 ## Procedure
@@ -62,7 +62,7 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
    Loading it migrates it on disk, as every MindRoom command does, see the [account guide](https://docs.mindroom.chat/deployment/rename-agent-account/#procedure).
 
    ```bash
-   mindroom agents rename openclaw harry \
+   mindroom agents rename atlas nova \
      --config config.yaml --storage-path mindroom_data
    ```
 
@@ -70,7 +70,7 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
    The command asks `Apply this plan?` unless you pass `--yes`.
 
    ```bash
-   mindroom agents rename openclaw harry \
+   mindroom agents rename atlas nova \
      --config config.yaml --storage-path mindroom_data --apply
    ```
 
@@ -336,7 +336,7 @@ The completed steps are undone first.
 Three limits are not refusals:
 
 - A config value that points into the agent's state directory is renamed only when no whitespace follows `agents/<OLD>`.
-  A path such as `agents/openclaw/my notes` stays as it is.
+  A path such as `agents/atlas/my notes` stays as it is.
   The config-line report lists it, so fix it by hand.
 - The command does not edit the text of workspace files, prompts, or memories.
   It only rewrites the delegation exports in workspaces and, in memories, the scope tags and the `agent` and `team_members` fields.

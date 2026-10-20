@@ -19684,7 +19684,7 @@ Adopt instead of copying only when you accept beginning the journal's history fr
 
 `mindroom agents rename OLD NEW` renames an agent's key in `config.yaml` and carries over everything MindRoom keeps under that name.
 The agent keeps its Matrix account, its Matrix ID, its device, and its rooms.
-Only the name MindRoom uses for it changes, for example from `openclaw` to `harry`.
+Only the name MindRoom uses for it changes, for example from `atlas` to `nova`.
 
 MindRoom keeps sessions, memory, workers, credentials, tracking records, and journal rows under the agent's name.
 If you only edit the key in `config.yaml`, MindRoom looks for all of them under the new name and finds nothing.
@@ -19719,9 +19719,9 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
 - It does not collide after normalization.
   Worker keys write a name without leading and trailing `_`.
   Agno ids lowercase a name, turn `_` into `-`, and split camel case, so `MyAgent` and `my_agent` both become `my-agent`.
-  The worker key check includes the agent's own old name, so `harry` cannot become `_harry`.
+  The worker key check includes the agent's own old name, so `nova` cannot become `_nova`.
   The Agno id check skips the agent being renamed, so it only refuses a new name whose id another agent already has.
-  With agents `harry` and `crew`, renaming `crew` to `Harry` is refused.
+  With agents `nova` and `crew`, renaming `crew` to `Nova` is refused.
   Colliding names would share workers or confuse team runs.
 
 ## Procedure
@@ -19744,7 +19744,7 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
    Loading it migrates it on disk, as every MindRoom command does, see the [account guide](https://docs.mindroom.chat/deployment/rename-agent-account/#procedure).
 
    ```bash
-   mindroom agents rename openclaw harry \
+   mindroom agents rename atlas nova \
      --config config.yaml --storage-path mindroom_data
    ```
 
@@ -19752,7 +19752,7 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
    The command asks `Apply this plan?` unless you pass `--yes`.
 
    ```bash
-   mindroom agents rename openclaw harry \
+   mindroom agents rename atlas nova \
      --config config.yaml --storage-path mindroom_data --apply
    ```
 
@@ -20018,7 +20018,7 @@ The completed steps are undone first.
 Three limits are not refusals:
 
 - A config value that points into the agent's state directory is renamed only when no whitespace follows `agents/<OLD>`.
-  A path such as `agents/openclaw/my notes` stays as it is.
+  A path such as `agents/atlas/my notes` stays as it is.
   The config-line report lists it, so fix it by hand.
 - The command does not edit the text of workspace files, prompts, or memories.
   It only rewrites the delegation exports in workspaces and, in memories, the scope tags and the `agent` and `team_members` fields.
@@ -20141,7 +20141,7 @@ See also [Data Storage & Journal](https://docs.mindroom.chat/deployment/storage/
 
 `mindroom agents rename-account` moves MindRoom's state over to a new Matrix ID after your homeserver renamed an agent's account in place.
 The agent's name in `config.yaml` does not change.
-Only its Matrix ID does, for example from `@mindroom_openclaw:example.org` to `@mindroom_harry:example.org`.
+Only its Matrix ID does, for example from `@mindroom_atlas:example.org` to `@mindroom_nova:example.org`.
 To rename the agent's key in `config.yaml` instead, and keep its Matrix ID, see [Renaming an Agent](https://docs.mindroom.chat/deployment/rename-agent/).
 
 MindRoom keeps credentials, workers, journal rows, and other state under the Matrix ID.
@@ -22175,8 +22175,8 @@ See [Renaming an Agent](https://docs.mindroom.chat/deployment/rename-agent/) bef
 ╰────────────────────────────────────────────────────────────────────────────────────────╯
 
  Examples
- mindroom agents rename openclaw harry          Show the plan
- mindroom agents rename openclaw harry --apply  Apply it
+ mindroom agents rename atlas nova          Show the plan
+ mindroom agents rename atlas nova --apply  Apply it
 
 
 
@@ -22185,8 +22185,8 @@ See [Renaming an Agent](https://docs.mindroom.chat/deployment/rename-agent/) bef
 <!-- OUTPUT:END -->
 
 ```bash
-mindroom agents rename openclaw harry --storage-path mindroom_data
-mindroom agents rename openclaw harry --storage-path mindroom_data --apply
+mindroom agents rename atlas nova --storage-path mindroom_data
+mindroom agents rename atlas nova --storage-path mindroom_data --apply
 ```
 
 ### agents rename-account

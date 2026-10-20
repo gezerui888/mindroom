@@ -12,10 +12,31 @@ import pytest
 import yaml
 
 from mindroom.agent_rename.scan import _LeftoverReport, scan_leftovers
+from mindroom.config.agent import AgentConfig, AgentPrivateConfig
+from mindroom.config.main import Config
+from mindroom.constants import RuntimePaths, matrix_state_file, tracking_dir, workspace_avatar_path
 from mindroom.credentials.manager import scoped_credentials_dir_part
 from mindroom.event_journal import EventJournalStore, EventKind, encode_thread_id
 from mindroom.event_journal.opening import event_journal_sqlite_path
+from mindroom.history.session_context import scope_session_storage_name
+from mindroom.history.team_scope import ad_hoc_team_scope_id
+from mindroom.history.types import HistoryScope
+from mindroom.knowledge.file_memory_knowledge import _memory_knowledge_base_id
+from mindroom.knowledge.indexing_config import storage_key_for_base
+from mindroom.legacy_handled_turns import legacy_responses_file_path
+from mindroom.matrix.state import MatrixState
+from mindroom.matrix.sync_continuity import SyncContinuityStore
+from mindroom.memory_scope_ids import agent_scope_user_id, build_team_user_id
+from mindroom.thread_models import _entity_fields, set_thread_model_override
+from mindroom.tool_system.worker_routing import (
+    ToolExecutionIdentity,
+    agent_state_root_path,
+    resolve_unscoped_worker_key,
+    resolve_worker_key,
+    worker_dir_name,
+)
 from tests.agent_rename_helpers import tree_snapshot
+from tests.conftest import TEST_ACCESS_TOKEN, test_runtime_paths
 
 OLD = "@old:x"
 NEW = "@new:x"
@@ -461,7 +482,7 @@ def test_values_naming_a_longer_agent_are_not_found(tmp_path: Path, spelling: st
 
 
 def test_values_that_only_mention_the_name_are_not_found(tmp_path: Path) -> None:
-    """Prose around the name, another case, non-strings and names used as keys are not the agent's spellings."""
+    """Prose around the name, another case, a longer name and non-strings are not the agent's spellings."""
     document = {
         "prose": "use the code tool",
         "sentence": "agent:code said hello",
@@ -471,7 +492,8 @@ def test_values_that_only_mention_the_name_are_not_found(tmp_path: Path) -> None
         "number": 1,
         "flag": True,
         "nothing": None,
-        "code": "a key is not a value",
+        "codex": "keys are matched like values",
+        "code_team": "the same",
         "list": ["decode", ["agent_codex"]],
         "member": ["team_helper+mycode", "team_mycode+helper", "agent_mycode", "my_agent_code"],
         "tenant": "v1:code:shared:helper",
@@ -571,4 +593,188 @@ async def test_journal_is_scanned_for_names_and_ids_together(tmp_path: Path) -> 
         "journal: approval_grant_locks.principal_id (1 cell)",
         "journal: journal_events.principal_id (1 cell)",
         "journal: journal_events.sender (1 cell)",
+    )
+
+
+def _storage_relative(runtime_paths: RuntimePaths, path: Path) -> str:
+    return path.resolve().relative_to(runtime_paths.storage_root.resolve()).as_posix()
+
+
+def _identity(name: str) -> ToolExecutionIdentity:
+    return ToolExecutionIdentity(
+        channel="matrix",
+        agent_name=name,
+        requester_id="@alice:example.org",
+        room_id=None,
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id=None,
+    )
+
+
+# The scan copies the formats below from the MindRoom functions that build them. Each test builds its paths and
+# values with those functions, so a format change in an owning module fails here instead of going unseen.
+# Team scopes list their members sorted, and "alpha" sorts before both agents, so the agent is the last member and
+# the requester suffix of a private team scope follows its name.
+BUILT_PATHS = (
+    "state root",
+    "session database",
+    "handled-turn ledger",
+    "avatar",
+    "file-memory scope",
+    "team file-memory scope",
+    "file-memory search index",
+    "OAuth directory",
+    "shared worker root",
+    "requester worker root",
+    "unscoped worker root",
+)
+BUILT_VALUES = (
+    "history scope",
+    "memory scope",
+    "model override field",
+    "team memory scope",
+    "ad-hoc team scope",
+    "private ad-hoc team scope",
+    "shared worker key",
+    "requester worker key",
+    "unscoped worker key",
+)
+
+
+def _built_path(runtime_paths: RuntimePaths, name: str, label: str) -> str:
+    """Return a path below the storage root, built by the MindRoom function that names it for the agent ``name``."""
+    storage = runtime_paths.storage_root
+    memory_root = agent_state_root_path(storage, name) / "memory_files"
+    index_id = _memory_knowledge_base_id(memory_root, agent_scope_user_id(name))
+    session_name = scope_session_storage_name(HistoryScope(kind="agent", scope_id=name))
+    worker_keys = {
+        "shared": resolve_worker_key("shared", _identity(name)) or "",
+        "user_agent": resolve_worker_key("user_agent", _identity(name)) or "",
+        "unscoped": resolve_unscoped_worker_key(name),
+    }
+    return {
+        "state root": f"{_storage_relative(runtime_paths, agent_state_root_path(storage, name))}/notes.txt",
+        "session database": f"agents/x/sessions/{session_name}.db",
+        "handled-turn ledger": _storage_relative(runtime_paths, legacy_responses_file_path(storage, name)),
+        "avatar": f"avatars/agents/{workspace_avatar_path('agents', name, runtime_paths).name}",
+        "file-memory scope": f"agents/x/memory_files/{agent_scope_user_id(name)}/notes.txt",
+        "team file-memory scope": f"agents/x/memory_files/{build_team_user_id(['alpha', name])}/notes.txt",
+        "file-memory search index": f"knowledge_db/{storage_key_for_base(index_id, memory_root)}",
+        "OAuth directory": f"private_oauth/_agents/{scoped_credentials_dir_part(name)}/notes.txt",
+        "shared worker root": f"workers/{worker_dir_name(worker_keys['shared'])}/notes.txt",
+        "requester worker root": f"workers/{worker_dir_name(worker_keys['user_agent'])}/notes.txt",
+        "unscoped worker root": f"workers/{worker_dir_name(worker_keys['unscoped'])}/notes.txt",
+    }[label]
+
+
+def _built_value(name: str, label: str) -> str:
+    """Return a string value, built by the MindRoom function that writes it for the agent ``name``."""
+    private_agents = {
+        name: AgentConfig(display_name="Agent", private=AgentPrivateConfig(per="user")),
+        "alpha": AgentConfig(display_name="Alpha"),
+    }
+    return {
+        "history scope": HistoryScope(kind="agent", scope_id=name).key,
+        "memory scope": agent_scope_user_id(name),
+        "model override field": next(iter(_entity_fields([name]))),
+        "team memory scope": build_team_user_id(["alpha", name]),
+        "ad-hoc team scope": ad_hoc_team_scope_id(["alpha", name], {}) or "",
+        "private ad-hoc team scope": ad_hoc_team_scope_id(
+            ["alpha", name],
+            private_agents,
+            requester_user_id="@alice:example.org",
+        )
+        or "",
+        "shared worker key": resolve_worker_key("shared", _identity(name)) or "",
+        "requester worker key": resolve_worker_key("user_agent", _identity(name)) or "",
+        "unscoped worker key": resolve_unscoped_worker_key(name),
+    }[label]
+
+
+@pytest.mark.parametrize("label", BUILT_PATHS)
+def test_paths_mindroom_builds_for_the_agent_are_found(tmp_path: Path, label: str) -> None:
+    """The path the owning function builds for the agent is found, down to the component that names it."""
+    runtime_paths = test_runtime_paths(tmp_path / "install")
+    created = _built_path(runtime_paths, NAME, label)
+    _write(runtime_paths.storage_root, created, "")
+
+    (reported,) = _scan_names(runtime_paths.storage_root).unexpected
+
+    assert created == reported or created.startswith(f"{reported}/")
+
+
+@pytest.mark.parametrize("label", BUILT_PATHS)
+def test_paths_mindroom_builds_for_a_longer_agent_are_not_found(tmp_path: Path, label: str) -> None:
+    """The same path built for ``code_team`` is not found when ``code`` is renamed."""
+    runtime_paths = test_runtime_paths(tmp_path / "install")
+    _write(runtime_paths.storage_root, _built_path(runtime_paths, OTHER, label), "")
+
+    assert not _scan_names(runtime_paths.storage_root).unexpected
+
+
+@pytest.mark.parametrize("label", BUILT_VALUES)
+def test_values_mindroom_builds_for_the_agent_are_found(tmp_path: Path, label: str) -> None:
+    """The value the owning function writes for the agent is found, and the one for ``code_team`` is not."""
+    _write(tmp_path, "records/agent.json", json.dumps({"field": _built_value(NAME, label)}))
+    _write(tmp_path, "records/other.json", json.dumps({"field": _built_value(OTHER, label)}))
+
+    assert _scan_names(tmp_path).unexpected == ("records/agent.json",)
+
+
+def test_sync_continuity_lock_files_of_the_agent_are_found(tmp_path: Path) -> None:
+    """The lock file of the agent's sync continuity store is found, and the one of ``code_team`` is not."""
+    for name in (NAME, OTHER):
+        SyncContinuityStore(tmp_path, name).load()
+
+    assert _scan_names(tmp_path).unexpected == ("sync_continuity/code.json.lock",)
+
+
+def test_matrix_state_account_keys_are_found(tmp_path: Path) -> None:
+    """An account key ``agent_<name>`` in ``matrix_state.yaml`` is found; a missed rewrite registers a fresh account."""
+    runtime_paths = test_runtime_paths(tmp_path / "install")
+    state = MatrixState()
+    for key in ("agent_router", f"agent_{OTHER}"):
+        state.add_account(key, f"mindroom_{key}", "pw", domain="x", device_id="D", access_token=TEST_ACCESS_TOKEN)
+    state.save(runtime_paths)
+    assert not _scan_names(runtime_paths.storage_root).unexpected
+
+    state.add_account(f"agent_{NAME}", "mindroom_code", "pw", domain="x", device_id="C", access_token=TEST_ACCESS_TOKEN)
+    state.save(runtime_paths)
+
+    assert matrix_state_file(runtime_paths).is_file()
+    assert _scan_names(runtime_paths.storage_root).unexpected == ("matrix_state.yaml",)
+
+
+def test_thread_model_fields_are_found(tmp_path: Path) -> None:
+    """A thread record's ``model:<name>`` field is found, and ``model:code_team`` is not."""
+    runtime_paths = test_runtime_paths(tmp_path / "install")
+    config = Config(agents={NAME: AgentConfig(display_name="Code"), OTHER: AgentConfig(display_name="Code Team")})
+    set_thread_model_override(
+        runtime_paths,
+        thread_id="$one",
+        model_name="default",
+        entity_names=[OTHER],
+        config=config,
+    )
+    assert not _scan_names(runtime_paths.storage_root).unexpected
+
+    set_thread_model_override(runtime_paths, thread_id="$two", model_name="default", entity_names=[NAME], config=config)
+
+    expected = _storage_relative(runtime_paths, tracking_dir(runtime_paths) / "thread_models.json")
+    assert _scan_names(runtime_paths.storage_root).unexpected == (expected,)
+
+
+@pytest.mark.parametrize("name", [NAME, OTHER])
+def test_memory_auto_flush_progress_keys_are_found(tmp_path: Path, name: str) -> None:
+    """The agent's bare key and its state root's ``agents/<name>`` key in the auto-flush progress are found."""
+    runtime_paths = test_runtime_paths(tmp_path / "install")
+    storage = runtime_paths.storage_root
+    scope = _storage_relative(runtime_paths, agent_state_root_path(storage, name))
+    assert scope == f"agents/{name}"
+    _write(storage, "tracking/by_agent.json", json.dumps({"started_at": 1, "agents": {name: 5}, "scopes": {}}))
+    _write(storage, "tracking/by_scope.json", json.dumps({"started_at": 1, "agents": {}, "scopes": {scope: {}}}))
+
+    assert _scan_names(storage).unexpected == (
+        ("tracking/by_agent.json", "tracking/by_scope.json") if name == NAME else ()
     )

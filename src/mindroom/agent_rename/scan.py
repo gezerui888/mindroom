@@ -6,7 +6,7 @@ identity, so the caller can split the ones its own reports already announced fro
 It checks the names of files and directories, the contents of JSON and YAML files, and every text cell
 of the event journal. Needles that are Matrix user IDs match the way the journal rewrite matches them,
 so the scan agrees with the rewrite about what still counts as the old ID.
-An agent's config name matches only as a whole: a path component, a string value or a journal cell that is
+An agent's config name matches only as a whole: a path component, a string value or key, or a journal cell that is
 one of the spellings MindRoom writes the name in, so ``code_team`` never counts as ``code``.
 """
 
@@ -69,7 +69,7 @@ def scan_leftovers(
     A needle that starts with ``@`` and contains ``:`` is a Matrix user ID and matches only as a whole ID,
     the way the journal rewrite matches it; any other needle matches as a plain substring.
     A name is an agent's config name and matches only as one of its whole spellings (see ``_names_agent``)
-    in a path component, in a string value of a JSON or YAML file, or in a journal cell.
+    in a path component, in a string value or key of a JSON or YAML file, or in a journal cell.
     A path is expected when it equals one of ``expected`` or lies inside one; absolute paths under the storage root
     and paths relative to it both work. Journal cells are never expected.
     Symlinks are not followed, and files that cannot be read or are too large are named instead of silently passed,
@@ -115,9 +115,10 @@ def _spellings(name: str) -> re.Pattern[str]:
     return re.compile(
         rf"""
           (?:agent_|agent:|model:)?{escaped}
-        | {escaped}(?:\.(?:db|json|png)|\.db-(?:wal|shm|journal))
+        | {escaped}(?:\.(?:db|png)|\.db-(?:wal|shm|journal)|\.json(?:\.lock)?)
         | {escaped}_responded\.json.*
         | {escaped}@.*
+        | agents/{escaped}
         | dispatch_obligations-{escaped}-.*
         | (?:file_memory_)?agent_{escaped}_[0-9a-f]{{16}}(?:_[0-9a-f]{{8}})?
         | [A-Za-z0-9._@+-]*_{escaped}-[0-9a-f]{{16}}
@@ -132,8 +133,9 @@ def _names_agent(text: str, name: str) -> bool:
     """Whether ``text`` is one of the whole spellings of the agent ``name``, never a longer name that starts with it.
 
     The spellings are the name itself and its composed forms (``agent_<name>``, ``agent:<name>``, ``model:<name>``),
-    the files named after it, a principal ``<name>@<user ID>``, a team scope id with the name among its members,
-    and the worker keys, worker directories and OAuth directories that embed it.
+    the files named after it, a principal ``<name>@<user ID>``, the state root key ``agents/<name>``,
+    a team scope id with the name among its members, and the worker keys, worker directories and OAuth directories
+    that embed it.
     """
     return _spellings(name).fullmatch(text) is not None or worker_key_agent_name(text) == name
 
@@ -198,7 +200,7 @@ def _scan_data_file(path: Path, relative: Path, needles: _Needles) -> str | None
         document = _parse(text, path.suffix.lower())
     except (ValueError, RecursionError, yaml.YAMLError):
         return f"{relative.as_posix()}: not scanned for names, it is not valid JSON or YAML"
-    return relative.as_posix() if any(needles.is_name_spelling(value) for value in _string_values(document)) else None
+    return relative.as_posix() if any(needles.is_name_spelling(string) for string in _strings(document)) else None
 
 
 def _parse(text: str, suffix: str) -> object:
@@ -208,17 +210,22 @@ def _parse(text: str, suffix: str) -> object:
     return json.loads(text) if suffix == ".json" else yaml_io.safe_load_without_aliases(text)
 
 
-def _string_values(document: object) -> Iterator[str]:
-    """Yield every string value in a parsed document, at any depth; mapping keys are not values."""
+def _strings(document: object) -> Iterator[str]:
+    """Yield every string in a parsed document, at any depth: its values and its mapping keys.
+
+    Keys count because MindRoom keys records by an agent: ``agent_<name>`` accounts in ``matrix_state.yaml``,
+    ``model:<name>`` fields of thread records, and the ``<name>`` and ``agents/<name>`` keys of auto-flush progress.
+    """
     pending = [document]
     while pending:
-        value = pending.pop()
-        if isinstance(value, str):
-            yield value
-        elif isinstance(value, dict):
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
+        item = pending.pop()
+        if isinstance(item, str):
+            yield item
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
 
 
 def _scan_journal(storage_root: Path, needles: _Needles) -> list[str]:

@@ -1,4 +1,4 @@
-"""Tests for moving the tracking files and side stores keyed by an agent's name with its config key."""
+"""Tests for moving the tracking records and side stores keyed by an agent's name with its config key."""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 from mindroom.agent_modes import resolve_agent_mode, set_agent_mode
-from mindroom.agent_rename.entity_files import entity_file_steps
 from mindroom.agent_rename.entity_state import entity_state_steps
+from mindroom.agent_rename.side_stores import entity_file_steps
 from mindroom.agent_rename.steps import (
     BACKUPS_DIRECTORY_NAME,
     DirectoryEdit,

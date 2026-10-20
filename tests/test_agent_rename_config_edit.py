@@ -95,7 +95,7 @@ def test_plain_scalar_that_needs_quoting_is_written_double_quoted(tmp_path: Path
     _edit(config, old="old", new=new)
 
     document = config_edit._compose(config.read_text())
-    assert [(node.value, node.style) for node, _ in config_edit._walk(document) if node.value == new] == [
+    assert [(node.value, node.style) for node, _, _ in config_edit._occurrences(document, ()) if node.value == new] == [
         (new, '"'),
         (new, '"'),
         (new, '"'),

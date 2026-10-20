@@ -4774,6 +4774,7 @@ path = "mindroom.cli.agents"
 depends_on = [
     # Mostly deferred imports, so `mindroom --help` does not load the rename engine.
     "mindroom.agent_rename.account_files",
+    "mindroom.agent_rename.config_edit",
     "mindroom.cli.config",
     "mindroom.config.main",
     "mindroom.constants",
@@ -9364,3 +9365,12 @@ depends_on = ["mindroom.agent_rename.workers", "mindroom.tool_system.worker_rout
 [[interfaces]]
 expose = ["entity_credential_steps", "rewrite_worker_key_agent"]
 from = ["mindroom.agent_rename.entity_files"]
+
+# Edits the config, its includes, and its `.env` as text for both rename commands.
+[[modules]]
+path = "mindroom.agent_rename.config_edit"
+depends_on = ["mindroom.config.yaml_includes"]
+
+[[interfaces]]
+expose = ["config_entity_steps", "config_value_steps", "env_value_steps"]
+from = ["mindroom.agent_rename.config_edit"]

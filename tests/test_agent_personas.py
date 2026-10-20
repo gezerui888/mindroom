@@ -239,7 +239,7 @@ def test_minimal_persona_cli_lists_only_its_named_toolkits(tmp_path: Path) -> No
     """A minimal persona's mindroom-agent catalog offers neither unnamed deferred toolkits nor the deferred-tool manager."""
     runtime = _runtime(tmp_path, tools=["shell", {"file": {"defer": True}}])
 
-    agent = _child(runtime, ["shell"], session_id="session-1", agent_mode="minimal")
+    agent = _child(runtime, ["shell"], agent_mode="minimal")
 
     assert isinstance(agent, MinimalAgent)
     assert [deferred.name for deferred in agent.deferred_toolkits] == []
@@ -501,14 +501,14 @@ def test_minimal_persona_reads_its_skills_as_context_documents(tmp_path: Path) -
     assert not any(document.startswith("other\n") for document in documents)
 
 
-def test_persona_with_tools_gets_no_deferred_loading_guidance(tmp_path: Path) -> None:
-    """An explicit tool list loads its toolkits up front, so the prompt never points at load_tool."""
+def test_persona_with_tools_gets_no_tool_search_guidance(tmp_path: Path) -> None:
+    """An explicit tool list loads its toolkits up front, so the prompt never points at tool_search."""
     runtime = _runtime(tmp_path, tools=["file", {"calculator": {"defer": True}}])
 
-    agent = _child(runtime, ["file"], session_id="session-1")
+    agent = _child(runtime, ["file"])
 
     instructions = "\n".join(str(item) for item in agent.instructions or [])
-    assert "load_tool" not in instructions
+    assert "tool_search" not in instructions
     assert "calculator" not in instructions
 
 
@@ -516,7 +516,7 @@ def test_minimal_persona_roster_lists_the_toolkits_it_built(tmp_path: Path) -> N
     """A minimal persona's bootstrap lists the toolkits it can call, deferred ones it named included."""
     runtime = _runtime(tmp_path, tools=["shell", "file", {"calculator": {"defer": True}}])
 
-    agent = _child(runtime, ["shell", "calculator"], session_id="session-1", agent_mode="minimal")
+    agent = _child(runtime, ["shell", "calculator"], agent_mode="minimal")
 
     assert isinstance(agent, MinimalAgent)
     [roster] = [line for line in agent.system_message.splitlines() if line.startswith("Toolkits callable")]

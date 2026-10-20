@@ -157,8 +157,9 @@ def _rename_account(
         _print_plan(_plan(runtime_paths, config, adoption, discard_new_principal=discard_new_principal), adoption)
         _say("Dry run: nothing was changed. Rerun with --apply to make these changes.")
         _say(
-            "--apply plans again under MindRoom's locks. Some event journal collisions only show up then; "
-            "if one does, everything is undone and the command refuses.",
+            "--apply plans again under MindRoom's locks. Event journal collisions in tables other than "
+            "room_member_joins only show up when --apply rewrites the journal; "
+            "if one does, that rewrite rolls back and the command refuses.",
         )
         return
     with stopped_runtime(runtime_paths):

@@ -241,7 +241,7 @@ def test_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert "Rewrite the event journal" in result.output
     assert f"Replace {OLD} with {NEW} in {runtime_paths.config_path}" in result.output
     assert "Dry run: nothing was changed." in result.output
-    assert "Some event journal collisions only show up then" in result.output
+    assert "only show up when --apply rewrites the journal" in result.output
     # The login check belongs to --apply.
     assert server.requests == []
 

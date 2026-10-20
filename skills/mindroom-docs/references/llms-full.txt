@@ -19697,6 +19697,7 @@ Run it after the homeserver renamed the account, and before MindRoom starts for 
 - The MindRoom fork of Tuwunel renames a local user in place with the admin command `query user-id-rewrite` ([mindroom-tuwunel#109](https://github.com/mindroom-ai/mindroom-tuwunel/pull/109)). Its operator guide is `docs/user-id-rewrite.md` in that repository. The account keeps its password, rooms, and history.
 - Synapse has no equivalent admin command, so this page does not apply to a Synapse server.
 - The new ID must be on the same server as the old one. A rename in place keeps the server, and the command refuses another one.
+- An in-place rename is only safe for an account whose rooms are not shared with other servers. The rewritten events no longer match their hashes and signatures, so a federated server that already holds them would reject them.
 
 If MindRoom already started under the new ID, it created fresh state there.
 Add `--discard-new-principal` to drop that state when it holds no replies or credentials.
@@ -19713,6 +19714,9 @@ Any other setup is refused with `not supported yet`.
    The command keeps its own backups, but a snapshot is the only rollback that also covers the homeserver.
 4. Run a dry run with the same `--config` and `--storage-path` the service uses.
    It prints the plan and changes nothing.
+   The one exception is a config in the legacy format, one that uses `authorization.global_users`.
+   Loading it migrates it on disk, as every MindRoom command does, and writes the original to `config.yaml.pre-membership-access` beside it.
+   Configs in the current format are not touched.
 
    ```bash
    mindroom agents rename-account harry @mindroom_harry:example.org \
@@ -19732,9 +19736,12 @@ Any other setup is refused with `not supported yet`.
 
 A dry run neither contacts the homeserver nor checks that MindRoom is stopped.
 `--apply` takes the locks a running MindRoom holds, so it refuses to run while MindRoom is up and blocks MindRoom from starting until it exits.
-It then checks the login (see below) and plans again under the locks.
-Some event journal collisions only show up in that second plan.
-If one does, the command changes nothing and refuses.
+It then checks the login (see below), plans again under the locks, prints the plan, and asks for confirmation.
+
+Neither plan can see collisions in the event journal.
+Those in tables other than `room_member_joins` are found when the journal rewrite runs, which is the first step of `--apply` and comes after you confirmed.
+The rewrite rolls back and the command refuses, naming `table.column`.
+Nothing changes, except that the backup directory remains.
 
 Running the same command again after a successful apply prints `Already adopted; nothing to do.` and exits 0.
 
@@ -19748,19 +19755,21 @@ Running the same command again after a successful apply prints `Already adopted;
 | `workers/` | Each worker whose key names the old ID as requester moves to the directory of its new key. Its `metadata/worker.json` and OAuth stores are rewritten. Docker control records and config projections of the old key are removed. |
 | `private_instances/` and `tracking/private_instances/` | Private scopes owned by the old ID move to the scope of the new ID, and their owner record is rewritten. |
 | `tracking/agents/*/personal_rooms/*.json` | The old ID is replaced in every record. A record owned by the old ID moves to the file name of the new ID. |
-| `control_state/matrix_message_sends/` | Files holding send intents of the old ID are removed into the backup, because MindRoom refuses to replay an intent as another sender. |
-| `config.yaml` and the YAML files it includes | Every string value equal to the old ID, such as entries in user lists, `bot_accounts`, or `authorization.aliases`, becomes the new ID. |
+| `matrix_message_sends/` in the control state directory | Files holding send intents of the old ID are removed into the backup, because MindRoom refuses to replay an intent as another sender. The directory is `control_state/` under the storage directory unless [`MINDROOM_CONTROL_STATE_PATH`](https://docs.mindroom.chat/configuration/#environment-variables) points elsewhere. |
+| `config.yaml` and the YAML files it includes | Every string value equal to the old ID, such as entries in user lists, `bot_accounts`, or `authorization.aliases`, becomes the new ID. A matching value inside a literal or folded block scalar makes the command refuse with `edit it by hand`. |
 
-IDs are matched as whole user IDs the way Tuwunel matches them.
+The event journal rewrite, the personal-room records, and the leftover scan match whole user IDs the way Tuwunel matches them.
 `@harry:example.org` is found in `ask @harry:example.org.` and in `@harry:example.org:DEVICEID`.
 It is not found in `@harry:example.org.uk` or `@harry:example.org:8448`, which name other users.
+Worker keys and private-instance owners are compared as whole IDs too.
+Config values are different: only a value that equals the old ID exactly is replaced.
 
 The config edit is made on the text, so comments, quoting, and indentation survive.
 The command parses the edited files again and refuses unless they differ from the originals only in those values.
 It never edits mapping keys, `.env`, or other files.
 
-Anything that went wrong while rewriting the journal rolls the whole transaction back.
-A row that would collide with a row already holding the new ID, in any table but `room_member_joins`, makes the command refuse and name the table and column.
+Anything that goes wrong while rewriting the journal rolls the whole transaction back.
+A row that would collide with a row already holding the new ID, in any table but `room_member_joins`, is found when the rewrite runs at the start of `--apply`, and makes the command refuse and name the table and column.
 
 The old Docker worker container is removed last, after every other step succeeded.
 If that fails, the command prints a warning and you remove the container by hand.
@@ -19769,7 +19778,7 @@ If that fails, the command prints a warning and you remove the container by hand
 
 These stay on purpose, and the plan lists them as `report:` lines.
 
-- `encryption_keys/<old ID>/` stays. Only that crypto store decrypts the old encrypted history, and the new device starts its own store. It cannot read encrypted history from before the rename.
+- The old crypto store stays. It is the directory under `encryption_keys/` named after the old ID without the `@` and with each `:` replaced by `_`, for example `encryption_keys/mindroom_openclaw_example.org/`. Only that store decrypts the old encrypted history, and the new device starts its own store. It cannot read encrypted history from before the rename.
 - A desktop bridge pinned to the old ID stays pinned. Pair it again.
 - Records of past tool jobs and scheduled runs outside the event journal keep the old ID as history.
 - A worker directory that looks like it belonged to the old ID, but whose worker key cannot be found, stays in place and is reported with its path.
@@ -19791,7 +19800,8 @@ When the new-ID state holds nothing you need, move that path away yourself and r
 
 ## Checks before it changes anything
 
-Every refusal exits 1 with the reason, and nothing has changed yet.
+Every refusal exits 1 with the reason and leaves your files as they were.
+Event journal collisions are the one refusal that only shows up while `--apply` is rewriting, as described in [Procedure](#procedure).
 
 - The config exists and loads, `AGENT` is an agent in it, and `matrix_state.yaml` holds the account `agent_<name>`.
 - The new ID is a valid Matrix user ID on the old ID's server, and is not another stored account.
@@ -19800,7 +19810,9 @@ Every refusal exits 1 with the reason, and nothing has changed yet.
 - The login check passes (`--apply` only). The command logs in at `/_matrix/client/v3/login` on the configured homeserver as the new ID with the stored password, then logs out. A rejected login means the server rename has not happened, and the command refuses with `The server does not accept <new ID> with the stored password`.
 - Event journal rows and paths under the new ID are dealt with as described in [New-ID state](#new-id-state).
 
-The login check uses plain HTTP and creates a device named `mindroom rename check`.
+The login check sends its requests straight to the configured homeserver, with the TLS settings MindRoom is configured to use, instead of going through MindRoom's Matrix client.
+That keeps it from creating a crypto store for the new ID.
+It creates a device named `mindroom rename check`.
 If logging that device out fails, the command warns and you remove the device from the account by hand.
 Pass `--skip-login-check` when the homeserver is unreachable from where you run the command, or when `matrix_state.yaml` holds no password for the agent.
 
@@ -19853,12 +19865,21 @@ The command never deletes it.
 It can hold copies of credentials and the config, so it is readable by its owner only.
 Delete it once you are sure of the result.
 
-`manifest.json` lists every step in the order it ran.
+`manifest.json` lists every planned step in plan order, including steps that never ran, and is updated as steps run.
 Each entry has a `type`, a `description`, a `source`, a `destination`, and a `backup` directory.
 The `backup` directories are numbered `000`, `001`, and so on, and hold the originals.
 Plain moves keep nothing there, because a move is only a rename.
 
-To restore by hand, stop MindRoom and walk the manifest from its last entry to its first:
+To restore by hand, stop MindRoom and walk the manifest from its last entry to its first.
+Skip the entries that have nothing to restore:
+
+- A `FinalAction` entry.
+  It is only used with the Docker worker backend, to retire the old workers, and is never undone.
+- A `SqliteEdit`, `FileRewrite`, or `DropPath` entry whose `backup` is `null`, because that step never ran.
+- A `MovePath` entry whose `destination` does not exist, because that move never happened.
+
+This matters most after `Undo failed:`, where the manifest includes steps the command never reached.
+Restore each remaining entry like this:
 
 | `type` | Restore |
 | --- | --- |

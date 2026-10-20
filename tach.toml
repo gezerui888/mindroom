@@ -9386,7 +9386,7 @@ depends_on = [
 # Moves the worker roots whose worker keys a rename changes; shared by account and agent renames.
 [[modules]]
 path = "mindroom.agent_rename.workers"
-depends_on = ["mindroom.tool_system.worker_routing"]
+depends_on = ["mindroom.constants", "mindroom.tool_system.worker_routing"]
 
 # Moves the files keyed by an agent's config name when the agent is renamed.
 [[modules]]

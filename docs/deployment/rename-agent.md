@@ -195,6 +195,8 @@ The command matches the exact name only, so renaming `code` leaves `code_team` a
   A Docker worker's mount point `agents/<OLD>` moves to the new name.
 - The worker's `venv/` moves into the backup, because the scripts in it name the old path.
   MindRoom builds a new one on the worker's next use, and packages installed into the old one must be installed again.
+- A Docker worker's startup manifest, `.runtime/startup_manifest.json`, names the old key, so it moves into the backup.
+  MindRoom writes a new one when it creates the worker's container.
 - Docker control records and config projections of the old key are removed.
   With the Docker worker backend the old container is removed last, after every other step succeeded.
   If that fails, the command prints a warning and you remove the container by hand.
@@ -239,7 +241,7 @@ Some state can be derived again, so the command drops it into the backup instead
 | --- | --- | --- |
 | The file-memory search index of the agent, `knowledge_db/file_memory_agent_<OLD>_*` | It carries the old name, so nothing reads it again. | MindRoom rebuilds it under the new name on next use. |
 | The `venv/` of each moved worker | Its scripts name the old path. | MindRoom builds a new one on the worker's next use. |
-| Docker records of the old worker keys | They belong to the old key. | MindRoom creates new ones. |
+| Docker records of the old worker keys, and the startup manifest of each moved Docker worker | They belong to the old key. | MindRoom creates new ones. |
 | Approval grants, subagent handles, Matrix send intents, and pending OAuth states of the agent | They are bound to the old name. | The agent asks again, or the flow starts over. |
 
 ## What it reports and does not change

@@ -30,6 +30,7 @@ from mindroom.agent_rename.steps import (
 )
 from mindroom.agent_rename.workers import DestinationExistsError, worker_move_steps
 from mindroom.config.main import Config
+from mindroom.constants import sandbox_startup_manifest_path
 from mindroom.credentials.manager import (
     PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME,
     scoped_credentials_dir_part,
@@ -47,6 +48,7 @@ from tests.agent_rename_fixtures.workers import (
     publish_credentials,
     read_credentials,
     worker_root,
+    write_docker_startup_manifest,
     write_json,
     write_worker,
 )
@@ -215,7 +217,8 @@ def test_shared_worker_moved_and_venv_dropped(tmp_path: Path) -> None:
 def test_docker_worker_retired_after_move(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """On Docker the old container is retired only after apply moved its state, and the moved root has no venv.
 
-    The Docker records of the old key are dropped and the agent's mount point inside the root follows the new name.
+    The Docker records of the old key and the moved root's startup manifest, which names the old key, are dropped,
+    and the agent's mount point inside the root follows the new name.
     The prefix agent's Docker worker is neither moved nor retired.
     """
     runtime_paths = _docker(test_runtime_paths(tmp_path))
@@ -232,6 +235,7 @@ def test_docker_worker_retired_after_move(tmp_path: Path, monkeypatch: pytest.Mo
             (root / name).mkdir(parents=True)
         write_json(workers / WORKER_CONTROL_DIRNAME / root.name / "metadata" / "worker.json", {"worker_key": key})
         (workers / PROJECTED_CONFIGS_DIRNAME / root.name).mkdir(parents=True)
+        write_docker_startup_manifest(runtime_paths, key)
     (old_root / "agents" / OLD).mkdir(parents=True)
     (worker_root(runtime_paths, prefix_key) / "agents" / PREFIX).mkdir(parents=True)
     prefix_paths = [
@@ -269,6 +273,7 @@ def test_docker_worker_retired_after_move(tmp_path: Path, monkeypatch: pytest.Mo
     assert not (workers / WORKER_CONTROL_DIRNAME / old_root.name).exists()
     assert not (workers / PROJECTED_CONFIGS_DIRNAME / old_root.name).exists()
     assert not (new_root / "venv").exists()
+    assert not sandbox_startup_manifest_path(new_root).exists()
     assert (new_root / "agents" / NEW).is_dir()
     assert not (new_root / "agents" / OLD).exists()
     assert {path: tree_snapshot(path) for path in prefix_paths} == prefix_before

@@ -44,7 +44,13 @@ from tests.agent_rename_fixtures.entity_state import seed_agent
 from tests.agent_rename_fixtures.journal import bound_principal, membership_admission, message_admission, record_turn
 from tests.agent_rename_fixtures.memory import install_memories, memory_config, visible_memories
 from tests.agent_rename_fixtures.side_stores import install_side_stores
-from tests.agent_rename_fixtures.workers import agent_worker_key, publish_credentials, read_credentials, write_worker
+from tests.agent_rename_fixtures.workers import (
+    agent_worker_key,
+    publish_credentials,
+    read_credentials,
+    write_docker_startup_manifest,
+    write_worker,
+)
 from tests.agent_rename_helpers import tree_snapshot
 from tests.conftest import TEST_ACCESS_TOKEN, test_runtime_paths
 
@@ -729,9 +735,13 @@ def test_apply_retires_old_docker_workers_then_shuts_the_worker_manager_down(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """On Docker the old worker's container is retired after every move, and the leased manager is shut down."""
+    """On Docker the old worker's container is retired after every move, and the leased manager is shut down.
+
+    The moved root's startup manifest names the old worker key; it is dropped, so the leftover scan stays clean.
+    """
     runtime_paths = _install(tmp_path, monkeypatch)
     monkeypatch.setenv("MINDROOM_WORKER_BACKEND", "docker")
+    write_docker_startup_manifest(runtime_paths, agent_worker_key("shared", OLD))
     manager = _RetiringManager()
     events: list[str] = []
 
@@ -749,3 +759,4 @@ def test_apply_retires_old_docker_workers_then_shuts_the_worker_manager_down(
     assert _steps(result.output)[-1].startswith("Retire the old Docker worker")
     assert manager.retired == [agent_worker_key("shared", OLD)]
     assert events == ["lease", "shutdown"]
+    assert _leftovers(result.output)[1] == []

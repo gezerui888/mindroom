@@ -18,6 +18,7 @@ from functools import partial
 from typing import TYPE_CHECKING, cast
 
 from mindroom.agent_rename.steps import DropPath, FileRewrite, FinalAction, MovePath, RenameRefusedError, SqliteEdit
+from mindroom.constants import sandbox_startup_manifest_path
 from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME
 from mindroom.tool_system.worker_routing import worker_dir_name, worker_key_agent_name, worker_log_id
 from mindroom.workers.backends.docker import WORKER_CONTROL_DIRNAME
@@ -217,7 +218,7 @@ def _worker_state_steps(
     rewrite: Callable[[str], str | None],
     discard_new_state: bool,
 ) -> list[Step]:
-    """Move one worker root, drop its venv, and rewrite what inside it names the old key, at its new place."""
+    """Move one worker root, drop its venv and startup manifest, and rewrite what names the old key, at its new place."""
     if not os.path.lexists(old_root):
         return []
     steps = move_steps(old_root, new_root, "the worker", discard_new_state=discard_new_state)
@@ -230,6 +231,17 @@ def _worker_state_steps(
                 venv,
                 f"Drop the moved worker's virtual environment {venv}; MindRoom rebuilds it on the worker's next use, "
                 "so packages installed into it must be installed again",
+            ),
+        )
+    # The Docker backend's startup manifest names the old key. It writes the manifest again before it creates the
+    # container of the new key, which no container has yet (workers/backends/docker.py's _write_startup_manifest).
+    if os.path.lexists(sandbox_startup_manifest_path(old_root)):
+        manifest = sandbox_startup_manifest_path(new_root)
+        steps.append(
+            DropPath(
+                manifest,
+                f"Drop the moved worker's startup manifest {manifest}, which names the old worker key; "
+                "MindRoom writes it again when it creates the worker's container",
             ),
         )
     steps += _agent_mount_steps(old_root, new_root, old_key=old_key, new_key=new_key)

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+from mindroom.constants import write_startup_manifest
 from mindroom.credentials.manager import (
     get_runtime_credentials_manager,
 )
@@ -17,10 +19,9 @@ from mindroom.tool_system.worker_routing import (
     resolve_worker_target,
     worker_dir_name,
 )
+from mindroom.workers.backends._dedicated_worker_common import build_dedicated_worker_runtime_paths
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from mindroom.constants import RuntimePaths
     from mindroom.oauth.providers import OAuthProvider
 
@@ -71,6 +72,21 @@ def write_worker(runtime_paths: RuntimePaths, worker_key: str) -> Path:
     (root / "venv" / "bin").mkdir(parents=True)
     (root / "venv" / "bin" / "pip").write_text(f"#!{root}/venv/bin/python\n", encoding="utf-8")
     return root
+
+
+def write_docker_startup_manifest(runtime_paths: RuntimePaths, worker_key: str) -> Path:
+    """Write the startup manifest the Docker backend writes into a worker root before creating its container."""
+    worker_runtime_paths = build_dedicated_worker_runtime_paths(
+        runtime_paths=runtime_paths,
+        backend_name="Docker",
+        worker_key=worker_key,
+        config_path=Path("/app/config.yaml"),
+        dedicated_root=Path("/app/worker"),
+        worker_port=8766,
+        shared_storage_root="/app/worker",
+        extra_env={},
+    )
+    return write_startup_manifest(worker_root(runtime_paths, worker_key), worker_runtime_paths, public_runtime=True)
 
 
 class DemoOAuthProvider:

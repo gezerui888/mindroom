@@ -420,6 +420,38 @@ def test_final_action_failure_is_a_warning(tmp_path: Path) -> None:
     assert "cannot reload" in result.warnings[0]
 
 
+def test_interrupted_final_action_is_a_warning(tmp_path: Path) -> None:
+    """Ctrl-C during a final action comes after every reversible step, so apply still returns its result.
+
+    The interrupted action and the ones it kept from running become warnings, and nothing is undone.
+    """
+    storage = _make_storage(tmp_path)
+    calls: list[str] = []
+
+    def interrupted() -> None:
+        calls.append("interrupted")
+        raise KeyboardInterrupt
+
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            FileRewrite(storage / "accounts.json", _rewrite_user_id, "rewrite accounts"),
+            FinalAction(interrupted, "retire the old worker"),
+            FinalAction(lambda: calls.append("second"), "retire another worker"),
+        ),
+        reports=(),
+    )
+
+    result = apply_plan(plan, kind="rename-account", now=NOW)
+
+    assert json.loads((storage / "accounts.json").read_text()) == {"user_id": "@new:x"}
+    assert calls == ["interrupted"]
+    assert result.warnings == (
+        "retire the old worker: interrupted",
+        "retire another worker: not run after the interrupt",
+    )
+
+
 def test_final_actions_run_after_every_other_step(tmp_path: Path) -> None:
     """A final action listed first still runs after the reversible steps, and never when one fails."""
     storage = _make_storage(tmp_path)

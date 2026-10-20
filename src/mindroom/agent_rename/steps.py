@@ -345,9 +345,14 @@ def apply_plan(plan: RenamePlan, *, kind: str, now: datetime) -> ApplyResult:
             raise RenameApplyError(step.description, msg) from failure
 
     warnings: list[str] = []
-    for index, step in final:
+    for position, (index, step) in enumerate(final):
         try:
             step.apply(_step_backup(backup_dir, index))
+        except KeyboardInterrupt:
+            # Every reversible step is done, so Ctrl-C only stops the final actions; the caller still reports the result.
+            warnings.append(f"{step.description}: interrupted")
+            warnings += [f"{skipped.description}: not run after the interrupt" for _, skipped in final[position + 1 :]]
+            break
         except Exception as failure:
             warnings.append(f"{step.description}: {failure}")
     return ApplyResult(backup_dir=backup_dir, warnings=tuple(warnings))

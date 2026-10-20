@@ -210,7 +210,11 @@ class DirectoryEdit:
             edited = scratch / self.path.name
             shutil.copytree(self.path, edited, symlinks=True)
             self.edit(edited)
-            _swap_directory(edited, self.path, scratch)
+            # Once swapped, the step must also return so the plan records it as done and can undo it;
+            # removing the replaced original takes a while, so Ctrl-C is ignored from the swap on.
+            with _sigint_ignored():
+                _swap_directory(edited, self.path, scratch)
+                shutil.rmtree(scratch, ignore_errors=True)
 
     def _undo(self, backup: Path) -> None:
         """Swap a copy of the backup into the directory's place."""

@@ -67,25 +67,37 @@ def memory_steps(runtime_paths: RuntimePaths, *, config: Config, old_name: str, 
     return steps
 
 
+def _team_members(scope_user_id: str) -> list[str]:
+    """Return the member names of a team scope id, or no names for any other scope."""
+    if not scope_user_id.startswith(_TEAM_SCOPE_PREFIX):
+        return []
+    return scope_user_id.removeprefix(_TEAM_SCOPE_PREFIX).split("+")
+
+
 def _renamed_scope_user_id(scope_user_id: str, old_name: str, new_name: str) -> str | None:
     """Return the scope id ``scope_user_id`` becomes, or ``None`` when it does not name the agent."""
     if scope_user_id == agent_scope_user_id(old_name):
         return agent_scope_user_id(new_name)
-    if not scope_user_id.startswith(_TEAM_SCOPE_PREFIX):
-        return None
-    members = scope_user_id.removeprefix(_TEAM_SCOPE_PREFIX).split("+")
+    members = _team_members(scope_user_id)
     if old_name not in members:
         return None
     return build_team_user_id([new_name if member == old_name else member for member in members])
 
 
 def _scope_renames(scope_user_ids: set[str], *, location: Path, old_name: str, new_name: str) -> dict[str, str]:
-    """Map each scope id naming the agent to its new id; refuses when a new id is already in use at ``location``."""
+    """Map each scope id naming the agent to its new id.
+
+    Refuses when a new id is already in use at ``location``, or when a team scope already names the new name
+    beside the old one, since renaming would merge the two members.
+    """
     renames: dict[str, str] = {}
     for scope_user_id in sorted(scope_user_ids):
         renamed = _renamed_scope_user_id(scope_user_id, old_name, new_name)
         if renamed is None:
             continue
+        if new_name in _team_members(scope_user_id):
+            msg = f"Cannot rename memory scope {scope_user_id} in {location}: {new_name} is already one of its members."
+            raise RenameRefusedError(msg)
         if renamed in scope_user_ids:
             msg = f"Cannot rename memory scope {scope_user_id} to {renamed} in {location}: {renamed} already exists there."
             raise DestinationExistsError(msg)
@@ -110,6 +122,12 @@ def _chroma_steps(store: Path, destination: Path, old_name: str, new_name: str) 
     renames = _scope_renames({value for (value,) in rows}, location=store, old_name=old_name, new_name=new_name)
     if not renames:
         return []
+    if store.is_symlink():
+        # The edit swaps a copy in, which would replace the link and leave the store it points to unedited.
+        msg = (
+            f"Cannot rename the memory scopes in {store}: it is a symlink. Replace it with the directory it points to."
+        )
+        raise RenameRefusedError(msg)
     listed = ", ".join(f"{old} to {new}" for old, new in renames.items())
     return [
         DirectoryEdit(

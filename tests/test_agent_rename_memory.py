@@ -94,6 +94,11 @@ def _store(root: Path, config: Config, runtime_paths: RuntimePaths) -> Iterator[
         yield store
 
 
+def _entities(store: ChromaDB) -> ChromaDB:
+    """Return mem0's entity store beside ``store``: collection ``<collection>_entities`` in the same Chroma store."""
+    return ChromaDB(collection_name=f"{store.collection_name}_entities", client=store.client)
+
+
 def _file_resolution(scope: str, root: Path, config: Config, runtime_paths: RuntimePaths) -> FileMemoryResolution:
     """Resolve a scope's file memory at ``root`` the way the file backend does for reads and writes."""
     return resolve_file_memory_resolution(
@@ -114,6 +119,13 @@ def _install(tmp_path: Path, memories: tuple[tuple[str, str, dict[str, Any]], ..
             with _store(root, config, runtime_paths) as store:
                 payload = {"data": text, "user_id": scope, **metadata}
                 store.insert(vectors=[_vector(text)], payloads=[payload], ids=[f"memory-{index}"])
+                # The entity record mem0 2.0.1 links to the memory (mem0/memory/main.py's _upsert_entity).
+                entity = {"data": f"{text} entity", "entity_type": "concept", "linked_memory_ids": [f"memory-{index}"]}
+                _entities(store).insert(
+                    vectors=[_vector(text)],
+                    payloads=[{**entity, "user_id": scope}],
+                    ids=[f"entity-{index}"],
+                )
             resolution = _file_resolution(scope, root, config, runtime_paths)
             _append_scope_memory_entry(scope, text, resolution, config)
     return runtime_paths
@@ -157,12 +169,14 @@ def _visible_files(caller: str | list[str], config: Config, runtime_paths: Runti
     return seen
 
 
-def _scope_ids_in_store(root: Path) -> set[str]:
+def _scope_ids_in_store(root: Path) -> dict[str, set[str]]:
+    """Map each collection of the Chroma store at ``root`` to the scope ids of its records."""
     with _client(str(root / "chroma")) as client:
         return {
-            str(metadata["user_id"])
+            collection.name: {
+                str(metadata["user_id"]) for metadata in collection.get(include=["metadatas"])["metadatas"] or []
+            }
             for collection in client.list_collections()
-            for metadata in collection.get(include=["metadatas"])["metadatas"] or []
         }
 
 
@@ -213,6 +227,12 @@ def test_memories_searchable_under_new_scope_ids(tmp_path: Path) -> None:
         assert [(hit.payload["data"], hit.payload["agent"]) for hit in hits] == [("code prefers tabs", NEW)]
         assert hits[0].score == pytest.approx(1.0)
         assert store.search(query="tabs", vectors=_vector("code prefers tabs"), filters={"user_id": "agent_code"}) == []
+        entities = _entities(store)
+        assert [
+            (hit.payload["data"], hit.payload["linked_memory_ids"])
+            for hit in entities.list(filters={"user_id": agent_scope_user_id(NEW)})[0]
+        ] == [("code prefers tabs entity", ["memory-0"])]
+        assert entities.list(filters={"user_id": "agent_code"})[0] == []
     assert not (_root(runtime_paths, NEW) / "memory_files" / agent_scope_user_id(OLD)).exists()
 
 
@@ -239,7 +259,10 @@ def test_team_scopes_recomputed(tmp_path: Path) -> None:
     }
     for agent, scopes in expected_scopes.items():
         root = _root(runtime_paths, agent)
-        assert _scope_ids_in_store(root) == scopes
+        # Memories and the entity records linked to them alike.
+        collections = _scope_ids_in_store(root)
+        assert len(collections) == 2
+        assert all(found == scopes for found in collections.values())
         assert {path.name for path in (root / "memory_files").iterdir()} == scopes
         assert not scopes & old_scopes
     with _store(_root(runtime_paths, HELPER), _config(NEW), runtime_paths) as store:
@@ -294,22 +317,44 @@ def test_failure_after_any_step_restores_the_tree(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("taken", ["chroma", "memory_files"])
-def test_existing_new_scope_refuses(tmp_path: Path, taken: str) -> None:
-    """A store that already holds the new scope id refuses before anything is written."""
+@pytest.mark.parametrize(
+    ("stale_scope", "refusal"),
+    [
+        (agent_scope_user_id(NEW), "agent_coder already exists there"),
+        # Renaming it would merge two members into one: team_coder+coder+helper.
+        (build_team_user_id([OLD, NEW, HELPER]), "coder is already one of its members"),
+    ],
+)
+def test_stale_new_scope_refuses(tmp_path: Path, taken: str, stale_scope: str, refusal: str) -> None:
+    """A store already holding the new scope id, or a scope naming both names, refuses before anything is written."""
     runtime_paths = _install(tmp_path)
     old_root = _root(runtime_paths, OLD)
     if taken == "chroma":
         with _store(old_root, _config(OLD), runtime_paths) as store:
-            payload = {"data": "a former coder's memory", "user_id": agent_scope_user_id(NEW)}
+            payload = {"data": "a former coder's memory", "user_id": stale_scope}
             store.insert(vectors=[_vector("code prefers tabs")], payloads=[payload], ids=["stale"])
     else:
-        (old_root / "memory_files" / agent_scope_user_id(NEW)).mkdir()
+        (old_root / "memory_files" / stale_scope).mkdir()
     before = tree_snapshot(runtime_paths.storage_root)
 
-    with pytest.raises(RenameRefusedError, match="agent_coder"):
+    with pytest.raises(RenameRefusedError, match=refusal):
         memory_steps(runtime_paths, config=_config(OLD), old_name=OLD, new_name=NEW)
 
     assert tree_snapshot(runtime_paths.storage_root) == before
+
+
+def test_symlinked_chroma_store_refuses(tmp_path: Path) -> None:
+    """Swapping an edited copy in would replace the link and leave the store it points to unedited, so it refuses."""
+    runtime_paths = _install(tmp_path)
+    store = _root(runtime_paths, OLD) / "chroma"
+    store.rename(tmp_path / "elsewhere")
+    store.symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    before = tree_snapshot(tmp_path)
+
+    with pytest.raises(RenameRefusedError, match="is a symlink"):
+        memory_steps(runtime_paths, config=_config(OLD), old_name=OLD, new_name=NEW)
+
+    assert tree_snapshot(tmp_path) == before
 
 
 def test_agent_without_memory_plans_nothing(tmp_path: Path) -> None:

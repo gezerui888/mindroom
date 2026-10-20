@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import json
 import os
+import shutil
 import signal
 import sqlite3
 from contextlib import closing
@@ -589,7 +590,11 @@ def test_directory_edit_swaps_in_an_edited_copy_and_keeps_a_backup(tmp_path: Pat
 
     result = apply_plan(plan, kind="rename", now=NOW)
 
-    assert edited != [store]
+    # The edit ran on a copy in a scratch directory beside the store, never on the store itself.
+    assert len(edited) == 1
+    assert edited[0] != store
+    assert edited[0].name == store.name
+    assert edited[0].parent.parent == store.parent
     assert tree_snapshot(store) == {
         "segment": "dir",
         "index.txt": b"user_id=@new:x",
@@ -660,3 +665,45 @@ def test_directory_edit_is_undone_when_a_later_step_fails(tmp_path: Path) -> Non
 
     assert _without_backups(tree_snapshot(storage)) == original
     assert store.stat().st_mode & 0o777 == 0o750
+
+
+def test_interrupt_after_the_directory_swap_cannot_split_the_plan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C while the replaced original is removed neither keeps the edit with earlier steps undone nor loses it.
+
+    The swap commits the edit, so the plan must go on recording it as done.
+    """
+    storage = _make_storage(tmp_path)
+    store = _make_store(storage)
+    remove_tree = shutil.rmtree
+
+    def ctrl_c_while_removing_the_original(path: Path, *args: object, **kwargs: object) -> None:
+        # A Ctrl-C raises KeyboardInterrupt in the main thread unless SIGINT is ignored.
+        if (Path(path) / "store.replaced").exists() and signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+            raise KeyboardInterrupt
+        remove_tree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(steps_module.shutil, "rmtree", ctrl_c_while_removing_the_original)
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            MovePath(storage / "accounts.json", storage / "moved.json", "move accounts"),
+            DirectoryEdit(store, _rewrite_store, "edit store"),
+        ),
+        reports=(),
+    )
+
+    interrupted = False
+    try:
+        apply_plan(plan, kind="rename", now=NOW)
+    except KeyboardInterrupt:
+        interrupted = True
+
+    assert (interrupted, (storage / "moved.json").exists(), (store / "index.txt").read_text()) == (
+        False,
+        True,
+        "user_id=@new:x",
+    )
+    assert sorted(path.name for path in store.parent.iterdir()) == ["state.txt", "store"]

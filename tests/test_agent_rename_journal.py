@@ -6,6 +6,7 @@ import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -29,7 +30,6 @@ from tests.agent_rename_helpers import tree_snapshot
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
 AGENT = "harry"
 OLD = "@old:x"
@@ -197,12 +197,12 @@ async def _journal(storage_root: Path) -> Path:
     return database
 
 
-def _steps(database: Path, *, discard_new_principal: bool = False) -> list[SqliteEdit]:
+def _steps(database: Path, *, new_user_id: str = NEW, discard_new_principal: bool = False) -> list[SqliteEdit]:
     return journal_account_steps(
         database,
         agent=AGENT,
         old_user_id=OLD,
-        new_user_id=NEW,
+        new_user_id=new_user_id,
         discard_new_principal=discard_new_principal,
     )
 
@@ -258,6 +258,36 @@ async def test_rewrites_principal_senders_and_payloads(tmp_path: Path) -> None:
     assert _query(database, "SELECT * FROM room_member_joins ORDER BY principal_id") == [
         (NEW_PRINCIPAL, ROOM, NEW, 1, 1),
         (ROUTER, ROOM, NEW, 7, 0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_remote_ids_extending_the_old_id_are_left_alone(tmp_path: Path) -> None:
+    """IDs whose server name continues past the old ID are other users; the server's rename leaves them alone."""
+    database = await _journal(tmp_path)
+    remote = json.dumps({"sender": "@old:x.example.org", "body": "see @old:x:8448 and @old:xy, thanks @old:x."})
+    with closing(sqlite3.connect(database)) as connection, connection:
+        _event(connection, ROUTER, "$from-remote", sender="@old:x.example.org")
+        connection.execute("UPDATE journal_events SET source_json = ? WHERE event_id = '$from-remote'", (remote,))
+
+    _apply(_steps(database), tmp_path)
+
+    assert _query(database, "SELECT sender, source_json FROM journal_events WHERE event_id = '$from-remote'") == [
+        ("@old:x.example.org", remote.replace("thanks @old:x.", "thanks @new:x.")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_id_extending_the_old_id_is_adopted(tmp_path: Path) -> None:
+    """A new ID that starts with the old one does not count as a leftover of it."""
+    database = await _journal(tmp_path)
+    extended = "@old:x.renamed"
+
+    _apply(_steps(database, new_user_id=extended), tmp_path)
+
+    assert _query(database, "SELECT principal_id, sender FROM journal_events ORDER BY principal_id") == [
+        ("harry@@old:x.renamed", extended),
+        (ROUTER, extended),
     ]
 
 
@@ -440,6 +470,34 @@ async def test_planning_writes_nothing(tmp_path: Path) -> None:
 
     assert tree_snapshot(tmp_path) == before
     assert len(steps) == 1
+
+
+def _leave_wal_behind(database: Path, *, keep_shm: bool) -> None:
+    """Commit a new-principal row that only the WAL holds, as a MindRoom that crashed would leave it."""
+    connection = sqlite3.connect(database)
+    connection.execute("PRAGMA wal_autocheckpoint = 0")
+    with connection:
+        _event(connection, NEW_PRINCIPAL, "$only-in-wal", sender="@alice:x")
+    saved = {suffix: Path(f"{database}{suffix}").read_bytes() for suffix in ("", "-wal", "-shm")}
+    # Closing checkpoints the WAL into the main file and removes the WAL and its index; put them back.
+    connection.close()
+    for suffix, content in saved.items():
+        if suffix != "-shm" or keep_shm:
+            Path(f"{database}{suffix}").write_bytes(content)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keep_shm", [False, True], ids=["wal", "wal-and-shm"])
+async def test_planning_with_a_leftover_wal_reads_it_and_writes_nothing(tmp_path: Path, keep_shm: bool) -> None:
+    """Commits that only a leftover WAL holds are seen, and the live files are not touched."""
+    database = await _journal(tmp_path)
+    _leave_wal_behind(database, keep_shm=keep_shm)
+    before = tree_snapshot(tmp_path)
+
+    with pytest.raises(RenameRefusedError, match="journal_events: 1"):
+        _steps(database)
+
+    assert tree_snapshot(tmp_path) == before
 
 
 def test_missing_journal_needs_no_steps(tmp_path: Path) -> None:

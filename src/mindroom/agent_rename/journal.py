@@ -8,18 +8,27 @@ so the journal must hold the new ID everywhere the server now shows it.
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
-from contextlib import closing
+import tempfile
+from contextlib import closing, contextmanager
 from functools import partial
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from mindroom.agent_rename.matching import contains_user_id, replace_user_id
 from mindroom.agent_rename.steps import RenameRefusedError, SqliteEdit
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _PRINCIPAL_COLUMNS = frozenset({"principal_id", "responder_principal_id"})
 # Rows for replies MindRoom already sent to Matrix; discarding them would lose track of messages in the rooms.
 _SENT_REPLY_TABLES = ("reply_messages", "matrix_delivery_outbox")
 # Grants hash the old principal into their scope key, so a renamed grant could never match again.
 _GRANT_TABLES = ("approval_grants", "approval_grant_cards")
+
+type _SqliteValue = str | bytes | int | float | None
 
 
 def journal_account_steps(
@@ -43,9 +52,9 @@ def journal_account_steps(
     old_principal = f"{agent}@{old_user_id}"
     new_principal = f"{agent}@{new_user_id}"
     try:
-        with closing(_connect_read_only(database)) as connection:
+        with _read_only(database) as connection:
             new_rows = _principal_row_counts(connection, _text_columns(connection), new_principal)
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, OSError) as exc:
         msg = f"Cannot read the event journal {database}: {exc}"
         raise RenameRefusedError(msg) from exc
     _refuse_new_principal_rows(new_rows, new_principal=new_principal, discard=discard_new_principal)
@@ -67,17 +76,34 @@ def journal_account_steps(
     return [SqliteEdit(database=database, edit=edit, description=description)]
 
 
-def _connect_read_only(database: Path) -> sqlite3.Connection:
-    """Open the journal for reading without creating anything next to it.
+@contextmanager
+def _read_only(database: Path) -> Iterator[sqlite3.Connection]:
+    """Read the journal without writing anything next to it.
 
-    Even a read-only connection to a WAL database creates its ``-wal`` and ``-shm`` files.
+    Even a read-only connection to a WAL database creates its ``-wal`` and ``-shm`` files, or updates the ``-shm``.
     MindRoom removes both when it closes cleanly, leaving every commit in the main file, which ``immutable`` reads
-    exactly. Only when a ``-wal`` file is present can commits live outside the main file, so read through it then.
+    exactly. A ``-wal`` left behind by a running or crashed MindRoom can hold commits the main file lacks, so the
+    database and its WAL are copied to a temporary directory and read there; SQLite rebuilds the index from the WAL.
     """
-    uri = database.absolute().as_uri()
-    if Path(f"{database}-wal").exists():
-        return sqlite3.connect(f"{uri}?mode=ro", uri=True)
-    return sqlite3.connect(f"{uri}?immutable=1", uri=True)
+    wal = Path(f"{database}-wal")
+    if not wal.exists():
+        with closing(sqlite3.connect(f"{database.absolute().as_uri()}?immutable=1", uri=True)) as connection:
+            yield connection
+        return
+    with tempfile.TemporaryDirectory(prefix="mindroom-agent-rename-") as directory:
+        copy = Path(directory) / database.name
+        shutil.copyfile(database, copy)
+        shutil.copyfile(wal, f"{copy}-wal")
+        with closing(sqlite3.connect(copy)) as connection:
+            yield connection
+
+
+def _sql_contains_user_id(value: _SqliteValue, user_id: str) -> bool:
+    return isinstance(value, str) and contains_user_id(value, user_id)
+
+
+def _sql_replace_user_id(value: _SqliteValue, old_user_id: str, new_user_id: str) -> _SqliteValue:
+    return replace_user_id(value, old_user_id, new_user_id) if isinstance(value, str) else value
 
 
 def _quote(identifier: str) -> str:
@@ -105,6 +131,14 @@ def _text_columns(connection: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
         rows = connection.execute("SELECT name, type FROM pragma_table_info(?)", (name,)).fetchall()
         columns[name] = tuple(column for column, declared_type in rows if _holds_text(declared_type))
     return columns
+
+
+def _holds_user_id(quoted_column: str) -> str:
+    """Return a condition true when the column holds ``:old`` as a whole user ID.
+
+    ``instr`` runs first so the Python matcher only sees cells that contain the ID's text at all.
+    """
+    return f"instr({quoted_column}, :old) > 0 AND contains_user_id({quoted_column}, :old)"
 
 
 def _principal_match(columns: tuple[str, ...]) -> str:
@@ -162,6 +196,8 @@ def _rewrite(
     discard_new_principal: bool,
 ) -> None:
     """Move the journal to the new ID inside the caller's transaction; raising rolls everything back."""
+    connection.create_function("contains_user_id", 2, _sql_contains_user_id, deterministic=True)
+    connection.create_function("replace_user_id", 3, _sql_replace_user_id, deterministic=True)
     columns = _text_columns(connection)
     new_rows = _principal_row_counts(connection, columns, new_principal)
     _refuse_new_principal_rows(new_rows, new_principal=new_principal, discard=discard_new_principal)
@@ -212,8 +248,8 @@ def _replace_identity(
             else:
                 # A row whose rewrite would collide keeps the old ID, and the leftover check refuses it.
                 replacements.append(
-                    f"UPDATE OR IGNORE {quoted_table} SET {quoted} = replace({quoted}, :old, :new) "  # noqa: S608 - quoted schema identifiers
-                    f"WHERE instr({quoted}, :old) > 0",
+                    f"UPDATE OR IGNORE {quoted_table} SET {quoted} = replace_user_id({quoted}, :old, :new) "  # noqa: S608 - quoted schema identifiers
+                    f"WHERE {_holds_user_id(quoted)}",
                 )
     for statement in (*renames, *replacements):
         connection.execute(statement, names)
@@ -226,12 +262,12 @@ def _refuse_leftovers(
     old_user_id: str,
     new_user_id: str,
 ) -> None:
-    """Refuse when any text cell still holds the old ID, naming each table and column."""
+    """Refuse when any text cell still holds the old ID as a whole user ID, naming each table and column."""
     leftovers: list[str] = []
     for table, table_columns in columns.items():
         if not table_columns:
             continue
-        sums = ", ".join(f"sum(instr({_quote(column)}, :old) > 0)" for column in table_columns)
+        sums = ", ".join(f"sum({_holds_user_id(_quote(column))})" for column in table_columns)
         counts = connection.execute(f"SELECT {sums} FROM {_quote(table)}", {"old": old_user_id}).fetchone()  # noqa: S608 - quoted schema identifiers
         leftovers.extend(
             f"{table}.{column} ({count})" for column, count in zip(table_columns, counts, strict=True) if count

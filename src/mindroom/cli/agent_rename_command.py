@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path  # noqa: TC003 - Typer reads the option annotations at runtime
@@ -26,7 +27,9 @@ from .agents import (
 from .config import activate_cli_runtime
 
 if TYPE_CHECKING:
-    from mindroom.agent_rename.steps import RenamePlan
+    from collections.abc import Iterable
+
+    from mindroom.agent_rename.steps import FileRewrite, RenamePlan
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
@@ -343,6 +346,19 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
     index, index_reports, index_staying = index_steps(runtime_paths, config=config, old_name=old, new_name=new)
     worker_root_reports, unknown_roots = unknown_worker_reports(runtime_paths, old_name=old)
     account_step = matrix_state_key_step(runtime_paths, old_name=old, new_name=new)
+    env_steps = env_value_steps(
+        runtime_paths.env_path,
+        variable=_CONNECTIONS_AGENT_VARIABLE,
+        old_value=old,
+        new_value=new,
+    )
+    config_steps = config_entity_steps(
+        runtime_paths.config_path.expanduser(),
+        old_name=old,
+        new_name=new,
+        storage_root=storage,
+    )
+    _require_writable((*(() if account_step is None else (account_step,)), *env_steps, *config_steps))
     # The journal goes first: its edit checks again in its transaction, and a failing first step leaves nothing to undo.
     # The state root moves before the stores inside it are edited, matrix_state.yaml and .env follow every store, and
     # the config edit is the last reversible step, so a run killed before it still has the old name configured.
@@ -357,13 +373,8 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
         *worker_steps,
         *index,
         *(() if account_step is None else (account_step,)),
-        *env_value_steps(runtime_paths.env_path, variable=_CONNECTIONS_AGENT_VARIABLE, old_value=old, new_value=new),
-        *config_entity_steps(
-            runtime_paths.config_path.expanduser(),
-            old_name=old,
-            new_name=new,
-            storage_root=storage,
-        ),
+        *env_steps,
+        *config_steps,
     )
     # Final actions always run after every reversible step; listing them last shows that.
     steps = (
@@ -376,3 +387,24 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
         reports=(*side_reports, *worker_reports, *worker_root_reports, *index_reports),
         staying=(*side_staying, *unknown_roots, *index_staying),
     )
+
+
+def _require_writable(steps: Iterable[FileRewrite]) -> None:
+    """Refuse when this user cannot write a file the rename edits after every store moved, or the file's directory.
+
+    Failing on such a file would undo the whole rename, so the dry run already refuses.
+    A ``FileRewrite`` replaces its file with a new file written beside it, which needs the directory to be writable.
+    """
+    from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
+
+    for step in steps:
+        if not os.access(step.path, os.W_OK):
+            msg = f"Cannot write {step.path}, which the rename edits. Make it writable for this user and run again."
+        elif not os.access(step.path.parent, os.W_OK | os.X_OK):
+            msg = (
+                f"Cannot write in {step.path.parent}, where the rename replaces {step.path}. "
+                "Make the directory writable for this user and run again."
+            )
+        else:
+            continue
+        raise RenameRefusedError(msg)

@@ -316,6 +316,11 @@ The completed steps are undone first.
   The command also refuses when `matrix_state.yaml` already holds an account `agent_<NEW>` or when the journal already has rows for `NEW`.
   It refuses when any path or record it must create under the new name already exists, and names it.
 - **MindRoom is running.** The message reads `Stop MindRoom first: another process holds <lock file>`.
+- **A file it cannot write.**
+  The command edits `matrix_state.yaml`, `.env` and the config files after every store has moved, so it checks first that you can write each of them and its directory.
+  A failure there would undo the whole rename.
+  The message reads `Cannot write <file>, which the rename edits.` or `Cannot write in <directory>, where the rename replaces <file>.`
+  A config that is a symlink into a read-only store, such as the Nix store, is refused this way.
 - **A config edit it cannot make safely.**
   The message tells you to change it by hand, or says the edit could not be verified.
   - A value to change is a block scalar, an alias or include shares it with a place that does not name the agent, or an alias uses it as both a key and a value: `The value <value> in <file> (line N) ...; edit it by hand.`

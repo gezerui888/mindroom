@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
@@ -527,6 +528,38 @@ def test_refuses_while_mindroom_runs(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert result.exit_code == 1, result.output
     assert f"Stop MindRoom first: another process holds {lock_path}." in result.output
     assert tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root writes files whatever their mode")
+@pytest.mark.parametrize("locked", ["config", "env", "matrix_state", "config directory"])
+def test_files_it_cannot_write_refuse_before_any_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    locked: str,
+) -> None:
+    """A config, .env or matrix_state.yaml this user cannot write, or whose directory it cannot write, refuses early.
+
+    They are edited after every store moved, so the dry run refuses, and --apply refuses before it writes anything.
+    """
+    runtime_paths = _install(tmp_path, monkeypatch)
+    path = {
+        "config": runtime_paths.config_path,
+        "env": runtime_paths.env_path,
+        "matrix_state": matrix_state_file(runtime_paths),
+        "config directory": runtime_paths.config_path.parent,
+    }[locked]
+    mode = path.stat().st_mode
+    path.chmod(0o555 if path.is_dir() else 0o444)
+    try:
+        before = tree_snapshot(tmp_path)
+        for args in ((), ("--apply", "--yes")):
+            result = _invoke(runtime_paths, *args)
+
+            assert result.exit_code == 1, result.output
+            assert f"Cannot write {'in ' if path.is_dir() else ''}{path}" in " ".join(result.output.split())
+        assert tree_snapshot(tmp_path) == before
+    finally:
+        path.chmod(mode)
 
 
 def test_declining_the_confirmation_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

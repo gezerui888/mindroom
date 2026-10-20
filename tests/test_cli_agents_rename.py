@@ -38,15 +38,15 @@ from mindroom.session_storage.agent_storage import create_session_storage, get_a
 from mindroom.tool_system.worker_routing import agent_state_root_path, worker_dir_name
 from mindroom.workers import runtime as workers_runtime
 from mindroom.yaml_io import safe_load
-from tests import test_agent_rename_indexes as index_fixture
-from tests import test_agent_rename_memory as memory_fixture
-from tests import test_agent_rename_teams as team_fixture
+from tests.agent_rename_fixtures import indexes as index_fixture
+from tests.agent_rename_fixtures import teams as team_fixture
+from tests.agent_rename_fixtures.entity_state import seed_agent
+from tests.agent_rename_fixtures.journal import bound_principal, membership_admission, message_admission, record_turn
+from tests.agent_rename_fixtures.memory import install_memories, memory_config, visible_memories
+from tests.agent_rename_fixtures.side_stores import install_side_stores
+from tests.agent_rename_fixtures.workers import agent_worker_key, publish_credentials, read_credentials, write_worker
 from tests.agent_rename_helpers import tree_snapshot
 from tests.conftest import TEST_ACCESS_TOKEN, test_runtime_paths
-from tests.test_agent_rename_entity_state import _seed_agent
-from tests.test_agent_rename_journal_entity import _bound, _membership, _message, _record_turn
-from tests.test_agent_rename_side_stores import _install as _install_side_stores
-from tests.test_agent_rename_workers import _key, _publish, _read, _write_worker
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -133,12 +133,12 @@ async def _write_journal(database: Path) -> None:
     try:
         for principal_id in (OLD_PRINCIPAL, PREFIX_PRINCIPAL):
             stream = uuid4()
-            principal = await _bound(store, principal_id, stream)
-            batch = (_membership(None, "join", 0, 0), _message("$from-alice"))
+            principal = await bound_principal(store, principal_id, stream)
+            batch = (membership_admission(None, "join", 0, 0), message_admission("$from-alice"))
             await principal.admit_ingestion_batch(IngestionBatchAdmission(stream, 1, batch))
         for agent in (OLD, PREFIX):
-            await _record_turn(store, agent, "$from-alice", HistoryScope(kind="agent", scope_id=agent))
-        await _record_turn(store, HELPER, "$team", HistoryScope(kind="team", scope_id=f"team_{OLD}+{HELPER}"))
+            await record_turn(store, agent, "$from-alice", HistoryScope(kind="agent", scope_id=agent))
+        await record_turn(store, HELPER, "$team", HistoryScope(kind="team", scope_id=f"team_{OLD}+{HELPER}"))
     finally:
         await store.close()
 
@@ -174,11 +174,11 @@ def _seed(runtime_paths: RuntimePaths, *, journal: bool) -> None:
     if journal:
         asyncio.run(_write_journal(event_journal_sqlite_path(runtime_paths.storage_root)))
     for agent in (OLD, PREFIX):
-        _seed_agent(runtime_paths, agent)
+        seed_agent(runtime_paths, agent)
         workspace = agent_state_root_path(runtime_paths.storage_root, agent) / "workspace"
         workspace.mkdir(exist_ok=True)
         (workspace / "notes.md").write_text(f"{agent} notes\n", encoding="utf-8")
-        _write_worker(runtime_paths, _key("shared", agent))
+        write_worker(runtime_paths, agent_worker_key("shared", agent))
 
 
 def _install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, journal: bool = True) -> RuntimePaths:
@@ -193,29 +193,29 @@ def _full_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RuntimePat
     """Build a stopped install with a store of every family the rename carries, drops or reports."""
     _environment(monkeypatch, tmp_path)
     # Side stores: tracking records, automations, join fences, calls, avatars, workflows, todos, triggers, ...
-    _install_side_stores(tmp_path)
+    install_side_stores(tmp_path)
     # Memory in mem0's Chroma stores and memory files, of the agent, its configured team and an ad-hoc team.
-    memory_fixture._install(tmp_path)
+    install_memories(tmp_path)
     runtime_paths = test_runtime_paths(tmp_path)
     # Team history: configured teams and ad-hoc team scopes with and without the agent.
-    team_fixture._install(runtime_paths)
+    team_fixture.install_teams(runtime_paths)
     _seed(runtime_paths, journal=True)
     for agent in (OLD, PREFIX):
         # A requester's worker of the agent, and the OAuth credentials of the agent and of that requester's use of it.
-        _write_worker(runtime_paths, _key("user_agent", agent))
+        write_worker(runtime_paths, agent_worker_key("user_agent", agent))
         for scope in ("shared", "user_agent"):
-            asyncio.run(_publish(runtime_paths, scope, agent))
+            asyncio.run(publish_credentials(runtime_paths, scope, agent))
     # What the rename reports instead of changing: files of older versions, state from when the agent was private,
     # and plugin state named after it.
-    index_fixture._legacy_files(runtime_paths, OLD)
-    index_fixture._legacy_files(runtime_paths, PREFIX)
-    index_fixture._private_state_root(OLD, index_fixture._private_config(), runtime_paths)
+    index_fixture.legacy_files(runtime_paths, OLD)
+    index_fixture.legacy_files(runtime_paths, PREFIX)
+    index_fixture.private_state_root(OLD, index_fixture.private_config(), runtime_paths)
     for root in UNKNOWN_WORKERS.values():
         (runtime_paths.storage_root / "workers" / root / "workspace").mkdir(parents=True)
     # Derived state: the file-memory search index of the agent, and the Git directory of the checkout in its workspace.
-    file_memory = index_fixture._config(memory_backend="file", memory_search={"mode": "semantic"})
-    index_fixture._file_memory_index(OLD, file_memory, runtime_paths)
-    index_fixture._knowledge_git("handbook", index_fixture._git_config({"handbook": OLD}), runtime_paths)
+    file_memory = index_fixture.index_config(memory_backend="file", memory_search={"mode": "semantic"})
+    index_fixture.file_memory_index(OLD, file_memory, runtime_paths)
+    index_fixture.knowledge_git("handbook", index_fixture.git_config({"handbook": OLD}), runtime_paths)
     plugin_state = runtime_paths.storage_root / "plugins" / "demo" / f"{OLD}.json"
     plugin_state.parent.mkdir(parents=True)
     plugin_state.write_text("{}", encoding="utf-8")
@@ -339,26 +339,30 @@ def test_apply_renames_every_store(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         [(NEW,), (PREFIX,), (HELPER,)],
     )
     # History, memory and team history load under the new name through MindRoom's own code.
-    storage_db = create_session_storage(NEW, team_fixture._config(NEW), runtime_paths, execution_identity=None)
+    storage_db = create_session_storage(NEW, team_fixture.team_config(NEW), runtime_paths, execution_identity=None)
     try:
         session = get_agent_session(storage_db, "s1")
         assert session is not None
         assert [run.run_id for run in scope_visible_runs(session, HistoryScope(kind="agent", scope_id=NEW))] == ["r2"]
     finally:
         storage_db.close()
-    memories = memory_fixture._visible(NEW, memory_fixture._config(NEW), runtime_paths)
+    memories = visible_memories(NEW, memory_config(NEW), runtime_paths)
     assert memories[f"agent_{NEW}", "code prefers tabs"] == 1
     for team in (team_fixture.AD_HOC, team_fixture.CONFIGURED):
-        assert team_fixture._history(runtime_paths, team_fixture._config(NEW), team.renamed()).replayed == ["r2"]
+        assert team_fixture.team_history(runtime_paths, team_fixture.team_config(NEW), team.renamed()).replayed == [
+            "r2",
+        ]
     # Side stores, workers and credentials.
     new_root = agent_state_root_path(storage, NEW)
     assert (new_root / "workspace" / "notes.md").read_text(encoding="utf-8") == "code notes\n"
     assert resolve_agent_mode(runtime_paths, new_root, NEW, "s1") == "minimal"
     assert SyncContinuityStore(storage, NEW).load().pending_join_decrypt_fences == {"!code-fence:x"}
     for scope in ("shared", "user_agent"):
-        assert not (storage / "workers" / worker_dir_name(_key(scope, OLD))).exists()
-        assert (storage / "workers" / worker_dir_name(_key(scope, NEW)) / "workspace" / "notes.md").is_file()
-        assert asyncio.run(_read(runtime_paths, scope, NEW)) == {"token": f"{scope}-{OLD}"}
+        assert not (storage / "workers" / worker_dir_name(agent_worker_key(scope, OLD))).exists()
+        assert (
+            storage / "workers" / worker_dir_name(agent_worker_key(scope, NEW)) / "workspace" / "notes.md"
+        ).is_file()
+        assert asyncio.run(read_credentials(runtime_paths, scope, NEW)) == {"token": f"{scope}-{OLD}"}
 
     assert not list((storage / "knowledge_db").iterdir())
     assert knowledge_git_dir(storage, new_root / "workspace" / "docs").is_dir()
@@ -639,7 +643,7 @@ def test_existing_destination_refuses_and_points_at_a_manifest(
     if manifest is not None:
         old, new = (OLD, NEW) if manifest == "this rename" else (HELPER, "assistant")
         written = _write_manifest(_rename_plan(runtime_paths, old, new), "20261019T000000Z")
-    taken = runtime_paths.storage_root / "workers" / worker_dir_name(_key("shared", NEW))
+    taken = runtime_paths.storage_root / "workers" / worker_dir_name(agent_worker_key("shared", NEW))
     taken.mkdir()
     before = tree_snapshot(tmp_path)
 
@@ -658,7 +662,7 @@ async def _write_turns_only(database: Path) -> None:
     """Record a turn of the agent in a journal that holds no principal of it."""
     store = EventJournalStore.open_sqlite(database)
     try:
-        await _record_turn(store, OLD, "$from-alice", HistoryScope(kind="agent", scope_id=OLD))
+        await record_turn(store, OLD, "$from-alice", HistoryScope(kind="agent", scope_id=OLD))
     finally:
         await store.close()
 
@@ -737,5 +741,5 @@ def test_apply_retires_old_docker_workers_then_shuts_the_worker_manager_down(
 
     assert result.exit_code == 0, result.output
     assert _steps(result.output)[-1].startswith("Retire the old Docker worker")
-    assert manager.retired == [_key("shared", OLD)]
+    assert manager.retired == [agent_worker_key("shared", OLD)]
     assert events == ["lease", "shutdown"]

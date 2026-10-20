@@ -22,14 +22,11 @@ from mindroom.event_journal import (
     ApprovalCall,
     ApprovalContinuation,
     ApprovalDecision,
-    DepartureSource,
     EventClass,
     EventJournalStore,
     EventKind,
     InboundEvent,
     IngestionBatchAdmission,
-    IngestionRecordAdmission,
-    IngestionRecordDisposition,
     PrincipalStore,
     ProjectedEvent,
     encode_thread_id,
@@ -40,12 +37,18 @@ from mindroom.event_journal.opening import event_journal_sqlite_path
 from mindroom.event_journal.replies import PreparedReplyRow, ReplyRowRequest
 from mindroom.handled_turns import HandledTurnLedger, TurnRecord, _reset_handled_turn_ledger_runtime
 from mindroom.history.types import HistoryScope
-from mindroom.message_target import MessageTarget
 from mindroom.reply_presentation import Presentation, Segment, current_answer, decode_presentation, encode_presentation
 from mindroom.response_sources import ResponseSources
 from mindroom.teams import _TeamStreamPresentation
 from mindroom.tool_jobs.runtime import BackgroundJob
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
+from tests.agent_rename_fixtures.journal import (
+    ROOM,
+    bound_principal,
+    membership_admission,
+    message_admission,
+    record_turn,
+)
 from tests.agent_rename_helpers import tree_snapshot
 from tests.approval_continuation_helpers import approval_continuation
 from tests.conftest import message_origin
@@ -65,7 +68,6 @@ OLD_PRINCIPAL = "code@@code:x"
 NEW_PRINCIPAL = "zeta@@code:x"
 PREFIX_PRINCIPAL = "code_team@@code_team:x"
 HELPER_PRINCIPAL = "helper@@helper:x"
-ROOM = "!room:x"
 UNTHREADED = encode_thread_id(None)
 NOW = datetime(2026, 10, 20, 12, 0, 0, tzinfo=UTC)
 # The scope a requester-partitioned ad-hoc team gets when one member is private (history/team_scope.py).
@@ -122,50 +124,14 @@ def _insert(connection: sqlite3.Connection, table: str, **values: object) -> Non
     connection.execute(f"INSERT INTO {table} ({columns}) VALUES ({marks})", tuple(values.values()))  # noqa: S608
 
 
-def _membership(previous: str | None, current: str, previous_epoch: int, epoch: int) -> IngestionRecordAdmission:
-    """One own-membership transition in the room, as the sync stream reports it."""
-    return IngestionRecordAdmission(
-        IngestionRecordDisposition.ROOM_LIFECYCLE,
-        source=DepartureSource.REPORTED,
-        room_id=ROOM,
-        previous_membership=previous,
-        membership=current,
-        previous_membership_epoch=previous_epoch,
-        membership_epoch=epoch,
-    )
-
-
-def _message(event_id: str) -> IngestionRecordAdmission:
-    """One message from alice in the room that the bot may answer."""
-    event = InboundEvent(
-        event_id=event_id,
-        room_id=ROOM,
-        thread_id=None,
-        kind=EventKind.MESSAGE,
-        event_class=EventClass.ACTIONABLE,
-        sender="@alice:x",
-        origin_server_ts=10,
-        source={"event_id": event_id, "sender": "@alice:x"},
-    )
-    return IngestionRecordAdmission(IngestionRecordDisposition.SEMANTIC_EVENT, event=event)
-
-
-async def _bound(store: EventJournalStore, principal_id: str, stream: UUID) -> PrincipalStore:
-    """Bind ``stream`` to the principal, as a device's first start does."""
-    principal = store.principal(principal_id)
-    consumer = await principal.load_or_create_ingestion_consumer(new_generation=uuid4())
-    await principal.bind_ingestion_stream(generation=consumer.generation, stream_id=stream)
-    return principal
-
-
 async def _synced_journal(database: Path) -> tuple[UUID, UUID]:
     """Sync one batch for the agent and for the prefix agent; return the agent's stream and consumer generation."""
     stream = uuid4()
     store = EventJournalStore.open_sqlite(database)
     try:
         for principal_id, principal_stream in ((OLD_PRINCIPAL, stream), (PREFIX_PRINCIPAL, uuid4())):
-            principal = await _bound(store, principal_id, principal_stream)
-            batch = (_membership(None, "join", 0, 0), _message("$from-alice"))
+            principal = await bound_principal(store, principal_id, principal_stream)
+            batch = (membership_admission(None, "join", 0, 0), message_admission("$from-alice"))
             await principal.admit_ingestion_batch(IngestionBatchAdmission(principal_stream, 1, batch))
         consumer = await store.principal(OLD_PRINCIPAL).load_or_create_ingestion_consumer(new_generation=uuid4())
     finally:
@@ -219,9 +185,9 @@ async def test_principal_and_its_sync_stream_are_renamed_and_the_stream_continue
         )
         await renamed.bind_ingestion_stream(generation=generation, stream_id=stream)
         redelivered = await renamed.admit_ingestion_batch(
-            IngestionBatchAdmission(stream, 2, (_message("$from-alice"),)),
+            IngestionBatchAdmission(stream, 2, (message_admission("$from-alice"),)),
         )
-        fresh = await renamed.admit_ingestion_batch(IngestionBatchAdmission(stream, 3, (_message("$next"),)))
+        fresh = await renamed.admit_ingestion_batch(IngestionBatchAdmission(stream, 3, (message_admission("$next"),)))
         history = await renamed.load_event("$from-alice")
     finally:
         await store.close()
@@ -229,25 +195,6 @@ async def test_principal_and_its_sync_stream_are_renamed_and_the_stream_continue
     assert not redelivered.semantic_event_new
     assert fresh.semantic_event_new
     assert history is not None
-
-
-def _target(event_id: str) -> MessageTarget:
-    return MessageTarget.resolve(ROOM, None, event_id)
-
-
-async def _record_turn(store: EventJournalStore, agent: str, event_id: str, scope: HistoryScope) -> None:
-    """Record ``agent``'s answer to ``event_id`` the way the bot does, through its handled-turn ledger."""
-    ledger = HandledTurnLedger(agent, records=store.turn_records(agent))
-    await ledger.load()
-    await ledger.record_handled_turn(
-        TurnRecord.create(
-            [event_id],
-            response_event_id=f"$answer-{agent}-{event_id}",
-            response_owner=agent,
-            history_scope=scope,
-            conversation_target=_target(event_id),
-        ),
-    )
 
 
 async def _turn_record(database: Path, agent: str, event_id: str) -> TurnRecord | None:
@@ -269,8 +216,8 @@ async def test_turn_handled_under_the_old_name_is_handled_under_the_new_name(tmp
     database = event_journal_sqlite_path(tmp_path)
     store = EventJournalStore.open_sqlite(database)
     try:
-        await _record_turn(store, OLD, "$from-alice", HistoryScope(kind="agent", scope_id=OLD))
-        await _record_turn(store, PREFIX, "$from-alice", HistoryScope(kind="agent", scope_id=PREFIX))
+        await record_turn(store, OLD, "$from-alice", HistoryScope(kind="agent", scope_id=OLD))
+        await record_turn(store, PREFIX, "$from-alice", HistoryScope(kind="agent", scope_id=PREFIX))
     finally:
         await store.close()
     prefix_record = await _turn_record(database, PREFIX, "$from-alice")
@@ -305,7 +252,7 @@ async def test_ad_hoc_team_scopes_take_the_recomputed_id(tmp_path: Path) -> None
     store = EventJournalStore.open_sqlite(database)
     try:
         for event_id, (agent, scope_id) in scopes.items():
-            await _record_turn(store, agent, event_id, HistoryScope(kind="team", scope_id=scope_id))
+            await record_turn(store, agent, event_id, HistoryScope(kind="team", scope_id=scope_id))
     finally:
         await store.close()
 
@@ -789,8 +736,8 @@ async def test_journal_naming_only_other_agents_needs_no_step(tmp_path: Path) ->
     database = event_journal_sqlite_path(tmp_path)
     store = EventJournalStore.open_sqlite(database)
     try:
-        await _bound(store, PREFIX_PRINCIPAL, uuid4())
-        await _record_turn(store, PREFIX, "$from-alice", HistoryScope(kind="team", scope_id=f"team_{PREFIX}+{HELPER}"))
+        await bound_principal(store, PREFIX_PRINCIPAL, uuid4())
+        await record_turn(store, PREFIX, "$from-alice", HistoryScope(kind="team", scope_id=f"team_{PREFIX}+{HELPER}"))
     finally:
         await store.close()
 
@@ -824,7 +771,7 @@ async def test_rows_already_under_the_new_principal_refuse(tmp_path: Path) -> No
     await _synced_journal(database)
     store = EventJournalStore.open_sqlite(database)
     try:
-        await _bound(store, "zeta@@zeta:x", uuid4())
+        await bound_principal(store, "zeta@@zeta:x", uuid4())
     finally:
         await store.close()
     before = _rows(database)
@@ -842,8 +789,8 @@ async def test_turn_records_already_under_the_new_name_refuse(tmp_path: Path) ->
     database = event_journal_sqlite_path(tmp_path)
     store = EventJournalStore.open_sqlite(database)
     try:
-        await _record_turn(store, OLD, "$from-alice", HistoryScope(kind="agent", scope_id=OLD))
-        await _record_turn(store, NEW, "$other", HistoryScope(kind="agent", scope_id=NEW))
+        await record_turn(store, OLD, "$from-alice", HistoryScope(kind="agent", scope_id=OLD))
+        await record_turn(store, NEW, "$other", HistoryScope(kind="agent", scope_id=NEW))
     finally:
         await store.close()
 
@@ -859,7 +806,7 @@ async def test_new_principal_rows_written_after_planning_refuse_at_apply(tmp_pat
     steps = _steps(database)
     store = EventJournalStore.open_sqlite(database)
     try:
-        await _bound(store, NEW_PRINCIPAL.replace(USER_ID, "@zeta:x"), uuid4())
+        await bound_principal(store, NEW_PRINCIPAL.replace(USER_ID, "@zeta:x"), uuid4())
     finally:
         await store.close()
     before = _rows(database)
@@ -877,7 +824,7 @@ async def test_team_scope_listing_both_names_refuses(tmp_path: Path) -> None:
     database = event_journal_sqlite_path(tmp_path)
     store = EventJournalStore.open_sqlite(database)
     try:
-        await _record_turn(store, HELPER, "$team", HistoryScope(kind="team", scope_id=f"team_{OLD}+{HELPER}+{NEW}"))
+        await record_turn(store, HELPER, "$team", HistoryScope(kind="team", scope_id=f"team_{OLD}+{HELPER}+{NEW}"))
     finally:
         await store.close()
 

@@ -213,7 +213,7 @@ def _manifest_of_this_rename(storage_root: Path, rename: _AgentRename) -> Path |
     from mindroom.tool_system.worker_routing import agent_state_root_path  # noqa: PLC0415
 
     # config_edit.config_entity_steps describes its edit like this.
-    config_edit = f"Rename the agent {rename.old} to {rename.new} in "
+    config_step = f"Rename the agent {rename.old} to {rename.new} in "
     state_root_move = (
         str(agent_state_root_path(storage_root, rename.old)),
         str(agent_state_root_path(storage_root, rename.new)),
@@ -224,18 +224,18 @@ def _manifest_of_this_rename(storage_root: Path, rename: _AgentRename) -> Path |
         except (OSError, ValueError):
             continue
         steps = recorded.get("steps") if isinstance(recorded, dict) else None
-        if isinstance(steps, list) and any(_is_step_of(step, config_edit, state_root_move) for step in steps):
+        if isinstance(steps, list) and any(_is_step_of(step, config_step, state_root_move) for step in steps):
             return manifest
     return None
 
 
-def _is_step_of(step: object, config_edit: str, state_root_move: tuple[str, str]) -> bool:
+def _is_step_of(step: object, config_step: str, state_root_move: tuple[str, str]) -> bool:
     """Whether a manifest step is the given config edit or state root move."""
     if not isinstance(step, dict):
         return False
     entry = cast("dict[str, object]", step)
     moved = (entry.get("source"), entry.get("destination"))
-    return moved == state_root_move or str(entry.get("description")).startswith(config_edit)
+    return moved == state_root_move or str(entry.get("description")).startswith(config_step)
 
 
 def _unfinished_rename_hint(rename: _AgentRename, manifest: Path) -> str:

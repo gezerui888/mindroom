@@ -14,11 +14,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from agno.db.sqlite import SqliteDb
-from agno.metrics import RunMetrics
-from agno.models.message import Message
-from agno.run.agent import RunOutput, RunStartedEvent
-from agno.run.base import RunStatus
 from agno.session.agent import AgentSession
 
 from mindroom import constants
@@ -35,32 +30,32 @@ from mindroom.agent_rename.steps import (
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.constants import matrix_state_file
-from mindroom.history import summary_rows
 from mindroom.history.replay import current_summary_text, scope_visible_runs
 from mindroom.history.storage import (
-    add_pending_force_compaction_scope,
     has_queued_force_compaction,
     read_scope_seen_event_ids,
-    read_scope_state,
-    set_force_compaction_state,
-    update_scope_seen_event_ids,
 )
 from mindroom.history.types import HistoryScope
 from mindroom.matrix.state import MatrixState
 from mindroom.session_storage.agent_storage import (
     create_session_storage,
-    create_state_storage,
     get_agent_session,
 )
-from mindroom.tool_system.worker_routing import agent_state_root_path
 from mindroom.usage.stats import collect_admin_usage
+from tests.agent_rename_fixtures.entity_state import (
+    ALICE,
+    SESSION,
+    agent_root,
+    agent_run,
+    learning_storage,
+    seed_agent,
+    session_storage,
+)
 from tests.agent_rename_helpers import SQLITE_SIDE_FILES, sqlite_schema, tree_rows
 from tests.conftest import TEST_ACCESS_TOKEN, seed_session, test_runtime_paths
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-    from agno.db.base import BaseDb
 
     from mindroom.agent_rename.steps import Step
     from mindroom.constants import RuntimePaths
@@ -69,8 +64,6 @@ OLD = "code"
 NEW = "coder"
 # Its name extends the renamed agent's, so a substring match would wrongly touch it.
 PREFIX = "code_team"
-ALICE = "@alice:x"
-SESSION = "s1"
 NOW = datetime(2026, 10, 20, 9, 30, 0, tzinfo=UTC)
 
 # The compaction archive every release from #2351 to v2026.10.340 created beside the sessions table.
@@ -86,102 +79,12 @@ _ARCHIVE_DDL = (
 )
 
 
-def _root(runtime_paths: RuntimePaths, agent: str) -> Path:
-    return agent_state_root_path(runtime_paths.storage_root, agent)
-
-
-def _sessions(runtime_paths: RuntimePaths, agent: str) -> BaseDb:
-    return create_state_storage(
-        agent,
-        _root(runtime_paths, agent),
-        subdir="sessions",
-        session_table=f"{agent}_sessions",
-    )
-
-
-def _learning(runtime_paths: RuntimePaths, agent: str) -> SqliteDb:
-    storage = create_state_storage(
-        agent,
-        _root(runtime_paths, agent),
-        subdir="learning",
-        session_table=f"{agent}_learning_sessions",
-    )
-    assert isinstance(storage, SqliteDb)
-    return storage
-
-
-def _run(agent: str, run_id: str) -> RunOutput:
-    return RunOutput(
-        run_id=run_id,
-        agent_id=agent,
-        agent_name=agent.title(),
-        session_id=SESSION,
-        user_id=ALICE,
-        status=RunStatus.completed,
-        model="test-model",
-        model_provider="test-provider",
-        content=f"answer {run_id}",
-        messages=[Message(role="user", content=f"question {run_id}"), Message(role="assistant", content="answer")],
-        metrics=RunMetrics(input_tokens=2, output_tokens=3, total_tokens=5),
-        events=[RunStartedEvent(agent_id=agent, run_id=run_id, session_id=SESSION)],
-        metadata={constants.MATRIX_SEEN_EVENT_IDS_METADATA_KEY: [f"${run_id}"]},
-    )
-
-
-def _seed_agent(runtime_paths: RuntimePaths, agent: str) -> None:
-    """Write an agent's history and learnings the way MindRoom does: two runs, the first summarized."""
-    scope = HistoryScope(kind="agent", scope_id=agent)
-    session = AgentSession(
-        session_id=SESSION,
-        agent_id=agent,
-        user_id=ALICE,
-        # Written like agno/agent/_storage.py's get_agent_data.
-        agent_data={"name": agent.title(), "agent_id": agent},
-        # An agent's own session state may hold any value, even one spelled like a scope key.
-        session_data={"session_state": add_pending_force_compaction_scope({"target": f"agent:{agent}"}, scope)},
-        metadata={},
-        runs=[_run(agent, "r1"), _run(agent, "r2")],
-    )
-    update_scope_seen_event_ids(session, scope, ["$preserved"])
-    set_force_compaction_state(session, scope, read_scope_state(session, scope), force=True)
-    # Another scope whose name extends this agent's keeps its own state.
-    update_scope_seen_event_ids(session, HistoryScope(kind="agent", scope_id=f"{agent}_team"), ["$other"])
-    storage = _sessions(runtime_paths, agent)
-    try:
-        seed_session(storage, session)
-        covered = summary_rows.covered_runs(storage, session_id=SESSION, run_ids=["r1"])
-        summary_rows.append_summary(
-            storage,
-            session_id=SESSION,
-            scope_key=scope.key,
-            based_on=None,
-            covered=covered,
-            summary=f"summary of {agent}'s r1",
-            summary_model="test-model",
-        )
-    finally:
-        storage.close()
-    learning = _learning(runtime_paths, agent)
-    try:
-        learning.upsert_learning(
-            id=f"user_memory_{agent}",
-            learning_type="user_memory",
-            content={"memories": [f"{agent} learned this"]},
-            user_id=ALICE,
-            agent_id=agent,
-        )
-        # Creates the learning store's sessions table, which the rename covers too.
-        learning.upsert_session(AgentSession(session_id=SESSION, agent_id=agent, user_id=ALICE))
-    finally:
-        learning.close()
-
-
 def _install(tmp_path: Path) -> RuntimePaths:
     runtime_paths = test_runtime_paths(tmp_path)
     for agent in (OLD, PREFIX):
-        _seed_agent(runtime_paths, agent)
-        (_root(runtime_paths, agent) / "workspace").mkdir()
-        (_root(runtime_paths, agent) / "workspace" / "notes.md").write_text(f"{agent} notes\n", encoding="utf-8")
+        seed_agent(runtime_paths, agent)
+        (agent_root(runtime_paths, agent) / "workspace").mkdir()
+        (agent_root(runtime_paths, agent) / "workspace" / "notes.md").write_text(f"{agent} notes\n", encoding="utf-8")
     return runtime_paths
 
 
@@ -235,7 +138,7 @@ def _crashed_install(tmp_path: Path, crash: str | None) -> RuntimePaths:
     runtime_paths = _install(tmp_path)
     if crash is not None:
         suffix, work = _CRASHES[crash]
-        database = _root(runtime_paths, OLD) / "sessions" / f"{OLD}.db"
+        database = agent_root(runtime_paths, OLD) / "sessions" / f"{OLD}.db"
         _crash_copy(database, suffix, work)
         assert Path(f"{database}{suffix}").exists()
     return runtime_paths
@@ -264,21 +167,21 @@ def test_history_visible_to_new_name(tmp_path: Path) -> None:
         assert has_queued_force_compaction(storage, SESSION, scope)
     finally:
         storage.close()
-    learning = _learning(runtime_paths, NEW)
+    learning = learning_storage(runtime_paths, NEW)
     try:
         learnings = learning.get_learnings(agent_id=NEW)
     finally:
         learning.close()
     assert [row["content"] for row in learnings] == [{"memories": ["code learned this"]}]
-    assert not _root(runtime_paths, OLD).exists()
-    assert (_root(runtime_paths, NEW) / "workspace" / "notes.md").read_text(encoding="utf-8") == "code notes\n"
+    assert not agent_root(runtime_paths, OLD).exists()
+    assert (agent_root(runtime_paths, NEW) / "workspace" / "notes.md").read_text(encoding="utf-8") == "code notes\n"
 
 
 def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
     """Every table, index and schema-version row of the agent's sessions and learning takes the new name."""
     runtime_paths = _install(tmp_path)
-    old_sessions = _root(runtime_paths, OLD) / "sessions" / f"{OLD}.db"
-    old_learning = _root(runtime_paths, OLD) / "learning" / f"{OLD}.db"
+    old_sessions = agent_root(runtime_paths, OLD) / "sessions" / f"{OLD}.db"
+    old_learning = agent_root(runtime_paths, OLD) / "learning" / f"{OLD}.db"
     with closing(sqlite3.connect(old_sessions)) as connection:
         # Agno also writes partial unique indexes named ``<table>_<name>``; one must keep its clauses.
         connection.execute(
@@ -297,8 +200,8 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
     steps = entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
     _apply(runtime_paths, steps)
 
-    sessions = _root(runtime_paths, NEW) / "sessions" / f"{NEW}.db"
-    learning = _root(runtime_paths, NEW) / "learning" / f"{NEW}.db"
+    sessions = agent_root(runtime_paths, NEW) / "sessions" / f"{NEW}.db"
+    learning = agent_root(runtime_paths, NEW) / "learning" / f"{NEW}.db"
     assert [type(step) for step in steps] == [MovePath, SqliteEdit, MovePath, SqliteEdit, MovePath]
     assert sqlite_schema(sessions) == expected_sessions
     assert {name for _type, name, _table, _sql in expected_sessions} >= {
@@ -367,7 +270,7 @@ def test_usage_stats_find_new_db(tmp_path: Path) -> None:
 def test_prefix_agent_untouched(tmp_path: Path) -> None:
     """Renaming ``code`` plans nothing on ``code_team`` and leaves its state root as it was."""
     runtime_paths = _install(tmp_path)
-    prefix_root = _root(runtime_paths, PREFIX)
+    prefix_root = agent_root(runtime_paths, PREFIX)
     before = tree_rows(prefix_root)
 
     steps = entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
@@ -477,14 +380,14 @@ def test_existing_destination_refuses(tmp_path: Path) -> None:
     runtime_paths = _install(tmp_path)
     for suffix in ("", *SQLITE_SIDE_FILES):
         # A stale write-ahead log under the new name would be replayed onto the renamed database.
-        stale = _root(runtime_paths, OLD) / "sessions" / f"{NEW}.db{suffix}"
+        stale = agent_root(runtime_paths, OLD) / "sessions" / f"{NEW}.db{suffix}"
         stale.touch()
         with pytest.raises(RenameRefusedError, match=str(stale)):
             entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
         stale.unlink()
 
-    _root(runtime_paths, NEW).mkdir()
-    with pytest.raises(RenameRefusedError, match=str(_root(runtime_paths, NEW))):
+    agent_root(runtime_paths, NEW).mkdir()
+    with pytest.raises(RenameRefusedError, match=str(agent_root(runtime_paths, NEW))):
         entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
 
 
@@ -518,10 +421,10 @@ def test_failure_after_any_step_restores_the_tree(tmp_path: Path, crash: str | N
 def _legacy_install(tmp_path: Path) -> RuntimePaths:
     """Return an install whose session database an older release left: Agno 2 blob runs and a compaction archive."""
     runtime_paths = test_runtime_paths(tmp_path)
-    storage = _sessions(runtime_paths, OLD)
-    seed_session(storage, AgentSession(session_id=SESSION, agent_id=OLD, user_id=ALICE, runs=[_run(OLD, "r2")]))
+    storage = session_storage(runtime_paths, OLD)
+    seed_session(storage, AgentSession(session_id=SESSION, agent_id=OLD, user_id=ALICE, runs=[agent_run(OLD, "r2")]))
     storage.close()
-    with closing(sqlite3.connect(_root(runtime_paths, OLD) / "sessions" / f"{OLD}.db")) as connection:
+    with closing(sqlite3.connect(agent_root(runtime_paths, OLD) / "sessions" / f"{OLD}.db")) as connection:
         connection.execute("DROP TABLE code_sessions_summaries")
         connection.execute("DROP TABLE code_sessions_removed_runs")
         for statement in _ARCHIVE_DDL:
@@ -534,11 +437,14 @@ def _legacy_install(tmp_path: Path) -> RuntimePaths:
         connection.execute(
             "INSERT INTO code_sessions_compacted_runs (compaction_id, session_id, run_id, run_type, event_ids, "
             "seen_event_ids, run_data) VALUES (1, ?, 'r1', 'agent', '[\"$r1\"]', '[\"$r1\"]', ?)",
-            (SESSION, json.dumps(_run(OLD, "r1").to_dict())),
+            (SESSION, json.dumps(agent_run(OLD, "r1").to_dict())),
         )
         # Databases Agno 2 created keep their runs blob, encoded twice.
         connection.execute("ALTER TABLE code_sessions ADD COLUMN runs JSON")
-        connection.execute("UPDATE code_sessions SET runs = ?", (json.dumps(json.dumps([_run(OLD, "r0").to_dict()])),))
+        connection.execute(
+            "UPDATE code_sessions SET runs = ?",
+            (json.dumps(json.dumps([agent_run(OLD, "r0").to_dict()])),),
+        )
         connection.commit()
     return runtime_paths
 
@@ -546,7 +452,7 @@ def _legacy_install(tmp_path: Path) -> RuntimePaths:
 def _replay(runtime_paths: RuntimePaths, agent: str) -> tuple[str | None, list[str | None], set[str]]:
     """Open the agent's sessions as MindRoom does and return its summary, replayed runs and seen events."""
     scope = HistoryScope(kind="agent", scope_id=agent)
-    storage = _sessions(runtime_paths, agent)
+    storage = session_storage(runtime_paths, agent)
     try:
         session = get_agent_session(storage, SESSION)
         assert session is not None
@@ -577,7 +483,7 @@ def test_separate_session_storage_moves_too(tmp_path: Path) -> None:
         process_env={**base.process_env, "MINDROOM_SESSION_STORAGE_PATH": str(session_root)},
     )
     storage = create_session_storage(OLD, Config(agents={OLD: AgentConfig(display_name="Code")}), runtime_paths, None)
-    seed_session(storage, AgentSession(session_id=SESSION, agent_id=OLD, user_id=ALICE, runs=[_run(OLD, "r1")]))
+    seed_session(storage, AgentSession(session_id=SESSION, agent_id=OLD, user_id=ALICE, runs=[agent_run(OLD, "r1")]))
     storage.close()
     assert (session_root / "agents" / OLD / "sessions" / f"{OLD}.db").is_file()
 
@@ -600,7 +506,7 @@ def test_crash_left_side_files_are_resolved_before_the_rename(tmp_path: Path, cr
 
     _apply(runtime_paths, entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW))
 
-    sessions = _root(runtime_paths, NEW) / "sessions"
+    sessions = agent_root(runtime_paths, NEW) / "sessions"
     with closing(sqlite3.connect(sessions / f"{NEW}.db")) as connection:
         assert connection.execute("SELECT agent_id, user_id FROM coder_sessions").fetchall() == [(NEW, user_id)]
         assert ("filler",) not in connection.execute("SELECT name FROM sqlite_master").fetchall()

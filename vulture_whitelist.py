@@ -423,3 +423,5 @@ _._reject_non_finite_numbers  # Pydantic field validator (src/mindroom/api/scrip
 entity_credential_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/entity_files.py)
 config_entity_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/config_edit.py)
 env_value_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/config_edit.py)
+entity_state_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/entity_state.py)
+matrix_state_key_step  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/entity_state.py)

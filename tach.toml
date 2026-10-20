@@ -9366,6 +9366,15 @@ depends_on = ["mindroom.agent_rename.workers", "mindroom.tool_system.worker_rout
 expose = ["entity_credential_steps", "rewrite_worker_key_agent"]
 from = ["mindroom.agent_rename.entity_files"]
 
+# Moves an agent's state root and renames its session and learning databases and its Matrix account key.
+[[modules]]
+path = "mindroom.agent_rename.entity_state"
+depends_on = ["mindroom.agent_rename.workers", "mindroom.constants", "mindroom.tool_system.worker_routing"]
+
+[[interfaces]]
+expose = ["entity_state_steps", "matrix_state_key_step"]
+from = ["mindroom.agent_rename.entity_state"]
+
 # Edits the config, its includes, and its `.env` as text for both rename commands.
 [[modules]]
 path = "mindroom.agent_rename.config_edit"

@@ -24,7 +24,7 @@ from mindroom.agent_rename.steps import DropPath, FileRewrite, FinalAction, Move
 from mindroom.constants import matrix_state_file, primary_records_dir, resolve_session_state_root
 from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME, scoped_credentials_dir_part
 from mindroom.desktop.native_config import native_config_path
-from mindroom.matrix.client_session import olm_store_dir
+from mindroom.matrix.client_session import olm_store_dir, olm_store_exists
 from mindroom.matrix.identity import MatrixID, managed_account_key
 from mindroom.matrix.personal_room_store import personal_room_digest
 from mindroom.private_storage.private_instance_identity_store import (
@@ -204,13 +204,21 @@ def _field(value: object, name: str) -> object:
     return cast("dict[str, object]", value).get(name) if isinstance(value, dict) else None
 
 
-def matrix_state_steps(runtime_paths: RuntimePaths, *, agent: str, new_user_id: str) -> tuple[list[Step], list[str]]:
+def matrix_state_steps(
+    runtime_paths: RuntimePaths,
+    *,
+    agent: str,
+    old_user_id: str,
+    new_user_id: str,
+) -> tuple[list[Step], list[str]]:
     """Return the step that points ``agent``'s stored account at ``new_user_id``, and report lines.
 
     MindRoom takes the agent's Matrix ID from this username, so the step belongs last among the reversible ones:
     a run killed before it still shows the old ID.
-    An account whose username was already changed by hand logged in as the new ID, so it gets no step
-    and keeps its device and token.
+    An account whose username was already changed by hand keeps the device it logged in with as the new ID.
+    A device whose crypto store is under ``old_user_id`` came from the old login instead, because the username was
+    changed without it; MindRoom refuses to start a device without a store under its ID, so that one is dropped.
+    No step means the stored device stays.
     Refuses when ``matrix_state.yaml`` holds no account for ``agent``.
     """
     path = matrix_state_file(runtime_paths)
@@ -221,14 +229,24 @@ def matrix_state_steps(runtime_paths: RuntimePaths, *, agent: str, new_user_id: 
         msg = f"{path} holds no account {account_key}, so there is no Matrix account to adopt."
         raise RenameRefusedError(msg)
     username = MatrixID.parse(new_user_id).username
-    if _field(accounts[account_key], "username") == username:
-        return [], [f"{path} already names {new_user_id} for {account_key}; its device and access token stay."]
-    step = FileRewrite(
-        path,
-        partial(_adopt_matrix_account, account_key=account_key, username=username),
-        f"Set the username of {account_key} in {path} to {username} and drop its old device and access token",
-    )
-    return [step], []
+    adopt = partial(_adopt_matrix_account, account_key=account_key, username=username)
+    if _field(accounts[account_key], "username") != username:
+        description = (
+            f"Set the username of {account_key} in {path} to {username} and drop its old device and access token"
+        )
+        return [FileRewrite(path, adopt, description)], []
+    device_id = _field(accounts[account_key], "device_id")
+    if (
+        isinstance(device_id, str)
+        and olm_store_exists(old_user_id, device_id, runtime_paths)
+        and not olm_store_exists(new_user_id, device_id, runtime_paths)
+    ):
+        description = (
+            f"Drop the device {device_id} and access token of {account_key} in {path}, "
+            f"which belong to {old_user_id}, so the next start logs in on a fresh device"
+        )
+        return [FileRewrite(path, adopt, description)], []
+    return [], [f"{path} already names {new_user_id} for {account_key}; its device and access token stay."]
 
 
 def _adopt_matrix_account(content: bytes, *, account_key: str, username: str) -> bytes:

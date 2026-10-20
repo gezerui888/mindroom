@@ -457,14 +457,20 @@ def _plan(
     from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415
 
     old_user_id, new_user_id = adoption.old_user_id, adoption.new_user_id
+    account_steps, account_reports = matrix_state_steps(
+        runtime_paths,
+        agent=adoption.agent,
+        old_user_id=old_user_id,
+        new_user_id=new_user_id,
+    )
     journal_steps, journal_reports = journal_account_steps(
         event_journal_sqlite_path(runtime_paths.storage_root),
         agent=adoption.agent,
         old_user_id=old_user_id,
         new_user_id=new_user_id,
         discard_new_principal=discard_new_principal,
-        # matrix_state_steps keeps the device of an account whose username already names the new ID.
-        new_device_kept=adoption.stored_user_id == new_user_id,
+        # Without a step for matrix_state.yaml the account keeps the device it uses under the new ID.
+        new_device_kept=not account_steps,
     )
     file_steps, reports = account_file_steps(
         runtime_paths,
@@ -475,7 +481,6 @@ def _plan(
         discard_new_identity_state=discard_new_principal,
     )
     config_steps = config_value_steps(runtime_paths.config_path, old_value=old_user_id, new_value=new_user_id)
-    account_steps, account_reports = matrix_state_steps(runtime_paths, agent=adoption.agent, new_user_id=new_user_id)
     final_steps = [step for step in file_steps if isinstance(step, FinalAction)]
     # The journal edit goes first: some of its collisions only show up when it runs,
     # and a failing first step leaves nothing to undo.

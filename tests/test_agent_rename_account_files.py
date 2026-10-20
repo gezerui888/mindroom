@@ -112,7 +112,7 @@ def _steps(runtime_paths: RuntimePaths, *, discard: bool = False) -> tuple[list[
         config=Config(),
         discard_new_identity_state=discard,
     )
-    account_steps, account_reports = matrix_state_steps(runtime_paths, agent=AGENT, new_user_id=NEW)
+    account_steps, account_reports = matrix_state_steps(runtime_paths, agent=AGENT, old_user_id=OLD, new_user_id=NEW)
     return [*steps, *account_steps], [*account_reports, *reports]
 
 
@@ -249,6 +249,40 @@ def test_matrix_state_username_changed_device_cleared(tmp_path: Path) -> None:
     _apply(runtime_paths)
 
     expected = state.model_copy(deep=True)
+    expected.add_account(f"agent_{AGENT}", "new", "secret", domain="x")
+    expected_paths = test_runtime_paths(tmp_path / "expected")
+    expected.save(expected_paths)
+    assert matrix_state_file(runtime_paths).read_bytes() == matrix_state_file(expected_paths).read_bytes()
+
+
+@pytest.mark.parametrize("store_owner", [OLD, NEW, None])
+def test_username_set_by_hand_keeps_only_a_device_of_the_new_id(tmp_path: Path, store_owner: str | None) -> None:
+    """A username already changed by hand keeps its device, unless the device's crypto store is the old ID's.
+
+    That device and token come from the old login: MindRoom refuses to start a device without a store under its ID,
+    so they are dropped as in a normal run, and the next start logs in on a fresh device.
+    """
+    runtime_paths = test_runtime_paths(tmp_path)
+    state = MatrixState()
+    state.add_account(f"agent_{AGENT}", "new", "secret", domain="x", device_id="DEVICE", access_token=TEST_ACCESS_TOKEN)
+    state.save(runtime_paths)
+    if store_owner is not None:
+        store = olm_store_dir(store_owner, runtime_paths) / f"{store_owner}_DEVICE.db"
+        store.parent.mkdir(parents=True)
+        store.write_bytes(b"")
+
+    steps, reports = matrix_state_steps(runtime_paths, agent=AGENT, old_user_id=OLD, new_user_id=NEW)
+
+    if store_owner != OLD:
+        assert steps == []
+        assert reports == [
+            f"{matrix_state_file(runtime_paths)} already names {NEW} for agent_{AGENT}; its device and access token stay.",
+        ]
+        return
+    assert reports == []
+    plan = RenamePlan(storage_root=runtime_paths.storage_root, steps=tuple(steps), reports=())
+    apply_plan(plan, kind="rename-account", now=NOW)
+    expected = MatrixState()
     expected.add_account(f"agent_{AGENT}", "new", "secret", domain="x")
     expected_paths = test_runtime_paths(tmp_path / "expected")
     expected.save(expected_paths)

@@ -25,6 +25,7 @@ from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRN
 from mindroom.event_journal import EventJournalStore, EventKind, encode_thread_id
 from mindroom.event_journal.opening import event_journal_sqlite_path
 from mindroom.file_locks import release_file_lock, try_exclusive_file_lock
+from mindroom.matrix.client_session import olm_store_dir
 from mindroom.matrix.state import MatrixState
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, WorkerScope, resolve_worker_key, worker_dir_name
 from mindroom.workers import runtime as workers_runtime
@@ -517,6 +518,33 @@ def test_from_adopts_a_manually_renamed_account(
 
     assert rerun.exit_code == 0, rerun.output
     assert "Already adopted; nothing to do." in rerun.output
+
+
+def test_from_drops_the_old_device_of_a_username_changed_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """A manual edit of only the username leaves the old login's device, which MindRoom cannot start with; --from drops it."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    old_store = olm_store_dir(OLD, runtime_paths) / f"{OLD}_OLDDEVICE.db"
+    old_store.parent.mkdir(parents=True)
+    old_store.write_bytes(b"")
+    path = matrix_state_file(runtime_paths)
+    state = safe_load(path.read_bytes())
+    state["accounts"][f"agent_{AGENT}"]["username"] = "new"
+    path.write_bytes(safe_dump(state, default_flow_style=False, sort_keys=False).encode())
+
+    result = _invoke(runtime_paths, "--from", OLD, "--apply", "--yes", "--skip-login-check")
+
+    assert result.exit_code == 0, result.output
+    assert f"Drop the device OLDDEVICE and access token of agent_{AGENT} in {path}" in result.output
+    account = safe_load(path.read_bytes())["accounts"][f"agent_{AGENT}"]
+    assert (account["username"], account["device_id"], account["access_token"]) == ("new", None, None)
+    # No device continues the old stream, so the next start binds a fresh one.
+    assert _journal_rows(runtime_paths, "SELECT principal_id FROM matrix_sync_consumers") == []
+    assert old_store.is_file()
+    assert server.requests == []
 
 
 @pytest.mark.parametrize(

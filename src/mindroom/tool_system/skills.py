@@ -30,7 +30,7 @@ from mindroom.logging_config import get_logger
 from mindroom.path_confinement import open_directory_within_root, read_regular_file_within_root
 from mindroom.tool_system.output_files import ToolOutputFilePolicy, wrap_function_for_output_files
 from mindroom.tool_system.skill_usage import record_skill_use
-from mindroom.tool_system.worker_routing import agent_workspace_root_path
+from mindroom.tool_system.worker_routing import agent_workspace_root_path, written_by_other_workers
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -44,7 +44,7 @@ logger = get_logger(__name__)
 
 SKILL_FILENAME = "SKILL.md"
 # The functions Agno generates for an agent's skills; none has an owning toolkit.
-# The first two only read a skill, while get_skill_script can also run its scripts.
+# The first two only read a skill, while get_skill_script also reads scripts and gives the commands that run them.
 SKILL_READ_FUNCTION_NAMES = frozenset({"get_skill_instructions", "get_skill_reference"})
 SKILL_FUNCTION_NAMES = SKILL_READ_FUNCTION_NAMES | {"get_skill_script"}
 _WORKSPACE_SKILLS_DIRNAME = "skills"
@@ -171,22 +171,27 @@ class SkillScriptLocation:
     # returning None for a shared runner. Looked up on each use, so an incomplete worker backend config fails
     # that call instead of agent creation.
     worker_storage_root: Callable[[], Path | None] | None = None
+    # Whether dedicated workers mount a configured skill directory, as their mount planner decides.
+    mounted: Callable[[Path], bool] | None = None
 
-    def visible_path(self, path: Path, *, workspace: bool) -> Path | None:
-        """Return where the shell finds ``path``, or None when its worker cannot see it.
+    def visible_path(self, script: Path, *, skill_directory: Path, workspace: bool) -> Path | None:
+        """Return where the shell finds ``script``, or None when its worker cannot see it.
 
         Dedicated workers mount workspaces, and the directories of the configured skills with scripts that
-        their agents list, at their place below the storage mount, and a shared runner sees workspaces where
-        this process does. No worker sees a skill outside the storage root, such as a bundled one.
+        their agents list and their mount planner accepts, at their place below the storage mount, and a
+        shared runner sees workspaces where this process does. No worker sees a skill outside the storage
+        root, such as a bundled one.
         """
         if self.worker_storage_root is None:
-            return path
-        if not path.is_relative_to(self.storage_root):
+            return script
+        if not script.is_relative_to(self.storage_root):
             return None
         worker_root = self.worker_storage_root()
         if worker_root is None:
-            return path if workspace else None
-        return worker_root / path.relative_to(self.storage_root)
+            return script if workspace else None
+        if not workspace and self.mounted is not None and not self.mounted(skill_directory):
+            return None
+        return worker_root / script.relative_to(self.storage_root)
 
 
 class _MindroomSkills(Skills):
@@ -298,7 +303,8 @@ class _MindroomSkills(Skills):
     #   or from a skill directory the shell's worker cannot see, remains MindRoom policy.
     # Coverage: tests/test_skill_scripts.py::test_skill_scripts_get_a_command_for_the_worker_that_mounts_them;
     #   tests/test_skill_scripts.py::test_a_local_shell_runs_the_command_on_this_host;
-    #   tests/test_skill_scripts.py::test_skill_scripts_need_the_agents_shell.
+    #   tests/test_skill_scripts.py::test_skill_scripts_need_the_agents_shell;
+    #   tests/test_skill_scripts.py::test_the_skill_tools_say_that_scripts_run_through_the_shell.
     async def _get_skill_script(  # ty: ignore[invalid-method-override]  # Agno awaits async tools
         self,
         skill_name: str,
@@ -307,6 +313,18 @@ class _MindroomSkills(Skills):
         args: list[str] | None = None,
         timeout: int = 30,  # noqa: ASYNC109 - the script's own time limit, which the shell enforces
     ) -> str:
+        """Read a script from a skill, or return the shell command that runs it.
+
+        Agno builds the parameter descriptions from this docstring.
+
+        Args:
+            skill_name: The name of the skill.
+            script_path: The filename of the script.
+            execute: If True, return the shell command that runs the script instead of its content.
+            args: Arguments for the script, which the returned command passes to it.
+            timeout: Seconds to give run_shell_command when you run the returned command (default: 30).
+
+        """
         skill = self.get_skill(skill_name)
         if skill is None or script_path not in skill.scripts:
             # Agno reports a missing skill or script, and what the skill has, without reading or running anything.
@@ -327,9 +345,14 @@ class _MindroomSkills(Skills):
         reply = {"skill_name": skill.name, "script_path": script_path}
         if self._script_location is None:
             return json.dumps({"error": _NO_SHELL_ERROR, **reply})
-        script = Path(skill.source_path) / "scripts" / script_path
+        skill_directory = Path(skill.source_path)
+        script = skill_directory / "scripts" / script_path
         workspace = skill.name in self._workspace_roots_by_skill
-        visible_script = self._script_location.visible_path(script, workspace=workspace)
+        visible_script = self._script_location.visible_path(
+            script,
+            skill_directory=skill_directory,
+            workspace=workspace,
+        )
         if visible_script is None:
             return json.dumps({"error": _UNSEEN_SCRIPT_ERROR, **reply})
         try:
@@ -536,6 +559,26 @@ def agent_workspace_skills_root(runtime_paths: RuntimePaths, agent_name: str, *,
 def _resolve_configured_skill_roots(skill_roots: Sequence[Path] | None = None) -> list[Path]:
     """Return configured global skill roots without the agent workspace root."""
     return _unique_paths(list(skill_roots) if skill_roots is not None else _get_default_skill_roots())
+
+
+def skill_directory_refusal(storage_root: Path, directory: Path, worker_roots: Path) -> str | None:
+    """Return why dedicated workers do not mount this skill directory, or None when they mount it.
+
+    Only a real directory below the storage root, reached without links and outside every directory other
+    sandbox workers write, is mounted, because container runtimes follow links in mount sources each time
+    they mount them.
+    """
+    if not directory.is_relative_to(storage_root):
+        return "outside the storage root"
+    relative_path = directory.relative_to(storage_root)
+    if written_by_other_workers(relative_path, worker_roots):
+        return "inside a directory other sandbox workers write"
+    try:
+        with open_directory_within_root(storage_root, relative_path):
+            pass
+    except OSError:
+        return "missing or reached through a link"
+    return None
 
 
 def skill_directories_with_scripts(skill_names: Collection[str]) -> tuple[Path, ...]:

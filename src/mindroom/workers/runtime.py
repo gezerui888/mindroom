@@ -38,6 +38,7 @@ __all__ = [
     "PrimaryWorkerManagerLease",
     "clear_worker_validation_snapshot_cache",
     "configured_primary_worker_manager_identity",
+    "dedicated_worker_roots",
     "get_primary_worker_manager",
     "lease_configured_primary_worker_manager",
     "lease_primary_worker_manager",
@@ -234,6 +235,13 @@ def worker_visible_storage_root(runtime_paths: RuntimePaths) -> Path | None:
     if backend_name == "docker":
         return Path(DockerWorkerBackendConfig.from_runtime(runtime_paths).storage_mount_path)
     return None
+
+
+def dedicated_worker_roots(runtime_paths: RuntimePaths) -> Path:
+    """Return the storage-relative directory below which dedicated workers keep their own state."""
+    if primary_worker_backend_name(runtime_paths) == "kubernetes":
+        return Path(KubernetesWorkerBackendConfig.from_runtime(runtime_paths).storage_subpath_prefix)
+    return Path("workers")
 
 
 def primary_worker_backend_available(

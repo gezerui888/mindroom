@@ -30,7 +30,6 @@ from mindroom.tool_system.worker_routing import (
     visible_workspace_roots,
     worker_key_agent_name,
     worker_log_id,
-    written_by_other_workers,
 )
 from mindroom.workers.backend import WorkerBackendError
 
@@ -459,14 +458,11 @@ def plan_skill_directory_mounts(
 ) -> tuple[SharedDirectoryMount, ...]:
     """Return read-only mounts of the skill directories with scripts that the agents one dedicated worker serves list.
 
-    Their scripts then run in the worker at their path below its storage mount. A skill
-    directory outside the storage root cannot be mounted, and one below it is mounted
-    only when it is a real directory reached without links, outside every directory
-    other sandbox workers write, because container runtimes follow links in mount
-    sources each time they mount them.
+    Their scripts then run in the worker at their path below its storage mount, for each directory that
+    ``skill_directory_refusal`` does not refuse.
     """
     # Skill loading is heavy, and the slim tool registry imports the worker backends.
-    from mindroom.tool_system.skills import skill_directories_with_scripts  # noqa: PLC0415
+    from mindroom.tool_system.skills import skill_directories_with_scripts, skill_directory_refusal  # noqa: PLC0415
 
     raw_agents = config_data.get("agents")
     agents = cast("Mapping[str, object]", raw_agents) if isinstance(raw_agents, Mapping) else {}
@@ -481,33 +477,23 @@ def plan_skill_directory_mounts(
     storage_root = runtime_paths.storage_root
     mounts: list[SharedDirectoryMount] = []
     for directory in skill_directories_with_scripts(skill_names):
-        if not directory.is_relative_to(storage_root):
-            continue
-        relative_path = directory.relative_to(storage_root)
-        if written_by_other_workers(relative_path, worker_roots):
-            logger.error(
-                "Refusing to mount a skill directory inside a directory other sandbox workers write",
-                worker=worker_log_id(worker_key),
-                directory=str(relative_path),
+        refusal = skill_directory_refusal(storage_root, directory, worker_roots)
+        if refusal is None:
+            mounts.append(
+                SharedDirectoryMount(
+                    local_path=directory,
+                    worker_visible_path=worker_visible_shared_storage_root / directory.relative_to(storage_root),
+                    read_only=True,
+                ),
             )
-            continue
-        try:
-            with open_directory_within_root(storage_root, relative_path):
-                pass
-        except OSError:
+        elif directory.is_relative_to(storage_root):
+            # A directory outside the storage root, such as the bundled skills, is not mounted by design.
             logger.warning(
-                "Not mounting a skill directory that is missing or reached through a link",
+                "Not mounting a skill directory",
                 worker=worker_log_id(worker_key),
-                directory=str(relative_path),
+                directory=str(directory.relative_to(storage_root)),
+                reason=refusal,
             )
-            continue
-        mounts.append(
-            SharedDirectoryMount(
-                local_path=directory,
-                worker_visible_path=worker_visible_shared_storage_root / relative_path,
-                read_only=True,
-            ),
-        )
     return tuple(mounts)
 
 

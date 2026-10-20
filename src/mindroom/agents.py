@@ -96,6 +96,7 @@ from mindroom.tool_system.skills import (
     SkillScriptLocation,
     agent_workspace_skills_root,
     build_agent_skills,
+    skill_directory_refusal,
 )
 from mindroom.tool_system.tool_hooks import build_tool_hook_bridge, prepend_tool_hook_bridge
 from mindroom.tool_system.worker_routing import (
@@ -104,7 +105,7 @@ from mindroom.tool_system.worker_routing import (
     resolve_agent_owned_path,
     shared_storage_root,
 )
-from mindroom.workers.runtime import primary_worker_backend_name, worker_visible_storage_root
+from mindroom.workers.runtime import dedicated_worker_roots, primary_worker_backend_name, worker_visible_storage_root
 from mindroom.workspaces import ensure_workspace_template
 
 if TYPE_CHECKING:
@@ -1482,9 +1483,18 @@ def _skill_script_location(
         runtime_paths=runtime_paths,
         worker_tools_override=config.get_agent_worker_tools(agent_name),
     )
+    if not worker_routed:
+        return SkillScriptLocation(storage_root=runtime_paths.storage_root)
+
+    def mounted(directory: Path) -> bool:
+        # The rule the worker mount planner applies, with the worker roots of the configured backend.
+        refusal = skill_directory_refusal(runtime_paths.storage_root, directory, dedicated_worker_roots(runtime_paths))
+        return refusal is None
+
     return SkillScriptLocation(
         storage_root=runtime_paths.storage_root,
-        worker_storage_root=partial(worker_visible_storage_root, runtime_paths) if worker_routed else None,
+        worker_storage_root=partial(worker_visible_storage_root, runtime_paths),
+        mounted=mounted,
     )
 
 

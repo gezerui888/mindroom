@@ -143,6 +143,8 @@ def _write_skill(tmp_path: Path, origin: str, monkeypatch: pytest.MonkeyPatch | 
         "plugin": tmp_path.resolve() / "ops",
         # Like a config bundle copied onto the storage volume.
         "plugin_below_storage": _storage(tmp_path) / "config-bundle" / "plugins" / "ops",
+        # Inside a directory that sandbox workers write, which no worker may mount.
+        "plugin_in_shared_directory": _storage(tmp_path) / "shared_directories" / "team" / "plugins" / "ops",
     }[origin]
     if origin == "workspace":
         skills_root = agent_workspace_root_path(_storage(tmp_path), "general") / "skills"
@@ -404,6 +406,29 @@ async def test_skill_scripts_a_worker_cannot_see_are_refused(
     assert read["content"] == _SCRIPT
 
 
+@pytest.mark.parametrize("layout", ["linked", "written_by_workers"])
+@pytest.mark.asyncio
+async def test_a_skill_directory_the_worker_does_not_mount_gets_no_command(
+    tmp_path: Path,
+    worker_calls: list[_WorkerCall],
+    layout: str,
+) -> None:
+    """A command names only skill directories the worker mounts, so one its mount planner refuses gets none."""
+    skill = _write_skill(tmp_path, "plugin_below_storage" if layout == "linked" else "plugin_in_shared_directory")
+    if layout == "linked":
+        real = _storage(tmp_path) / "elsewhere" / "xl_check"
+        real.parent.mkdir(parents=True)
+        skill.directory.rename(real)
+        skill.directory.symlink_to(real, target_is_directory=True)
+    setup = _create_worker_agent(tmp_path, skill, "docker")
+
+    refused = await _get_skill_script(setup.agent, execute=True)
+
+    assert "cannot see" in str(refused["error"])
+    assert "command" not in refused
+    assert worker_calls == []
+
+
 @pytest.mark.asyncio
 async def test_a_shared_runner_gets_a_workspace_script_at_its_host_path(
     tmp_path: Path,
@@ -523,16 +548,23 @@ async def test_a_shell_that_needs_approval_still_gets_the_command(tmp_path: Path
     assert not skill.ran_here
 
 
+@pytest.mark.parametrize("memory_backend", ["file", "mem0"], ids=["workspace", "no-workspace"])
 @pytest.mark.asyncio
-async def test_the_skill_tools_say_that_scripts_run_through_the_shell(tmp_path: Path) -> None:
-    """The tool description and the skill guidance tell the model that execute=True gives it a command to run."""
+async def test_the_skill_tools_say_that_scripts_run_through_the_shell(tmp_path: Path, memory_backend: str) -> None:
+    """The tool description, its parameters, and the skill guidance tell the model that execute=True gives a command.
+
+    Without a workspace the function is not wrapped for output files, so its parameters come from its own docstring.
+    """
     skill = _write_skill(tmp_path, "plugin")
-    setup = _create_agent(tmp_path, skill, tools=["shell"])
+    setup = _create_agent(tmp_path, skill, tools=["shell"], agent_settings={"memory_backend": memory_backend})
 
-    function = await _function(setup.agent, "get_skill_script")
+    schema = (await _function(setup.agent, "get_skill_script")).to_dict()
 
-    assert "never runs the script" in str(function.description)
-    assert "run_shell_command" in str(function.description)
+    assert "never runs the script" in schema["description"]
+    assert "run_shell_command" in schema["description"]
+    parameters = json.dumps(schema["parameters"])
+    assert "execute the script" not in parameters
+    assert "execution time" not in parameters
     instructions = setup.agent.instructions
     assert isinstance(instructions, list)
     assert any("returns the shell command" in str(line) for line in instructions)

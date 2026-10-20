@@ -7142,6 +7142,7 @@ expose = [
     "set_plugin_skill_roots",
     "skill_can_edit",
     "skill_directories_with_scripts",
+    "skill_directory_refusal",
     "workspace_entry_names",
     "workspace_skill_file_names",
 ]

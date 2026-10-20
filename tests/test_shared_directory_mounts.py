@@ -264,6 +264,6 @@ def test_a_skill_directory_other_workers_write_is_not_mounted(tmp_path: Path) ->
         mounts = _plan_skills(runtime_paths, resolve_unscoped_worker_key("alice"), {"alice": ["audit"]})
 
     assert mounts == ()
-    assert [entry["directory"] for entry in logs if entry["log_level"] == "error"] == [
-        "shared_directories/team/skills/audit",
+    assert [(entry["directory"], entry["reason"]) for entry in logs if entry["log_level"] == "warning"] == [
+        ("shared_directories/team/skills/audit", "inside a directory other sandbox workers write"),
     ]

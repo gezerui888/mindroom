@@ -444,7 +444,14 @@ def _partial_markdown_renderer(render: Callable[[str], str]) -> Callable[[str], 
     Only the formatted body changes; the plain body, which shows Markdown as written, and the
     reply's recorded text keep the streamed text.
     """
-    return lambda text: render(close_partial_markdown(text) or _PROGRESS_PLACEHOLDER)
+
+    def render_partial(text: str) -> str:
+        try:
+            return render(close_partial_markdown(text) or _PROGRESS_PLACEHOLDER)
+        except IndexError:  # markdown-it-py can index past a quote's last line; render the text as main does.
+            return render(text)
+
+    return render_partial
 
 
 def _prepare_delivery_from_snapshot(snapshot: _StreamingDeliverySnapshot) -> _PreparedStreamingDelivery:

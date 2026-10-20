@@ -4,6 +4,7 @@ import re
 from collections.abc import Callable, Mapping
 from html import escape, unescape
 from html.parser import HTMLParser
+from itertools import accumulate
 from os.path import commonprefix
 from typing import Any
 from urllib.parse import urlsplit
@@ -550,8 +551,9 @@ def _stop_at_unfinished_markup(state: StateInline, silent: bool) -> bool:
             env["open_label"] = start
         else:
             label_end = state.md.helpers.parseLinkLabel(state, start, True)
-            if label_end > env["last_paren"] and src.startswith("(", label_end + 1):  # Its URL is still arriving.
-                env["open_label"], env["end"] = start, label_end
+            # Its URL is still arriving: the label keeps its brackets, so the text around it parses as it will.
+            if label_end > env["last_paren"] and src.startswith("(", label_end + 1):
+                env["end"] = label_end + 1
     if start == env["end"]:
         state.pos = state.posMax
     return state.pos > start
@@ -580,12 +582,14 @@ def _close_partial_inline(text: str) -> str:
         shown = f"{text} {run}" if text.endswith("`") else text + run
     if (label := env.get("open_label")) is not None:
         shown = shown[:label] + shown[label + 1 :]
-    # Openers nothing closed yet, innermost first; one that could also close, like the `*` of `2*3`, may be literal.
-    pending = reversed(state.delimiters)
+    # Openers nothing closed yet, innermost first, except those inside a closed pair, which stay literal.
+    # One that could also close, like the `*` of `2*3`, may be literal. `reach` is the furthest closer matched before each.
+    reach = list(accumulate((d.end for d in state.delimiters), max, initial=-1))
+    pending = [d for i, d in enumerate(state.delimiters) if d.open and not d.close and d.end < 0 and reach[i] < i]
     shown = shown.rstrip()
     if (len(shown) - len(shown.rstrip("\\"))) % 2:  # A trailing backslash would escape any closer.
         return shown
-    return shown + "".join(state.tokens[d.token].content for d in pending if d.open and not d.close and d.end < 0)
+    return shown + "".join(state.tokens[d.token].content for d in reversed(pending))
 
 
 def build_thread_relation(

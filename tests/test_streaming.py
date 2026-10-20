@@ -852,6 +852,28 @@ def test_only_in_progress_edits_close_partial_markdown_in_the_formatted_body(con
     assert table_content["formatted_body"] == "<p>Thinking...</p>\n"
 
 
+def test_an_in_progress_edit_markdown_it_cannot_shape_renders_the_streamed_text(config: Config) -> None:
+    """markdown-it-py fails on a quoted table cut at an empty quote line, so the edit renders the text as written."""
+    streaming = StreamingResponse(
+        target=MessageTarget.resolve("!test:localhost", "$thread", "$reply"),
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+    )
+    streaming.accumulated_text = "> | a | b |\n> |---|---|\n> \n> **"
+    progress = streaming._delivery_snapshot(is_final=False, allow_empty_progress=False, stream_status=None)
+    final = streaming._delivery_snapshot(
+        is_final=True,
+        allow_empty_progress=False,
+        stream_status=STREAM_STATUS_COMPLETED,
+    )
+    assert progress is not None
+    assert final is not None
+
+    in_progress = streaming_mod._prepare_delivery_from_snapshot(progress).content
+    final_content = streaming_mod._prepare_delivery_from_snapshot(final).content
+    assert in_progress["formatted_body"] == final_content["formatted_body"]
+
+
 def test_only_a_final_edit_warns_about_an_unfinished_interactive_block(config: Config) -> None:
     """A block still arriving is not malformed yet; only a final reply that never closes it logs a warning."""
     streaming = StreamingResponse(

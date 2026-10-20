@@ -32,13 +32,15 @@ from tests.cpu_budget_helpers import cpu_budget
         ("Run `", "Run"),
         ("Fares ~~", "Fares"),
         ("Then **~~", "Then"),
-        # A link whose label or URL is still arriving shows its label.
+        # A link whose label is still arriving shows its label; one whose URL is still arriving keeps its brackets.
         ("[Open the draft]", "[Open the draft]"),
-        ("[Open the draft](", "Open the draft"),
-        ("[Open the draft](https://docs.example/dra", "Open the draft"),
-        ("See [the **draft**](https://docs.example/a_b", "See the **draft**"),
+        ("[Open the draft](", "[Open the draft]"),
+        ("[Open the draft](https://docs.example/dra", "[Open the draft]"),
+        ("See [the **draft**](https://docs.example/a_b", "See [the **draft**]"),
+        ("__Result__[source](https://example.org/paper", "__Result__[source]"),
+        ("- [1. Introduction](https://example.org/intro", "- [1. Introduction]"),
         ("[**Open the draf", "**Open the draf**"),
-        ("Open [`notes.md`](https://docs.example/no", "Open `notes.md`"),
+        ("Open [`notes.md`](https://docs.example/no", "Open [`notes.md`]"),
         # Only the block still streaming changes; a finished one renders as written.
         ("**Not closed\n\nNext *one", "**Not closed\n\nNext *one*"),
         ("- **First**\n- Second **is", "- **First**\n- Second **is**"),
@@ -90,8 +92,10 @@ def test_partial_markdown_is_shown_as_it_will_render(streamed: str, shown: str) 
         "Done \\*not bold",
         # A trailing backslash would escape a closer.
         "Open **C:\\",
-        # Nested emphasis closed by one run, spans across quote or list item lines, and a setext heading.
+        # Nested emphasis closed by one run, an opener inside a closed pair, spans across quote or list item lines,
+        # and a setext heading.
         "**Bold *italic*** more text",
+        "**_config.yaml** contains",
         "*a **b*** more text",
         "> **first\n> second**",
         "- **first\n  second**",

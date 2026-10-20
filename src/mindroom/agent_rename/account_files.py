@@ -127,15 +127,16 @@ def account_file_steps(
     rename = _AccountRename(old_user_id, new_user_id, discard_new_identity_state)
     oauth_steps, requester_keys = _requester_oauth_steps(runtime_paths.storage_root, rename)
     worker_steps, worker_reports = _worker_steps(runtime_paths, config, rename, requester_keys=requester_keys)
+    matrix_state_steps, matrix_state_reports = _matrix_state_steps(runtime_paths, agent, rename)
     steps: list[Step] = [
-        _matrix_state_step(runtime_paths, agent, rename),
+        *matrix_state_steps,
         *oauth_steps,
         *worker_steps,
         *_private_instance_steps(runtime_paths, rename),
         *_personal_room_steps(runtime_paths, agent, rename),
         *_message_send_intent_steps(runtime_paths, rename),
     ]
-    return steps, [*worker_reports, *_reports(runtime_paths, old_user_id)]
+    return steps, [*matrix_state_reports, *worker_reports, *_reports(runtime_paths, old_user_id)]
 
 
 def _move(source: Path, destination: Path, label: str, rename: _AccountRename) -> list[Step]:
@@ -205,7 +206,15 @@ def _field(value: object, name: str) -> object:
     return cast("dict[str, object]", value).get(name) if isinstance(value, dict) else None
 
 
-def _matrix_state_step(runtime_paths: RuntimePaths, agent: str, rename: _AccountRename) -> FileRewrite:
+def _matrix_state_steps(
+    runtime_paths: RuntimePaths,
+    agent: str,
+    rename: _AccountRename,
+) -> tuple[list[Step], list[str]]:
+    """Point the stored account at the new localpart, unless its username was already changed by hand.
+
+    A hand-changed account already logged in as the new ID, so its device and token stay.
+    """
     path = matrix_state_file(runtime_paths)
     account_key = managed_account_key(agent)
     state = yaml_io.safe_load(path.read_bytes()) if path.exists() else None
@@ -214,11 +223,14 @@ def _matrix_state_step(runtime_paths: RuntimePaths, agent: str, rename: _Account
         msg = f"{path} holds no account {account_key}, so there is no Matrix account to adopt."
         raise RenameRefusedError(msg)
     username = MatrixID.parse(rename.new_user_id).username
-    return FileRewrite(
+    if _field(accounts[account_key], "username") == username:
+        return [], [f"{path} already names {rename.new_user_id} for {account_key}; its device and access token stay."]
+    step = FileRewrite(
         path,
         partial(_adopt_matrix_account, account_key=account_key, username=username),
         f"Set the username of {account_key} in {path} to {username} and drop its old device and access token",
     )
+    return [step], []
 
 
 def _adopt_matrix_account(content: bytes, *, account_key: str, username: str) -> bytes:

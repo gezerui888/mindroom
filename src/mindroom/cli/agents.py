@@ -34,12 +34,22 @@ class _Adoption:
     agent: str
     old_user_id: str
     new_user_id: str
+    stored_user_id: str
     password: str | None
 
 
 def rename_account(
     agent: str = typer.Argument(..., help="The agent's name in the config."),
     new_user_id: str = typer.Argument(..., help="The Matrix ID the server renamed the agent's account to."),
+    from_user_id: str | None = typer.Option(
+        None,
+        "--from",
+        metavar="OLD_USER_ID",
+        help=(
+            "The Matrix ID the server renamed the account from, when matrix_state.yaml already holds the new one "
+            "because its username was changed by hand."
+        ),
+    ),
     apply: bool = typer.Option(False, "--apply", help="Make the changes; without it the plan is only printed."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Apply without asking for confirmation."),
     discard_new_principal: bool = typer.Option(
@@ -89,6 +99,7 @@ def rename_account(
             config,
             agent=agent,
             new_user_id=new_user_id,
+            from_user_id=from_user_id,
             apply=apply,
             yes=yes,
             discard_new_principal=discard_new_principal,
@@ -140,6 +151,7 @@ def _rename_account(
     *,
     agent: str,
     new_user_id: str,
+    from_user_id: str | None,
     apply: bool,
     yes: bool,
     discard_new_principal: bool,
@@ -147,7 +159,7 @@ def _rename_account(
 ) -> None:
     from mindroom.agent_rename.guard import require_supported_backends, stopped_runtime  # noqa: PLC0415
 
-    adoption = _adoption(runtime_paths, config, agent=agent, new_user_id=new_user_id)
+    adoption = _adoption(runtime_paths, config, agent=agent, new_user_id=new_user_id, from_user_id=from_user_id)
     if adoption is None:
         _say("Already adopted; nothing to do.")
         return
@@ -195,14 +207,21 @@ def _stored_accounts(runtime_paths: RuntimePaths) -> dict[str, MatrixAccount]:
         raise RenameRefusedError(msg) from exc
 
 
-def _adoption(runtime_paths: RuntimePaths, config: Config, *, agent: str, new_user_id: str) -> _Adoption | None:
-    """Check the request and return it, or ``None`` when the stored account already has the new ID."""
+def _adoption(
+    runtime_paths: RuntimePaths,
+    config: Config,
+    *,
+    agent: str,
+    new_user_id: str,
+    from_user_id: str | None,
+) -> _Adoption | None:
+    """Check the request and return it, or ``None`` when nothing is left under another ID.
+
+    The stored username alone does not prove an adoption: changing it by hand leaves the journal and files
+    under the old ID. So when it already names the new ID, the journal decides, and ``--from`` names the old ID.
+    """
     from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
-    from mindroom.matrix.identity import (  # noqa: PLC0415
-        MatrixID,
-        managed_account_key,
-        parse_historical_matrix_user_id,
-    )
+    from mindroom.matrix.identity import MatrixID, managed_account_key  # noqa: PLC0415
 
     state_path = matrix_state_file(runtime_paths)
     accounts = _stored_accounts(runtime_paths)
@@ -212,30 +231,106 @@ def _adoption(runtime_paths: RuntimePaths, config: Config, *, agent: str, new_us
         for key, account in accounts.items()
     }
     account_key = managed_account_key(agent)
-    old_user_id = user_ids.get(account_key)
-    # Checked before anything that can refuse, so a rerun after a successful apply is a no-op.
-    if old_user_id == new_user_id:
+    stored_user_id = user_ids.get(account_key)
+    # Checked before anything else that can refuse, so a rerun after a successful apply is a no-op.
+    if from_user_id is None and stored_user_id == new_user_id:
+        _refuse_journal_under_other_ids(runtime_paths, agent=agent, new_user_id=new_user_id)
         return None
     if agent not in config.agents:
         msg = f"{agent} is not an agent in {runtime_paths.config_path}."
         raise RenameRefusedError(msg)
-    if old_user_id is None:
+    if stored_user_id is None:
         msg = f"{state_path} holds no account {account_key}, so there is no Matrix account to adopt."
         raise RenameRefusedError(msg)
-    try:
-        parse_historical_matrix_user_id(new_user_id)
-    except ValueError as exc:
-        msg = f"{new_user_id} is not a Matrix user ID ({exc})."
-        raise RenameRefusedError(msg) from exc
+    old_user_id = _old_user_id(
+        state_path,
+        account_key,
+        stored_user_id=stored_user_id,
+        new_user_id=new_user_id,
+        from_user_id=from_user_id,
+    )
     old_domain = MatrixID.parse(old_user_id).domain
     if MatrixID.parse(new_user_id).domain != old_domain:
         msg = f"{new_user_id} is not on {old_domain}, the server of {old_user_id}; a rename in place keeps the server."
         raise RenameRefusedError(msg)
-    owner = next((key for key, user_id in user_ids.items() if user_id == new_user_id), None)
+    owner = _other_owner(user_ids, account_key, new_user_id)
     if owner is not None:
         msg = f"{new_user_id} is already the stored account {owner} in {state_path}."
         raise RenameRefusedError(msg)
-    return _Adoption(agent, old_user_id, new_user_id, accounts[account_key].password)
+    owner = _other_owner(user_ids, account_key, old_user_id)
+    if owner is not None:
+        msg = f"--from {old_user_id} is the stored account {owner} in {state_path}, not a former ID of {account_key}."
+        raise RenameRefusedError(msg)
+    return _Adoption(agent, old_user_id, new_user_id, stored_user_id, accounts[account_key].password)
+
+
+def _old_user_id(
+    state_path: Path,
+    account_key: str,
+    *,
+    stored_user_id: str,
+    new_user_id: str,
+    from_user_id: str | None,
+) -> str:
+    """Check both IDs and return the one to adopt from: ``--from`` when given, otherwise the stored account's."""
+    from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
+    from mindroom.matrix.identity import parse_historical_matrix_user_id  # noqa: PLC0415
+
+    for user_id in (new_user_id, from_user_id):
+        try:
+            if user_id is not None:
+                parse_historical_matrix_user_id(user_id)
+        except ValueError as exc:
+            msg = f"{user_id} is not a Matrix user ID ({exc})."
+            raise RenameRefusedError(msg) from exc
+    if from_user_id is None:
+        return stored_user_id
+    if from_user_id == new_user_id:
+        msg = f"--from {from_user_id} is the new ID itself; pass the ID the server renamed the account from."
+        raise RenameRefusedError(msg)
+    if stored_user_id not in (from_user_id, new_user_id):
+        msg = (
+            f"--from {from_user_id} does not match the stored account {stored_user_id} of {account_key} "
+            f"in {state_path}; --from is for a stored account that already holds {new_user_id}."
+        )
+        raise RenameRefusedError(msg)
+    return from_user_id
+
+
+def _other_owner(user_ids: dict[str, str], account_key: str, user_id: str) -> str | None:
+    """Return the stored account other than ``account_key`` that has ``user_id``, if any."""
+    return next((key for key, stored in user_ids.items() if key != account_key and stored == user_id), None)
+
+
+def _refuse_journal_under_other_ids(runtime_paths: RuntimePaths, *, agent: str, new_user_id: str) -> None:
+    """Refuse when the journal still keys ``agent``'s rows by an ID other than the stored ``new_user_id``.
+
+    That is what changing the stored username by hand leaves behind: MindRoom then runs as the new ID,
+    and its sync fails on the old rows with ``IngestionBatchIntegrityError``.
+    """
+    import shlex  # noqa: PLC0415
+
+    from mindroom.agent_rename.journal import other_principal_user_ids  # noqa: PLC0415
+    from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
+    from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415
+
+    database = event_journal_sqlite_path(runtime_paths.storage_root)
+    others = other_principal_user_ids(database, agent=agent, user_id=new_user_id)
+    if not others:
+        return
+    found = "; ".join(f"{agent}@{user_id} ({counts})" for user_id, counts in others.items())
+    storage_options = ["--config", str(runtime_paths.config_path), "--storage-path", str(runtime_paths.storage_root)]
+    commands = (
+        shlex.join(["mindroom", "agents", "rename-account", agent, new_user_id, "--from", user_id, *storage_options])
+        for user_id in others
+    )
+    msg = (
+        f"{matrix_state_file(runtime_paths)} already names {new_user_id} for agent_{agent}, "
+        f"but the event journal {database} still has rows for {found}, so its state was never moved. "
+        f"If the server renamed that account to {new_user_id}, run this to move its state:"
+        + "".join(f"\n  {command}" for command in commands)
+    )
+    raise RenameRefusedError(msg)
 
 
 def _check_login(runtime_paths: RuntimePaths, adoption: _Adoption) -> None:
@@ -334,10 +429,11 @@ def _plan(
 
 
 def _print_plan(plan: RenamePlan, adoption: _Adoption) -> None:
-    _say(
-        f"Plan to adopt {adoption.new_user_id} for agent {adoption.agent}, "
-        f"whose stored account is {adoption.old_user_id}:",
-    )
+    if adoption.stored_user_id == adoption.old_user_id:
+        header = f"whose stored account is {adoption.old_user_id}:"
+    else:
+        header = f"from {adoption.old_user_id}; its stored account already is {adoption.new_user_id}:"
+    _say(f"Plan to adopt {adoption.new_user_id} for agent {adoption.agent}, {header}")
     for line in plan.describe():
         _say(f"  - {line}")
 

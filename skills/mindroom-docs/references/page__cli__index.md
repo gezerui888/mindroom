@@ -1172,18 +1172,23 @@ See [Renaming an Agent's Matrix Account](https://docs.mindroom.chat/deployment/r
 │                             [required]                                                 │
 ╰────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ──────────────────────────────────────────────────────────────────────────────╮
-│ --apply                                Make the changes; without it the plan is only   │
-│                                        printed.                                        │
-│ --yes                    -y            Apply without asking for confirmation.          │
-│ --discard-new-principal                Delete what MindRoom created under the new ID   │
-│                                        when it ran after the server rename: its event  │
-│                                        journal rows and new-ID state that holds no     │
-│                                        credentials.                                    │
-│ --skip-login-check                     Apply without first logging in as the new ID    │
-│                                        with the stored password.                       │
-│ --config                 -c      PATH  Use this config file path.                      │
-│ --storage-path           -s      PATH  Base directory for persistent MindRoom data.    │
-│ --help                   -h            Show this message and exit.                     │
+│ --from                           OLD_USER_ID  The Matrix ID the server renamed the     │
+│                                               account from, when matrix_state.yaml     │
+│                                               already holds the new one because its    │
+│                                               username was changed by hand.            │
+│ --apply                                       Make the changes; without it the plan is │
+│                                               only printed.                            │
+│ --yes                    -y                   Apply without asking for confirmation.   │
+│ --discard-new-principal                       Delete what MindRoom created under the   │
+│                                               new ID when it ran after the server      │
+│                                               rename: its event journal rows and       │
+│                                               new-ID state that holds no credentials.  │
+│ --skip-login-check                            Apply without first logging in as the    │
+│                                               new ID with the stored password.         │
+│ --config                 -c      PATH         Use this config file path.               │
+│ --storage-path           -s      PATH         Base directory for persistent MindRoom   │
+│                                               data.                                    │
+│ --help                   -h                   Show this message and exit.              │
 ╰────────────────────────────────────────────────────────────────────────────────────────╯
 
  Examples

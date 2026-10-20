@@ -27,7 +27,7 @@ from mindroom.file_locks import release_file_lock, try_exclusive_file_lock
 from mindroom.matrix.state import MatrixState
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, WorkerScope, resolve_worker_key, worker_dir_name
 from mindroom.workers import runtime as workers_runtime
-from mindroom.yaml_io import safe_load
+from mindroom.yaml_io import safe_dump, safe_load
 from tests.agent_rename_helpers import tree_snapshot
 from tests.conftest import TEST_ACCESS_TOKEN
 
@@ -395,6 +395,123 @@ def test_discard_new_principal_reaches_the_journal(
 
     assert applied.exit_code == 0, applied.output
     assert _journal_rows(runtime_paths, "SELECT principal_id FROM matrix_sync_consumers") == []
+    assert server.requests == []
+
+
+def _adopt_by_hand(runtime_paths: RuntimePaths) -> None:
+    """Change the stored username to the new localpart and bind a new device, as the 2026-10-19 manual fix did."""
+    path = matrix_state_file(runtime_paths)
+    state = safe_load(path.read_bytes())
+    account = state["accounts"][f"agent_{AGENT}"]
+    account.update(username="new", device_id="NEWDEVICE", access_token="new-device-token")  # noqa: S106
+    path.write_bytes(safe_dump(state, default_flow_style=False, sort_keys=False).encode())
+
+
+def test_manual_adoption_refuses_without_from(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """A username already set to the new ID does not count as adopted while the journal still names the old ID."""
+    runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
+    _adopt_by_hand(runtime_paths)
+    before = tree_snapshot(tmp_path)
+    rerun = (
+        f"mindroom agents rename-account {AGENT} {NEW} --from {OLD} "
+        f"--config {runtime_paths.config_path} --storage-path {runtime_paths.storage_root}"
+    )
+
+    for args in ((), ("--apply", "--yes", "--skip-login-check", "--discard-new-principal")):
+        result = _invoke(runtime_paths, *args)
+
+        assert result.exit_code == 1, result.output
+        assert "Already adopted" not in result.output
+        assert OLD_PRINCIPAL in result.output
+        assert rerun in result.output
+    assert tree_snapshot(tmp_path) == before
+    assert server.requests == []
+
+
+def test_from_adopts_a_manually_renamed_account(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """--from moves the journal and files from the old ID and keeps the new device the manual fix bound."""
+    runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
+    _adopt_by_hand(runtime_paths)
+    storage = runtime_paths.storage_root
+
+    result = _invoke(runtime_paths, "--from", OLD, "--discard-new-principal", "--apply", "--yes", "--skip-login-check")
+
+    assert result.exit_code == 0, result.output
+    account = safe_load(matrix_state_file(runtime_paths).read_bytes())["accounts"][f"agent_{AGENT}"]
+    assert (account["username"], account["device_id"], account["access_token"]) == (
+        "new",
+        "NEWDEVICE",
+        "new-device-token",
+    )
+    assert _journal_rows(runtime_paths, "SELECT principal_id, sender FROM journal_events ORDER BY principal_id") == [
+        (NEW_PRINCIPAL, NEW),
+        (ROUTER, NEW),
+    ]
+    assert _journal_rows(runtime_paths, "SELECT * FROM matrix_sync_consumers") == []
+    assert _stored_worker_key(_oauth_path(storage, NEW)) == _key("user_agent", NEW)
+    assert (storage / "workers" / worker_dir_name(_key("user", NEW)) / "workspace" / "notes.md").is_file()
+    assert runtime_paths.config_path.read_text() == CONFIG.replace(OLD, NEW)
+    assert f"Leftover scan: nothing in {storage} names {OLD} any more." in result.output
+    assert server.requests == []
+
+    rerun = _invoke(runtime_paths)
+
+    assert rerun.exit_code == 0, rerun.output
+    assert "Already adopted; nothing to do." in rerun.output
+
+
+@pytest.mark.parametrize(
+    ("from_user_id", "reason"),
+    [
+        ("old", "old is not a Matrix user ID"),
+        ("@old:y", f"{NEW} is not on y, the server of @old:y"),
+        (NEW, f"--from {NEW} is the new ID itself"),
+        ("@router:x", "--from @router:x is the stored account agent_router"),
+    ],
+)
+def test_from_is_validated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+    from_user_id: str,
+    reason: str,
+) -> None:
+    """--from must be a Matrix ID on the new ID's server that differs from it and is no other stored account."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    _adopt_by_hand(runtime_paths)
+    before = tree_snapshot(tmp_path)
+
+    for args in ((), ("--apply", "--yes")):
+        result = _invoke(runtime_paths, "--from", from_user_id, *args)
+
+        assert result.exit_code == 1, result.output
+        assert reason in result.output
+    assert tree_snapshot(tmp_path) == before
+    assert server.requests == []
+
+
+def test_from_must_match_a_stored_account_not_yet_renamed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """While the stored account still has its own ID, --from may only repeat that ID."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    before = tree_snapshot(tmp_path)
+
+    result = _invoke(runtime_paths, "--from", "@other:x")
+
+    assert result.exit_code == 1, result.output
+    assert f"--from @other:x does not match the stored account {OLD} of agent_{AGENT}" in result.output
+    assert tree_snapshot(tmp_path) == before
     assert server.requests == []
 
 

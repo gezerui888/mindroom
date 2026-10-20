@@ -73,6 +73,38 @@ def journal_account_steps(
     return [SqliteEdit(database=database, edit=edit, description=description)]
 
 
+def other_principal_user_ids(database: Path, *, agent: str, user_id: str) -> dict[str, str]:
+    """Return the IDs other than ``user_id`` that ``agent``'s journal principals name, with their row counts.
+
+    The journal keys ``agent``'s rows by ``<agent>@<Matrix ID>``, so rows under another ID mean the journal still
+    holds state from before the stored account took ``user_id``.
+    A journal that was never created holds none.
+    """
+    if not database.exists():
+        return {}
+    prefix = f"{agent}@"
+    try:
+        with read_only_connection(database) as connection:
+            columns = text_columns(connection)
+            principals: set[str] = set()
+            for table, names in columns.items():
+                for column in names:
+                    if column not in _PRINCIPAL_COLUMNS:
+                        continue
+                    quoted = quote_identifier(column)
+                    # substr instead of LIKE: `_` in an agent name is a LIKE wildcard.
+                    query = f"SELECT DISTINCT {quoted} FROM {quote_identifier(table)} WHERE substr({quoted}, 1, ?) = ?"  # noqa: S608 - quoted schema identifiers
+                    principals.update(principal for (principal,) in connection.execute(query, (len(prefix), prefix)))
+            return {
+                principal.removeprefix(prefix): _format_counts(_principal_row_counts(connection, columns, principal))
+                for principal in sorted(principals)
+                if principal != f"{prefix}{user_id}"
+            }
+    except (sqlite3.Error, OSError) as exc:
+        msg = f"Cannot read the event journal {database}: {exc}"
+        raise RenameRefusedError(msg) from exc
+
+
 def _sql_contains_user_id(value: _SqliteValue, user_id: str) -> bool:
     return isinstance(value, str) and contains_user_id(value, user_id)
 

@@ -21,7 +21,9 @@ Run it after the homeserver renamed the account, and before MindRoom starts for 
 - The new ID must be on the same server as the old one. A rename in place keeps the server, and the command refuses another one.
 - An in-place rename is only safe for an account whose rooms are not shared with other servers. The rewritten events no longer match their hashes and signatures, so a federated server that already holds them would reject them.
 
-If MindRoom already started under the new ID, it created fresh state there.
+MindRoom takes an agent's Matrix ID from the `username` stored in `matrix_state.yaml`.
+If you already changed that username to the new localpart by hand, see [After a manual username change](#after-a-manual-username-change).
+If MindRoom then started under the new ID, it created fresh state there.
 Add `--discard-new-principal` to drop that state when it holds no replies or credentials.
 [New-ID state](#new-id-state) explains what it deletes and when it still refuses.
 
@@ -66,12 +68,36 @@ The rewrite rolls back and the command refuses, naming `table.column`.
 Nothing changes, except that the backup directory remains.
 
 Running the same command again after a successful apply prints `Already adopted; nothing to do.` and exits 0.
+Before it says so, it checks the event journal: when `matrix_state.yaml` names the new ID but the journal still has rows for `<name>@<another ID>`, it refuses and prints the command to run with `--from`.
+
+### After a manual username change
+
+If you set the agent's `username` in `matrix_state.yaml` to the new localpart yourself, the stored account names the new ID, but the event journal, OAuth stores, workers, and config are still under the old one.
+On its next start MindRoom syncs as the new ID and fails on the old journal rows with `IngestionBatchIntegrityError`.
+The command does not treat the username alone as proof of an adoption.
+When the journal still has rows for `<name>@<old ID>`, it refuses, names them, and prints the command to run, with `--from <old ID>`:
+
+```bash
+mindroom agents rename-account harry @mindroom_harry:example.org \
+  --from @mindroom_openclaw:example.org --config config.yaml --storage-path mindroom_data
+```
+
+With `--from`, the old ID comes from the option instead of `matrix_state.yaml`.
+The journal and files move from it and the config values are replaced, as in a normal run.
+`matrix_state.yaml` stays as it is, because its device and access token already belong to the new ID; a `report:` line in the plan says so.
+If MindRoom started after your edit, add `--discard-new-principal` for the state it wrote under the new ID.
+
+`--from` must be a Matrix user ID on the new ID's server, differ from the new ID, and not be another stored account.
+While `matrix_state.yaml` still names the old ID, `--from` may only repeat that ID.
+The check only looks at the journal.
+If the journal holds no rows for the old ID, for example because you fixed it by hand, the command prints `Already adopted; nothing to do.` even when OAuth stores or workers are still under the old ID.
+Run it with `--from` in that case too.
 
 ## What changes
 
 | Where | Change |
 | --- | --- |
-| `matrix_state.yaml`, account `agent_<name>` | The `username` becomes the new localpart. The old `device_id` and `access_token` are cleared so the next start logs in on a fresh device. The password stays. |
+| `matrix_state.yaml`, account `agent_<name>` | The `username` becomes the new localpart. The old `device_id` and `access_token` are cleared so the next start logs in on a fresh device. The password stays. An account whose `username` already is the new localpart is left alone (see [After a manual username change](#after-a-manual-username-change)). |
 | Event journal, `tracking/event_journal.db` | In one transaction: the principal `<name>@<old ID>` becomes `<name>@<new ID>`, the old ID is replaced in every other text column, the principal's sync consumer and approval grants are deleted, and leftover old-ID `room_member_joins` rows are deleted. |
 | `private_oauth/` | The directory of the old ID moves to the directory of the new ID. The worker key inside each OAuth credential store is rewritten. |
 | `workers/` | Each worker whose key names the old ID as requester moves to the directory of its new key. Its `metadata/worker.json` and OAuth stores are rewritten. Docker control records and config projections of the old key are removed. |
@@ -127,6 +153,7 @@ Event journal collisions are the one refusal that only shows up while `--apply` 
 
 - The config exists and loads, `AGENT` is an agent in it, and `matrix_state.yaml` holds the account `agent_<name>`.
 - The new ID is a valid Matrix user ID on the old ID's server, and is not another stored account.
+- With `--from`, the old ID passes the same checks, differs from the new ID, and matches the stored account unless that already names the new ID.
 - The journal backend and worker backend are supported.
 - MindRoom is stopped: `Stop MindRoom first: another process holds <lock file>`.
 - The login check passes (`--apply` only). The command logs in at `/_matrix/client/v3/login` on the configured homeserver as the new ID with the stored password, then logs out. A rejected login means the server rename has not happened, and the command refuses with `The server does not accept <new ID> with the stored password`.

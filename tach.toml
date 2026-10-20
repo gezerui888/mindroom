@@ -3331,6 +3331,7 @@ visibility = [
 path = "mindroom.memory_scope_ids"
 depends_on = []
 visibility = [
+    "mindroom.agent_rename.memory",
     "mindroom.knowledge.file_memory_knowledge",
     "mindroom.memory._file_backend",
     "mindroom.memory._mem0_backend",
@@ -9374,6 +9375,15 @@ depends_on = ["mindroom.agent_rename.workers", "mindroom.constants", "mindroom.t
 [[interfaces]]
 expose = ["entity_state_steps", "matrix_state_key_step"]
 from = ["mindroom.agent_rename.entity_state"]
+
+# Renames the memory scopes naming an agent in mem0's Chroma stores and file memory.
+[[modules]]
+path = "mindroom.agent_rename.memory"
+depends_on = ["mindroom.agent_rename.workers", "mindroom.memory_scope_ids", "mindroom.tool_system.worker_routing"]
+
+[[interfaces]]
+expose = ["memory_steps"]
+from = ["mindroom.agent_rename.memory"]
 
 # Edits the config, its includes, and its `.env` as text for both rename commands.
 [[modules]]

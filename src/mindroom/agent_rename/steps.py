@@ -96,6 +96,30 @@ def _make_private_directory(path: Path) -> None:
     path.mkdir(mode=_PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
 
 
+@contextmanager
+def _scratch_beside(path: Path) -> Iterator[Path]:
+    """Yield an empty private directory beside ``path``, so renames between the two stay on one filesystem.
+
+    The directory and anything left in it are removed afterwards.
+    """
+    scratch = Path(tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"))
+    try:
+        yield scratch
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _swap_directory(replacement: Path, destination: Path, scratch: Path) -> None:
+    """Put ``replacement`` in the place of the directory ``destination``, which moves into ``scratch``."""
+    replaced = scratch / f"{destination.name}.replaced"
+    destination.rename(replaced)
+    try:
+        replacement.rename(destination)
+    except BaseException:
+        replaced.rename(destination)
+        raise
+
+
 @dataclass(frozen=True)
 class MovePath:
     """Rename a file or directory; refuses when the destination already exists."""
@@ -167,6 +191,36 @@ class FileRewrite:
 
 
 @dataclass(frozen=True)
+class DirectoryEdit:
+    """Run ``edit`` on a copy of a directory, then swap the edited copy into the directory's place."""
+
+    path: Path
+    edit: Callable[[Path], None]
+    description: str
+    stores_backup: ClassVar[bool] = True
+
+    def apply(self, backup: Path) -> None:
+        """Copy the directory into ``backup``, run ``edit`` on a second copy beside it, then swap that copy in.
+
+        ``edit`` receives the second copy's path. The swap is the commit point, so a failing edit changes nothing.
+        """
+        _make_private_directory(backup)
+        shutil.copytree(self.path, backup / self.path.name, symlinks=True)
+        with _scratch_beside(self.path) as scratch:
+            edited = scratch / self.path.name
+            shutil.copytree(self.path, edited, symlinks=True)
+            self.edit(edited)
+            _swap_directory(edited, self.path, scratch)
+
+    def _undo(self, backup: Path) -> None:
+        """Swap a copy of the backup into the directory's place."""
+        with _scratch_beside(self.path) as scratch:
+            restored = scratch / self.path.name
+            shutil.copytree(backup / self.path.name, restored, symlinks=True)
+            _swap_directory(restored, self.path, scratch)
+
+
+@dataclass(frozen=True)
 class DropPath:
     """Remove a path from its place by moving it into the backup directory, so a drop is recoverable."""
 
@@ -200,7 +254,7 @@ class FinalAction:
         """Do nothing: final actions are never undone."""
 
 
-Step = MovePath | SqliteEdit | FileRewrite | DropPath | FinalAction
+Step = MovePath | SqliteEdit | FileRewrite | DirectoryEdit | DropPath | FinalAction
 
 
 @dataclass(frozen=True)
@@ -229,7 +283,7 @@ def _manifest_entry(step: Step, step_backup: Path) -> dict[str, str | None]:
         source, destination = step.source, step.destination
     elif isinstance(step, SqliteEdit):
         source, destination = step.database, None
-    elif isinstance(step, FileRewrite | DropPath):
+    elif isinstance(step, FileRewrite | DirectoryEdit | DropPath):
         source, destination = step.path, None
     else:
         source, destination = None, None

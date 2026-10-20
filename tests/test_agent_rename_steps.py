@@ -16,6 +16,7 @@ import pytest
 from mindroom.agent_rename import steps as steps_module
 from mindroom.agent_rename.steps import (
     ApplyResult,
+    DirectoryEdit,
     DropPath,
     FileRewrite,
     FinalAction,
@@ -554,3 +555,108 @@ def test_describe_leaves_the_filesystem_untouched(tmp_path: Path) -> None:
     _four_step_plan(storage).describe()
 
     assert tree_snapshot(tmp_path) == before
+
+
+def _make_store(storage: Path) -> Path:
+    store = storage / "agents" / "old" / "store"
+    (store / "segment").mkdir(parents=True)
+    (store / "index.txt").write_text("user_id=@old:x")
+    (store / "segment" / "data.bin").write_bytes(b"vectors")
+    store.chmod(0o750)
+    return store
+
+
+def _rewrite_store(directory: Path) -> None:
+    (directory / "index.txt").write_text("user_id=@new:x")
+    (directory / "segment" / "added.bin").write_bytes(b"new")
+
+
+def test_directory_edit_swaps_in_an_edited_copy_and_keeps_a_backup(tmp_path: Path) -> None:
+    """The edit runs on a copy that replaces the directory; the backup holds the original and the manifest names it."""
+    storage = _make_storage(tmp_path)
+    store = _make_store(storage)
+    edited: list[Path] = []
+
+    def record_and_rewrite(directory: Path) -> None:
+        edited.append(directory)
+        _rewrite_store(directory)
+
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(DirectoryEdit(store, record_and_rewrite, "edit store"),),
+        reports=(),
+    )
+
+    result = apply_plan(plan, kind="rename", now=NOW)
+
+    assert edited != [store]
+    assert tree_snapshot(store) == {
+        "segment": "dir",
+        "index.txt": b"user_id=@new:x",
+        "segment/data.bin": b"vectors",
+        "segment/added.bin": b"new",
+    }
+    assert store.stat().st_mode & 0o777 == 0o750
+    assert tree_snapshot(result.backup_dir / "000" / "store") == {
+        "segment": "dir",
+        "index.txt": b"user_id=@old:x",
+        "segment/data.bin": b"vectors",
+    }
+    assert sorted(path.name for path in store.parent.iterdir()) == ["state.txt", "store"]
+    assert json.loads((result.backup_dir / "manifest.json").read_text())["steps"] == [
+        {
+            "type": "DirectoryEdit",
+            "description": "edit store",
+            "source": str(store),
+            "destination": None,
+            "backup": str(result.backup_dir / "000"),
+        },
+    ]
+
+
+def test_failing_directory_edit_changes_nothing(tmp_path: Path) -> None:
+    """An edit that fails halfway leaves the directory as it was and no copy beside it."""
+    storage = _make_storage(tmp_path)
+    store = _make_store(storage)
+    original = tree_snapshot(storage)
+
+    def rewrite_then_fail(directory: Path) -> None:
+        _rewrite_store(directory)
+        msg = "boom"
+        raise RuntimeError(msg)
+
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            MovePath(storage / "accounts.json", storage / "moved.json", "move accounts"),
+            DirectoryEdit(store, rewrite_then_fail, "edit store"),
+        ),
+        reports=(),
+    )
+
+    with pytest.raises(RenameApplyError, match="edit store"):
+        apply_plan(plan, kind="rename", now=NOW)
+
+    assert _without_backups(tree_snapshot(storage)) == original
+    assert store.stat().st_mode & 0o777 == 0o750
+
+
+def test_directory_edit_is_undone_when_a_later_step_fails(tmp_path: Path) -> None:
+    """Undo puts the backup copy back in the directory's place, with its mode."""
+    storage = _make_storage(tmp_path)
+    store = _make_store(storage)
+    original = tree_snapshot(storage)
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            DirectoryEdit(store, _rewrite_store, "edit store"),
+            FileRewrite(storage / "accounts.json", _fail_rewrite, "rewrite accounts"),
+        ),
+        reports=(),
+    )
+
+    with pytest.raises(RenameApplyError, match="rewrite accounts"):
+        apply_plan(plan, kind="rename", now=NOW)
+
+    assert _without_backups(tree_snapshot(storage)) == original
+    assert store.stat().st_mode & 0o777 == 0o750

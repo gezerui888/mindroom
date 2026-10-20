@@ -463,6 +463,8 @@ def _plan(
         old_user_id=old_user_id,
         new_user_id=new_user_id,
         discard_new_principal=discard_new_principal,
+        # matrix_state_steps keeps the device of an account whose username already names the new ID.
+        new_device_kept=adoption.stored_user_id == new_user_id,
     )
     file_steps, reports = account_file_steps(
         runtime_paths,

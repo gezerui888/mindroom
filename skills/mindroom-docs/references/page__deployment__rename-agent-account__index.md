@@ -104,7 +104,7 @@ To finish such an install with `--from`, restore the journal from before your fi
 | Where | Change |
 | --- | --- |
 | `matrix_state.yaml`, account `agent_<name>` | The `username` becomes the new localpart. The old `device_id` and `access_token` are cleared so the next start logs in on a fresh device. The password stays. An account whose `username` already is the new localpart is left alone (see [After a manual username change](#after-a-manual-username-change)). |
-| Event journal, `tracking/event_journal.db` | In one transaction: the principal `<name>@<old ID>` becomes `<name>@<new ID>`, the old ID is replaced in every other text column, the principal's sync consumer and approval grants are deleted, and leftover old-ID `room_member_joins` rows are deleted. When `<name>@<old ID>` has no rows, there is nothing to move: only text cells that still hold the old ID are replaced, nothing of `<name>@<new ID>` is deleted, and a journal without such cells is left as it is. |
+| Event journal, `tracking/event_journal.db` | In one transaction: the principal `<name>@<old ID>` becomes `<name>@<new ID>`, the old ID is replaced in every other text column, the principal's approval grants are deleted, and leftover old-ID `room_member_joins` rows are deleted. The sync stream state of `<name>@<old ID>`, its `matrix_sync_consumers` row and its `matrix_ingestion_membership` rows, is deleted too: it belongs to the old device's Matrix sync stream, which no device continues, and a new stream reports every room from membership epoch 0, which kept rows would refuse. When `<name>@<old ID>` has no rows, there is nothing to move: only text cells that still hold the old ID are replaced, nothing of `<name>@<new ID>` is deleted, and a journal without such cells is left as it is. |
 | `private_oauth/` | The directory of the old ID moves to the directory of the new ID. The worker key inside each OAuth credential store is rewritten. |
 | `workers/` | Each worker whose key names the old ID as requester moves to the directory of its new key. Its `metadata/worker.json` and OAuth stores are rewritten. Its `venv/` is moved into the backup, because the scripts in it name the old path; MindRoom builds a new one on the worker's next use, and packages installed into the old one must be installed again. Docker control records and config projections of the old key are removed. |
 | `private_instances/` and `tracking/private_instances/` | Private scopes owned by the old ID move to the scope of the new ID, and their owner record is rewritten. |
@@ -148,6 +148,8 @@ Without `--discard-new-principal` the command refuses and names it, either both 
 With `--discard-new-principal`:
 
 - The journal rows under `<name>@<new ID>` are deleted first, then the rows of `<name>@<old ID>` move in their place.
+  When `matrix_state.yaml` already names the new ID (a `--from` run after a manual username change), the sync stream state of `<name>@<new ID>`, its `matrix_sync_consumers` row and `matrix_ingestion_membership` rows, is not deleted: that account keeps the device MindRoom already uses under the new ID, and the device continues that stream.
+  Otherwise the next start logs in on a fresh device, and that state is deleted with the rest.
 - A destination path that holds only OAuth stores without credentials, lock files, and empty directories is moved into the backup directory, then the old path moves in.
 
 The flag only deletes journal rows while `<name>@<old ID>` still has rows.

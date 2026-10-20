@@ -117,31 +117,44 @@ def _event(connection: sqlite3.Connection, principal: str, *, sender: str) -> No
 
 
 def _journal(storage_root: Path, *, new_principal_rows: bool = False) -> Path:
-    """Build a journal with the real schema: harry's event seen by harry and the router, and harry's sync consumer."""
+    """Build a journal with the real schema: harry's event seen by harry and the router, and harry's sync stream."""
     database = event_journal_sqlite_path(storage_root)
     asyncio.run(EventJournalStore.open_sqlite(database).close())
     with closing(sqlite3.connect(database)) as connection, connection:
         _event(connection, OLD_PRINCIPAL, sender=OLD)
         _event(connection, ROUTER, sender=OLD)
-        _insert(
-            connection,
-            "matrix_sync_consumers",
-            principal_id=OLD_PRINCIPAL,
-            consumer_generation="generation-1",
-            stream_id="stream-1",
-            next_sequence=5,
-        )
+        _sync_stream(connection, OLD_PRINCIPAL, "1", next_sequence=5, membership_epoch=1)
         if new_principal_rows:
             # MindRoom ran after the server rename and bound a sync stream under the new principal.
-            _insert(
-                connection,
-                "matrix_sync_consumers",
-                principal_id=NEW_PRINCIPAL,
-                consumer_generation="generation-2",
-                stream_id="stream-2",
-                next_sequence=1,
-            )
+            _sync_stream(connection, NEW_PRINCIPAL, "2", next_sequence=1, membership_epoch=0)
     return database
+
+
+def _sync_stream(
+    connection: sqlite3.Connection,
+    principal: str,
+    name: str,
+    *,
+    next_sequence: int,
+    membership_epoch: int,
+) -> None:
+    """Write a principal's sync consumer and the producer position its stream reached in the room."""
+    _insert(
+        connection,
+        "matrix_sync_consumers",
+        principal_id=principal,
+        consumer_generation=f"generation-{name}",
+        stream_id=f"stream-{name}",
+        next_sequence=next_sequence,
+    )
+    _insert(
+        connection,
+        "matrix_ingestion_membership",
+        principal_id=principal,
+        room_id="!room:x",
+        membership="join",
+        membership_epoch=membership_epoch,
+    )
 
 
 def _oauth_store(path: Path, worker_key: str) -> None:
@@ -274,6 +287,7 @@ def test_apply_adopts_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, s
         (ROUTER, NEW),
     ]
     assert _journal_rows(runtime_paths, "SELECT * FROM matrix_sync_consumers") == []
+    assert _journal_rows(runtime_paths, "SELECT * FROM matrix_ingestion_membership") == []
     assert not _oauth_path(storage, OLD).exists()
     assert _stored_worker_key(_oauth_path(storage, NEW)) == _key("user_agent", NEW)
     assert not (storage / "workers" / worker_dir_name(_key("user", OLD))).exists()
@@ -423,7 +437,9 @@ def test_discard_new_principal_reaches_the_journal(
     applied = _invoke(runtime_paths, "--apply", "--yes", "--skip-login-check", "--discard-new-principal")
 
     assert applied.exit_code == 0, applied.output
+    # The stored device is dropped, so the next start binds a fresh stream: neither principal's stream state stays.
     assert _journal_rows(runtime_paths, "SELECT principal_id FROM matrix_sync_consumers") == []
+    assert _journal_rows(runtime_paths, "SELECT principal_id FROM matrix_ingestion_membership") == []
     assert server.requests == []
 
 
@@ -484,7 +500,13 @@ def test_from_adopts_a_manually_renamed_account(
         (NEW_PRINCIPAL, NEW),
         (ROUTER, NEW),
     ]
-    assert _journal_rows(runtime_paths, "SELECT * FROM matrix_sync_consumers") == []
+    # The kept device continues the stream it bound under the new ID, so that stream's state stays.
+    assert _journal_rows(runtime_paths, "SELECT * FROM matrix_sync_consumers") == [
+        (NEW_PRINCIPAL, "generation-2", "stream-2", 1),
+    ]
+    assert _journal_rows(runtime_paths, "SELECT * FROM matrix_ingestion_membership") == [
+        (NEW_PRINCIPAL, "!room:x", "join", 0),
+    ]
     assert _stored_worker_key(_oauth_path(storage, NEW)) == _key("user_agent", NEW)
     assert (storage / "workers" / worker_dir_name(_key("user", NEW)) / "workspace" / "notes.md").is_file()
     assert runtime_paths.config_path.read_text() == CONFIG.replace(OLD, NEW)

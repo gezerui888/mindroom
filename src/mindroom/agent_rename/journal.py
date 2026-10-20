@@ -24,6 +24,8 @@ _PRINCIPAL_COLUMNS = frozenset({"principal_id", "responder_principal_id"})
 _SENT_REPLY_TABLES = ("reply_messages", "matrix_delivery_outbox")
 # Grants hash the old principal into their scope key, so a renamed grant could never match again.
 _GRANT_TABLES = ("approval_grants", "approval_grant_cards")
+# A principal's sync consumer and the producer positions its stream reached; they belong to one device's sync stream.
+_SYNC_STREAM_TABLES = ("matrix_sync_consumers", "matrix_ingestion_membership")
 
 type _SqliteValue = str | bytes | int | float | None
 
@@ -35,13 +37,19 @@ def journal_account_steps(
     old_user_id: str,
     new_user_id: str,
     discard_new_principal: bool,
+    new_device_kept: bool,
 ) -> tuple[list[SqliteEdit], list[str]]:
     """Return the one edit that moves ``agent``'s journal state from ``old_user_id`` to ``new_user_id``, and reports.
 
     When the old principal has rows, the edit moves them: it renames the principal, replaces the old ID in every
-    text cell, and drops the principal's sync consumer and approval grants. Rows the new principal has as well mean
+    text cell, and drops the principal's approval grants. Rows the new principal has as well mean
     MindRoom ran under the new ID before the journal was moved; that refuses unless ``discard_new_principal``
     is set, and always when they include replies already sent.
+
+    The sync stream state, a principal's sync consumer and producer membership positions, must belong to the stream
+    the device's store continues. The old principal's never does, so it is dropped. The new principal's stays only
+    when ``new_device_kept`` says the stored account keeps the device it uses under the new ID; otherwise the next
+    start logs in on a fresh device that binds a fresh stream, and it is dropped as well.
 
     When the old principal has no rows there is nothing to move, and the new principal's rows are the agent's own
     history: moved by an earlier run that was killed or is repeated, or written since. They are never deleted,
@@ -72,11 +80,19 @@ def journal_account_steps(
             new_principal=new_principal,
             discard=discard_new_principal,
         )
-        discarded = f"delete the rows already under {new_principal} ({_format_counts(new_rows)}), " if new_rows else ""
+        kept = {table: count for table, count in new_rows.items() if new_device_kept and table in _SYNC_STREAM_TABLES}
+        discarded = {table: count for table, count in new_rows.items() if table not in kept}
+        deletion = f"delete the rows already under {new_principal} ({_format_counts(discarded)}), " if discarded else ""
+        stream = (
+            f"drop the sync stream state of {old_principal} and keep that of {new_principal} "
+            f"({_format_counts(kept)}), whose device continues that stream"
+            if kept
+            else "drop the principal's sync stream state, so the next start binds a fresh stream"
+        )
         description = (
-            f"Rewrite the event journal {database}: {discarded}rename principal {old_principal} to {new_principal}, "
+            f"Rewrite the event journal {database}: {deletion}rename principal {old_principal} to {new_principal}, "
             f"replace {old_user_id} with {new_user_id} in every text cell, "
-            "and drop the principal's sync consumer and approval grants"
+            f"{stream}, and drop the principal's approval grants"
         )
     elif old_cells:
         description = (
@@ -94,6 +110,7 @@ def journal_account_steps(
         new_principal=new_principal,
         move_principal=bool(old_rows),
         discard_new_principal=discard_new_principal,
+        new_device_kept=new_device_kept,
     )
     return [SqliteEdit(database=database, edit=edit, description=description)], []
 
@@ -220,11 +237,12 @@ def _rewrite(
     new_principal: str,
     move_principal: bool,
     discard_new_principal: bool,
+    new_device_kept: bool,
 ) -> None:
     """Move the journal to the new ID inside the caller's transaction; raising rolls everything back.
 
     Without ``move_principal`` the old principal had no rows when planned, so only text cells change
-    and nothing of the new principal is deleted.
+    and nothing of the new principal is deleted, its sync stream state included.
     """
     _register_matchers(connection)
     columns = text_columns(connection)
@@ -246,7 +264,12 @@ def _rewrite(
             new_principal=new_principal,
             discard=discard_new_principal,
         )
-        _delete_principal_rows(connection, columns, tables=tuple(new_rows), principal=new_principal)
+        # The new device's store continues the new principal's stream, so that stream's state must stay.
+        kept = _SYNC_STREAM_TABLES if new_device_kept else ()
+        discarded = tuple(table for table in new_rows if table not in kept)
+        _delete_principal_rows(connection, columns, tables=discarded, principal=new_principal)
+        # No device continues the old login's stream; a fresh stream starts every room at membership epoch 0.
+        _delete_principal_rows(connection, columns, tables=_SYNC_STREAM_TABLES, principal=old_principal)
     _replace_identity(
         connection,
         columns,
@@ -256,9 +279,6 @@ def _rewrite(
         # Any old-ID row left here collided with a row the bot already recorded for the new ID.
         connection.execute("DELETE FROM room_member_joins WHERE user_id = ?", (old_user_id,))
     if move_principal:
-        if "matrix_sync_consumers" in columns:
-            # The consumer binds a sync stream to the old login's device; the new device must bind a fresh one.
-            connection.execute("DELETE FROM matrix_sync_consumers WHERE principal_id = ?", (new_principal,))
         _delete_principal_rows(connection, columns, tables=_GRANT_TABLES, principal=new_principal)
     _refuse_leftovers(connection, columns, old_user_id=old_user_id, new_user_id=new_user_id)
 

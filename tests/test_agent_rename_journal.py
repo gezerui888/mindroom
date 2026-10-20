@@ -15,6 +15,7 @@ import pytest
 from mindroom.agent_rename.journal import journal_account_steps, other_principal_user_ids
 from mindroom.agent_rename.steps import RenamePlan, RenameRefusedError, SqliteEdit, apply_plan
 from mindroom.event_journal import (
+    DepartureSource,
     EventClass,
     EventJournalStore,
     EventKind,
@@ -23,6 +24,8 @@ from mindroom.event_journal import (
     IngestionBatchIntegrityError,
     IngestionRecordAdmission,
     IngestionRecordDisposition,
+    PrincipalStore,
+    RoomMembershipPosition,
     encode_thread_id,
 )
 from mindroom.event_journal.opening import event_journal_sqlite_path
@@ -197,13 +200,20 @@ async def _journal(storage_root: Path) -> Path:
     return database
 
 
-def _steps(database: Path, *, new_user_id: str = NEW, discard_new_principal: bool = False) -> list[SqliteEdit]:
+def _steps(
+    database: Path,
+    *,
+    new_user_id: str = NEW,
+    discard_new_principal: bool = False,
+    new_device_kept: bool = False,
+) -> list[SqliteEdit]:
     steps, _reports = journal_account_steps(
         database,
         agent=AGENT,
         old_user_id=OLD,
         new_user_id=new_user_id,
         discard_new_principal=discard_new_principal,
+        new_device_kept=new_device_kept,
     )
     return steps
 
@@ -448,6 +458,161 @@ async def test_readmitting_rewritten_event_is_duplicate_not_integrity_error(tmp_
     assert not facts.semantic_event_new
 
 
+def _membership(previous: str | None, current: str, previous_epoch: int, epoch: int) -> IngestionRecordAdmission:
+    """One own-membership transition in the room, as the sync stream reports it."""
+    return IngestionRecordAdmission(
+        IngestionRecordDisposition.ROOM_LIFECYCLE,
+        source=DepartureSource.REPORTED,
+        room_id=ROOM,
+        previous_membership=previous,
+        membership=current,
+        previous_membership_epoch=previous_epoch,
+        membership_epoch=epoch,
+    )
+
+
+def _message(event_id: str) -> IngestionRecordAdmission:
+    """One message from alice in the room."""
+    event = InboundEvent(
+        event_id=event_id,
+        room_id=ROOM,
+        thread_id=None,
+        kind=EventKind.MESSAGE,
+        event_class=EventClass.CONTEXT_ONLY,
+        sender="@alice:x",
+        origin_server_ts=10,
+        source={"event_id": event_id, "sender": "@alice:x"},
+    )
+    return IngestionRecordAdmission(IngestionRecordDisposition.SEMANTIC_EVENT, event=event)
+
+
+# A stream that saw harry join, leave, and join again ends at producer epoch 1, like the production journal did.
+_REJOINED = (_membership(None, "join", 0, 0), _membership("join", "leave", 0, 1), _membership("leave", "join", 1, 1))
+_CONSUMER = "SELECT consumer_generation, stream_id, next_sequence FROM matrix_sync_consumers WHERE principal_id = ?"
+_PRODUCER = "SELECT room_id, membership, membership_epoch FROM matrix_ingestion_membership WHERE principal_id = ?"
+
+
+async def _bound(store: EventJournalStore, principal_id: str, stream: UUID) -> PrincipalStore:
+    """Bind ``stream`` to the principal, as a device's first start does."""
+    principal = store.principal(principal_id)
+    consumer = await principal.load_or_create_ingestion_consumer(new_generation=uuid4())
+    await principal.bind_ingestion_stream(generation=consumer.generation, stream_id=stream)
+    return principal
+
+
+@pytest.mark.asyncio
+async def test_renamed_principal_admits_the_fresh_stream_of_its_new_device(tmp_path: Path) -> None:
+    """The old stream's producer positions go with its sync consumer, so the new device's stream admits every room.
+
+    A fresh stream reports each room from membership epoch 0. Kept positions of the old stream failed every
+    room's admission with IngestionBatchIntegrityError, which is what production hit after a clean adoption.
+    """
+    database = event_journal_sqlite_path(tmp_path)
+    old_stream, fresh_stream = uuid4(), uuid4()
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        harry = await _bound(store, OLD_PRINCIPAL, old_stream)
+        await harry.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, (*_REJOINED, _message("$before"))))
+    finally:
+        await store.close()
+
+    _apply(_steps(database), tmp_path)
+
+    assert _query(database, "SELECT * FROM matrix_sync_consumers") == []
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        harry = await _bound(store, NEW_PRINCIPAL, fresh_stream)
+        facts = await harry.admit_ingestion_batch(
+            IngestionBatchAdmission(fresh_stream, 1, (_membership(None, "join", 0, 0),)),
+        )
+        producer = await harry.ingestion_membership_position(ROOM)
+        tenure = await harry.membership_position(ROOM)
+        history = await harry.load_event("$before")
+    finally:
+        await store.close()
+    assert facts.receipt_new
+    assert producer == RoomMembershipPosition("join", 0)
+    # The journal's own tenure and history are the old principal's, renamed.
+    assert tenure == RoomMembershipPosition("join", 1)
+    assert history is not None
+
+
+@pytest.mark.asyncio
+async def test_discard_keeps_the_stream_of_the_device_already_running_under_the_new_id(tmp_path: Path) -> None:
+    """With the new ID's device kept, its sync consumer and producer positions stay, and the old principal's history joins them.
+
+    The old principal's own stream state is dropped: no device continues that stream any more.
+    """
+    database = event_journal_sqlite_path(tmp_path)
+    old_stream, new_stream = uuid4(), uuid4()
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        harry = await _bound(store, OLD_PRINCIPAL, old_stream)
+        await harry.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, (*_REJOINED, _message("$before"))))
+        renamed = await _bound(store, NEW_PRINCIPAL, new_stream)
+        await renamed.admit_ingestion_batch(
+            IngestionBatchAdmission(new_stream, 1, (_membership(None, "join", 0, 0), _message("$after"))),
+        )
+    finally:
+        await store.close()
+    new_consumer = _query(database, _CONSUMER, NEW_PRINCIPAL)
+    new_producer = _query(database, _PRODUCER, NEW_PRINCIPAL)
+    assert [row[1:] for row in new_consumer] == [(str(new_stream), 2)]
+    assert new_producer == [(ROOM, "join", 0)]
+
+    (step,) = _steps(database, discard_new_principal=True, new_device_kept=True)
+    _apply([step], tmp_path)
+
+    assert _query(database, _CONSUMER, NEW_PRINCIPAL) == new_consumer
+    assert _query(database, _PRODUCER, NEW_PRINCIPAL) == new_producer
+    assert _query(database, "SELECT event_id FROM journal_events WHERE principal_id = ?", NEW_PRINCIPAL) == [
+        ("$before",),
+    ]
+    assert other_principal_user_ids(database, agent=AGENT, user_id=NEW) == {}
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        renamed = store.principal(NEW_PRINCIPAL)
+        facts = await renamed.admit_ingestion_batch(
+            IngestionBatchAdmission(new_stream, 2, (_membership("join", "leave", 0, 1),)),
+        )
+        producer = await renamed.ingestion_membership_position(ROOM)
+    finally:
+        await store.close()
+    assert facts.receipt_new
+    assert producer == RoomMembershipPosition("leave", 1)
+    assert f"keep that of {NEW_PRINCIPAL} (matrix_ingestion_membership: 1, matrix_sync_consumers: 1)" in (
+        step.description
+    )
+
+
+@pytest.mark.asyncio
+async def test_discard_drops_the_new_id_stream_when_the_next_start_uses_a_fresh_device(tmp_path: Path) -> None:
+    """Without the new ID's device kept, neither principal's stream is continued, so both stream states go."""
+    database = event_journal_sqlite_path(tmp_path)
+    old_stream, new_stream, fresh_stream = uuid4(), uuid4(), uuid4()
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        harry = await _bound(store, OLD_PRINCIPAL, old_stream)
+        await harry.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, _REJOINED))
+        renamed = await _bound(store, NEW_PRINCIPAL, new_stream)
+        await renamed.admit_ingestion_batch(IngestionBatchAdmission(new_stream, 1, (_membership(None, "join", 0, 0),)))
+    finally:
+        await store.close()
+
+    _apply(_steps(database, discard_new_principal=True), tmp_path)
+
+    assert _query(database, "SELECT * FROM matrix_sync_consumers") == []
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        harry = await _bound(store, NEW_PRINCIPAL, fresh_stream)
+        facts = await harry.admit_ingestion_batch(
+            IngestionBatchAdmission(fresh_stream, 1, (_membership(None, "join", 0, 0),)),
+        )
+    finally:
+        await store.close()
+    assert facts.receipt_new
+
+
 @pytest.mark.asyncio
 async def test_full_text_tables_are_left_alone(tmp_path: Path) -> None:
     """Virtual tables and their shadow tables are never updated, nor counted as leftovers."""
@@ -517,6 +682,7 @@ def test_unreadable_journal_is_refused(tmp_path: Path) -> None:
         _steps(database)
 
 
+@pytest.mark.asyncio
 async def test_other_principal_user_ids_lists_ids_the_agent_was_keyed_by(tmp_path: Path) -> None:
     """Principals of the agent under another ID are listed with their row counts, read without writing anything."""
     database = await _journal(tmp_path)
@@ -564,6 +730,7 @@ async def test_moved_journal_is_left_alone_even_with_the_flag(tmp_path: Path) ->
             old_user_id=OLD,
             new_user_id=NEW,
             discard_new_principal=discard,
+            new_device_kept=False,
         )
         assert steps == []
         assert reports == [
@@ -588,6 +755,7 @@ async def test_mistyped_old_id_deletes_nothing(tmp_path: Path) -> None:
         old_user_id="@typo:x",
         new_user_id=NEW,
         discard_new_principal=True,
+        new_device_kept=False,
     )
 
     assert steps == []

@@ -44,7 +44,10 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
 
 ## Procedure
 
-1. Stop MindRoom.
+1. Stop MindRoom, and keep it from starting by itself until step 5.
+   Disable its systemd unit (`systemctl disable --now <unit>`) or set its container's restart policy to `no` (`docker update --restart=no <container>`).
+   If the unit comes from a NixOS configuration, also pause automatic deployments such as comin, which would start it again, and do not reboot.
+   A MindRoom that starts after a killed run finds the agent half-renamed, see [Killed runs and reruns](#killed-runs-and-reruns).
 2. Take a snapshot or copy of the storage directory and the config directory.
    Include `MINDROOM_SESSION_STORAGE_PATH` and `MINDROOM_CONTROL_STATE_PATH` when you set them to paths outside the storage directory.
    The command keeps its own backups, but a snapshot is the simplest rollback.
@@ -71,7 +74,7 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
      --config config.yaml --storage-path mindroom_data --apply
    ```
 
-5. Start MindRoom.
+5. Turn auto-start back on and start MindRoom.
    The agent syncs with the same device and access token as before.
    Ask it something in a room it was in, and check that it remembers an earlier conversation.
 
@@ -328,7 +331,7 @@ The completed steps are undone first.
 - **A journal with the agent's principal but no stored account.**
   Restore the account `agent_<OLD>` in `matrix_state.yaml` first.
 
-Two limits are not refusals:
+Three limits are not refusals:
 
 - A config value that points into the agent's state directory is renamed only when no whitespace follows `agents/<OLD>`.
   A path such as `agents/openclaw/my notes` stays as it is.
@@ -336,6 +339,10 @@ Two limits are not refusals:
 - The command does not edit the text of workspace files, prompts, or memories.
   It only rewrites the delegation exports in workspaces and, in memories, the scope tags and the `agent` and `team_members` fields.
   Text that mentions the old name stays.
+- The state directory `agents/<OLD>/` moves as a whole, so whatever inside it records its own absolute path still points at the old one.
+  Examples are a virtual environment the agent created in its workspace, whose scripts name the old path, Git worktrees, whose `.git` files and the main repository's `worktrees/*/gitdir` files hold absolute paths, and absolute symlinks into the directory.
+  To find them after the rename, run `grep -rlI -- '/agents/<OLD>/' <storage>/agents/<NEW>` for files that name the old path and `find <storage>/agents/<NEW> -xtype l` for broken symlinks.
+  Create a virtual environment again, run `git worktree repair <worktree>...` in the main repository with the new path of each worktree, and point symlinks at the new path.
 
 ## When a step fails
 
@@ -353,7 +360,13 @@ Ctrl-C is ignored while the command undoes steps.
 If the command itself is killed during `--apply`, for example by `kill -9`, an out-of-memory kill, or a power loss, nothing is undone.
 The config is edited last, so a run killed before that edit still has `OLD` configured.
 
-Running the same rename again then refuses.
+Do not start MindRoom until you have restored from the manifest or your snapshot.
+A half-renamed install still has `OLD` configured, while its journal principal, sync state, and turn records may already be `NEW`'s.
+MindRoom then starts `OLD` on a fresh sync stream and can answer messages it already handled.
+Once `matrix_state.yaml` was edited, it holds no account for `OLD`.
+If the agent's Matrix ID is not the one MindRoom generates for `OLD`, MindRoom takes the agent's account for a retired bot and kicks it from its rooms.
+
+Running the same rename again after a kill refuses.
 It finds state under the new name that the killed run left, and it prints `Agent OLD is still configured, but ... so an earlier rename to NEW stopped before it finished.`
 It names what it found and the manifest of that run.
 The same applies when a destination of a move already exists.
@@ -413,6 +426,9 @@ A copy cut short must not replace a good `source`.
 Check that the copy is whole before you use it.
 For a database, `sqlite3 <copy> 'PRAGMA integrity_check'` must print `ok`, and `sqlite3 <copy> .tables` must list the tables, because an empty file also passes the first check.
 For a text file, open the copy and check that it ends where a whole one would, for example that JSON or YAML still parses.
+For a directory, such as the memory store a `DirectoryEdit` copies, compare the copy's file list with the directory at `source`, for example with `diff <(cd <copy> && find . | sort) <(cd <source> && find . | sort)`.
+A file missing from the copy means the copy was cut short.
+The database in it must pass the database check too, for a memory store `<copy>/chroma.sqlite3`.
 If you cannot tell, restore your snapshot instead.
 
 Restore each remaining entry like this:

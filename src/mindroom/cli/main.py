@@ -16,7 +16,8 @@ from rich.markup import escape
 
 from mindroom.constants import ensure_writable_config_path
 
-from .agents import rename, rename_account
+from .agent_rename_command import rename
+from .agents import rename_account
 from .api import is_loopback_host
 from .banner import make_banner
 from .config import (

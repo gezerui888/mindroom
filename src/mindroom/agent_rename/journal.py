@@ -123,6 +123,14 @@ def other_principal_user_ids(database: Path, *, agent: str, user_id: str) -> dic
     holds state from before the stored account took ``user_id``.
     A journal that was never created holds none.
     """
+    return {other: counts for other, counts in principal_user_ids(database, agent=agent).items() if other != user_id}
+
+
+def principal_user_ids(database: Path, *, agent: str) -> dict[str, str]:
+    """Return every Matrix ID that ``agent``'s journal principals ``<agent>@<Matrix ID>`` name, with their row counts.
+
+    A journal that was never created holds none.
+    """
     if not database.exists():
         return {}
     prefix = f"{agent}@"
@@ -141,7 +149,6 @@ def other_principal_user_ids(database: Path, *, agent: str, user_id: str) -> dic
             return {
                 principal.removeprefix(prefix): format_counts(principal_row_counts(connection, columns, principal))
                 for principal in sorted(principals)
-                if principal != f"{prefix}{user_id}"
             }
     except (sqlite3.Error, OSError) as exc:
         msg = f"Cannot read the event journal {database}: {exc}"

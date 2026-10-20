@@ -20,7 +20,8 @@ from mindroom.agent_modes import resolve_agent_mode
 from mindroom.agent_rename import workers as worker_moves
 from mindroom.agent_rename.guard import stopped_runtime
 from mindroom.agent_rename.steps import BACKUPS_DIRECTORY_NAME, RenamePlan, apply_plan
-from mindroom.cli import agents as cli_agents
+from mindroom.cli import agent_rename_command
+from mindroom.cli.agents import load_config_or_exit
 from mindroom.cli.main import app
 from mindroom.constants import matrix_state_file, tracking_dir
 from mindroom.event_journal import EventJournalStore, IngestionBatchAdmission
@@ -502,9 +503,9 @@ def test_rerun_after_success_refuses(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
 def _killed_run(runtime_paths: RuntimePaths, last_step: str) -> Path:
     """Leave the install as a run killed right after the step starting with ``last_step``; return its manifest."""
-    config = cli_agents._load_config_or_exit(runtime_paths)
-    rename = cli_agents._AgentRename(OLD, NEW, OLD_USER_ID, has_account=True)
-    plan = cli_agents._rename_plan(runtime_paths, config, rename)
+    config = load_config_or_exit(runtime_paths)
+    rename = agent_rename_command._AgentRename(OLD, NEW, OLD_USER_ID, has_account=True)
+    plan = agent_rename_command._rename_plan(runtime_paths, config, rename)
     end = next(index for index, step in enumerate(plan.steps) if step.description.startswith(last_step)) + 1
     killed = RenamePlan(storage_root=plan.storage_root, steps=plan.steps[:end], reports=())
     return apply_plan(killed, kind="rename", now=NOW).backup_dir / "manifest.json"

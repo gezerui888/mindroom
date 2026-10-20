@@ -565,6 +565,7 @@ depends_on = [
 visibility = [
     "mindroom.api.config_lifecycle",
     "mindroom.bot",
+    "mindroom.cli.agent_rename_command",
     "mindroom.cli.agents",
     "mindroom.cli.main",
     "mindroom.commands.config_commands",
@@ -4778,6 +4779,22 @@ depends_on = [
     # Mostly deferred imports, so `mindroom --help` does not load the rename engine.
     "mindroom.agent_rename.account_files",
     "mindroom.agent_rename.config_edit",
+    "mindroom.agent_rename.journal",
+    "mindroom.cli.config",
+    "mindroom.config.main",
+    "mindroom.constants",
+    "mindroom.desktop.native_config",
+    "mindroom.event_journal.opening",
+    "mindroom.matrix.state",
+    "mindroom.matrix_identifiers",
+]
+visibility = ["mindroom.cli.agent_rename_command", "mindroom.cli.main"]
+
+[[modules]]
+path = "mindroom.cli.agent_rename_command"
+depends_on = [
+    # Mostly deferred imports, so `mindroom --help` does not load the rename engine.
+    "mindroom.agent_rename.config_edit",
     "mindroom.agent_rename.entity_files",
     "mindroom.agent_rename.entity_state",
     "mindroom.agent_rename.indexes",
@@ -4787,12 +4804,11 @@ depends_on = [
     "mindroom.agent_rename.side_stores",
     "mindroom.agent_rename.teams",
     "mindroom.agent_rename.workers",
+    "mindroom.cli.agents",
     "mindroom.cli.config",
     "mindroom.config.main",
     "mindroom.constants",
-    "mindroom.desktop.native_config",
     "mindroom.event_journal.opening",
-    "mindroom.matrix.state",
     "mindroom.matrix_identifiers",
     "mindroom.tool_system.worker_routing",
 ]
@@ -4802,6 +4818,7 @@ visibility = ["mindroom.cli.main"]
 path = "mindroom.cli.main"
 depends_on = [
     "mindroom.api.auth",
+    "mindroom.cli.agent_rename_command",
     "mindroom.cli.agents",
     "mindroom.cli.api",
     "mindroom.cli.config_bundle",
@@ -9461,6 +9478,7 @@ expose = [
     "journal_account_steps",
     "other_principal_user_ids",
     "principal_row_counts",
+    "principal_user_ids",
 ]
 from = ["mindroom.agent_rename.journal"]
 

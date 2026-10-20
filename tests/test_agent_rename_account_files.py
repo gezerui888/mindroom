@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import closing
 from dataclasses import replace
@@ -23,7 +24,7 @@ from mindroom.agent_rename.steps import (
     apply_plan,
 )
 from mindroom.config.main import Config
-from mindroom.constants import matrix_state_file, primary_records_dir
+from mindroom.constants import matrix_state_file, primary_records_dir, resolve_session_state_root
 from mindroom.credentials.manager import (
     PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME,
     get_runtime_credentials_manager,
@@ -41,6 +42,7 @@ from mindroom.matrix.personal_room_store import (
 from mindroom.matrix.state import MatrixState
 from mindroom.oauth.credential_lifecycle import OAuthCredentialContext
 from mindroom.oauth.credential_store import oauth_credential_reader, oauth_credential_transaction
+from mindroom.private_storage.legacy_private_storage_aliases import historical_private_instance_worker_key
 from mindroom.private_storage.private_instance_identity_store import (
     PrivateInstanceIdentity,
     ensure_private_instance_identity,
@@ -517,6 +519,43 @@ def test_private_instance_scope_moved_and_record_rewritten(tmp_path: Path) -> No
     assert {instance.requester_id for instance in instances} == {"@alice:x", NEW}
     other_scope = private_instance_scope_root_path(storage, other_key)
     assert load_private_instance_identity(storage, other_scope) == PrivateInstanceIdentity(other_key, "@alice:x")
+
+
+def test_private_instance_session_mirror_and_aliases_follow_the_scope(tmp_path: Path) -> None:
+    """With separate session storage, the scope's session mirror moves too, and links to the moved scope are dropped.
+
+    The links are the aliases a startup upgrade published at the old owner's pre-``~`` key; MindRoom only accepts
+    such an alias at the historical key of the scope's current owner, which the new ID never had.
+    """
+    runtime_paths = _install(tmp_path)
+    runtime_paths = replace(
+        runtime_paths,
+        process_env={**runtime_paths.process_env, "MINDROOM_SESSION_STORAGE_PATH": str(tmp_path / "sessions")},
+    )
+    storage = runtime_paths.storage_root
+    old_key, new_key = _key("user_agent", OLD), _key("user_agent", NEW)
+    ensure_private_instance_identity(storage, worker_key=old_key, requester_id=OLD)
+    old_scope, new_scope = (private_instance_scope_root_path(storage, key) for key in (old_key, new_key))
+    old_sessions = resolve_session_state_root(old_scope / "code", runtime_paths)
+    assert old_sessions.is_relative_to(tmp_path / "sessions")
+    (old_sessions / "sessions").mkdir(parents=True)
+    (old_sessions / "sessions" / "code.db").write_text("history", encoding="utf-8")
+    alias_name = worker_dir_name(historical_private_instance_worker_key(old_key, OLD))
+    aliases = [old_scope.parent / alias_name, old_sessions.parent.parent / alias_name]
+    for alias in aliases:
+        alias.symlink_to(old_scope.name, target_is_directory=True)
+
+    steps, _reports = _steps(runtime_paths)
+
+    assert [step.path for step in steps if isinstance(step, DropPath)] == aliases
+
+    _apply(runtime_paths)
+
+    assert not old_sessions.parent.exists()
+    new_sessions = resolve_session_state_root(new_scope / "code", runtime_paths)
+    assert (new_sessions / "sessions" / "code.db").read_text() == "history"
+    assert not any(os.path.lexists(alias) for alias in aliases)
+    assert load_private_instance_identity(storage, new_scope) == PrivateInstanceIdentity(new_key, NEW)
 
 
 def test_personal_room_and_intent_files(tmp_path: Path) -> None:

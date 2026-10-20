@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, cast
 from mindroom import yaml_io
 from mindroom.agent_rename.matching import replace_user_id
 from mindroom.agent_rename.steps import DropPath, FileRewrite, FinalAction, MovePath, RenameRefusedError, SqliteEdit
-from mindroom.constants import matrix_state_file, primary_records_dir
+from mindroom.constants import matrix_state_file, primary_records_dir, resolve_session_state_root
 from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME, scoped_credentials_dir_part
 from mindroom.desktop.native_config import native_config_path
 from mindroom.matrix.client_session import olm_store_dir
@@ -442,9 +442,16 @@ def _rewrite_private_instance_record(content: bytes, *, new_key: str, new_user_i
 
 
 def _private_instance_steps(runtime_paths: RuntimePaths, rename: _AccountRename) -> list[Step]:
-    """Move private scopes owned by the old ID, with the primary's record copies below ``tracking/``."""
+    """Move private scopes owned by the old ID, with the primary's record copies below ``tracking/``.
+
+    With ``MINDROOM_SESSION_STORAGE_PATH`` set, a scope's session databases sit in a mirror of the scope below
+    that root, which moves too. Links in either namespace to a moved scope are dropped: they are the aliases a startup
+    upgrade published at the old owner's key from before the ``~`` prefix, and MindRoom only accepts such an alias
+    for the historical key of the scope's current owner, which the new ID never had.
+    """
     storage = runtime_paths.storage_root
     scopes = private_instances_root_path(storage)
+    session_scopes = resolve_session_state_root(scopes, runtime_paths)
     scope_names = sorted(
         {
             path.name
@@ -466,7 +473,10 @@ def _private_instance_steps(runtime_paths: RuntimePaths, rename: _AccountRename)
             continue
         new_scope = private_instance_scope_root_path(storage, new_key)
         new_roots = (new_scope, primary_records_dir(new_scope, runtime_paths))
-        for old_root, new_root, owner_key in zip(old_roots, new_roots, owner_keys, strict=True):
+        moves = list(zip(old_roots, new_roots, owner_keys, strict=True))
+        if session_scopes != scopes:
+            moves.append((session_scopes / name, session_scopes / new_scope.name, None))
+        for old_root, new_root, owner_key in moves:
             if not os.path.lexists(old_root):
                 continue
             steps += _move(old_root, new_root, "the private instance", rename)
@@ -479,6 +489,13 @@ def _private_instance_steps(runtime_paths: RuntimePaths, rename: _AccountRename)
                         f"Rewrite the owner of {record} to {rename.new_user_id}",
                     ),
                 )
+        steps += [
+            DropPath(link, f"Drop the link {link} to the moved private instance {link.parent / name}")
+            for namespace in dict.fromkeys((scopes, session_scopes))
+            if namespace.is_dir()
+            for link in sorted(namespace.iterdir())
+            if link.is_symlink() and link.readlink().as_posix() == name
+        ]
     return steps
 
 

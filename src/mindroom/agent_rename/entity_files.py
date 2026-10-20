@@ -21,6 +21,7 @@ from mindroom.tool_system.worker_routing import normalize_worker_key_part, worke
 
 if TYPE_CHECKING:
     import sqlite3
+    from pathlib import Path
 
     from mindroom.agent_rename.steps import Step
     from mindroom.constants import RuntimePaths
@@ -91,8 +92,10 @@ def entity_credential_steps(runtime_paths: RuntimePaths, *, old_name: str, new_n
     return steps
 
 
-def unknown_worker_reports(runtime_paths: RuntimePaths, *, old_name: str) -> list[str]:
+def unknown_worker_reports(runtime_paths: RuntimePaths, *, old_name: str) -> tuple[list[str], list[Path]]:
     """Report the worker roots named like a worker of agent ``old_name`` whose worker key nothing records.
+
+    Returns the report lines and those roots, which stay where they are.
 
     ``worker_move_steps`` moves the roots of known worker keys only. A root without readable metadata that no OAuth
     store names may still be the agent's, as its name ends with the agent's key component and the key's digest;
@@ -100,13 +103,14 @@ def unknown_worker_reports(runtime_paths: RuntimePaths, *, old_name: str) -> lis
     """
     workers = runtime_paths.storage_root / "workers"
     if not workers.is_dir():
-        return []
+        return [], []
     known = {worker_dir_name(key) for key in known_worker_keys(runtime_paths.storage_root)}
     named = re.compile(f".*_{re.escape(normalize_worker_key_part(old_name))}{_WORKER_DIGEST}")
     roots = [entry for entry in sorted(workers.iterdir()) if named.fullmatch(entry.name) and entry.name not in known]
     if not roots:
-        return []
-    return [
+        return [], []
+    report = (
         f"These worker roots are named like workers of agent {old_name}, but nothing records their worker keys, "
-        f"so they stay as they are: {', '.join(str(root) for root in roots)}.",
-    ]
+        f"so they stay as they are: {', '.join(str(root) for root in roots)}."
+    )
+    return [report], roots

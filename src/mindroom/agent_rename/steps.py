@@ -268,6 +268,8 @@ class RenamePlan:
     storage_root: Path
     steps: tuple[Step, ...]
     reports: tuple[str, ...]
+    # The paths the reports name as staying where they are, which a leftover scan finds on purpose.
+    staying: tuple[Path, ...] = ()
 
     def describe(self) -> list[str]:
         """Return every step description, then every report prefixed with ``report:``."""

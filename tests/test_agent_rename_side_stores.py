@@ -443,7 +443,7 @@ def _install(tmp_path: Path) -> _Install:  # noqa: PLR0915
 
 def _plan(runtime_paths: RuntimePaths, *, old: str = OLD, new: str = NEW) -> tuple[list[Step], list[str]]:
     """Plan like `mindroom agents rename`: the state root moves first, then the side stores."""
-    steps, reports = entity_file_steps(runtime_paths, config=_config(old), old_name=old, new_name=new)
+    steps, reports, _ = entity_file_steps(runtime_paths, config=_config(old), old_name=old, new_name=new)
     return [*entity_state_steps(runtime_paths, old_name=old, new_name=new), *steps], reports
 
 
@@ -851,8 +851,10 @@ def test_unfinished_delegations_naming_the_agent_are_reported(tmp_path: Path) ->
     broken.parent.mkdir(parents=True)
     broken.write_bytes(b"not a database")
 
-    _, reports = entity_file_steps(runtime_paths, config=_config(OLD), old_name=OLD, new_name=NEW)
+    _, reports, staying = entity_file_steps(runtime_paths, config=_config(OLD), old_name=OLD, new_name=NEW)
 
+    # Saved runs are reported by session; their databases move with their state roots.
+    assert staying == []
     [report, unreadable] = [report for report in reports if "delegation" in report]
     assert f"could not be read to look for unfinished delegations: {broken}" in unreadable
     assert "3 unfinished delegations" in report
@@ -875,8 +877,10 @@ def test_config_paths_into_moved_shared_directories_are_reported(tmp_path: Path)
         },
     )
 
-    _, reports = entity_file_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
+    _, reports, staying = entity_file_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
 
+    # The config values are reported; the directory they point into moves.
+    assert staying == []
     [report] = [report for report in reports if "shared_directories" in report]
     assert "knowledge_bases.notes.path" in report
     assert "knowledge_bases.drafts.path" not in report
@@ -914,11 +918,12 @@ def test_private_delegation_exports_naming_the_agent_are_reported(tmp_path: Path
     export = handle.child_workspace / handle.scoped_path / "run.json"
     assert export.is_file()
 
-    steps, reports = entity_file_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
+    steps, reports, staying = entity_file_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
 
     assert not [step for step in steps if isinstance(step, FileRewrite) and step.path == export]
     [report] = [report for report in reports if "private" in report]
     assert str(export) in report
+    assert staying == [export]
 
 
 def test_prefix_agent_untouched(tmp_path: Path) -> None:
@@ -1015,4 +1020,4 @@ def test_agent_without_side_stores_plans_nothing(tmp_path: Path) -> None:
     """An agent that never wrote a side store gets no steps and no reports."""
     runtime_paths = test_runtime_paths(tmp_path)
 
-    assert entity_file_steps(runtime_paths, config=_config(OLD), old_name=OLD, new_name=NEW) == ([], [])
+    assert entity_file_steps(runtime_paths, config=_config(OLD), old_name=OLD, new_name=NEW) == ([], [], [])

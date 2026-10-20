@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from functools import partial
-from pathlib import Path
+from pathlib import Path  # noqa: TC003 - Typer reads the option annotations at runtime
 from typing import TYPE_CHECKING, cast
 
 import typer
@@ -93,7 +93,7 @@ def _rename(runtime_paths: RuntimePaths, config: Config, *, old: str, new: str, 
         say(f"agent {old} is now {new}.", label="[green]Renamed:[/green] ")
         print_applied(result)
         storage = runtime_paths.storage_root
-        print_leftovers(storage, f"agent {old}", names=(old,), expected=_reported_paths(plan.reports, storage))
+        print_leftovers(storage, f"agent {old}", names=(old,), expected=frozenset(plan.staying))
 
 
 def _agent_rename(runtime_paths: RuntimePaths, config: Config, *, old: str, new: str) -> _AgentRename:
@@ -332,14 +332,15 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
         user_id=rename.user_id,
         configured_teams=frozenset(config.teams),
     )
-    side_steps, side_reports = entity_file_steps(runtime_paths, config=config, old_name=old, new_name=new)
+    side_steps, side_reports, side_staying = entity_file_steps(runtime_paths, config=config, old_name=old, new_name=new)
     worker_steps, worker_reports = worker_move_steps(
         runtime_paths,
         config=config,
         rewrite=partial(rewrite_worker_key_agent, old_name=old, new_name=new),
         discard_new_state=False,
     )
-    index, index_reports = index_steps(runtime_paths, config=config, old_name=old, new_name=new)
+    index, index_reports, index_staying = index_steps(runtime_paths, config=config, old_name=old, new_name=new)
+    worker_root_reports, unknown_roots = unknown_worker_reports(runtime_paths, old_name=old)
     account_step = matrix_state_key_step(runtime_paths, old_name=old, new_name=new)
     # The journal goes first: its edit checks again in its transaction, and a failing first step leaves nothing to undo.
     # The state root moves before the stores inside it are edited, matrix_state.yaml and .env follow every store, and
@@ -368,25 +369,9 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
         *(step for step in ordered if not isinstance(step, FinalAction)),
         *(step for step in ordered if isinstance(step, FinalAction)),
     )
-    reports = (
-        *side_reports,
-        *worker_reports,
-        *unknown_worker_reports(runtime_paths, old_name=old),
-        *index_reports,
-    )
-    return RenamePlan(storage_root=storage, steps=steps, reports=reports)
-
-
-def _reported_paths(reports: tuple[str, ...], storage_root: Path) -> frozenset[Path]:
-    """Return the paths in the storage directory that the plan's reports name, which the leftover scan expects.
-
-    Reports name paths in prose, followed by punctuation. A path with whitespace in it is cut short there,
-    so it does not count and the scan lists it as not reported. The storage directory itself never counts,
-    as everything in it would.
-    """
-    return frozenset(
-        path
-        for report in reports
-        for word in report.split()
-        if (path := Path(word.rstrip(".,;:)"))) != storage_root and path.is_relative_to(storage_root)
+    return RenamePlan(
+        storage_root=storage,
+        steps=steps,
+        reports=(*side_reports, *worker_reports, *worker_root_reports, *index_reports),
+        staying=(*side_staying, *unknown_roots, *index_staying),
     )

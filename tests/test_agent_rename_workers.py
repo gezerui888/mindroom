@@ -14,7 +14,11 @@ import pytest
 
 from mindroom.agent_rename import workers as worker_moves
 from mindroom.agent_rename.account_files import account_file_steps
-from mindroom.agent_rename.entity_files import entity_credential_steps, rewrite_worker_key_agent
+from mindroom.agent_rename.entity_files import (
+    entity_credential_steps,
+    rewrite_worker_key_agent,
+    unknown_worker_reports,
+)
 from mindroom.agent_rename.steps import (
     DropPath,
     FileRewrite,
@@ -438,3 +442,27 @@ def test_account_rename_behavior_unchanged(tmp_path: Path) -> None:
         f"{unknown} looks like a worker of {old_user}, but its worker key is unknown, so it stays in place.",
         f"Records of past tool jobs and scheduled runs outside the event journal keep {old_user} as history.",
     ]
+
+
+def test_unknown_worker_roots_named_like_the_agent_stay_and_are_reported(tmp_path: Path) -> None:
+    """A root named like a worker of the agent whose key nothing records stays, and is reported with its path.
+
+    Roots with known keys move instead, and a root of the agent whose name extends the renamed one's is not its own.
+    """
+    runtime_paths = test_runtime_paths(tmp_path)
+    workers = runtime_paths.storage_root / "workers"
+    unknown = workers / "v1_acme_shared_code-0123456789abcdef"
+    prefix_unknown = workers / "v1_acme_shared_code_team-0123456789abcdef"
+    for root in (unknown, prefix_unknown):
+        (root / "workspace").mkdir(parents=True)
+    _write_worker(runtime_paths, _key("shared", OLD))
+
+    reports, staying = unknown_worker_reports(runtime_paths, old_name=OLD)
+
+    assert staying == [unknown]
+    assert reports == [
+        f"These worker roots are named like workers of agent {OLD}, but nothing records their worker keys, "
+        f"so they stay as they are: {unknown}.",
+    ]
+    assert unknown_worker_reports(runtime_paths, old_name=PREFIX)[1] == [prefix_unknown]
+    assert unknown_worker_reports(test_runtime_paths(tmp_path / "empty"), old_name=OLD) == ([], [])

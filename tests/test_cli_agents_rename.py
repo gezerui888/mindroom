@@ -7,6 +7,7 @@ tests, for the renamed agent ``code`` and for ``code_team``, whose name extends 
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
@@ -398,6 +399,41 @@ def test_prefix_agent_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert f"agent_{PREFIX}" in safe_load(matrix_state_file(runtime_paths).read_bytes())["accounts"]
 
 
+def test_leftovers_inside_a_moved_store_are_not_taken_for_staying_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A report that names a moved store does not make what still names the agent inside it expected."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    calls = runtime_paths.storage_root / "calls" / OLD
+    calls.mkdir(parents=True)
+    (calls / "notes.json").write_text(json.dumps({"agent": OLD}), encoding="utf-8")
+
+    result = _invoke(runtime_paths, "--apply", "--yes")
+
+    assert result.exit_code == 0, result.output
+    # The report names both the old and the moved transcripts directory.
+    assert f"the transcripts move to {runtime_paths.storage_root / 'calls' / NEW}." in result.output
+    assert _leftovers(result.output) == ([], [f"calls/{NEW}/notes.json"])
+
+
+def test_files_the_scan_cannot_parse_are_listed_without_failing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON file that does not parse cannot be checked for the name; it is listed, and the rename still succeeds."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    (tracking_dir(runtime_paths) / "broken.json").write_text("{not json", encoding="utf-8")
+
+    result = _invoke(runtime_paths, "--apply", "--yes")
+
+    assert result.exit_code == 0, result.output
+    assert _leftovers(result.output) == (
+        [],
+        ["tracking/broken.json: not scanned for names, it is not valid JSON or YAML"],
+    )
+
+
 @pytest.mark.parametrize(
     ("old", "new", "reason"),
     [
@@ -417,6 +453,7 @@ def test_prefix_agent_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         (OLD, "_shared", "_shared is reserved for MindRoom"),
         (OLD, "router", "router is reserved for MindRoom"),
         (OLD, "code_", "code_ is written code in worker keys, like agent code"),
+        (OLD, "_code", "_code is written code in worker keys, like agent code"),
         (OLD, "helper_", "helper_ is written helper in worker keys, like agent helper"),
         (OLD, "Helper", "Helper has the id helper, like agent helper"),
         (OLD, "codeTeam", "codeTeam has the id code-team, like agent code_team"),

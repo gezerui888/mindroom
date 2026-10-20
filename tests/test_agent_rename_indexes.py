@@ -89,7 +89,13 @@ def _config(**agent_fields: object) -> Config:
 
 
 def _plan(runtime_paths: RuntimePaths, config: Config) -> tuple[list[Step], list[str]]:
-    return index_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
+    steps, reports, _ = index_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
+    return steps, reports
+
+
+def _staying(runtime_paths: RuntimePaths, config: Config) -> set[Path]:
+    """Return the paths the reports name as staying where they are."""
+    return set(index_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)[2])
 
 
 def _apply(runtime_paths: RuntimePaths, steps: list[Step]) -> None:
@@ -225,9 +231,11 @@ def _legacy_files(runtime_paths: RuntimePaths, agent: str) -> list[Path]:
 
 def test_an_agent_without_indexes_only_gets_the_scheduled_task_report(tmp_path: Path) -> None:
     """With nothing derived from the agent on disk, only the scheduled task note remains, since it needs Matrix."""
-    steps, reports = _plan(_runtime_paths(tmp_path), _config())
+    runtime_paths = _runtime_paths(tmp_path)
+    steps, reports = _plan(runtime_paths, _config())
 
     assert steps == []
+    assert _staying(runtime_paths, _config()) == set()
     assert len(reports) == 1
     assert _SCHEDULED in reports[0]
     assert f"@{OLD}" in reports[0]
@@ -244,6 +252,7 @@ def test_file_memory_search_indexes_of_the_agent_are_dropped_into_the_backup(tmp
 
     steps, _ = _plan(runtime_paths, config)
 
+    assert _staying(runtime_paths, config) == set()
     assert all(isinstance(step, DropPath) for step in steps)
     assert sorted(step.path.resolve() for step in steps if isinstance(step, DropPath)) == sorted([own, earlier])
     _apply(runtime_paths, steps)
@@ -265,6 +274,7 @@ def test_private_instance_roots_left_by_a_formerly_private_agent_are_reported(tm
 
     assert steps == []
     assert _listed(_report(reports, _PRIVATE)) == {str(own)}
+    assert _staying(runtime_paths, _config()) == {own}
 
 
 def test_no_private_instance_report_for_an_agent_that_was_never_private(tmp_path: Path) -> None:
@@ -290,6 +300,9 @@ def test_the_knowledge_graph_of_the_old_state_root_is_reported(tmp_path: Path) -
     assert graph in report
     assert "knowledge_graph.generation" in report
     assert "knowledge_graph.ingest.backfill_days (7)" in report
+    # The graph's ingestion progress stays with it.
+    progress = runtime_paths.storage_root / "knowledge_graph" / "ingestion" / f"{graph}.json"
+    assert _staying(runtime_paths, config) == {progress}
 
 
 def test_no_graph_report_without_a_started_graph_of_the_agent(tmp_path: Path) -> None:
@@ -379,6 +392,7 @@ def test_mem0_history_messages_of_the_agent_scope_are_reported(tmp_path: Path) -
     assert report is not None
     assert str(database) in report
     assert f"user_id={agent_scope_user_id(OLD)}" in report
+    assert _staying(runtime_paths, _config()) == {database}
 
 
 def test_mem0_history_defaults_to_the_home_directory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -436,6 +450,7 @@ def test_an_unreadable_mem0_history_database_is_reported(tmp_path: Path, damage:
     assert report is not None
     assert "could not be read" in report
     assert str(database) in report
+    assert _staying(runtime_paths, _config()) == {database}
 
 
 def test_plugin_state_paths_naming_the_agent_are_reported(tmp_path: Path) -> None:
@@ -455,6 +470,7 @@ def test_plugin_state_paths_naming_the_agent_are_reported(tmp_path: Path) -> Non
     _, reports = _plan(runtime_paths, _config())
 
     assert _listed(_report(reports, _PLUGINS)) == {str(path) for path in expected}
+    assert _staying(runtime_paths, _config()) == expected
 
 
 def test_no_plugin_report_without_paths_naming_the_agent(tmp_path: Path) -> None:
@@ -501,6 +517,7 @@ def test_config_lines_the_config_edit_leaves_are_reported(tmp_path: Path) -> Non
     report = _report(reports, _CONFIG_LINES)
     assert report is not None
     assert report.endswith(f"{config_path} (line 11); {prompt} (line 2).")
+    assert _staying(runtime_paths, load_config(runtime_paths)) == {config_path, prompt}
 
 
 def test_no_config_line_report_when_the_config_edit_renames_every_mention(tmp_path: Path) -> None:
@@ -532,6 +549,7 @@ def test_legacy_files_of_the_agent_are_reported(tmp_path: Path) -> None:
     _, reports = _plan(runtime_paths, _config())
 
     assert _listed(_report(reports, _LEGACY)) == {str(path) for path in expected}
+    assert _staying(runtime_paths, _config()) == set(expected)
 
 
 def test_a_handled_turn_ledger_not_imported_yet_moves_to_the_new_name(tmp_path: Path) -> None:

@@ -473,8 +473,10 @@ def entity_file_steps(
     config: Config,
     old_name: str,
     new_name: str,
-) -> tuple[list[Step], list[str]]:
-    """Return the steps that move the tracking records and side stores keyed by the agent's name, and report lines.
+) -> tuple[list[Step], list[str], list[Path]]:
+    """Return the steps that move the tracking records and side stores keyed by the agent's name, reports, and paths.
+
+    The report lines say what the rename leaves as it is; the paths are the ones those lines name as staying.
 
     Moves come first: ``tracking/agents/<OLD>``, ``tracking/automations/<OLD>``, ``sync_continuity/<OLD>.json``
     and its lock, ``calls/<OLD>``, the agent's dynamic workflow owner directory, its avatar, and
@@ -514,15 +516,16 @@ def entity_file_steps(
         *_gateway_selection_steps(storage, rename),
         *_drop_steps(runtime_paths, rename),
     ]
+    private_exports = _private_delegation_exports(runtime_paths, config, rename)
     reports = [
         *workflow_reports,
         *script_reports,
         *_call_reports(storage, rename),
         *_unfinished_delegation_reports(runtime_paths, rename),
         *_shared_directory_config_reports(runtime_paths, config, rename),
-        *_private_delegation_export_reports(runtime_paths, config, rename),
+        *_private_delegation_export_reports(private_exports, rename),
     ]
-    return steps, reports
+    return steps, reports, private_exports
 
 
 def _call_reports(storage_root: Path, rename: _NameRename) -> list[str]:
@@ -673,8 +676,8 @@ def _shared_directory_config_reports(runtime_paths: RuntimePaths, config: Config
     ]
 
 
-def _private_delegation_export_reports(runtime_paths: RuntimePaths, config: Config, rename: _NameRename) -> list[str]:
-    """Report delegation exports in private agents' workspaces that name the agent; they are not rewritten."""
+def _private_delegation_exports(runtime_paths: RuntimePaths, config: Config, rename: _NameRename) -> list[Path]:
+    """Return the delegation exports in private agents' workspaces that name the agent; they are not rewritten."""
     scopes = private_instances_root_path(runtime_paths.storage_root)
     if not scopes.is_dir():
         return []
@@ -689,6 +692,10 @@ def _private_delegation_export_reports(runtime_paths: RuntimePaths, config: Conf
                 record = _read_json(export)
                 if _delegation_names(record, rename=rename) != record:
                     exports.append(export)
+    return exports
+
+
+def _private_delegation_export_reports(exports: list[Path], rename: _NameRename) -> list[str]:
     if not exports:
         return []
     return [

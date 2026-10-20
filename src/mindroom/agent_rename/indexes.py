@@ -78,8 +78,10 @@ def index_steps(
     config: Config,
     old_name: str,
     new_name: str,
-) -> tuple[list[Step], list[str]]:
-    """Return the steps that drop or move the agent's derived state, and report lines for what the rename leaves.
+) -> tuple[list[Step], list[str], list[Path]]:
+    """Return the steps that drop or move the agent's derived state, report lines, and the paths that stay.
+
+    The report lines say what the rename leaves as it is; the paths are the ones those lines name as staying.
 
     The file-memory search indexes of the scope ``agent_<OLD>`` are dropped from ``knowledge_db/``, for every
     file-memory root they were built for. The Git directory of each knowledge checkout below ``agents/<OLD>`` moves
@@ -94,17 +96,22 @@ def index_steps(
         *_knowledge_git_steps(runtime_paths, config, old_name, new_name),
         *ledger_steps,
     ]
-    reports = [
-        *_knowledge_graph_reports(runtime_paths, config, old_name, new_name),
-        *_private_instance_reports(runtime_paths, old_name),
-        *_mem0_history_reports(runtime_paths, old_name, new_name),
-        *_plugin_state_reports(runtime_paths, old_name),
-        *_config_line_reports(runtime_paths, old_name, new_name),
+    scheduled_tasks = (
         f"Scheduled tasks are Matrix room state, which the rename neither reads nor changes; "
-        f"a task whose message mentions @{old_name} keeps that text, so edit such tasks to mention @{new_name}.",
-        *_legacy_file_reports(runtime_paths, old_name, moved_ledger=bool(ledger_steps)),
+        f"a task whose message mentions @{old_name} keeps that text, so edit such tasks to mention @{new_name}."
+    )
+    reported = [
+        _knowledge_graph_reports(runtime_paths, config, old_name, new_name),
+        _private_instance_reports(runtime_paths, old_name),
+        _mem0_history_reports(runtime_paths, old_name, new_name),
+        _plugin_state_reports(runtime_paths, old_name),
+        _config_line_reports(runtime_paths, old_name, new_name),
+        ([scheduled_tasks], []),
+        _legacy_file_reports(runtime_paths, old_name, moved_ledger=bool(ledger_steps)),
     ]
-    return steps, reports
+    reports = [report for lines, _ in reported for report in lines]
+    staying = [path for _, paths in reported for path in paths]
+    return steps, reports, staying
 
 
 def _entries(directory: Path, matches: Callable[[str], object]) -> list[Path]:
@@ -173,7 +180,7 @@ def _ledger_steps(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> 
     return move_steps(ledger, destination, label, discard_new_state=False)
 
 
-def _private_instance_reports(runtime_paths: RuntimePaths, name: str) -> list[str]:
+def _private_instance_reports(runtime_paths: RuntimePaths, name: str) -> tuple[list[str], list[Path]]:
     """Report the private-instance state roots of the agent, left from when it was private.
 
     A private agent keeps one state root per requester, ``<scope>/<agent>`` in ``private_instances/``; the rename
@@ -185,34 +192,42 @@ def _private_instance_reports(runtime_paths: RuntimePaths, name: str) -> list[st
         for root in _entries(scope, lambda entry: entry == name)
     ]
     if not roots:
-        return []
-    return [
+        return [], []
+    report = (
         f"These private-instance state roots of agent {name}, left from when it was private, stay as they are: "
-        f"{', '.join(str(root) for root in roots)}.",
-    ]
+        f"{', '.join(str(root) for root in roots)}."
+    )
+    return [report], roots
 
 
-def _knowledge_graph_reports(runtime_paths: RuntimePaths, config: Config, old_name: str, new_name: str) -> list[str]:
-    """Report the agent's started knowledge graph, which is named after its old state root."""
+def _knowledge_graph_reports(
+    runtime_paths: RuntimePaths,
+    config: Config,
+    old_name: str,
+    new_name: str,
+) -> tuple[list[str], list[Path]]:
+    """Report the agent's started knowledge graph, which is named after its old state root, with its progress file."""
     graph = graph_scope(old_name, config, runtime_paths, None).graph_name
-    if not runtime_paths.storage_root.joinpath(*_GRAPH_INGESTION_STATE, f"{graph}.json").exists():
-        return []
+    progress = runtime_paths.storage_root.joinpath(*_GRAPH_INGESTION_STATE, f"{graph}.json")
+    if not progress.exists():
+        return [], []
     backfill_days = config.knowledge_graph.ingest.backfill_days
-    return [
+    report = (
         f"The knowledge graph {graph} of agent {old_name} stays in the graph store unused: a graph is named after "
         f"its agent's state root, so {new_name} starts a new graph from the conversations active within "
         f"knowledge_graph.ingest.backfill_days ({backfill_days}) of its first start. To cover older conversations, "
         "raise backfill_days before starting MindRoom, or later together with knowledge_graph.generation, "
-        "which starts every graph over.",
-    ]
+        "which starts every graph over."
+    )
+    return [report], [progress]
 
 
-def _mem0_history_reports(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> list[str]:
+def _mem0_history_reports(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> tuple[list[str], list[Path]]:
     """Report the agent's recent messages in mem0's history database, which keys them by the old scope id."""
     mem0_dir = runtime_paths.process_env.get(_MEM0_DIR_VARIABLE) or str(Path("~").expanduser() / ".mem0")
     database = Path(mem0_dir) / _MEM0_HISTORY_DATABASE
     if not database.is_file():
-        return []
+        return [], []
     session_scope = f"user_id={agent_scope_user_id(old_name)}"
     try:
         with read_only_connection(database) as connection:
@@ -229,17 +244,19 @@ def _mem0_history_reports(runtime_paths: RuntimePaths, old_name: str, new_name: 
                 ).fetchone()
             )
     except (OSError, sqlite3.Error) as error:
-        return [
+        report = (
             f"mem0's history database {database} could not be read ({error}), so it may keep recent messages of "
-            f"agent {old_name} under the scope {session_scope}, which the rename does not change.",
-        ]
+            f"agent {old_name} under the scope {session_scope}, which the rename does not change."
+        )
+        return [report], [database]
     if not found:
-        return []
-    return [
+        return [], []
+    report = (
         f"mem0's history database {database}, outside the storage root, keeps the recent messages of agent "
         f"{old_name} under the scope {session_scope}, which the rename does not change, so memory extraction "
-        f"for {new_name} starts without their context.",
-    ]
+        f"for {new_name} starts without their context."
+    )
+    return [report], [database]
 
 
 def _paths_named(root: Path, names: frozenset[str]) -> list[Path]:
@@ -251,7 +268,7 @@ def _paths_named(root: Path, names: frozenset[str]) -> list[Path]:
     return found
 
 
-def _plugin_state_reports(runtime_paths: RuntimePaths, name: str) -> list[str]:
+def _plugin_state_reports(runtime_paths: RuntimePaths, name: str) -> tuple[list[str], list[Path]]:
     """Report the paths below each plugin's state root named after the agent; each plugin owns its own format."""
     names = frozenset({name, f"{name}.json"})
     paths = sorted(
@@ -261,14 +278,15 @@ def _plugin_state_reports(runtime_paths: RuntimePaths, name: str) -> list[str]:
         for path in _paths_named(plugin, names)
     )
     if not paths:
-        return []
-    return [
+        return [], []
+    report = (
         f"These plugin state paths name agent {name}, and the rename leaves them as they are: "
-        f"{', '.join(str(path) for path in paths)}.",
-    ]
+        f"{', '.join(str(path) for path in paths)}."
+    )
+    return [report], paths
 
 
-def _config_line_reports(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> list[str]:
+def _config_line_reports(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> tuple[list[str], list[Path]]:
     """Report the config lines, includes and prose files among them, that still mention the agent after the config edit."""
     config_path = runtime_paths.config_path.expanduser()
     rewrites = {
@@ -283,6 +301,7 @@ def _config_line_reports(runtime_paths: RuntimePaths, old_name: str, new_name: s
     mention = re.compile(f"(?<![{_NAME_CHARACTER}]){re.escape(old_name)}(?![{_NAME_CHARACTER}])")
     _, files = load_yaml_config_source(config_path)
     places: list[str] = []
+    mentioning: list[Path] = []
     for path in sorted(files):
         content = path.read_bytes()
         if path in rewrites:
@@ -294,15 +313,17 @@ def _config_line_reports(runtime_paths: RuntimePaths, old_name: str, new_name: s
         ]
         if lines:
             places.append(f"{path} (line{'s' if len(lines) > 1 else ''} {', '.join(lines)})")
+            mentioning.append(path)
     if not places:
-        return []
-    return [
+        return [], []
+    report = (
         f"These config lines mention {old_name} and the rename does not change them, "
-        f"such as other agents' instructions: {'; '.join(places)}.",
-    ]
+        f"such as other agents' instructions: {'; '.join(places)}."
+    )
+    return [report], mentioning
 
 
-def _legacy_file_reports(runtime_paths: RuntimePaths, name: str, *, moved_ledger: bool) -> list[str]:
+def _legacy_file_reports(runtime_paths: RuntimePaths, name: str, *, moved_ledger: bool) -> tuple[list[str], list[Path]]:
     """Report the files older MindRoom versions kept for the agent under its name, except a ledger that moves."""
     storage = runtime_paths.storage_root
     tracking = tracking_dir(runtime_paths)
@@ -325,8 +346,9 @@ def _legacy_file_reports(runtime_paths: RuntimePaths, name: str, *, moved_ledger
         *_entries(tracking, leftover_ledger),
     ]
     if not paths:
-        return []
-    return [
+        return [], []
+    report = (
         f"These files from older MindRoom versions name agent {name} and stay as they are: "
-        f"{', '.join(str(path) for path in paths)}.",
-    ]
+        f"{', '.join(str(path) for path in paths)}."
+    )
+    return [report], paths

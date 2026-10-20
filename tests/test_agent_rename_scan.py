@@ -41,7 +41,7 @@ def _event(connection: sqlite3.Connection, event_id: str, *, sender: str, source
     connection.execute(
         "INSERT INTO journal_events (principal_id, event_id, room_id, thread_id, kind, sender, origin_server_ts, "
         "source_json, membership_epoch, state) VALUES (?, ?, ?, ?, ?, ?, 10, ?, 0, 'settled')",
-        (f"harry@{NEW}", event_id, ROOM, encode_thread_id(None), EventKind.MESSAGE.value, sender, json.dumps(source)),
+        (f"nova@{NEW}", event_id, ROOM, encode_thread_id(None), EventKind.MESSAGE.value, sender, json.dumps(source)),
     )
 
 

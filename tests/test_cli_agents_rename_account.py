@@ -40,14 +40,14 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
-AGENT = "harry"
+AGENT = "nova"
 OLD = "@old:x"
 NEW = "@new:x"
-OLD_PRINCIPAL = "harry@@old:x"
-NEW_PRINCIPAL = "harry@@new:x"
+OLD_PRINCIPAL = "nova@@old:x"
+NEW_PRINCIPAL = "nova@@new:x"
 ROUTER = "router@@router:x"
 PASSWORD = "stored-secret"  # noqa: S105
-CONFIG = "agents:\n  harry:\n    display_name: Harry\nbot_accounts:\n  - '@old:x'   # harry himself\n"
+CONFIG = "agents:\n  nova:\n    display_name: Nova\nbot_accounts:\n  - '@old:x'   # nova himself\n"
 
 runner = CliRunner()
 
@@ -105,7 +105,7 @@ def _event(connection: sqlite3.Connection, principal: str, *, sender: str) -> No
         connection,
         "journal_events",
         principal_id=principal,
-        event_id="$from-harry",
+        event_id="$from-nova",
         room_id="!room:x",
         thread_id=encode_thread_id(None),
         kind=EventKind.MESSAGE.value,
@@ -118,7 +118,7 @@ def _event(connection: sqlite3.Connection, principal: str, *, sender: str) -> No
 
 
 def _journal(storage_root: Path, *, new_principal_rows: bool = False) -> Path:
-    """Build a journal with the real schema: harry's event seen by harry and the router, and harry's sync stream."""
+    """Build a journal with the real schema: nova's event seen by nova and the router, and nova's sync stream."""
     database = event_journal_sqlite_path(storage_root)
     asyncio.run(EventJournalStore.open_sqlite(database).close())
     with closing(sqlite3.connect(database)) as connection, connection:
@@ -184,7 +184,7 @@ def _oauth_path(storage_root: Path, requester_id: str) -> Path:
 
 
 def _install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, new_principal_rows: bool = False) -> RuntimePaths:
-    """Build a stopped install whose server already renamed harry from @old:x to @new:x."""
+    """Build a stopped install whose server already renamed nova from @old:x to @new:x."""
     for name in ("MINDROOM_WORKER_BACKEND", "MATRIX_SERVER_NAME", "MATRIX_SSL_VERIFY", "MINDROOM_CONFIG_TEMPLATE"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("MATRIX_HOMESERVER", "http://localhost:8008")
@@ -673,8 +673,8 @@ def test_rerun_after_a_killed_from_run_keeps_the_moved_journal(
 ) -> None:
     """A killed --from run leaves the journal moved, and no rerun deletes those rows.
 
-    Without --from the journal shows no other ID. With --from @old:x nothing shows any more that it was harry's,
-    because @old:x is not the ID MindRoom generates for harry, so the rerun refuses and the manifest is the way back.
+    Without --from the journal shows no other ID. With --from @old:x nothing shows any more that it was nova's,
+    because @old:x is not the ID MindRoom generates for nova, so the rerun refuses and the manifest is the way back.
     """
     runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
     _adopt_by_hand(runtime_paths)
@@ -705,7 +705,7 @@ def test_repeating_a_successful_from_run_changes_nothing(
 ) -> None:
     """The same --from --discard-new-principal --apply run a second time writes nothing and keeps the journal.
 
-    The first run moved harry's journal rows away from @old:x, so nothing shows any more that @old:x was his.
+    The first run moved nova's journal rows away from @old:x, so nothing shows any more that @old:x was his.
     """
     runtime_paths = _install(tmp_path, monkeypatch, new_principal_rows=True)
     _adopt_by_hand(runtime_paths)
@@ -727,7 +727,7 @@ def test_from_naming_someone_else_is_refused(
     monkeypatch: pytest.MonkeyPatch,
     server: _MatrixServer,
 ) -> None:
-    """A --from that nothing shows to be harry's refuses, so a person's credentials and mentions never move to him."""
+    """A --from that nothing shows to be nova's refuses, so a person's credentials and mentions never move to him."""
     runtime_paths = _install(tmp_path, monkeypatch)
     _adopt_by_hand(runtime_paths)
     alice = "@alice:x"
@@ -742,12 +742,12 @@ def test_from_naming_someone_else_is_refused(
         assert result.exit_code == 1, result.output
         assert f"--from {alice} must be a former Matrix ID of agent {AGENT}" in result.output
         assert f"has no rows for {AGENT}@{alice}" in result.output
-        assert "is not @mindroom_harry:x, the ID MindRoom generates for harry" in result.output
+        assert "is not @mindroom_nova:x, the ID MindRoom generates for nova" in result.output
     assert tree_snapshot(tmp_path) == before
     assert server.requests == []
 
 
-@pytest.mark.parametrize(("namespace", "generated"), [("", "@mindroom_harry:x"), ("ab12", "@mindroom_harry_ab12:x")])
+@pytest.mark.parametrize(("namespace", "generated"), [("", "@mindroom_nova:x"), ("ab12", "@mindroom_nova_ab12:x")])
 def test_from_with_the_generated_id_needs_no_journal_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -765,7 +765,7 @@ def test_from_with_the_generated_id_needs_no_journal_rows(
     storage = runtime_paths.storage_root
     _oauth_store(_oauth_path(storage, generated), _key("user_agent", generated))
     if namespace:
-        unnamespaced = _invoke(runtime_paths, "--from", "@mindroom_harry:x")
+        unnamespaced = _invoke(runtime_paths, "--from", "@mindroom_nova:x")
         assert unnamespaced.exit_code == 1, unnamespaced.output
         assert "must be a former Matrix ID" in unnamespaced.output
 
@@ -791,7 +791,7 @@ def test_adoption_check_only_offers_ids_on_the_new_server(
     runtime_paths = _install(tmp_path, monkeypatch)
     assert _invoke(runtime_paths, "--apply", "--yes").exit_code == 0
     with closing(sqlite3.connect(event_journal_sqlite_path(runtime_paths.storage_root))) as connection, connection:
-        _event(connection, "harry@@old:y", sender="@old:y")
+        _event(connection, "nova@@old:y", sender="@old:y")
 
     other_server = _invoke(runtime_paths)
 
@@ -799,7 +799,7 @@ def test_adoption_check_only_offers_ids_on_the_new_server(
     assert "Already adopted; nothing to do." in other_server.output
 
     with closing(sqlite3.connect(event_journal_sqlite_path(runtime_paths.storage_root))) as connection, connection:
-        _event(connection, "harry@@older:x", sender="@older:x")
+        _event(connection, "nova@@older:x", sender="@older:x")
 
     same_server = _invoke(runtime_paths)
 

@@ -92,8 +92,8 @@ agents_app = typer.Typer(help="Manage agents.")
 agents_app.command(
     "rename-account",
     epilog=examples(
-        ("mindroom agents rename-account harry @harry:example.org", "Show the plan"),
-        ("mindroom agents rename-account harry @harry:example.org --apply", "Apply it"),
+        ("mindroom agents rename-account nova @nova:example.org", "Show the plan"),
+        ("mindroom agents rename-account nova @nova:example.org --apply", "Apply it"),
     ),
 )(rename_account)
 config_app.command("migrate", rich_help_panel="Create and edit")(config_migrate)

@@ -69,7 +69,7 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
     from mindroom.oauth.providers import OAuthProvider
 
-AGENT = "harry"
+AGENT = "nova"
 OLD = "@old:x"
 NEW = "@new:x"
 NOW = datetime(2026, 10, 19, 21, 45, 58, tzinfo=UTC)

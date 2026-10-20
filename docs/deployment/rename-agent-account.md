@@ -6,7 +6,7 @@ icon: lucide/user-pen
 
 `mindroom agents rename-account` moves MindRoom's state over to a new Matrix ID after your homeserver renamed an agent's account in place.
 The agent's name in `config.yaml` does not change.
-Only its Matrix ID does, for example from `@mindroom_openclaw:example.org` to `@mindroom_harry:example.org`.
+Only its Matrix ID does, for example from `@mindroom_atlas:example.org` to `@mindroom_nova:example.org`.
 
 MindRoom keeps credentials, workers, journal rows, and other state under the Matrix ID.
 After a server-side rename it would look for all of them under the new ID and find nothing.
@@ -54,7 +54,7 @@ Any other setup is refused with `not supported yet`.
    Configs without those fields are not touched.
 
    ```bash
-   mindroom agents rename-account harry @mindroom_harry:example.org \
+   mindroom agents rename-account nova @mindroom_nova:example.org \
      --config config.yaml --storage-path mindroom_data
    ```
 
@@ -62,7 +62,7 @@ Any other setup is refused with `not supported yet`.
    The command asks `Apply this plan?` unless you pass `--yes`.
 
    ```bash
-   mindroom agents rename-account harry @mindroom_harry:example.org \
+   mindroom agents rename-account nova @mindroom_nova:example.org \
      --config config.yaml --storage-path mindroom_data --apply
    ```
 
@@ -89,8 +89,8 @@ The command does not treat the username alone as proof of an adoption.
 When the journal still has rows for `<name>@<old ID>` with an old ID on the new ID's server, it refuses, names them, and prints the command to run, with `--from <old ID>`:
 
 ```bash
-mindroom agents rename-account harry @mindroom_harry:example.org \
-  --from @mindroom_openclaw:example.org --config config.yaml --storage-path mindroom_data
+mindroom agents rename-account nova @mindroom_nova:example.org \
+  --from @mindroom_atlas:example.org --config config.yaml --storage-path mindroom_data
 ```
 
 With `--from`, the old ID comes from the option instead of `matrix_state.yaml`.
@@ -131,8 +131,8 @@ Otherwise move the remaining OAuth stores and workers by hand, as listed in [Wha
 | `config.yaml` and the YAML files it includes | Every string value equal to the old ID, such as entries in user lists, `bot_accounts`, or `authorization.aliases`, becomes the new ID. A matching value inside a literal or folded block scalar makes the command refuse with `edit it by hand`. |
 
 The event journal rewrite, the personal-room records, and the leftover scan match whole user IDs the way Tuwunel's `query user-id-rewrite` matches them.
-`@harry:example.org` is found in `ask @harry:example.org.`, in `@harry:example.org:DEVICEID`, and in `@harry:example.org:12AB`, whose device ID starts with digits.
-It is not found in `@harry:example.org.uk`, `@harry:example.org:8448`, or `@harry:example.org:1234`, which name other users or servers.
+`@nova:example.org` is found in `ask @nova:example.org.`, in `@nova:example.org:DEVICEID`, and in `@nova:example.org:12AB`, whose device ID starts with digits.
+It is not found in `@nova:example.org.uk`, `@nova:example.org:8448`, or `@nova:example.org:1234`, which name other users or servers.
 Digits after a `:` count as a port unless a letter follows them, so an all-digit suffix is never matched.
 Worker keys and private-instance owners are compared as whole IDs too.
 Config values are different: only a value that equals the old ID exactly is replaced.
@@ -152,7 +152,7 @@ If that fails, the command prints a warning and you remove the container by hand
 These stay on purpose, and the plan lists them as `report:` lines.
 
 - The old crypto store stays.
-  It is the directory under `encryption_keys/` named after the old ID without the `@` and with each `:` replaced by `_`, for example `encryption_keys/mindroom_openclaw_example.org/`.
+  It is the directory under `encryption_keys/` named after the old ID without the `@` and with each `:` replaced by `_`, for example `encryption_keys/mindroom_atlas_example.org/`.
   Only that store decrypts the old encrypted history, and the new device starts its own store.
   It cannot read encrypted history from before the rename.
 - A desktop bridge pinned to the old ID stays pinned.

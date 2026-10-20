@@ -34,12 +34,12 @@ from tests.agent_rename_helpers import tree_snapshot
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-AGENT = "harry"
+AGENT = "nova"
 OLD = "@old:x"
 NEW = "@new:x"
 # bot.py joins the agent name and the Matrix ID with one "@", and the ID starts with "@".
-OLD_PRINCIPAL = "harry@@old:x"
-NEW_PRINCIPAL = "harry@@new:x"
+OLD_PRINCIPAL = "nova@@old:x"
+NEW_PRINCIPAL = "nova@@new:x"
 ROUTER = "router@@router:x"
 ROOM = "!room:x"
 UNTHREADED = encode_thread_id(None)
@@ -130,23 +130,23 @@ def _outbox(connection: sqlite3.Connection, principal: str) -> None:
 
 
 async def _journal(storage_root: Path) -> Path:
-    """Build a journal with the real schema, holding rows for harry under his old ID and for the router."""
+    """Build a journal with the real schema, holding rows for nova under his old ID and for the router."""
     database = event_journal_sqlite_path(storage_root)
     await EventJournalStore.open_sqlite(database).close()
     with closing(sqlite3.connect(database)) as connection, connection:
-        # harry's own message, as both principals saw it.
-        _event(connection, OLD_PRINCIPAL, "$from-harry", sender=OLD)
-        _event(connection, ROUTER, "$from-harry", sender=OLD)
+        # nova's own message, as both principals saw it.
+        _event(connection, OLD_PRINCIPAL, "$from-nova", sender=OLD)
+        _event(connection, ROUTER, "$from-nova", sender=OLD)
         _insert(
             connection,
             "visible_messages",
             principal_id=ROUTER,
-            logical_event_id="$from-harry",
+            logical_event_id="$from-nova",
             room_id=ROOM,
             thread_id=UNTHREADED,
             sender=OLD,
             created_ts=10,
-            revision_event_id="$from-harry",
+            revision_event_id="$from-nova",
             revision_ts=10,
             content_json=json.dumps({"body": "hello", "sender": OLD}),
             membership_epoch=0,
@@ -160,7 +160,7 @@ async def _journal(storage_root: Path) -> Path:
             anchor_event_id="$from-alice",
             record_json=json.dumps({"response_owner": OLD_PRINCIPAL, "sender": OLD}),
         )
-        # The router tracked harry joining under both IDs, so the rewritten old row collides with the new one.
+        # The router tracked nova joining under both IDs, so the rewritten old row collides with the new one.
         joins = "principal_id, room_id, user_id, baseline_receipt_order, completed"
         connection.executemany(
             f"INSERT INTO room_member_joins ({joins}) VALUES (?, ?, ?, ?, ?)",  # noqa: S608
@@ -175,8 +175,8 @@ async def _journal(storage_root: Path) -> Path:
                 stream_id=f"stream-{principal}",
                 next_sequence=sequence,
             )
-        _grant(connection, OLD_PRINCIPAL, "harry-grant", responder=OLD_PRINCIPAL)
-        _grant(connection, ROUTER, "router-grant-for-harry", responder=OLD_PRINCIPAL)
+        _grant(connection, OLD_PRINCIPAL, "nova-grant", responder=OLD_PRINCIPAL)
+        _grant(connection, ROUTER, "router-grant-for-nova", responder=OLD_PRINCIPAL)
         _grant(connection, ROUTER, "router-grant", responder=ROUTER)
         _insert(
             connection,
@@ -253,8 +253,8 @@ async def test_rewrites_principal_senders_and_payloads(tmp_path: Path) -> None:
 
     assert _cells_containing(database, OLD) == []
     assert _query(database, "SELECT principal_id, sender, source_json FROM journal_events ORDER BY principal_id") == [
-        (NEW_PRINCIPAL, NEW, json.dumps({"event_id": "$from-harry", "sender": NEW})),
-        (ROUTER, NEW, json.dumps({"event_id": "$from-harry", "sender": NEW})),
+        (NEW_PRINCIPAL, NEW, json.dumps({"event_id": "$from-nova", "sender": NEW})),
+        (ROUTER, NEW, json.dumps({"event_id": "$from-nova", "sender": NEW})),
     ]
     assert _query(database, "SELECT principal_id, sender, content_json FROM visible_messages") == [
         (ROUTER, NEW, json.dumps({"body": "hello", "sender": NEW})),
@@ -297,7 +297,7 @@ async def test_new_id_extending_the_old_id_is_adopted(tmp_path: Path) -> None:
     _apply(_steps(database, new_user_id=extended), tmp_path)
 
     assert _query(database, "SELECT principal_id, sender FROM journal_events ORDER BY principal_id") == [
-        ("harry@@old:x.renamed", extended),
+        ("nova@@old:x.renamed", extended),
         (ROUTER, extended),
     ]
 
@@ -331,7 +331,7 @@ async def test_existing_new_principal_refused_without_flag(tmp_path: Path) -> No
     _apply(_steps(database, discard_new_principal=True), tmp_path)
 
     assert _query(database, "SELECT event_id FROM journal_events WHERE principal_id = ?", NEW_PRINCIPAL) == [
-        ("$from-harry",),
+        ("$from-nova",),
     ]
     assert _query(database, "SELECT * FROM room_membership WHERE principal_id = ?", NEW_PRINCIPAL) == []
     assert _cells_containing(database, OLD) == []
@@ -415,16 +415,16 @@ async def test_consumer_row_and_grants_removed(tmp_path: Path) -> None:
 
 
 def _delivery(stream: UUID, sequence: int, *, sender: str) -> IngestionBatchAdmission:
-    """One sync batch carrying harry's message, as the router receives it."""
+    """One sync batch carrying nova's message, as the router receives it."""
     event = InboundEvent(
-        event_id="$from-harry",
+        event_id="$from-nova",
         room_id=ROOM,
         thread_id=None,
         kind=EventKind.MESSAGE,
         event_class=EventClass.ACTIONABLE,
         sender=sender,
         origin_server_ts=10,
-        source={"event_id": "$from-harry", "sender": sender},
+        source={"event_id": "$from-nova", "sender": sender},
     )
     record = IngestionRecordAdmission(IngestionRecordDisposition.SEMANTIC_EVENT, event=event)
     return IngestionBatchAdmission(stream, sequence, (record,))
@@ -486,7 +486,7 @@ def _message(event_id: str) -> IngestionRecordAdmission:
     return IngestionRecordAdmission(IngestionRecordDisposition.SEMANTIC_EVENT, event=event)
 
 
-# A stream that saw harry join, leave, and join again ends at producer epoch 1, like the production journal did.
+# A stream that saw nova join, leave, and join again ends at producer epoch 1, like the production journal did.
 _REJOINED = (_membership(None, "join", 0, 0), _membership("join", "leave", 0, 1), _membership("leave", "join", 1, 1))
 _CONSUMER = "SELECT consumer_generation, stream_id, next_sequence FROM matrix_sync_consumers WHERE principal_id = ?"
 _PRODUCER = "SELECT room_id, membership, membership_epoch FROM matrix_ingestion_membership WHERE principal_id = ?"
@@ -511,8 +511,8 @@ async def test_renamed_principal_admits_the_fresh_stream_of_its_new_device(tmp_p
     old_stream, fresh_stream = uuid4(), uuid4()
     store = EventJournalStore.open_sqlite(database)
     try:
-        harry = await _bound(store, OLD_PRINCIPAL, old_stream)
-        await harry.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, (*_REJOINED, _message("$before"))))
+        nova = await _bound(store, OLD_PRINCIPAL, old_stream)
+        await nova.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, (*_REJOINED, _message("$before"))))
     finally:
         await store.close()
 
@@ -521,13 +521,13 @@ async def test_renamed_principal_admits_the_fresh_stream_of_its_new_device(tmp_p
     assert _query(database, "SELECT * FROM matrix_sync_consumers") == []
     store = EventJournalStore.open_sqlite(database)
     try:
-        harry = await _bound(store, NEW_PRINCIPAL, fresh_stream)
-        facts = await harry.admit_ingestion_batch(
+        nova = await _bound(store, NEW_PRINCIPAL, fresh_stream)
+        facts = await nova.admit_ingestion_batch(
             IngestionBatchAdmission(fresh_stream, 1, (_membership(None, "join", 0, 0),)),
         )
-        producer = await harry.ingestion_membership_position(ROOM)
-        tenure = await harry.membership_position(ROOM)
-        history = await harry.load_event("$before")
+        producer = await nova.ingestion_membership_position(ROOM)
+        tenure = await nova.membership_position(ROOM)
+        history = await nova.load_event("$before")
     finally:
         await store.close()
     assert facts.receipt_new
@@ -547,8 +547,8 @@ async def test_discard_keeps_the_stream_of_the_device_already_running_under_the_
     old_stream, new_stream = uuid4(), uuid4()
     store = EventJournalStore.open_sqlite(database)
     try:
-        harry = await _bound(store, OLD_PRINCIPAL, old_stream)
-        await harry.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, (*_REJOINED, _message("$before"))))
+        nova = await _bound(store, OLD_PRINCIPAL, old_stream)
+        await nova.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, (*_REJOINED, _message("$before"))))
         renamed = await _bound(store, NEW_PRINCIPAL, new_stream)
         await renamed.admit_ingestion_batch(
             IngestionBatchAdmission(new_stream, 1, (_membership(None, "join", 0, 0), _message("$after"))),
@@ -592,8 +592,8 @@ async def test_discard_drops_the_new_id_stream_when_the_next_start_uses_a_fresh_
     old_stream, new_stream, fresh_stream = uuid4(), uuid4(), uuid4()
     store = EventJournalStore.open_sqlite(database)
     try:
-        harry = await _bound(store, OLD_PRINCIPAL, old_stream)
-        await harry.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, _REJOINED))
+        nova = await _bound(store, OLD_PRINCIPAL, old_stream)
+        await nova.admit_ingestion_batch(IngestionBatchAdmission(old_stream, 1, _REJOINED))
         renamed = await _bound(store, NEW_PRINCIPAL, new_stream)
         await renamed.admit_ingestion_batch(IngestionBatchAdmission(new_stream, 1, (_membership(None, "join", 0, 0),)))
     finally:
@@ -604,8 +604,8 @@ async def test_discard_drops_the_new_id_stream_when_the_next_start_uses_a_fresh_
     assert _query(database, "SELECT * FROM matrix_sync_consumers") == []
     store = EventJournalStore.open_sqlite(database)
     try:
-        harry = await _bound(store, NEW_PRINCIPAL, fresh_stream)
-        facts = await harry.admit_ingestion_batch(
+        nova = await _bound(store, NEW_PRINCIPAL, fresh_stream)
+        facts = await nova.admit_ingestion_batch(
             IngestionBatchAdmission(fresh_stream, 1, (_membership(None, "join", 0, 0),)),
         )
     finally:
@@ -688,7 +688,7 @@ async def test_other_principal_user_ids_lists_ids_the_agent_was_keyed_by(tmp_pat
     database = await _journal(tmp_path)
     with closing(sqlite3.connect(database)) as connection, connection:
         _event(connection, NEW_PRINCIPAL, "$after-rename", sender=NEW)
-        # An agent whose name only matches "harry" as a LIKE pattern.
+        # An agent whose name only matches "nova" as a LIKE pattern.
         _event(connection, "hXrry@@other:x", "$other-agent", sender="@other:x")
     before = tree_snapshot(tmp_path)
 
@@ -760,7 +760,7 @@ async def test_mistyped_old_id_deletes_nothing(tmp_path: Path) -> None:
 
     assert steps == []
     assert reports == [
-        f"The event journal {database} has no rows for harry@@typo:x, so it stays as it is; "
+        f"The event journal {database} has no rows for nova@@typo:x, so it stays as it is; "
         f"its rows for {NEW_PRINCIPAL} (journal_events: 1) are kept.",
     ]
     assert _rows(database) == before

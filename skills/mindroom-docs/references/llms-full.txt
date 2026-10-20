@@ -19784,9 +19784,11 @@ Run it with `--from` in that case too.
 | `matrix_message_sends/` in the control state directory | Files holding send intents of the old ID are removed into the backup, because MindRoom refuses to replay an intent as another sender. The directory is `control_state/` under the storage directory unless [`MINDROOM_CONTROL_STATE_PATH`](https://docs.mindroom.chat/configuration/#environment-variables) points elsewhere. |
 | `config.yaml` and the YAML files it includes | Every string value equal to the old ID, such as entries in user lists, `bot_accounts`, or `authorization.aliases`, becomes the new ID. A matching value inside a literal or folded block scalar makes the command refuse with `edit it by hand`. |
 
-The event journal rewrite, the personal-room records, and the leftover scan match whole user IDs the way Tuwunel matches them.
-`@harry:example.org` is found in `ask @harry:example.org.` and in `@harry:example.org:DEVICEID`.
-It is not found in `@harry:example.org.uk` or `@harry:example.org:8448`, which name other users.
+The event journal rewrite, the personal-room records, and the leftover scan match whole user IDs the way Tuwunel's `query user-id-rewrite` matches them.
+`@harry:example.org` is found in `ask @harry:example.org.`, in `@harry:example.org:DEVICEID`, and in `@harry:example.org:12AB`, whose device ID starts with digits.
+It is not found in `@harry:example.org.uk`, `@harry:example.org:8448`, or `@harry:example.org:1234`, which name other users or servers.
+Digits after a `:` count as a port unless a letter follows them, so an all-digit suffix is never matched.
+This is the rule of mindroom-tuwunel#109 since its commit `875f009`; earlier builds of that pull request treated every `:` followed by a digit as a port.
 Worker keys and private-instance owners are compared as whole IDs too.
 Config values are different: only a value that equals the old ID exactly is replaced.
 

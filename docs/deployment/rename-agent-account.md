@@ -246,20 +246,33 @@ Delete it once you are sure of the result.
 Each entry has a `type`, a `description`, a `source`, a `destination`, and a `backup` directory.
 The `backup` directories are numbered `000`, `001`, and so on, and hold the originals.
 Plain moves keep nothing there, because a move is only a rename.
+The number is the entry's position in the manifest, counting from `000`, and the directory is `<backup dir>/NNN`.
+
+The command rewrites the manifest after a step returns.
+It is current after `Not applied:` and `Undo failed:`.
+After a kill it lags by the step that was running, and that entry can say `backup: null` although the step took effect.
+So decide by the numbered directory on disk, not by the `backup` field.
 
 To restore by hand, stop MindRoom and walk the manifest from its last entry to its first.
 Skip the entries that have nothing to restore:
 
 - A `FinalAction` entry.
   It is only used with the Docker worker backend, to retire the old workers, and is never undone.
-- A `SqliteEdit`, `FileRewrite`, or `DropPath` entry whose `backup` is `null`, because that step never ran.
-- A `DropPath` entry whose `backup` directory is empty, because its item was already moved back.
+- A `SqliteEdit`, `FileRewrite`, or `DropPath` entry whose numbered directory does not exist, because that step never started.
+- A `DropPath` entry whose numbered directory holds no item, because the drop never ran or was already undone.
 - A `MovePath` entry, unless its `destination` exists and its `source` does not.
   Otherwise the move never happened or was already undone.
   With `--discard-new-principal`, the `destination` of a move that never ran can still exist, because the `DropPath` before it, which would have removed it, never ran either.
   Moving that `destination` back would put it inside `source`.
 
 Restoring a `SqliteEdit` or `FileRewrite` entry that was already undone does no harm.
+Neither does restoring one that never took effect, because `source` still holds the original.
+
+One entry needs a check first: the last one with a numbered directory after a kill or a failed step.
+The command may have stopped while it copied the original into that directory, for example because the disk was full.
+A copy cut short must not replace a good `source`.
+Check that the copy is whole before you use it, for example `sqlite3 <copy> .tables` for a database.
+If you cannot tell, restore your snapshot instead.
 
 This matters most after `Undo failed:`, where the manifest includes steps the command never reached.
 Restore each remaining entry like this:

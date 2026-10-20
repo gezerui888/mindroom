@@ -9473,11 +9473,12 @@ depends_on = ["mindroom.config.yaml_includes"]
 expose = ["config_entity_steps", "config_value_steps", "env_value_steps"]
 from = ["mindroom.agent_rename.config_edit"]
 
-# Drops the knowledge indexes named after an agent and reports the state its rename leaves as it is.
+# Drops or moves the derived state named after an agent and reports the state its rename leaves as it is.
 [[modules]]
 path = "mindroom.agent_rename.indexes"
 depends_on = [
     "mindroom.agent_rename.config_edit",
+    "mindroom.agent_rename.workers",
     "mindroom.config.yaml_includes",
     "mindroom.constants",
     "mindroom.knowledge.indexing_config",

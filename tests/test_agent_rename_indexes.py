@@ -3,35 +3,46 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 import time
+from contextlib import closing
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import pytest
 from mem0.memory.main import _build_session_scope
 from mem0.memory.storage import SQLiteManager
 
+from mindroom.agent_rename.entity_state import entity_state_steps
 from mindroom.agent_rename.indexes import index_steps
-from mindroom.agent_rename.steps import BACKUPS_DIRECTORY_NAME, DropPath, RenamePlan, apply_plan
+from mindroom.agent_rename.steps import (
+    BACKUPS_DIRECTORY_NAME,
+    DropPath,
+    MovePath,
+    RenamePlan,
+    RenameRefusedError,
+    apply_plan,
+)
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.knowledge import KnowledgeBaseConfig, KnowledgeGitConfig
 from mindroom.config.main import Config, load_config
 from mindroom.constants import resolve_runtime_paths, tracking_dir
+from mindroom.knowledge.file_listing import git_checkout_present
 from mindroom.knowledge.file_memory_knowledge import resolve_agent_file_memory_knowledge, resolve_file_memory_knowledge
 from mindroom.knowledge.indexing_config import knowledge_git_dir
+from mindroom.knowledge.manager import KnowledgeManager
 from mindroom.knowledge.registry import published_index_storage_path, resolve_published_index_key
 from mindroom.knowledge_graph.ingestion import KnowledgeGraphIngestionWorker
 from mindroom.knowledge_graph.scope import graph_scope
 from mindroom.legacy_handled_turns import legacy_responses_file_path
 from mindroom.memory_scope_ids import agent_scope_user_id
-from mindroom.runtime_resolution import shared_knowledge_path
+from mindroom.runtime_resolution import resolve_agent_runtime, shared_knowledge_path
 from mindroom.tool_system.runtime_context import get_plugin_state_root
 from mindroom.tool_system.worker_routing import agent_state_root_path, build_requester_execution_identity
 from tests.agent_rename_helpers import tree_snapshot
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
     from mindroom.agent_rename.steps import Step
     from mindroom.constants import RuntimePaths
@@ -46,6 +57,7 @@ NOW = datetime(2026, 10, 20, 9, 30, 0, tzinfo=UTC)
 _SCHEDULED = "Scheduled tasks"
 _GRAPH = "knowledge graph"
 _GIT = "Git directory"
+_PRIVATE = "private-instance state roots"
 _MEM0 = "mem0's history database"
 _PLUGINS = "plugin state paths"
 _CONFIG_LINES = "config lines"
@@ -127,19 +139,24 @@ def _file_memory_index(agent: str, config: Config, runtime_paths: RuntimePaths, 
     return _mkdir(published_index_storage_path(key))
 
 
-def _private_knowledge_index(agent: str, config: Config, runtime_paths: RuntimePaths) -> Path:
-    """Create the store of a private agent's knowledge index where MindRoom keeps it for one requester."""
-    base_id = config.resolve_entity(agent).private_knowledge_base_id
-    assert base_id is not None
-    identity = build_requester_execution_identity(agent_name=agent, runtime_paths=runtime_paths, requester_id=REQUESTER)
-    key = resolve_published_index_key(
-        base_id,
-        config=config,
-        runtime_paths=runtime_paths,
-        execution_identity=identity,
-        create=True,
+def _private_config() -> Config:
+    """Return a config in which the renamed agent and the agent whose name extends it are private."""
+    private = AgentPrivateConfig(per="user")
+    return Config(
+        agents={
+            OLD: AgentConfig(display_name="Code", private=private),
+            PREFIX: AgentConfig(display_name="Code Team", private=private),
+            HELPER: AgentConfig(display_name="Helper"),
+        },
     )
-    return _mkdir(published_index_storage_path(key))
+
+
+def _private_state_root(agent: str, config: Config, runtime_paths: RuntimePaths) -> Path:
+    """Create the state root MindRoom keeps for one requester's instance of a private agent."""
+    identity = build_requester_execution_identity(agent_name=agent, runtime_paths=runtime_paths, requester_id=REQUESTER)
+    state_root = resolve_agent_runtime(agent, config, runtime_paths, identity, create=True).state_root
+    assert state_root.is_dir()
+    return state_root
 
 
 def _start_graph(agent: str, config: Config, runtime_paths: RuntimePaths) -> str:
@@ -155,17 +172,17 @@ def _start_graph(agent: str, config: Config, runtime_paths: RuntimePaths) -> str
     return graph
 
 
-def _git_config(agents: tuple[str, ...]) -> Config:
-    """Return a config with a Git-backed knowledge base in the workspace of each agent in ``agents``."""
+def _git_config(bases: dict[str, str]) -> Config:
+    """Return a config with Git-backed knowledge bases, each checked out in the workspace of the agent it maps to."""
     config = _config()
-    bases = {
-        f"{agent}_docs": KnowledgeBaseConfig(
+    knowledge_bases = {
+        base_id: KnowledgeBaseConfig(
             path=f"${{MINDROOM_STORAGE_PATH}}/agents/{agent}/workspace/docs",
-            git=KnowledgeGitConfig(repo_url=f"https://example.org/{agent}.git"),
+            git=KnowledgeGitConfig(repo_url=f"https://example.org/{base_id}.git"),
         )
-        for agent in agents
+        for base_id, agent in bases.items()
     }
-    return config.model_copy(update={"knowledge_bases": bases})
+    return config.model_copy(update={"knowledge_bases": knowledge_bases})
 
 
 def _knowledge_git(base_id: str, config: Config, runtime_paths: RuntimePaths) -> Path:
@@ -201,6 +218,8 @@ def _legacy_files(runtime_paths: RuntimePaths, agent: str) -> list[Path]:
         _touch(storage / f"{agent}.db"),
         _mkdir(storage / "memory_search_db" / f"{scope}_{search_digest}"),
         _touch(responded.with_suffix(f"{responded.suffix}.imported")),
+        # An older ledger reader set an unreadable ledger aside like this.
+        _touch(responded.with_name(f"{responded.name}.corrupt-20260801T000000Z")),
     ]
 
 
@@ -235,27 +254,27 @@ def test_file_memory_search_indexes_of_the_agent_are_dropped_into_the_backup(tmp
     assert {path.name for path in backups.glob("*/*/*") if path.is_dir()} == {own.name, earlier.name}
 
 
-def test_the_private_knowledge_index_of_a_formerly_private_agent_is_dropped(tmp_path: Path) -> None:
-    """An index MindRoom built for the agent's private knowledge while it was private is dropped."""
+def test_private_instance_roots_left_by_a_formerly_private_agent_are_reported(tmp_path: Path) -> None:
+    """State MindRoom kept for a requester while the agent was private stays where it is and is listed."""
     runtime_paths = _runtime_paths(tmp_path)
-    private = AgentPrivateConfig(per="user", knowledge={"path": "docs"})
-    private_config = Config(
-        agents={
-            OLD: AgentConfig(display_name="Code", private=private),
-            PREFIX: AgentConfig(display_name="Code Team", private=private),
-            HELPER: AgentConfig(display_name="Helper"),
-        },
-    )
-    own = _private_knowledge_index(OLD, private_config, runtime_paths)
-    prefix = _private_knowledge_index(PREFIX, private_config, runtime_paths)
+    own = _private_state_root(OLD, _private_config(), runtime_paths)
+    _private_state_root(PREFIX, _private_config(), runtime_paths)
 
     # The rename supports only agents that are not private, so the agent is no longer private now.
-    steps, _ = _plan(runtime_paths, _config())
+    steps, reports = _plan(runtime_paths, _config())
 
-    assert [step.path.resolve() for step in steps if isinstance(step, DropPath)] == [own]
-    _apply(runtime_paths, steps)
-    assert not own.exists()
-    assert (prefix / "data").read_bytes() == b"data"
+    assert steps == []
+    assert _listed(_report(reports, _PRIVATE)) == {str(own)}
+
+
+def test_no_private_instance_report_for_an_agent_that_was_never_private(tmp_path: Path) -> None:
+    """The private state of the agent whose name extends the renamed one's is not the agent's."""
+    runtime_paths = _runtime_paths(tmp_path)
+    _private_state_root(PREFIX, _private_config(), runtime_paths)
+
+    _, reports = _plan(runtime_paths, _config())
+
+    assert _report(reports, _PRIVATE) is None
 
 
 def test_the_knowledge_graph_of_the_old_state_root_is_reported(tmp_path: Path) -> None:
@@ -284,31 +303,67 @@ def test_no_graph_report_without_a_started_graph_of_the_agent(tmp_path: Path) ->
     assert _report(reports, _GRAPH) is None
 
 
-def test_git_directories_of_checkouts_in_the_moved_state_root_are_reported(tmp_path: Path) -> None:
-    """A Git-backed base checked out in the agent's state root keeps its Git directory under the old path's hash."""
+def _moved_checkout(runtime_paths: RuntimePaths) -> Path:
+    return agent_state_root_path(runtime_paths.storage_root, NEW) / "workspace" / "docs"
+
+
+def test_git_directories_of_checkouts_in_the_moved_state_root_follow_them(tmp_path: Path) -> None:
+    """The Git directory of a checkout in the agent's state root moves to the name of the moved checkout's path."""
     runtime_paths = _runtime_paths(tmp_path)
-    config = _git_config((OLD, PREFIX))
+    config = _git_config({f"{OLD}_docs": OLD, f"{PREFIX}_docs": PREFIX})
     old_git = _knowledge_git(f"{OLD}_docs", config, runtime_paths)
     prefix_git = _knowledge_git(f"{PREFIX}_docs", config, runtime_paths)
-    moved_checkout = agent_state_root_path(runtime_paths.storage_root, NEW) / "workspace" / "docs"
-    new_git = knowledge_git_dir(runtime_paths.storage_root, moved_checkout)
+    new_git = knowledge_git_dir(runtime_paths.storage_root, _moved_checkout(runtime_paths))
 
-    _, reports = _plan(runtime_paths, config)
+    steps, reports = _plan(runtime_paths, config)
 
-    report = _report(reports, _GIT)
-    assert report is not None
-    assert str(old_git) in report
-    assert str(new_git) in report
-    assert f"{OLD}_docs" in report
-    assert str(prefix_git) not in report
+    assert [(step.source, step.destination) for step in steps if isinstance(step, MovePath)] == [(old_git, new_git)]
+    assert _report(reports, _GIT) is None
+    _apply(runtime_paths, steps)
+    assert (new_git / "data").read_bytes() == b"data"
+    assert (prefix_git / "data").read_bytes() == b"data"
 
 
-def test_no_git_report_when_the_checkout_has_no_git_directory_yet(tmp_path: Path) -> None:
-    """A base that never synced has no Git directory to leave behind."""
+@pytest.mark.asyncio
+async def test_git_sync_opens_the_moved_checkout_instead_of_cloning_into_it(tmp_path: Path) -> None:
+    """After the state root and its Git directory move, Git sync finds the repository of the moved checkout."""
+    runtime_paths = _runtime_paths(tmp_path)
+    base_id = f"{OLD}_docs"
+    config = _git_config({base_id: OLD})
+    manager = KnowledgeManager(base_id, config=config, runtime_paths=runtime_paths)
+    assert await manager.git_source._ensure_repository(manager.git_source._git_config())
+    (manager.knowledge_path / "doc.md").write_text("synced\n", encoding="utf-8")
+
+    steps, _ = _plan(runtime_paths, config)
+    _apply(runtime_paths, [*entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW), *steps])
+
+    # The config edit points the base at the moved checkout.
+    moved = KnowledgeManager(base_id, config=_git_config({base_id: NEW}), runtime_paths=runtime_paths)
+    assert moved.knowledge_path == _moved_checkout(runtime_paths).resolve()
+    assert git_checkout_present(moved.knowledge_path, moved.git_source.git_dir)
+    # False: the repository was found, not created; creating one refuses a checkout that is not empty.
+    assert not await moved.git_source._ensure_repository(moved.git_source._git_config())
+    assert (moved.knowledge_path / "doc.md").read_text(encoding="utf-8") == "synced\n"
+
+
+def test_git_directory_move_refuses_when_the_new_name_is_taken(tmp_path: Path) -> None:
+    """A Git directory already at the new name is never replaced."""
+    runtime_paths = _runtime_paths(tmp_path)
+    config = _git_config({f"{OLD}_docs": OLD})
+    _knowledge_git(f"{OLD}_docs", config, runtime_paths)
+    _mkdir(knowledge_git_dir(runtime_paths.storage_root, _moved_checkout(runtime_paths)))
+
+    with pytest.raises(RenameRefusedError, match="already exists"):
+        _plan(runtime_paths, config)
+
+
+def test_no_git_move_when_the_checkout_has_no_git_directory_yet(tmp_path: Path) -> None:
+    """A base that never synced has no Git directory to move."""
     runtime_paths = _runtime_paths(tmp_path)
 
-    _, reports = _plan(runtime_paths, _git_config((OLD,)))
+    steps, reports = _plan(runtime_paths, _git_config({f"{OLD}_docs": OLD}))
 
+    assert steps == []
     assert _report(reports, _GIT) is None
 
 
@@ -348,6 +403,39 @@ def test_no_mem0_report_without_messages_of_the_agent_scope(tmp_path: Path) -> N
     _, reports = _plan(runtime_paths, _config())
 
     assert _report(reports, _MEM0) is None
+
+
+def test_a_mem0_history_database_without_recent_messages_is_not_reported(tmp_path: Path) -> None:
+    """A history database without mem0's messages table keeps no recent messages to lose."""
+    runtime_paths = _runtime_paths(tmp_path)
+    database = tmp_path / "mem0" / "history.db"
+    database.parent.mkdir()
+    with closing(sqlite3.connect(database)) as connection:
+        connection.execute("CREATE TABLE history (id TEXT PRIMARY KEY)")
+
+    _, reports = _plan(runtime_paths, _config())
+
+    assert _report(reports, _MEM0) is None
+
+
+@pytest.mark.parametrize("damage", ["not_a_database", "uncopyable_wal"])
+def test_an_unreadable_mem0_history_database_is_reported(tmp_path: Path, damage: str) -> None:
+    """A history database that cannot be read, or whose WAL cannot be copied to read it, is reported as such."""
+    runtime_paths = _runtime_paths(tmp_path)
+    database = tmp_path / "mem0" / "history.db"
+    if damage == "not_a_database":
+        _touch(database)
+    else:
+        _mem0_messages(database, OLD)
+        # Reading a database with a WAL copies both first, which fails for a directory.
+        _mkdir(database.with_name(f"{database.name}-wal"))
+
+    _, reports = _plan(runtime_paths, _config())
+
+    report = _report(reports, _MEM0)
+    assert report is not None
+    assert "could not be read" in report
+    assert str(database) in report
 
 
 def test_plugin_state_paths_naming_the_agent_are_reported(tmp_path: Path) -> None:
@@ -446,10 +534,51 @@ def test_legacy_files_of_the_agent_are_reported(tmp_path: Path) -> None:
     assert _listed(_report(reports, _LEGACY)) == {str(path) for path in expected}
 
 
+def test_a_handled_turn_ledger_not_imported_yet_moves_to_the_new_name(tmp_path: Path) -> None:
+    """The startup import reads the ledger under the agent's current name, so one not imported yet follows the agent."""
+    runtime_paths = _runtime_paths(tmp_path)
+    storage = runtime_paths.storage_root
+    ledger = _touch(legacy_responses_file_path(storage, OLD))
+    ledger.write_text('{"records": {}}', encoding="utf-8")
+    prefix_ledger = _touch(legacy_responses_file_path(storage, PREFIX))
+    new_ledger = legacy_responses_file_path(storage, NEW)
+
+    steps, reports = _plan(runtime_paths, _config())
+
+    assert [(step.source, step.destination) for step in steps if isinstance(step, MovePath)] == [(ledger, new_ledger)]
+    assert _report(reports, _LEGACY) is None
+    _apply(runtime_paths, steps)
+    assert not ledger.exists()
+    assert new_ledger.read_text(encoding="utf-8") == '{"records": {}}'
+    assert prefix_ledger.read_bytes() == b"data"
+
+
+def test_a_ledger_beside_its_imported_copy_stays_and_is_reported(tmp_path: Path) -> None:
+    """A ledger with an `.imported` sibling is not moved; both are listed with the legacy files."""
+    runtime_paths = _runtime_paths(tmp_path)
+    ledger = _touch(legacy_responses_file_path(runtime_paths.storage_root, OLD))
+    imported = _touch(ledger.with_suffix(f"{ledger.suffix}.imported"))
+
+    steps, reports = _plan(runtime_paths, _config())
+
+    assert steps == []
+    assert _listed(_report(reports, _LEGACY)) == {str(ledger), str(imported)}
+
+
+def test_a_ledger_move_refuses_when_the_new_name_has_one(tmp_path: Path) -> None:
+    """A ledger already under the new name is never replaced."""
+    runtime_paths = _runtime_paths(tmp_path)
+    _touch(legacy_responses_file_path(runtime_paths.storage_root, OLD))
+    _touch(legacy_responses_file_path(runtime_paths.storage_root, NEW))
+
+    with pytest.raises(RenameRefusedError, match="already exists"):
+        _plan(runtime_paths, _config())
+
+
 def test_planning_writes_nothing_and_leaves_the_prefix_agent_alone(tmp_path: Path) -> None:
     """With every store present for both agents, planning changes no file and nothing of `code_team` is planned."""
     runtime_paths = _runtime_paths(tmp_path)
-    config = _git_config((OLD, PREFIX)).model_copy(
+    config = _git_config({f"{OLD}_docs": OLD, f"{PREFIX}_docs": PREFIX}).model_copy(
         update={
             "agents": {
                 name: AgentConfig(
@@ -462,10 +591,12 @@ def test_planning_writes_nothing_and_leaves_the_prefix_agent_alone(tmp_path: Pat
             },
         },
     )
+    planned: list[Path] = []
     for agent in (OLD, PREFIX):
-        _file_memory_index(agent, config, runtime_paths)
+        index = _file_memory_index(agent, config, runtime_paths)
         _start_graph(agent, config, runtime_paths)
-        _knowledge_git(f"{agent}_docs", config, runtime_paths)
+        git_dir = _knowledge_git(f"{agent}_docs", config, runtime_paths)
+        planned += [index, git_dir] if agent == OLD else []
         _mem0_messages(tmp_path / "mem0" / "history.db", agent)
         _touch(get_plugin_state_root("notes", runtime_paths=runtime_paths) / f"{agent}.json")
         _legacy_files(runtime_paths, agent)
@@ -474,6 +605,7 @@ def test_planning_writes_nothing_and_leaves_the_prefix_agent_alone(tmp_path: Pat
     steps, reports = _plan(runtime_paths, config)
 
     assert tree_snapshot(tmp_path) == before
-    assert [PREFIX not in step.path.name for step in steps if isinstance(step, DropPath)] == [True]
-    assert {_report(reports, marker) is not None for marker in (_GRAPH, _GIT, _MEM0, _PLUGINS, _LEGACY)} == {True}
+    sources = [step.path if isinstance(step, DropPath) else step.source for step in steps]
+    assert sorted(source.resolve() for source in sources) == sorted(planned)
+    assert {_report(reports, marker) is not None for marker in (_GRAPH, _MEM0, _PLUGINS, _LEGACY)} == {True}
     assert [report for report in reports if PREFIX in report] == []

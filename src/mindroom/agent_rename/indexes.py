@@ -1,13 +1,15 @@
-"""Plan dropping the derived indexes named after an agent, and report what its rename leaves as it is.
+"""Plan the derived state an agent's rename drops or moves, and report what it leaves as it is.
 
 Knowledge indexes are derived from files and named after the knowledge base they serve. The file-memory search index
-of the agent's scope and the index of its private knowledge base carry the agent's name, so after the rename they are
-never read again; they are dropped into the backup and rebuild under the new name on next use.
-What the rename does not change is reported: the knowledge graph and the knowledge Git directories named after paths
-in the agent's old state root, mem0's history database outside the storage root, plugin state, config lines that
-mention the agent in prose, scheduled tasks in Matrix room state, and files of older MindRoom versions.
+of the agent's scope carries the agent's name, so after the rename it is never read again; it is dropped into the
+backup and rebuilds under the new name on next use. The Git directory of a knowledge checkout in the agent's state root
+is named after the checkout's path, and a handled-turn ledger not imported yet is read under the agent's name, so
+both move with the agent. What the rename does not change is reported: the knowledge graph named after the old state
+root, private-instance state left from when the agent was private, mem0's history database outside the storage root,
+plugin state, config lines that mention the agent in prose, scheduled tasks in Matrix room state, and files of older
+MindRoom versions.
 Names match exactly, never as substrings, so renaming ``code`` leaves ``code_team`` alone.
-Building the steps only reads.
+Building the steps only reads; every refusal happens here, before anything is written.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from typing import TYPE_CHECKING
 from mindroom.agent_rename.config_edit import config_entity_steps
 from mindroom.agent_rename.sqlite_read import read_only_connection
 from mindroom.agent_rename.steps import DropPath
+from mindroom.agent_rename.workers import move_steps
 from mindroom.config.yaml_includes import load_yaml_config_source
 from mindroom.constants import tracking_dir
 from mindroom.knowledge.indexing_config import knowledge_git_dir
@@ -43,7 +46,8 @@ if TYPE_CHECKING:
 # `<base id>_<8 hex digits>`, with every character of the base id but letters, digits, `_` and `-` written as `_`.
 _KNOWLEDGE_DB = "knowledge_db"
 _STORE_DIGEST = "_[0-9a-f]{8}"
-# knowledge/file_memory_knowledge.py's _memory_knowledge_base_id: `file_memory_<scope id>_<16 hex digits>`.
+# knowledge/file_memory_knowledge.py's _memory_knowledge_base_id: `file_memory_<scope id>_<16 hex digits>`; the scope
+# id of an agent, `agent_<name>`, holds no character that either name writes as `_`.
 _FILE_MEMORY_BASE_PREFIX = "file_memory_"
 _FILE_MEMORY_DIGEST = "_[0-9a-f]{16}"
 # knowledge_graph/ingestion.py's _state_path: a graph's ingestion progress, written when ingestion starts the graph.
@@ -52,8 +56,12 @@ _GRAPH_INGESTION_STATE = ("knowledge_graph", "ingestion")
 # and mem0/memory/main.py's _build_session_scope, which keys mem0's recent messages by the memory scope.
 _MEM0_DIR_VARIABLE = "MEM0_DIR"
 _MEM0_HISTORY_DATABASE = "history.db"
+# mem0/memory/storage.py's SQLiteManager keeps the recent messages in this table; older mem0 versions had none.
+_MEM0_MESSAGES_TABLE = "messages"
 # hooks/context.py's _resolve_plugin_state_root and tool_system/runtime_context.py's get_plugin_state_root.
 _PLUGINS = "plugins"
+# legacy_handled_turns.py's import_legacy_ledger renames an imported ledger with this suffix appended.
+_IMPORTED_LEDGER_SUFFIX = ".imported"
 # Legacy files whose readers are gone: the dispatch obligations before the event journal (#1800),
 # `dispatch_obligations-<entity>-<12 hex digits>.sqlite3` in tracking/, the session databases before per-agent
 # state roots, and the file-memory search indexes before knowledge indexes (#1165), `<scope id>_<16 hex digits>`.
@@ -71,26 +79,30 @@ def index_steps(
     old_name: str,
     new_name: str,
 ) -> tuple[list[Step], list[str]]:
-    """Return the steps that drop the agent's derived indexes, and report lines for what the rename leaves as it is.
+    """Return the steps that drop or move the agent's derived state, and report lines for what the rename leaves.
 
     The file-memory search indexes of the scope ``agent_<OLD>`` are dropped from ``knowledge_db/``, for every
-    file-memory root they were built for. The index of the private knowledge base ``__agent_private__:<OLD>``
-    is dropped from the private-instance state roots, where MindRoom built it while the agent was private.
+    file-memory root they were built for. The Git directory of each knowledge checkout below ``agents/<OLD>`` moves
+    to the name its path below ``agents/<NEW>`` gives, and ``tracking/<OLD>_responded.json`` moves to the new name
+    unless it was imported already. These steps run after the state root moves to ``agents/<NEW>``.
     ``config`` is the config that still names the agent; the config text is read from ``runtime_paths.config_path``.
+    Refuses when a move's destination already exists.
     """
+    ledger_steps = _ledger_steps(runtime_paths, old_name, new_name)
     steps: list[Step] = [
         *_file_memory_index_drops(runtime_paths, old_name),
-        *_private_knowledge_index_drops(runtime_paths, config, old_name),
+        *_knowledge_git_steps(runtime_paths, config, old_name, new_name),
+        *ledger_steps,
     ]
     reports = [
         *_knowledge_graph_reports(runtime_paths, config, old_name, new_name),
-        *_knowledge_git_reports(runtime_paths, config, old_name, new_name),
+        *_private_instance_reports(runtime_paths, old_name),
         *_mem0_history_reports(runtime_paths, old_name, new_name),
         *_plugin_state_reports(runtime_paths, old_name),
         *_config_line_reports(runtime_paths, old_name, new_name),
         f"Scheduled tasks are Matrix room state, which the rename neither reads nor changes; "
         f"a task whose message mentions @{old_name} keeps that text, so edit such tasks to mention @{new_name}.",
-        *_legacy_file_reports(runtime_paths, old_name),
+        *_legacy_file_reports(runtime_paths, old_name, moved_ledger=bool(ledger_steps)),
     ]
     return steps, reports
 
@@ -102,15 +114,10 @@ def _entries(directory: Path, matches: Callable[[str], object]) -> list[Path]:
     return sorted(entry for entry in directory.iterdir() if matches(entry.name))
 
 
-def _safe_identifier(value: str) -> str:
-    """Write ``value`` as storage_key_for_base writes a base id in its store's name."""
-    return "".join(character if character.isalnum() or character in {"_", "-"} else "_" for character in value)
-
-
 def _file_memory_index_drops(runtime_paths: RuntimePaths, name: str) -> list[Step]:
     """Drop the file-memory search indexes of the agent's scope, which are named after it and its memory root."""
     # File-memory bases are not private, so their indexes sit below the storage root itself.
-    base_prefix = f"{_FILE_MEMORY_BASE_PREFIX}{_safe_identifier(agent_scope_user_id(name))}"
+    base_prefix = f"{_FILE_MEMORY_BASE_PREFIX}{agent_scope_user_id(name)}"
     store = re.compile(f"{re.escape(base_prefix)}{_FILE_MEMORY_DIGEST}{_STORE_DIGEST}")
     return [
         DropPath(path, f"Drop the file-memory search index {path} of agent {name}; it rebuilds on next use")
@@ -118,18 +125,70 @@ def _file_memory_index_drops(runtime_paths: RuntimePaths, name: str) -> list[Ste
     ]
 
 
-def _private_knowledge_index_drops(runtime_paths: RuntimePaths, config: Config, name: str) -> list[Step]:
-    """Drop the private knowledge indexes of the agent, at each private-instance state root of the agent.
+def _knowledge_git_steps(runtime_paths: RuntimePaths, config: Config, old_name: str, new_name: str) -> list[Step]:
+    """Move the Git directory of each Git-backed knowledge checkout in the agent's state root along with it.
 
-    A private base's binding stores its index below the private agent's state root, ``<scope>/<agent>``
-    in ``private_instances/`` (runtime_resolution.py's resolve_knowledge_binding), never in ``agents/<agent>``.
+    ``knowledge_git_dir`` names a Git directory after its checkout's absolute path, so the moved checkout would find
+    none and Git sync would refuse to clone into it, as it is not empty (knowledge/git_source.py's
+    _initialize_repository). Every Git command names its work tree, so the moved directory needs no edit.
     """
-    base_id = f"{config.PRIVATE_KNOWLEDGE_BASE_ID_PREFIX}{name}"
-    store = re.compile(f"{re.escape(_safe_identifier(base_id))}{_STORE_DIGEST}")
+    storage = runtime_paths.storage_root
+    old_root = agent_state_root_path(storage, old_name).resolve()
+    new_root = agent_state_root_path(storage, new_name).resolve()
+    checkouts: dict[Path, list[str]] = {}
+    for base_id, base in config.knowledge_bases.items():
+        if base.git is None:
+            continue
+        try:
+            checkout = shared_knowledge_path(base.path, runtime_paths)
+        except (OSError, RuntimeError, ValueError):
+            # MindRoom cannot sync a base whose path it cannot resolve either.
+            continue
+        if checkout.is_relative_to(old_root):
+            checkouts.setdefault(checkout, []).append(base_id)
+    steps: list[Step] = []
+    for checkout, base_ids in checkouts.items():
+        git_dir = knowledge_git_dir(storage, checkout)
+        if os.path.lexists(git_dir):
+            moved = knowledge_git_dir(storage, new_root / checkout.relative_to(old_root))
+            label = f"the Git directory of knowledge base {', '.join(base_ids)}, named after its checkout path,"
+            steps += move_steps(git_dir, moved, label, discard_new_state=False)
+    return steps
+
+
+def _unimported_ledger(runtime_paths: RuntimePaths, name: str) -> Path | None:
+    """Return the agent's pre-journal handled-turn ledger when a start has not imported it yet."""
+    ledger = legacy_responses_file_path(runtime_paths.storage_root, name)
+    imported = ledger.with_name(f"{ledger.name}{_IMPORTED_LEDGER_SUFFIX}")
+    return ledger if ledger.is_file() and not os.path.lexists(imported) else None
+
+
+def _ledger_steps(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> list[Step]:
+    """Move a ledger not imported yet to the new name, which the startup import reads it under (bot.py)."""
+    ledger = _unimported_ledger(runtime_paths, old_name)
+    if ledger is None:
+        return []
+    destination = legacy_responses_file_path(runtime_paths.storage_root, new_name)
+    label = f"the handled-turn ledger of agent {old_name}, not imported yet,"
+    return move_steps(ledger, destination, label, discard_new_state=False)
+
+
+def _private_instance_reports(runtime_paths: RuntimePaths, name: str) -> list[str]:
+    """Report the private-instance state roots of the agent, left from when it was private.
+
+    A private agent keeps one state root per requester, ``<scope>/<agent>`` in ``private_instances/``; the rename
+    supports only agents that are not private, so such roots are state of an earlier config.
+    """
+    roots = [
+        root
+        for scope in _entries(private_instances_root_path(runtime_paths.storage_root), lambda _: True)
+        for root in _entries(scope, lambda entry: entry == name)
+    ]
+    if not roots:
+        return []
     return [
-        DropPath(path, f"Drop the private knowledge index {path} of agent {name}; it rebuilds on next use")
-        for state_root in sorted(private_instances_root_path(runtime_paths.storage_root).glob(f"*/{name}"))
-        for path in _entries(state_root / _KNOWLEDGE_DB, store.fullmatch)
+        f"These private-instance state roots of agent {name}, left from when it was private, stay as they are: "
+        f"{', '.join(str(root) for root in roots)}.",
     ]
 
 
@@ -148,41 +207,6 @@ def _knowledge_graph_reports(runtime_paths: RuntimePaths, config: Config, old_na
     ]
 
 
-def _knowledge_git_reports(runtime_paths: RuntimePaths, config: Config, old_name: str, new_name: str) -> list[str]:
-    """Report the Git directories of knowledge checkouts in the agent's state root, which are named after their path.
-
-    Git sync of such a base finds no Git directory for the moved checkout and refuses to clone into it, as it is
-    not empty (knowledge/git_source.py's _initialize_repository).
-    """
-    storage = runtime_paths.storage_root
-    old_root = agent_state_root_path(storage, old_name).resolve()
-    new_root = agent_state_root_path(storage, new_name).resolve()
-    checkouts: dict[Path, list[str]] = {}
-    for base_id, base in config.knowledge_bases.items():
-        if base.git is None:
-            continue
-        try:
-            checkout = shared_knowledge_path(base.path, runtime_paths)
-        except (OSError, RuntimeError, ValueError):
-            # MindRoom cannot sync a base whose path it cannot resolve either.
-            continue
-        if checkout.is_relative_to(old_root):
-            checkouts.setdefault(checkout, []).append(base_id)
-    reports: list[str] = []
-    for checkout, base_ids in checkouts.items():
-        git_dir = knowledge_git_dir(storage, checkout)
-        if not os.path.lexists(git_dir):
-            continue
-        moved = new_root / checkout.relative_to(old_root)
-        moved_git_dir = knowledge_git_dir(storage, moved)
-        reports.append(
-            f"The Git directory {git_dir} of knowledge base {', '.join(base_ids)} is named after its checkout "
-            f"{checkout}, which moves to {moved}; Git sync looks for {moved_git_dir} and refuses to clone into the "
-            f"moved checkout, so move {git_dir} to {moved_git_dir} before starting MindRoom.",
-        )
-    return reports
-
-
 def _mem0_history_reports(runtime_paths: RuntimePaths, old_name: str, new_name: str) -> list[str]:
     """Report the agent's recent messages in mem0's history database, which keys them by the old scope id."""
     mem0_dir = runtime_paths.process_env.get(_MEM0_DIR_VARIABLE) or str(Path("~").expanduser() / ".mem0")
@@ -192,14 +216,24 @@ def _mem0_history_reports(runtime_paths: RuntimePaths, old_name: str, new_name: 
     session_scope = f"user_id={agent_scope_user_id(old_name)}"
     try:
         with read_only_connection(database) as connection:
-            found = connection.execute(
-                "SELECT 1 FROM messages WHERE session_scope = ? LIMIT 1",
-                (session_scope,),
+            has_messages = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (_MEM0_MESSAGES_TABLE,),
             ).fetchone()
-    except sqlite3.Error:
-        # A database without mem0's messages table holds no recent messages to lose.
-        return []
-    if found is None:
+            # A database without mem0's messages table holds no recent messages to lose.
+            found = (
+                has_messages
+                and connection.execute(
+                    f"SELECT 1 FROM {_MEM0_MESSAGES_TABLE} WHERE session_scope = ? LIMIT 1",  # noqa: S608
+                    (session_scope,),
+                ).fetchone()
+            )
+    except (OSError, sqlite3.Error) as error:
+        return [
+            f"mem0's history database {database} could not be read ({error}), so it may keep recent messages of "
+            f"agent {old_name} under the scope {session_scope}, which the rename does not change.",
+        ]
+    if not found:
         return []
     return [
         f"mem0's history database {database}, outside the storage root, keeps the recent messages of agent "
@@ -268,24 +302,27 @@ def _config_line_reports(runtime_paths: RuntimePaths, old_name: str, new_name: s
     ]
 
 
-def _legacy_file_reports(runtime_paths: RuntimePaths, name: str) -> list[str]:
-    """Report the files older MindRoom versions kept for the agent under its name."""
+def _legacy_file_reports(runtime_paths: RuntimePaths, name: str, *, moved_ledger: bool) -> list[str]:
+    """Report the files older MindRoom versions kept for the agent under its name, except a ledger that moves."""
     storage = runtime_paths.storage_root
     tracking = tracking_dir(runtime_paths)
-    responded = legacy_responses_file_path(storage, name).name
+    ledger = legacy_responses_file_path(storage, name)
     memory_search = re.compile(f"{re.escape(agent_scope_user_id(name))}{_FILE_MEMORY_DIGEST}")
 
     def session_database(entry: str) -> bool:
         # The database and the side files SQLite keeps beside it.
         return entry == f"{name}.db" or entry.startswith(f"{name}.db-")
 
+    def leftover_ledger(entry: str) -> bool:
+        # The pre-journal handled-turn ledger once imported, and copies of it older readers set aside.
+        return entry.startswith(ledger.name) and not (moved_ledger and entry == ledger.name)
+
     paths = [
         *_entries(tracking, lambda entry: entry.startswith(f"{_DISPATCH_OBLIGATIONS_PREFIX}{name}-")),
         *_entries(storage / _LEGACY_SESSIONS, session_database),
         *_entries(storage, session_database),
         *_entries(storage / _LEGACY_MEMORY_SEARCH, memory_search.fullmatch),
-        # The pre-journal handled-turn ledger, which a start imports once under the agent's name and renames `.imported`.
-        *_entries(tracking, lambda entry: entry.startswith(responded)),
+        *_entries(tracking, leftover_ledger),
     ]
     if not paths:
         return []

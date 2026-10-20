@@ -1253,8 +1253,8 @@ See [Renaming an Agent's Matrix Account](deployment/rename-agent-account.md) bef
 ╰────────────────────────────────────────────────────────────────────────────────────────╯
 
  Examples
- mindroom agents rename-account harry @harry:example.org          Show the plan
- mindroom agents rename-account harry @harry:example.org --apply  Apply it
+ mindroom agents rename-account nova @nova:example.org          Show the plan
+ mindroom agents rename-account nova @nova:example.org --apply  Apply it
 
 
 
@@ -1263,8 +1263,8 @@ See [Renaming an Agent's Matrix Account](deployment/rename-agent-account.md) bef
 <!-- OUTPUT:END -->
 
 ```bash
-mindroom agents rename-account harry @harry:example.org --storage-path mindroom_data
-mindroom agents rename-account harry @harry:example.org --storage-path mindroom_data --apply
+mindroom agents rename-account nova @nova:example.org --storage-path mindroom_data
+mindroom agents rename-account nova @nova:example.org --storage-path mindroom_data --apply
 ```
 
 ## threads

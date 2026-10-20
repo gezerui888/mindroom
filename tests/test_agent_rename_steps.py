@@ -41,7 +41,7 @@ def _create_database(path: Path, *, wal: bool = False) -> None:
         if wal:
             connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("CREATE TABLE accounts (name TEXT PRIMARY KEY, user_id TEXT)")
-        connection.execute("INSERT INTO accounts VALUES ('harry', '@old:x')")
+        connection.execute("INSERT INTO accounts VALUES ('nova', '@old:x')")
         connection.commit()
     path.chmod(0o600)
 
@@ -52,7 +52,7 @@ def _rows(path: Path) -> list[tuple[str, str]]:
 
 
 def _set_user_id(connection: sqlite3.Connection) -> None:
-    connection.execute("UPDATE accounts SET user_id = '@new:x' WHERE name = 'harry'")
+    connection.execute("UPDATE accounts SET user_id = '@new:x' WHERE name = 'nova'")
 
 
 def _fail_after_update(connection: sqlite3.Connection) -> None:
@@ -114,13 +114,13 @@ def test_apply_runs_steps_and_writes_manifest(tmp_path: Path) -> None:
     assert (storage / "agents" / "new" / "state.txt").read_text() == "state"
     assert json.loads((storage / "accounts.json").read_text()) == {"user_id": "@new:x"}
     assert (storage / "accounts.json").stat().st_mode & 0o777 == 0o640
-    assert _rows(storage / "journal.db") == [("harry", "@new:x")]
+    assert _rows(storage / "journal.db") == [("nova", "@new:x")]
     assert (storage / "journal.db").stat().st_mode & 0o777 == 0o600
     assert (result.backup_dir / "002" / "journal.db").stat().st_mode & 0o777 == 0o600
     assert not (storage / "legacy.txt").exists()
     assert (result.backup_dir / "003" / "legacy.txt").read_text() == "legacy"
     assert json.loads((result.backup_dir / "001" / "accounts.json").read_text()) == {"user_id": "@old:x"}
-    assert _rows(result.backup_dir / "002" / "journal.db") == [("harry", "@old:x")]
+    assert _rows(result.backup_dir / "002" / "journal.db") == [("nova", "@old:x")]
     assert not list(storage.glob("**/*.tmp"))
 
     manifest = json.loads((result.backup_dir / "manifest.json").read_text())
@@ -250,7 +250,7 @@ def test_failure_undoes_every_step_kind(tmp_path: Path, wal: bool) -> None:
 
     assert caught.value.step == "rewrite state"
     assert not list(storage.glob("journal.db-*"))
-    assert _rows(storage / "journal.db") == [("harry", "@old:x")]
+    assert _rows(storage / "journal.db") == [("nova", "@old:x")]
     assert (storage / "journal.db").stat().st_mode & 0o777 == 0o600
     restored = _without_backups(tree_snapshot(storage))
     assert restored.pop("journal.db")

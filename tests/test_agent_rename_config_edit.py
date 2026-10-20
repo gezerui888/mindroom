@@ -42,8 +42,8 @@ def test_replaces_user_id_values_keeping_comments_and_quotes(tmp_path: Path) -> 
         tmp_path / "config.yaml",
         "# Who may talk to the agents\n"
         "agents:\n"
-        "  harry:\n"
-        "    display_name: Harry   # not touched\n"
+        "  nova:\n"
+        "    display_name: Nova   # not touched\n"
         "    authorized_users:\n"
         "      - '@old:example.org'   # the owner\n"
         '      - "@old:example.org"\n'
@@ -59,8 +59,8 @@ def test_replaces_user_id_values_keeping_comments_and_quotes(tmp_path: Path) -> 
     assert config.read_text() == (
         "# Who may talk to the agents\n"
         "agents:\n"
-        "  harry:\n"
-        "    display_name: Harry   # not touched\n"
+        "  nova:\n"
+        "    display_name: Nova   # not touched\n"
         "    authorized_users:\n"
         "      - '@new:example.org'   # the owner\n"
         '      - "@new:example.org"\n'
@@ -127,7 +127,7 @@ def test_edits_include_files(tmp_path: Path) -> None:
         tmp_path / "config.yaml",
         "agents: !include agents.yaml\nusers:\n  - !expand users/list.yaml\n  - '@old:example.org'\nplain: !include clean.yaml\n",
     )
-    agents = _write(tmp_path / "agents.yaml", "harry:\n  # owner\n  owner: '@old:example.org'\n")
+    agents = _write(tmp_path / "agents.yaml", "nova:\n  # owner\n  owner: '@old:example.org'\n")
     users = _write(tmp_path / "users" / "list.yaml", '- "@old:example.org"\n- "@keep:example.org"\n')
     clean = _write(tmp_path / "clean.yaml", "a: b\n")
     clean_before = clean.read_bytes()
@@ -137,7 +137,7 @@ def test_edits_include_files(tmp_path: Path) -> None:
     _apply(steps, tmp_path / "storage")
 
     assert config.read_text().count(NEW) == 1
-    assert agents.read_text() == "harry:\n  # owner\n  owner: '@new:example.org'\n"
+    assert agents.read_text() == "nova:\n  # owner\n  owner: '@new:example.org'\n"
     assert users.read_text() == '- "@new:example.org"\n- "@keep:example.org"\n'
     assert clean.read_bytes() == clean_before
 

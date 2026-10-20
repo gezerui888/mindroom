@@ -8,19 +8,16 @@ so the journal must hold the new ID everywhere the server now shows it.
 
 from __future__ import annotations
 
-import shutil
 import sqlite3
-import tempfile
-from contextlib import closing, contextmanager
 from functools import partial
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mindroom.agent_rename.matching import contains_user_id, replace_user_id
+from mindroom.agent_rename.sqlite_read import quote_identifier, read_only_connection, text_columns
 from mindroom.agent_rename.steps import RenameRefusedError, SqliteEdit
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from pathlib import Path
 
 _PRINCIPAL_COLUMNS = frozenset({"principal_id", "responder_principal_id"})
 # Rows for replies MindRoom already sent to Matrix; discarding them would lose track of messages in the rooms.
@@ -52,8 +49,8 @@ def journal_account_steps(
     old_principal = f"{agent}@{old_user_id}"
     new_principal = f"{agent}@{new_user_id}"
     try:
-        with _read_only(database) as connection:
-            new_rows = _principal_row_counts(connection, _text_columns(connection), new_principal)
+        with read_only_connection(database) as connection:
+            new_rows = _principal_row_counts(connection, text_columns(connection), new_principal)
     except (sqlite3.Error, OSError) as exc:
         msg = f"Cannot read the event journal {database}: {exc}"
         raise RenameRefusedError(msg) from exc
@@ -76,61 +73,12 @@ def journal_account_steps(
     return [SqliteEdit(database=database, edit=edit, description=description)]
 
 
-@contextmanager
-def _read_only(database: Path) -> Iterator[sqlite3.Connection]:
-    """Read the journal without writing anything next to it.
-
-    Even a read-only connection to a WAL database creates its ``-wal`` and ``-shm`` files, or updates the ``-shm``.
-    MindRoom removes both when it closes cleanly, leaving every commit in the main file, which ``immutable`` reads
-    exactly. A ``-wal`` left behind by a running or crashed MindRoom can hold commits the main file lacks, so the
-    database and its WAL are copied to a temporary directory and read there; SQLite rebuilds the index from the WAL.
-    """
-    wal = Path(f"{database}-wal")
-    if not wal.exists():
-        with closing(sqlite3.connect(f"{database.absolute().as_uri()}?immutable=1", uri=True)) as connection:
-            yield connection
-        return
-    with tempfile.TemporaryDirectory(prefix="mindroom-agent-rename-") as directory:
-        copy = Path(directory) / database.name
-        shutil.copyfile(database, copy)
-        shutil.copyfile(wal, f"{copy}-wal")
-        with closing(sqlite3.connect(copy)) as connection:
-            yield connection
-
-
 def _sql_contains_user_id(value: _SqliteValue, user_id: str) -> bool:
     return isinstance(value, str) and contains_user_id(value, user_id)
 
 
 def _sql_replace_user_id(value: _SqliteValue, old_user_id: str, new_user_id: str) -> _SqliteValue:
     return replace_user_id(value, old_user_id, new_user_id) if isinstance(value, str) else value
-
-
-def _quote(identifier: str) -> str:
-    return '"' + identifier.replace('"', '""') + '"'
-
-
-def _holds_text(declared_type: str) -> bool:
-    """Whether SQLite keeps text stored in a column of this type as text: TEXT affinity, or no type at all."""
-    declared = declared_type.upper()
-    return not declared or ("INT" not in declared and any(word in declared for word in ("CHAR", "CLOB", "TEXT")))
-
-
-def _text_columns(connection: sqlite3.Connection) -> dict[str, tuple[str, ...]]:
-    """Map every ordinary table to its text columns.
-
-    SQLite's own tables are skipped, and so are virtual tables and their shadow tables,
-    which only the virtual table's module may write.
-    """
-    tables = connection.execute("SELECT name, sql FROM sqlite_master WHERE type = 'table'").fetchall()
-    virtual = [name for name, sql in tables if (sql or "").lstrip().upper().startswith("CREATE VIRTUAL TABLE")]
-    columns: dict[str, tuple[str, ...]] = {}
-    for name, _ in tables:
-        if name.startswith("sqlite_") or any(name == table or name.startswith(f"{table}_") for table in virtual):
-            continue
-        rows = connection.execute("SELECT name, type FROM pragma_table_info(?)", (name,)).fetchall()
-        columns[name] = tuple(column for column, declared_type in rows if _holds_text(declared_type))
-    return columns
 
 
 def _holds_user_id(quoted_column: str) -> str:
@@ -143,7 +91,7 @@ def _holds_user_id(quoted_column: str) -> str:
 
 def _principal_match(columns: tuple[str, ...]) -> str:
     """Return a condition matching rows whose principal columns name ``:principal``, or ``""`` if there are none."""
-    return " OR ".join(f"{_quote(column)} = :principal" for column in columns if column in _PRINCIPAL_COLUMNS)
+    return " OR ".join(f"{quote_identifier(column)} = :principal" for column in columns if column in _PRINCIPAL_COLUMNS)
 
 
 def _principal_row_counts(
@@ -157,7 +105,7 @@ def _principal_row_counts(
         match = _principal_match(names)
         if not match:
             continue
-        query = f"SELECT count(*) FROM {_quote(table)} WHERE {match}"  # noqa: S608 - quoted schema identifiers
+        query = f"SELECT count(*) FROM {quote_identifier(table)} WHERE {match}"  # noqa: S608 - quoted schema identifiers
         (count,) = connection.execute(query, {"principal": principal}).fetchone()
         if count:
             counts[table] = count
@@ -198,7 +146,7 @@ def _rewrite(
     """Move the journal to the new ID inside the caller's transaction; raising rolls everything back."""
     connection.create_function("contains_user_id", 2, _sql_contains_user_id, deterministic=True)
     connection.create_function("replace_user_id", 3, _sql_replace_user_id, deterministic=True)
-    columns = _text_columns(connection)
+    columns = text_columns(connection)
     new_rows = _principal_row_counts(connection, columns, new_principal)
     _refuse_new_principal_rows(new_rows, new_principal=new_principal, discard=discard_new_principal)
     _delete_principal_rows(connection, columns, tables=tuple(new_rows), principal=new_principal)
@@ -228,7 +176,7 @@ def _delete_principal_rows(
     for table in tables:
         match = _principal_match(columns.get(table, ()))
         if match:
-            delete = f"DELETE FROM {_quote(table)} WHERE {match}"  # noqa: S608 - quoted schema identifiers
+            delete = f"DELETE FROM {quote_identifier(table)} WHERE {match}"  # noqa: S608 - quoted schema identifiers
             connection.execute(delete, {"principal": principal})
 
 
@@ -242,7 +190,7 @@ def _replace_identity(
     replacements: list[str] = []
     for table, table_columns in columns.items():
         for column in table_columns:
-            quoted_table, quoted = _quote(table), _quote(column)
+            quoted_table, quoted = quote_identifier(table), quote_identifier(column)
             if column in _PRINCIPAL_COLUMNS:
                 renames.append(f"UPDATE {quoted_table} SET {quoted} = :new_principal WHERE {quoted} = :old_principal")  # noqa: S608 - quoted schema identifiers
             else:
@@ -267,8 +215,8 @@ def _refuse_leftovers(
     for table, table_columns in columns.items():
         if not table_columns:
             continue
-        sums = ", ".join(f"sum({_holds_user_id(_quote(column))})" for column in table_columns)
-        counts = connection.execute(f"SELECT {sums} FROM {_quote(table)}", {"old": old_user_id}).fetchone()  # noqa: S608 - quoted schema identifiers
+        sums = ", ".join(f"sum({_holds_user_id(quote_identifier(column))})" for column in table_columns)
+        counts = connection.execute(f"SELECT {sums} FROM {quote_identifier(table)}", {"old": old_user_id}).fetchone()  # noqa: S608 - quoted schema identifiers
         leftovers.extend(
             f"{table}.{column} ({count})" for column, count in zip(table_columns, counts, strict=True) if count
         )

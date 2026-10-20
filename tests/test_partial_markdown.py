@@ -46,11 +46,12 @@ from tests.cpu_budget_helpers import cpu_budget
         ("> **Quoted\n> text", "> **Quoted\n> text**"),
         ("## The **plan", "## The **plan**"),
         ("- **First\n  second", "- **First\n  second**"),
+        ("Here's what stands out:\n- **", "Here's what stands out:"),
         # Inline math, autolinks, links, and images are parsed as rendering parses them.
         ("The interval $[0, 1)$ is **half", "The interval $[0, 1)$ is **half**"),
         ("See <https://x.example/_search> and *more", "See <https://x.example/_search> and *more*"),
         ("*See [the *draft](https://docs.example/a) now", "*See [the *draft](https://docs.example/a) now*"),
-        ("- **`", "- "),
+        ("- **`", ""),
         (
             "See ![chart `v2](https://x.example/i.png) and **more",
             "See ![chart `v2](https://x.example/i.png) and **more**",
@@ -60,6 +61,8 @@ from tests.cpu_budget_helpers import cpu_budget
         ("Three rules differ:\n| Rule | Vantrell | Kessler |\n|---|--", "Three rules differ:"),
         ("| Rule | Vantrell |\n|---|---|\n| Hotels | **$25", "| Rule | Vantrell |\n|---|---|\n| Hotels | **$25**"),
         ("| **Rule | Vantrell |\n|---|---|", "| **Rule | Vantrell |\n|---|---|"),
+        # A pipe line a blank line has ended is a paragraph, not a table header.
+        ("|x| denotes the absolute value of x.\n\n", "|x| denotes the absolute value of x."),
     ],
 )
 def test_partial_markdown_is_shown_as_it_will_render(streamed: str, shown: str) -> None:
@@ -85,6 +88,8 @@ def test_partial_markdown_is_shown_as_it_will_render(streamed: str, shown: str) 
         "[@Quill](https://matrix.to/#/@mindroom_quill:localhost) has the **draft**",
         "🔧 `web_search` [1]",
         "Done \\*not bold",
+        # A trailing backslash would escape a closer.
+        "Open **C:\\",
         # Nested emphasis closed by one run, spans across quote or list item lines, and a setext heading.
         "**Bold *italic*** more text",
         "*a **b*** more text",

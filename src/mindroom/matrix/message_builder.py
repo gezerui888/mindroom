@@ -497,17 +497,21 @@ def close_partial_markdown(text: str) -> str:
     link shows its label, and table lines wait until they form a table.
     Finished blocks, code blocks, and code spans are left as written.
     """
-    text = _normalize_input_line_endings(text).rstrip()
+    normalized = _normalize_input_line_endings(text)
+    text = normalized.rstrip()
     lines = text.split("\n")
     blocks = [token for token in _PARTIAL_MARKDOWN_PARSER.parse(text) if token.map]
     if not blocks or blocks[-1].type != "inline":
         # The text ends in code, math, HTML, or a rule, which already render as they stream.
         return text
-    if blocks[-2].type == "paragraph_open" and _PIPE_TABLE_LINE_PATTERN.match(lines[-1]):
-        table_start = len(lines) - 1
-        while table_start and _PIPE_TABLE_LINE_PATTERN.match(lines[table_start - 1]):
-            table_start -= 1
-        return "\n".join(lines[:table_start]).rstrip()
+    # A pipe line may be a table header until a blank line ends its paragraph or its separator row arrives.
+    if (
+        blocks[-2].type == "paragraph_open"
+        and _PIPE_TABLE_LINE_PATTERN.match(lines[-1])
+        and normalized.count("\n", len(text)) < 2
+    ):
+        separator = len(lines) > 1 and not lines[-1].strip(" |:-") and _PIPE_TABLE_LINE_PATTERN.match(lines[-2])
+        return "\n".join(lines[: -2 if separator else -1]).rstrip()
     # Only the last block's inline text is still arriving, after any list or quote marker or the row's earlier
     # cells. A table pads a row still arriving with empty cells, so the cell being written is the last with text.
     inline_lines = next(
@@ -521,7 +525,11 @@ def close_partial_markdown(text: str) -> str:
     first_line, *later_lines = lines[-len(inline_lines) :]
     first_line_text = commonprefix([first_line[::-1], inline_lines[0][::-1]])
     inline_start = len(text) - len("\n".join([first_line_text, *later_lines]))
-    return text[:inline_start] + _close_partial_inline(text[inline_start:])
+    closed = _close_partial_inline(text[inline_start:])
+    if not closed and text[inline_start:] and blocks[-2].type == "paragraph_open":
+        # Left bare, a list marker after a paragraph line would underline that line as a heading.
+        return text[: text.rfind("\n", 0, inline_start) + 1].rstrip()
+    return text[:inline_start] + closed
 
 
 def _stop_at_unfinished_markup(state: StateInline, silent: bool) -> bool:
@@ -574,9 +582,10 @@ def _close_partial_inline(text: str) -> str:
         shown = shown[:label] + shown[label + 1 :]
     # Openers nothing closed yet, innermost first; one that could also close, like the `*` of `2*3`, may be literal.
     pending = reversed(state.delimiters)
-    return shown.rstrip() + "".join(
-        state.tokens[d.token].content for d in pending if d.open and not d.close and d.end < 0
-    )
+    shown = shown.rstrip()
+    if (len(shown) - len(shown.rstrip("\\"))) % 2:  # A trailing backslash would escape any closer.
+        return shown
+    return shown + "".join(state.tokens[d.token].content for d in pending if d.open and not d.close and d.end < 0)
 
 
 def build_thread_relation(

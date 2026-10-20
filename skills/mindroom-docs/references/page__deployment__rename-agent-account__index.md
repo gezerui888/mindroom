@@ -267,7 +267,9 @@ Neither does restoring one that never took effect, because `source` still holds 
 One entry needs a check first: the last one with a numbered directory after a kill or a failed step.
 The command may have stopped while it copied the original into that directory, for example because the disk was full.
 A copy cut short must not replace a good `source`.
-Check that the copy is whole before you use it, for example `sqlite3 <copy> .tables` for a database.
+Check that the copy is whole before you use it.
+For a database, `sqlite3 <copy> 'PRAGMA integrity_check'` must print `ok`, and `sqlite3 <copy> .tables` must list the tables, because an empty file also passes the first check.
+Open a copied file and make sure it is complete.
 If you cannot tell, restore your snapshot instead.
 
 This matters most after `Undo failed:`, where the manifest includes steps the command never reached.

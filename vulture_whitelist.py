@@ -421,6 +421,7 @@ delete_user_service_route  # FastAPI route (src/mindroom/api/egress_credentials.
 get_presets  # FastAPI route (src/mindroom/api/egress_broker.py, src/mindroom/api/egress_credentials.py)
 _._reject_non_finite_numbers  # Pydantic field validator (src/mindroom/api/script_gateway.py)
 entity_credential_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/entity_files.py)
+entity_file_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/entity_files.py)
 config_entity_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/config_edit.py)
 env_value_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/config_edit.py)
 entity_state_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/entity_state.py)

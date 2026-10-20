@@ -8999,7 +8999,7 @@ visibility = [
 [[modules]]
 path = "mindroom.automations.threads"
 depends_on = ["mindroom.constants", "mindroom.path_confinement"]
-visibility = ["mindroom.automations", "mindroom.automations.dreaming", "mindroom.automations.runner", "mindroom.knowledge_graph.ingestion", "mindroom.automations.exploration"]
+visibility = ["mindroom.agent_rename.entity_files", "mindroom.automations", "mindroom.automations.dreaming", "mindroom.automations.runner", "mindroom.knowledge_graph.ingestion", "mindroom.automations.exploration"]
 
 [[modules]]
 path = "mindroom.automations.steps"
@@ -9361,11 +9361,17 @@ depends_on = ["mindroom.tool_system.worker_routing"]
 # Moves the files keyed by an agent's config name when the agent is renamed.
 [[modules]]
 path = "mindroom.agent_rename.entity_files"
-depends_on = ["mindroom.agent_rename.workers", "mindroom.tool_system.worker_routing"]
+depends_on = [
+    "mindroom.agent_rename.workers",
+    "mindroom.automations.threads",
+    "mindroom.constants",
+    "mindroom.dynamic_workflows",
+    "mindroom.tool_system.worker_routing",
+]
 
 # The providers `mindroom agents rename` plans with.
 [[interfaces]]
-expose = ["entity_credential_steps", "rewrite_worker_key_agent"]
+expose = ["entity_credential_steps", "entity_file_steps", "rewrite_worker_key_agent"]
 from = ["mindroom.agent_rename.entity_files"]
 
 # Renames an agent inside an Agno session store; shared by the agent's own stores and its team stores.

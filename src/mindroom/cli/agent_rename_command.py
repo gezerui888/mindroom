@@ -65,9 +65,10 @@ def rename(
 ) -> None:
     """Rename an agent in the config and carry its state over to the new name.
 
-    Run it with MindRoom stopped. It moves the agent's state, history, memory, team history,
-    workers, credentials and tracking records to the new name, renames it in the event journal
-    and matrix_state.yaml, and renames it in the config last. Its Matrix account and device stay.
+    Run it with MindRoom stopped. It moves the agent's state, history, memory,
+    team history, workers, credentials and tracking records to the new name,
+    renames it in the event journal and matrix_state.yaml, and renames it in the
+    config last. Its Matrix account and device stay.
     """
     runtime_paths = activate_cli_runtime(path=config_path, storage_path=storage_path)
     config = load_config_or_exit(runtime_paths)

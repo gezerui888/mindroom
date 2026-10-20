@@ -127,6 +127,22 @@ def test_ad_hoc_history_visible_under_recomputed_scope(tmp_path: Path, team: Tea
     ]
 
 
+def test_ad_hoc_scope_sorted_again_when_the_new_name_sorts_after_a_member(tmp_path: Path) -> None:
+    """Renaming ``code`` to ``zeta`` moves ``team_code+helper`` to ``team_helper+zeta``, the scope its members resolve to."""
+    runtime_paths = install_teams(test_runtime_paths(tmp_path))
+    renamed = TeamScope(("zeta", HELPER))
+
+    _apply(runtime_paths, team_steps(runtime_paths, config=team_config(OLD), old_name=OLD, new_name="zeta"))
+
+    history = team_history(runtime_paths, team_config("zeta"), renamed)
+    assert history.scope_id == "team_helper+zeta"
+    assert history.replayed == ["r2"]
+    assert history.summary == "summary of team_code+helper's r1"
+    assert history.member_runs == [("zeta", f"r2-{OLD}"), (HELPER, f"r2-{HELPER}")]
+    assert history.member_responses == [["zeta", HELPER]]
+    assert not _store(runtime_paths, "team_code+helper").exists()
+
+
 def test_configured_team_member_runs_visible_as_new_name(tmp_path: Path) -> None:
     """A configured team keeps its store, and the agent's member runs in it carry the new name."""
     runtime_paths = install_teams(test_runtime_paths(tmp_path))

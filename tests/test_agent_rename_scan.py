@@ -409,6 +409,31 @@ def test_names_in_expected_paths_are_listed_as_expected(tmp_path: Path) -> None:
     )
 
 
+def test_dangling_links_into_the_old_state_root_are_unexpected(tmp_path: Path) -> None:
+    """A link left pointing into agents/<name> after it moved is listed, even inside a path reported as staying.
+
+    MindRoom would create an empty agents/<name> through such a link at its next start.
+    Links that still work, or that dangle into another agent's root, are not about the renamed agent.
+    """
+    agents = tmp_path / "agents"
+    (agents / "coder" / "workspace").mkdir(parents=True)
+    (agents / "mind_flash").symlink_to("code")
+    (agents / "live").symlink_to("coder")
+    (agents / "other").symlink_to("code_team")
+    _write(tmp_path, "plugins/ping/notes.txt", "")
+    (tmp_path / "plugins" / "ping" / "workspace").symlink_to("../../agents/code/workspace")
+    (tmp_path / "plugins" / "ping" / "absolute").symlink_to(agents / "code" / "workspace" / "notes.md")
+
+    assert _scan_names(tmp_path, tmp_path / "plugins" / "ping") == _LeftoverReport(
+        unexpected=(
+            "agents/mind_flash: dangling symlink to code",
+            f"plugins/ping/absolute: dangling symlink to {agents / 'code' / 'workspace' / 'notes.md'}",
+            "plugins/ping/workspace: dangling symlink to ../../agents/code/workspace",
+        ),
+        expected=(),
+    )
+
+
 def test_names_are_not_looked_for_where_the_scan_never_enters(tmp_path: Path) -> None:
     """Backups, the crypto store and worker virtualenvs and caches stay unscanned for names too."""
     hit = json.dumps({"agent": NAME})

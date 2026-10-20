@@ -19779,7 +19779,7 @@ After `--apply` the command prints, in order:
 4. A `Warning:` line for each problem that does not undo the rename, such as an old Docker worker that could not be removed.
 5. A leftover scan of the storage directory, see [Leftover scan](#leftover-scan).
 
-Steps run in this order: the event journal, the state directory and the stores in it, teams, tracking and side stores, credentials, workers, derived indexes, `matrix_state.yaml`, `.env`, and `config.yaml` last.
+Steps run in this order: the event journal, the state directory with its session and learning databases, the symlinks into it, memory, teams, tracking and side stores, credentials, workers, derived indexes, `matrix_state.yaml`, `.env`, and `config.yaml` last.
 Every move runs before the edits to what it moved.
 The config goes last on purpose, because a run that stops early then still has the old name configured, see [Killed runs and reruns](#killed-runs-and-reruns).
 
@@ -19821,6 +19821,7 @@ Running the same command again after it succeeded exits 1 with `OLD is not a con
   That holds the workspace, file-backed memory, the memory store, and the learning and session databases.
   With `MINDROOM_SESSION_STORAGE_PATH` set, the agent's directory in that root moves too.
   An agent that never ran has no directory and gets no step.
+- Symlinks in the storage directory or directly in the config directory that point into `agents/<OLD>`, such as `agents/other -> <OLD>` for an agent sharing the directory, are retargeted to `agents/<NEW>`, keeping relative links relative.
 - `sessions/<OLD>.db` becomes `<NEW>.db`.
   In one transaction the command renames the tables `<OLD>_sessions` and `<OLD>_sessions_*` and recreates their indexes under the new names.
   It updates the schema version rows, sets the agent ID of every session and run to the new name, and renames the history summary scope `agent:<OLD>`.
@@ -19969,6 +19970,7 @@ Read them before you start MindRoom.
 The scan looks for the old name in file and directory names, in the strings and keys of JSON and YAML files, and in the text cells of the event journal.
 It matches the whole name and its known spellings, such as `agent_<OLD>`, so it never counts `code_team` as `code`.
 It skips `encryption_keys`, the backup directory, and the package and cache directories of workers.
+It also lists dangling symlinks that point into `agents/<OLD>`, because MindRoom would create that directory again through them.
 It lists what it found in two groups:
 
 - `Reported above as staying` holds places the plan said it would leave.
@@ -20022,9 +20024,10 @@ Three limits are not refusals:
   It only rewrites the delegation exports in workspaces and, in memories, the scope tags and the `agent` and `team_members` fields.
   Text that mentions the old name stays.
 - The state directory `agents/<OLD>/` moves as a whole, so whatever inside it records its own absolute path still points at the old one.
-  Examples are a virtual environment the agent created in its workspace, whose scripts name the old path, Git worktrees, whose `.git` files and the main repository's `worktrees/*/gitdir` files hold absolute paths, and absolute symlinks into the directory.
-  To find them after the rename, run `grep -rlI -- '/agents/<OLD>/' <storage>/agents/<NEW>` for files that name the old path and `find <storage>/agents/<NEW> -xtype l` for broken symlinks.
-  Create a virtual environment again, run `git worktree repair <worktree>...` in the main repository with the new path of each worktree, and point symlinks at the new path.
+  Examples are a virtual environment the agent created in its workspace, whose scripts name the old path, and Git worktrees, whose `.git` files and the main repository's `worktrees/*/gitdir` files hold absolute paths.
+  To find them after the rename, run `grep -rlI -- '/agents/<OLD>/' <storage>/agents/<NEW>` for files that name the old path.
+  Create a virtual environment again, and run `git worktree repair <worktree>...` in the main repository with the new path of each worktree.
+  Symlinks into the directory are retargeted only in the storage directory and at the top of the config directory; point any others at the new path by hand.
 
 ## When a step fails
 

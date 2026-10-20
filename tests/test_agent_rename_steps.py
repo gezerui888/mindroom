@@ -26,6 +26,7 @@ from mindroom.agent_rename.steps import (
     RenamePlan,
     RenameRefusedError,
     RenameUndoError,
+    RetargetLink,
     SqliteEdit,
     apply_plan,
 )
@@ -707,3 +708,74 @@ def test_interrupt_after_the_directory_swap_cannot_split_the_plan(
         "user_id=@new:x",
     )
     assert sorted(path.name for path in store.parent.iterdir()) == ["state.txt", "store"]
+
+
+def test_retarget_link_points_the_link_elsewhere_and_records_both_targets(tmp_path: Path) -> None:
+    """The link is replaced by one with the new text, and the manifest names the link with its old and new text."""
+    storage = _make_storage(tmp_path)
+    link = storage / "agents" / "alias"
+    link.symlink_to("old")
+    (storage / "agents" / "new").mkdir()
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(RetargetLink(link, "old", "new", "retarget alias"),),
+        reports=(),
+    )
+
+    result = apply_plan(plan, kind="rename", now=NOW)
+
+    assert link.readlink().as_posix() == "new"
+    assert sorted(path.name for path in link.parent.iterdir()) == ["alias", "new", "old"]
+    assert json.loads((result.backup_dir / "manifest.json").read_text())["steps"] == [
+        {
+            "type": "RetargetLink",
+            "description": "retarget alias",
+            "source": str(link),
+            "destination": None,
+            "backup": None,
+            "old_target": "old",
+            "new_target": "new",
+        },
+    ]
+
+
+def test_retarget_link_is_undone_when_a_later_step_fails(tmp_path: Path) -> None:
+    """Undo puts the original link text back."""
+    storage = _make_storage(tmp_path)
+    (storage / "agents" / "alias").symlink_to("old")
+    original = tree_snapshot(storage)
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            RetargetLink(storage / "agents" / "alias", "old", "new", "retarget alias"),
+            FileRewrite(storage / "accounts.json", _fail_rewrite, "rewrite accounts"),
+        ),
+        reports=(),
+    )
+
+    with pytest.raises(RenameApplyError, match="rewrite accounts"):
+        apply_plan(plan, kind="rename", now=NOW)
+
+    assert _without_backups(tree_snapshot(storage)) == original
+
+
+@pytest.mark.parametrize("current", ["other", "file", "missing"])
+def test_retarget_link_refuses_a_link_that_changed_since_planning(tmp_path: Path, current: str) -> None:
+    """A path that is no longer a link with the planned text refuses the step and is left as it is."""
+    storage = _make_storage(tmp_path)
+    link = storage / "agents" / "alias"
+    if current == "other":
+        link.symlink_to("other")
+    elif current == "file":
+        link.write_text("not a link")
+    before = tree_snapshot(storage)
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(RetargetLink(link, "old", "new", "retarget alias"),),
+        reports=(),
+    )
+
+    with pytest.raises(RenameRefusedError, match="changed since the rename was planned"):
+        apply_plan(plan, kind="rename", now=NOW)
+
+    assert _without_backups(tree_snapshot(storage)) == before

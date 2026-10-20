@@ -318,6 +318,7 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
     from mindroom.agent_rename.entity_state import entity_state_steps, matrix_state_key_step  # noqa: PLC0415
     from mindroom.agent_rename.indexes import index_steps  # noqa: PLC0415
     from mindroom.agent_rename.journal_entity import journal_entity_steps  # noqa: PLC0415
+    from mindroom.agent_rename.links import link_steps  # noqa: PLC0415
     from mindroom.agent_rename.memory import memory_steps  # noqa: PLC0415
     from mindroom.agent_rename.side_stores import entity_file_steps  # noqa: PLC0415
     from mindroom.agent_rename.steps import FinalAction, RenamePlan  # noqa: PLC0415
@@ -360,12 +361,13 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
     )
     _require_writable((*(() if account_step is None else (account_step,)), *env_steps, *config_steps))
     # The journal goes first: its edit checks again in its transaction, and a failing first step leaves nothing to undo.
-    # The state root moves before the stores inside it are edited, matrix_state.yaml and .env follow every store, and
-    # the config edit is the last reversible step, so a run killed before it still has the old name configured.
-    # The providers read the config that still names the old agent.
+    # The state root moves before the stores inside it are edited and before the links into it follow it there,
+    # matrix_state.yaml and .env follow every store, and the config edit is the last reversible step, so a run killed
+    # before it still has the old name configured. The providers read the config that still names the old agent.
     ordered = (
         *journal_steps,
         *entity_state_steps(runtime_paths, old_name=old, new_name=new),
+        *link_steps(runtime_paths, old_name=old, new_name=new),
         *memory_steps(runtime_paths, config=config, old_name=old, new_name=new),
         *team_steps(runtime_paths, config=config, old_name=old, new_name=new),
         *side_steps,

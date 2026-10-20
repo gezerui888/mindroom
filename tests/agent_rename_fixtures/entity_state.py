@@ -39,8 +39,8 @@ SESSION = "s1"
 
 
 def agent_root(runtime_paths: RuntimePaths, agent: str) -> Path:
-    """Return the agent's state root."""
-    return agent_state_root_path(runtime_paths.storage_root, agent)
+    """Return the agent's state root, resolved like ``resolve_agent_storage`` resolves it, so links are followed."""
+    return agent_state_root_path(runtime_paths.storage_root, agent).resolve()
 
 
 def session_storage(runtime_paths: RuntimePaths, agent: str) -> BaseDb:

@@ -29,7 +29,7 @@ from mindroom.agent_rename.sqlite_read import quote_identifier, read_only_connec
 from mindroom.agent_rename.steps import BACKUPS_DIRECTORY_NAME
 from mindroom.credentials.manager import scoped_credentials_dir_part
 from mindroom.event_journal.opening import event_journal_sqlite_path
-from mindroom.tool_system.worker_routing import worker_key_agent_name
+from mindroom.tool_system.worker_routing import agent_state_root_path, shared_storage_root, worker_key_agent_name
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -71,14 +71,16 @@ def scan_leftovers(
     A name is an agent's config name and matches only as one of its whole spellings (see ``_names_agent``)
     in a path component, in a string value or key of a JSON or YAML file, or in a journal cell.
     A path is expected when it equals one of ``expected`` or lies inside one; absolute paths under the storage root
-    and paths relative to it both work. Journal cells are never expected.
+    and paths relative to it both work. Journal cells are never expected, and neither are dangling symlinks whose
+    text points into the state root ``agents/<name>`` of a name, through which MindRoom would create that root again.
     Symlinks are not followed, and files that cannot be read or are too large are named instead of silently passed,
     and so are JSON and YAML files that do not parse although their text holds a name.
     """
     wanted = _Needles(tuple(needle for needle in needles if needle), tuple(name for name in names if name))
-    found = _scan_files(storage_root, wanted)
+    found, dangling = _scan_files(storage_root, wanted)
     expected_paths = {_relative_to(storage_root, path) for path in expected}
     unexpected = {line for path, line in found if not _is_expected(path, expected_paths)}
+    unexpected.update(dangling)
     unexpected.update(_scan_journal(storage_root, wanted))
     return _LeftoverReport(
         unexpected=tuple(sorted(unexpected)),
@@ -166,16 +168,24 @@ def _is_expected(path: Path, expected: set[Path]) -> bool:
     return path in expected or not expected.isdisjoint(path.parents)
 
 
-def _is_skipped(relative: Path) -> bool:
+def is_skipped(relative: Path) -> bool:
+    """Whether the walk of the storage root leaves out ``relative``, a path relative to the storage root."""
     parts = relative.parts
     if len(parts) == 1:
         return parts[0] in _SKIPPED_ROOT_DIRECTORIES
     return parts[0] == _WORKERS_DIRECTORY and parts[-1] in _SKIPPED_WORKER_DIRECTORIES
 
 
-def _scan_files(storage_root: Path, needles: _Needles) -> list[tuple[Path, str]]:
-    """Return ``(relative path, report line)`` for every file or directory that names a needle."""
+def _scan_files(storage_root: Path, needles: _Needles) -> tuple[list[tuple[Path, str]], list[str]]:
+    """Return ``(relative path, report line)`` for every path that names a needle, and the dangling-link lines.
+
+    A dangling-link line names a symlink whose target no longer exists and whose text points into the state root
+    ``agents/<name>`` of a name.
+    """
     found: list[tuple[Path, str]] = []
+    dangling: list[str] = []
+    resolved_root = shared_storage_root(storage_root)
+    name_roots = tuple(agent_state_root_path(storage_root, name) for name in needles.names)
 
     def unreadable(error: OSError) -> None:
         relative = _relative_to(storage_root, Path(str(error.filename)))
@@ -183,7 +193,7 @@ def _scan_files(storage_root: Path, needles: _Needles) -> list[tuple[Path, str]]
 
     for directory, directory_names, file_names in os.walk(storage_root, onerror=unreadable):
         current = _relative_to(storage_root, Path(directory))
-        directory_names[:] = [name for name in directory_names if not _is_skipped(current / name)]
+        directory_names[:] = [name for name in directory_names if not is_skipped(current / name)]
         named = [
             current / name
             for name in (*directory_names, *file_names)
@@ -192,11 +202,17 @@ def _scan_files(storage_root: Path, needles: _Needles) -> list[tuple[Path, str]]
         found.extend((relative, relative.as_posix()) for relative in named)
         for name in file_names:
             path = Path(directory) / name
-            if path.suffix.lower() in _DATA_SUFFIXES and not path.is_symlink() and path.is_file():
+            if path.is_symlink():
+                # Dangling links are listed among the files; the text is read from the real directory holding it.
+                text = os.readlink(path)  # noqa: PTH115 - the report shows the text as written
+                target = Path(os.path.normpath(resolved_root / current / text))
+                if not path.exists() and any(target.is_relative_to(root) for root in name_roots):
+                    dangling.append(f"{(current / name).as_posix()}: dangling symlink to {text}")
+            elif path.suffix.lower() in _DATA_SUFFIXES and path.is_file():
                 line = _scan_data_file(path, current / name, needles)
                 if line:
                     found.append((current / name, line))
-    return found
+    return found, dangling
 
 
 def _scan_data_file(path: Path, relative: Path, needles: _Needles) -> str | None:

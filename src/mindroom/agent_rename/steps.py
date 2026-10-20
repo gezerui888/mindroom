@@ -242,6 +242,40 @@ class DropPath:
         _move(backup / self.path.name, self.path)
 
 
+def _replace_link(path: Path, *, expected: str, target: str) -> None:
+    """Atomically replace the symlink ``path`` whose text is ``expected`` with one pointing at ``target``."""
+    # Path.readlink normalizes the text, which would hide a change such as an added trailing /.
+    if not path.is_symlink() or os.readlink(path) != expected:  # noqa: PTH115
+        msg = f"{path} is no longer a symlink to {expected}; it changed since the rename was planned."
+        raise RenameRefusedError(msg)
+    with _scratch_beside(path) as scratch:
+        replacement = scratch / path.name
+        replacement.symlink_to(target)
+        replacement.replace(path)
+
+
+@dataclass(frozen=True)
+class RetargetLink:
+    """Point the symlink ``path`` at ``target`` instead of ``old_target``, its text when the plan was built.
+
+    Refuses when ``path`` is no longer a symlink with that text. The manifest records both texts, so no backup is kept.
+    """
+
+    path: Path
+    old_target: str
+    target: str
+    description: str
+    stores_backup: ClassVar[bool] = False
+
+    def apply(self, backup: Path) -> None:  # noqa: ARG002
+        """Replace the link with one pointing at ``target``, through a new link renamed over it."""
+        _replace_link(self.path, expected=self.old_target, target=self.target)
+
+    def _undo(self, backup: Path) -> None:  # noqa: ARG002
+        """Point the link back at ``old_target``."""
+        _replace_link(self.path, expected=self.target, target=self.old_target)
+
+
 @dataclass(frozen=True)
 class FinalAction:
     """An irreversible action that runs after every other step; its failure is only a warning."""
@@ -258,7 +292,7 @@ class FinalAction:
         """Do nothing: final actions are never undone."""
 
 
-Step = MovePath | SqliteEdit | FileRewrite | DirectoryEdit | DropPath | FinalAction
+Step = MovePath | SqliteEdit | FileRewrite | DirectoryEdit | DropPath | RetargetLink | FinalAction
 
 
 @dataclass(frozen=True)
@@ -289,17 +323,20 @@ def _manifest_entry(step: Step, step_backup: Path) -> dict[str, str | None]:
         source, destination = step.source, step.destination
     elif isinstance(step, SqliteEdit):
         source, destination = step.database, None
-    elif isinstance(step, FileRewrite | DirectoryEdit | DropPath):
+    elif isinstance(step, FileRewrite | DirectoryEdit | DropPath | RetargetLink):
         source, destination = step.path, None
     else:
         source, destination = None, None
-    return {
+    entry = {
         "type": type(step).__name__,
         "description": step.description,
         "source": None if source is None else str(source),
         "destination": None if destination is None else str(destination),
         "backup": str(step_backup) if step.stores_backup and step_backup.exists() else None,
     }
+    if isinstance(step, RetargetLink):
+        entry |= {"old_target": step.old_target, "new_target": step.target}
+    return entry
 
 
 def _write_manifest(plan: RenamePlan, *, kind: str, now: datetime, backup_dir: Path) -> None:

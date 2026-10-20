@@ -26,6 +26,8 @@ from mindroom.agent_rename.steps import BACKUPS_DIRECTORY_NAME, RenamePlan, appl
 from mindroom.cli import agent_rename_command
 from mindroom.cli.agents import load_config_or_exit
 from mindroom.cli.main import app
+from mindroom.config.agent import AgentConfig
+from mindroom.config.main import Config
 from mindroom.constants import matrix_state_file, tracking_dir
 from mindroom.event_journal import EventJournalStore, IngestionBatchAdmission
 from mindroom.event_journal.opening import event_journal_sqlite_path
@@ -61,7 +63,6 @@ if TYPE_CHECKING:
 
     from click.testing import Result
 
-    from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
 
 OLD = "code"
@@ -70,6 +71,8 @@ NEW = "coder"
 PREFIX = "code_team"
 HELPER = "helper"
 DIARY = "diary"
+# Shares the renamed agent's state root through the link agents/mind_flash -> code.
+SHARER = "mind_flash"
 OLD_USER_ID = "@mindroom_code:x"
 OLD_PRINCIPAL = f"{OLD}@{OLD_USER_ID}"
 NEW_PRINCIPAL = f"{NEW}@{OLD_USER_ID}"
@@ -226,6 +229,9 @@ def _full_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> RuntimePat
     plugin_state = runtime_paths.storage_root / "plugins" / "demo" / f"{OLD}.json"
     plugin_state.parent.mkdir(parents=True)
     plugin_state.write_text("{}", encoding="utf-8")
+    # Another agent shares the agent's state root through a link, and its history lives there.
+    (runtime_paths.storage_root / "agents" / SHARER).symlink_to(OLD)
+    seed_agent(runtime_paths, SHARER)
     return _finish_install(tmp_path, runtime_paths)
 
 
@@ -303,6 +309,10 @@ def test_dry_run_changes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     # The journal goes first, then the state root, every other store, matrix_state.yaml, .env, and the config last.
     assert steps[0].startswith("Rewrite the event journal")
     assert steps[1].startswith(f"Move the state of agent {OLD} ")
+    # The link into the state root follows it once it moved.
+    sharer_link = runtime_paths.storage_root / "agents" / SHARER
+    retarget = f"Point the symlink {sharer_link} at {NEW} instead of {OLD}, where the state of agent {OLD} moved"
+    assert steps.index(retarget) > 1
     assert steps[-3].startswith(f"Rename the account agent_{OLD} in {matrix_state_file(runtime_paths)}")
     assert steps[-2] == f"Set {CONNECTIONS_AGENT} from {OLD} to {NEW} in {runtime_paths.env_path}"
     assert steps[-1] == f"Rename the agent {OLD} to {NEW} in {config_path}"
@@ -373,6 +383,7 @@ def test_apply_renames_every_store(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert not list((storage / "knowledge_db").iterdir())
     assert knowledge_git_dir(storage, new_root / "workspace" / "docs").is_dir()
+    _assert_sharer_keeps_its_history(runtime_paths)
 
     expected, unexpected = _leftovers(result.output)
     assert f"Leftover scan: places in {storage} that still name agent {OLD}" in result.output
@@ -381,6 +392,27 @@ def test_apply_renames_every_store(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert any(line.startswith("private_instances/") for line in expected)
     assert f"tracking/{OLD}_responded.json.imported" in expected
     assert f"workers/{UNKNOWN_WORKERS[OLD]}" in expected
+
+
+def _assert_sharer_keeps_its_history(runtime_paths: RuntimePaths) -> None:
+    """The agent sharing the state root through a link still finds its history, now in the moved root."""
+    storage = runtime_paths.storage_root
+    sharer_root = agent_state_root_path(storage, SHARER)
+    sessions = agent_state_root_path(storage, NEW) / "sessions" / f"{SHARER}.db"
+    assert sharer_root.readlink().as_posix() == NEW
+    assert sharer_root.resolve() / "sessions" / f"{SHARER}.db" == sessions
+    sharer_config = Config(agents={SHARER: AgentConfig(display_name="Flash")})
+    sharer_db = create_session_storage(SHARER, sharer_config, runtime_paths, execution_identity=None)
+    try:
+        assert getattr(sharer_db, "db_file", None) == str(sessions)
+        sharer_session = get_agent_session(sharer_db, "s1")
+        assert sharer_session is not None
+        sharer_scope = HistoryScope(kind="agent", scope_id=SHARER)
+        assert [run.run_id for run in scope_visible_runs(sharer_session, sharer_scope)] == ["r2"]
+    finally:
+        sharer_db.close()
+    # Resolving its paths and opening its store went through the retargeted link, so no old state root came back.
+    assert not os.path.lexists(storage / "agents" / OLD)
 
 
 def test_prefix_agent_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

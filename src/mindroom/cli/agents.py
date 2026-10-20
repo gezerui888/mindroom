@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 from dataclasses import dataclass
 from pathlib import Path  # noqa: TC003 - Typer reads the option annotations at runtime
 from typing import TYPE_CHECKING
@@ -351,8 +352,6 @@ def _refuse_journal_under_other_ids(runtime_paths: RuntimePaths, *, agent: str, 
     That is what changing the stored username by hand leaves behind: MindRoom then runs as the new ID,
     and its sync fails on the old rows with ``IngestionBatchIntegrityError``.
     """
-    import shlex  # noqa: PLC0415
-
     from mindroom.agent_rename.journal import other_principal_user_ids  # noqa: PLC0415
     from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
     from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415

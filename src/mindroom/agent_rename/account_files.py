@@ -512,8 +512,18 @@ def _personal_room_steps(runtime_paths: RuntimePaths, agent: str, rename: _Accou
     return steps
 
 
+def _without_sender(content: bytes, *, sender_id: str) -> bytes:
+    store = json.loads(content)
+    store["sends"] = {key: intent for key, intent in store["sends"].items() if _field(intent, "sender_id") != sender_id}
+    # Written like custom_tools/matrix_message_idempotency.py's _write.
+    return json.dumps(store).encode()
+
+
 def _message_send_intent_steps(runtime_paths: RuntimePaths, rename: _AccountRename) -> list[Step]:
-    """Drop idempotent Matrix send stores holding the old sender, which MindRoom refuses to replay as another sender."""
+    """Remove the old sender's intents from idempotent Matrix send stores; MindRoom refuses to replay them.
+
+    A store is keyed by requester, agent, and room, not by sender, so intents of the new ID in it stay.
+    """
     if runtime_paths.control_state_root is None:
         return []
     steps: list[Step] = []
@@ -522,7 +532,13 @@ def _message_send_intent_steps(runtime_paths: RuntimePaths, rename: _AccountRena
         if isinstance(sends, dict) and any(
             _field(intent, "sender_id") == rename.old_user_id for intent in sends.values()
         ):
-            steps.append(DropPath(path, f"Drop the Matrix send intents of {rename.old_user_id} in {path}"))
+            steps.append(
+                FileRewrite(
+                    path,
+                    partial(_without_sender, sender_id=rename.old_user_id),
+                    f"Remove the Matrix send intents of {rename.old_user_id} from {path}",
+                ),
+            )
     return steps
 
 

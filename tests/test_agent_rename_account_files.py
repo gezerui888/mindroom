@@ -563,8 +563,47 @@ def test_personal_room_and_intent_files(tmp_path: Path) -> None:
     assert own is not None
     assert own.user_id == NEW
     assert untouched_path.read_bytes() == untouched
-    assert not (sends / "old.json").exists()
-    assert (sends / "other.json").exists()
+    assert json.loads((sends / "old.json").read_text()) == {"version": 1, "sends": {}}
+    assert json.loads((sends / "other.json").read_text()) == {
+        "version": 1,
+        "sends": {"k": {**intent, "sender_id": "@router:x"}},
+    }
+
+
+def test_send_intents_of_the_new_id_stay(tmp_path: Path) -> None:
+    """A send store is keyed by requester, agent, and room, so it can hold sends of both IDs; only the old ID's go.
+
+    A pending send MindRoom recorded under the new ID keeps its transaction ID, so a retry cannot send it twice.
+    """
+    runtime_paths = _install(tmp_path)
+    path = runtime_paths.control_state_root / "matrix_message_sends" / "mixed.json"
+    common = {"recipient": None, "recipient_user_id": None, "thread_id": None, "starts_thread": False}
+    old_receipt = {
+        **common,
+        "payload": None,
+        "transaction_id": "matrix-message-old",
+        "sender_id": OLD,
+        "device_id": "OLDDEVICE",
+        "event_id": "$sent:x",
+        "completed_at": 1.0,
+    }
+    new_pending = {
+        **common,
+        "payload": {"msgtype": "m.text", "body": "hi"},
+        "transaction_id": "matrix-message-new",
+        "sender_id": NEW,
+        "device_id": "NEWDEVICE",
+        "event_id": None,
+        "completed_at": None,
+    }
+    store = {"version": 1, "scope": ["@alice:x", AGENT, "!room:x"], "sends": {"a": old_receipt, "b": new_pending}}
+    _write_json(path, store)
+
+    _apply(runtime_paths)
+
+    assert json.loads(path.read_text()) == {**store, "sends": {"b": new_pending}}
+    (backup,) = (runtime_paths.storage_root / "agent-rename-backups").iterdir()
+    assert [json.loads(saved.read_text()) for saved in backup.glob("*/mixed.json")] == [store]
 
 
 def test_reports_encryption_keys_and_desktop_pin(tmp_path: Path) -> None:

@@ -14,7 +14,14 @@ import pytest
 
 from mindroom.agent_rename import account_files
 from mindroom.agent_rename.account_files import account_file_steps, rewrite_worker_key
-from mindroom.agent_rename.steps import FinalAction, RenamePlan, RenameRefusedError, apply_plan
+from mindroom.agent_rename.steps import (
+    DropPath,
+    FinalAction,
+    MovePath,
+    RenamePlan,
+    RenameRefusedError,
+    apply_plan,
+)
 from mindroom.config.main import Config
 from mindroom.constants import matrix_state_file, primary_records_dir
 from mindroom.credentials.manager import (
@@ -93,12 +100,19 @@ def _install(tmp_path: Path) -> RuntimePaths:
     return runtime_paths
 
 
-def _steps(runtime_paths: RuntimePaths) -> tuple[list[Step], list[str]]:
-    return account_file_steps(runtime_paths, agent=AGENT, old_user_id=OLD, new_user_id=NEW, config=Config())
+def _steps(runtime_paths: RuntimePaths, *, discard: bool = False) -> tuple[list[Step], list[str]]:
+    return account_file_steps(
+        runtime_paths,
+        agent=AGENT,
+        old_user_id=OLD,
+        new_user_id=NEW,
+        config=Config(),
+        discard_new_identity_state=discard,
+    )
 
 
-def _apply(runtime_paths: RuntimePaths) -> list[str]:
-    steps, reports = _steps(runtime_paths)
+def _apply(runtime_paths: RuntimePaths, *, discard: bool = False) -> list[str]:
+    steps, reports = _steps(runtime_paths, discard=discard)
     plan = RenamePlan(storage_root=runtime_paths.storage_root, steps=tuple(steps), reports=tuple(reports))
     result = apply_plan(plan, kind="rename-account", now=NOW)
     assert result.warnings == ()
@@ -114,14 +128,18 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _oauth_store(path: Path, worker_key: str) -> None:
+def _oauth_store(path: Path, worker_key: str, *, credential_present: int = 1) -> None:
     """Create a minimal OAuth credential store bound to ``worker_key``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path)) as connection:
         connection.execute(
-            "CREATE TABLE oauth_credential_state (singleton INTEGER PRIMARY KEY, provider_id TEXT, worker_key TEXT)",
+            "CREATE TABLE oauth_credential_state "
+            "(singleton INTEGER PRIMARY KEY, provider_id TEXT, worker_key TEXT, credential_present INTEGER)",
         )
-        connection.execute("INSERT INTO oauth_credential_state VALUES (1, 'demo', ?)", (worker_key,))
+        connection.execute(
+            "INSERT INTO oauth_credential_state VALUES (1, 'demo', ?, ?)",
+            (worker_key, credential_present),
+        )
         connection.commit()
 
 
@@ -263,14 +281,65 @@ async def test_oauth_dir_moved_and_worker_key_rewritten(tmp_path: Path) -> None:
 
 
 def test_destination_that_exists_refuses(tmp_path: Path) -> None:
-    """A store that already exists under the new ID refuses the plan and names it."""
+    """Without the discard flag, a store that already exists under the new ID refuses, naming it and the flag."""
     runtime_paths = _install(tmp_path)
     oauth_root = runtime_paths.storage_root / PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME
     _oauth_store(oauth_root / scoped_credentials_dir_part(OLD) / "code-1" / "demo_oauth_credentials.sqlite3", "")
     (oauth_root / scoped_credentials_dir_part(NEW)).mkdir(parents=True)
 
-    with pytest.raises(RenameRefusedError, match=scoped_credentials_dir_part(NEW)):
+    with pytest.raises(RenameRefusedError) as raised:
         _steps(runtime_paths)
+
+    assert str(oauth_root / scoped_credentials_dir_part(NEW)) in str(raised.value)
+    assert "--discard-new-principal drops new-ID state that holds no credentials" in str(raised.value)
+
+
+def test_discard_drops_credential_free_destinations_before_moving(tmp_path: Path) -> None:
+    """With the discard flag, new-ID trees that hold no credentials are dropped into the backup, then replaced."""
+    runtime_paths = _install(tmp_path)
+    storage = runtime_paths.storage_root
+    old_key, new_key = _key("user_agent", OLD), _key("user_agent", NEW)
+    _oauth_store(_requester_store(storage, OLD), old_key)
+    new_oauth = storage / PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME / scoped_credentials_dir_part(NEW)
+    _oauth_store(_requester_store(storage, NEW), new_key, credential_present=0)
+    (_requester_store(storage, NEW).parent / "demo_oauth_credentials.lock").write_text("", encoding="utf-8")
+    (new_oauth / "empty").mkdir()
+    workers = storage / "workers"
+    old_worker = workers / worker_dir_name(old_key)
+    new_worker = workers / worker_dir_name(new_key)
+    (old_worker / "workspace").mkdir(parents=True)
+    (old_worker / "workspace" / "notes.md").write_text("notes", encoding="utf-8")
+    for name in ("credentials", ".shared_credentials"):
+        (new_worker / name).mkdir(parents=True)
+
+    steps, _reports = _steps(runtime_paths, discard=True)
+
+    for destination in (new_oauth, new_worker):
+        index = next(i for i, step in enumerate(steps) if isinstance(step, DropPath) and step.path == destination)
+        move = steps[index + 1]
+        assert isinstance(move, MovePath)
+        assert move.destination == destination
+
+    _apply(runtime_paths, discard=True)
+
+    assert _stored_worker_key(_requester_store(storage, NEW)) == new_key
+    assert (new_worker / "workspace" / "notes.md").read_text() == "notes"
+    assert not (new_worker / "credentials").exists()
+    backups = storage / "agent-rename-backups"
+    assert any(path.name == "demo_oauth_credentials.lock" for path in backups.rglob("*"))
+
+
+def test_discard_refuses_destination_holding_credentials(tmp_path: Path) -> None:
+    """Even with the discard flag, a new-ID store holding credentials refuses, naming the store."""
+    runtime_paths = _install(tmp_path)
+    storage = runtime_paths.storage_root
+    _oauth_store(_requester_store(storage, OLD), _key("user_agent", OLD))
+    _oauth_store(_requester_store(storage, NEW), _key("user_agent", NEW), credential_present=1)
+
+    with pytest.raises(RenameRefusedError) as raised:
+        _steps(runtime_paths, discard=True)
+
+    assert f"credentials in {_requester_store(storage, NEW)}" in str(raised.value)
 
 
 def test_worker_dir_moved_metadata_rewritten_and_oauth_store_rewritten(tmp_path: Path) -> None:
@@ -289,8 +358,9 @@ def test_worker_dir_moved_metadata_rewritten_and_oauth_store_rewritten(tmp_path:
     _oauth_store(old_root / "credentials" / "demo_oauth_credentials.sqlite3", old_key)
     _write_json(workers / worker_dir_name(other_key) / "metadata" / "worker.json", {"worker_key": other_key})
 
-    _apply(runtime_paths)
+    reports = _apply(runtime_paths)
 
+    assert not any("looks like a worker" in report for report in reports)
     new_root = workers / worker_dir_name(new_key)
     assert not old_root.exists()
     assert json.loads((new_root / "metadata" / "worker.json").read_text()) == {
@@ -301,6 +371,25 @@ def test_worker_dir_moved_metadata_rewritten_and_oauth_store_rewritten(tmp_path:
     assert (new_root / "workspace" / "notes.md").read_text() == "notes"
     assert _stored_worker_key(new_root / "credentials" / "demo_oauth_credentials.sqlite3") == new_key
     assert (workers / worker_dir_name(other_key) / "metadata" / "worker.json").exists()
+
+
+def test_other_users_workers_are_neither_moved_nor_reported(tmp_path: Path) -> None:
+    """Workers of users whose IDs start like the old one stay put and unreported; only possible old-ID roots report."""
+    runtime_paths = _install(tmp_path)
+    workers = runtime_paths.storage_root / "workers"
+    others = [_key(scope, user) for scope in ("user", "user_agent") for user in ("@old:x.example.org", "@older:x")]
+    for key in others:
+        _write_json(workers / worker_dir_name(key) / "metadata" / "worker.json", {"worker_key": key})
+    (workers / "v1_default_user_@older_x-0123456789abcdef").mkdir()
+    possibly_old = workers / "v1_default_user_agent_@old_x_code-0123456789abcdef"
+    possibly_old.mkdir()
+
+    steps, reports = _steps(runtime_paths)
+
+    assert not [step for step in steps if isinstance(step, MovePath)]
+    assert reports[:-1] == [
+        f"{possibly_old} looks like a worker of {OLD}, but its worker key is unknown, so it stays in place.",
+    ]
 
 
 def test_docker_workers_moved_control_dropped_and_retired(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

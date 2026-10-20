@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass
@@ -89,6 +90,7 @@ def rewrite_worker_key(worker_key: str, *, old_user_id: str, new_user_id: str) -
 class _AccountRename:
     old_user_id: str
     new_user_id: str
+    discard_new_identity_state: bool
 
     def worker_key(self, worker_key: str) -> str | None:
         return rewrite_worker_key(worker_key, old_user_id=self.old_user_id, new_user_id=self.new_user_id)
@@ -111,6 +113,7 @@ def account_file_steps(
     old_user_id: str,
     new_user_id: str,
     config: Config,
+    discard_new_identity_state: bool,
 ) -> tuple[list[Step], list[str]]:
     """Return the steps that move ``agent``'s files from ``old_user_id`` to ``new_user_id``, and report lines.
 
@@ -118,8 +121,10 @@ def account_file_steps(
     name the old requester, personal-room records, and Matrix send intents of the old sender.
     ``config`` is only used when a Docker worker is retired after apply.
     Refuses when ``matrix_state.yaml`` holds no account for ``agent`` or a destination already exists.
+    MindRoom creates new-ID state when it runs after the server rename; with ``discard_new_identity_state``
+    a destination holding no credentials is dropped into the backup before the move instead.
     """
-    rename = _AccountRename(old_user_id, new_user_id)
+    rename = _AccountRename(old_user_id, new_user_id, discard_new_identity_state)
     oauth_steps, requester_keys = _requester_oauth_steps(runtime_paths.storage_root, rename)
     worker_steps, worker_reports = _worker_steps(runtime_paths, config, rename, requester_keys=requester_keys)
     steps: list[Step] = [
@@ -133,11 +138,58 @@ def account_file_steps(
     return steps, [*worker_reports, *_reports(runtime_paths, old_user_id)]
 
 
-def _move(source: Path, destination: Path, label: str) -> MovePath:
-    if os.path.lexists(destination):
-        msg = f"Cannot move {source} to {destination}: {destination} already exists."
+def _move(source: Path, destination: Path, label: str, rename: _AccountRename) -> list[Step]:
+    """Move ``source`` to ``destination``, first dropping a destination that is discardable new-ID state."""
+    move = MovePath(source, destination, f"Move {label} {source} to {destination}")
+    if not os.path.lexists(destination):
+        return [move]
+    if not rename.discard_new_identity_state:
+        msg = (
+            f"Cannot move {source} to {destination}: {destination} already exists. "
+            "--discard-new-principal drops new-ID state that holds no credentials."
+        )
         raise RenameRefusedError(msg)
-    return MovePath(source, destination, f"Move {label} {source} to {destination}")
+    blocker = _credential_free_blocker(destination)
+    if blocker is not None:
+        msg = f"Cannot move {source} to {destination}: {destination} already exists and holds {blocker}."
+        raise RenameRefusedError(msg)
+    return [DropPath(destination, f"Drop {destination}, new-ID state that holds no credentials"), move]
+
+
+def _credential_free_blocker(path: Path) -> str | None:
+    """Describe the first thing under ``path`` beyond credential-free OAuth stores, lock files and empty directories.
+
+    Returns ``None`` when there is nothing else, so dropping ``path`` loses no credentials or data.
+    """
+    # rglob lists symlinks without following them, so a symlink below is reported, never walked through.
+    entries = sorted(path.rglob("*")) if path.is_dir() and not path.is_symlink() else [path]
+    for entry in entries:
+        if entry.is_symlink():
+            return f"the symlink {entry}"
+        if entry.is_dir() or entry.name.endswith(".lock"):
+            continue
+        if not entry.name.endswith("_credentials.sqlite3"):
+            return f"the file {entry}"
+        if _oauth_store_holds_credentials(entry):
+            return f"credentials in {entry}"
+    return None
+
+
+def _oauth_store_holds_credentials(database: Path) -> bool:
+    try:
+        with closing(sqlite3.connect(f"{database.absolute().as_uri()}?immutable=1", uri=True)) as connection:
+            if not _has_oauth_state(connection):
+                return False
+            query = "SELECT 1 FROM oauth_credential_state WHERE credential_present != 0 LIMIT 1"
+            return connection.execute(query).fetchone() is not None
+    except sqlite3.Error as exc:
+        msg = f"Cannot read the OAuth credential store {database}: {exc}"
+        raise RenameRefusedError(msg) from exc
+
+
+def _has_oauth_state(connection: sqlite3.Connection) -> bool:
+    query = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_credential_state'"
+    return connection.execute(query).fetchone() is not None
 
 
 def _read_json(path: Path) -> object:
@@ -184,10 +236,7 @@ def _oauth_worker_keys(database: Path) -> list[str]:
     """Read the worker keys an OAuth credential store is bound to, without writing anything next to it."""
     try:
         with closing(sqlite3.connect(f"{database.absolute().as_uri()}?immutable=1", uri=True)) as connection:
-            table = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'oauth_credential_state'",
-            ).fetchone()
-            if table is None:
+            if not _has_oauth_state(connection):
                 return []
             return [key for (key,) in connection.execute("SELECT worker_key FROM oauth_credential_state")]
     except sqlite3.Error as exc:
@@ -241,9 +290,9 @@ def _requester_oauth_steps(storage_root: Path, rename: _AccountRename) -> tuple[
     if not os.path.lexists(source):
         return [], set()
     destination = oauth_root / scoped_credentials_dir_part(rename.new_user_id)
-    move = _move(source, destination, f"the OAuth credentials of {rename.old_user_id}")
+    moves = _move(source, destination, f"the OAuth credentials of {rename.old_user_id}", rename)
     edits, old_keys = _oauth_store_edits(source, destination, _REQUESTER_OAUTH_STORES, rename)
-    return [move, *edits], old_keys
+    return [*moves, *edits], old_keys
 
 
 def _metadata_worker_key(path: Path) -> str | None:
@@ -264,7 +313,7 @@ def _worker_state_steps(old_root: Path, new_root: Path, rename: _AccountRename) 
     """Move one worker root and rewrite the metadata and OAuth stores inside it at their new place."""
     if not os.path.lexists(old_root):
         return []
-    steps: list[Step] = [_move(old_root, new_root, "the worker")]
+    steps = _move(old_root, new_root, "the worker", rename)
     metadata_key = _metadata_worker_key(old_root / "metadata" / "worker.json")
     new_metadata_key = None if metadata_key is None else rename.worker_key(metadata_key)
     if metadata_key is not None and new_metadata_key is not None:
@@ -314,14 +363,12 @@ def _worker_steps(
     keys = requester_keys | {key for path in metadata_files if (key := _metadata_worker_key(path)) is not None}
     docker = primary_worker_backend_name(runtime_paths) == "docker"
     steps: list[Step] = []
-    found: set[str] = set()
     for old_key in sorted(keys):
         new_key = rename.worker_key(old_key)
         old_dir = worker_dir_name(old_key)
         backend_paths = [path for path in (control / old_dir, projections / old_dir) if os.path.lexists(path)]
         if new_key is None or not (os.path.lexists(workers / old_dir) or backend_paths):
             continue
-        found.add(old_dir)
         steps += _worker_state_steps(workers / old_dir, workers / worker_dir_name(new_key), rename)
         steps += [DropPath(path, f"Drop the old worker's Docker record {path}") for path in backend_paths]
         if docker:
@@ -331,18 +378,25 @@ def _worker_steps(
                     f"Retire the old Docker worker {worker_log_id(old_key)} of {rename.old_user_id}",
                 ),
             )
-    return steps, _unknown_worker_reports(workers, found, rename.old_user_id)
+    known = {worker_dir_name(key) for key in keys}
+    return steps, _unknown_worker_reports(workers, known, rename.old_user_id)
 
 
-def _unknown_worker_reports(workers: Path, found: set[str], old_user_id: str) -> list[str]:
+def _unknown_worker_reports(workers: Path, known: set[str], old_user_id: str) -> list[str]:
+    """Report worker roots whose key is unknown and whose name could hold the old requester.
+
+    A worker directory name turns every run of other characters in the key into ``_``,
+    so the old requester appears normalized, followed by ``_`` and the agent or by ``-`` and the digest.
+    Anything else after it, like ``.example.org``, belongs to another user.
+    """
     if not workers.is_dir():
         return []
-    # Worker directory names spell the requester as normalize_worker_key_part does.
-    requester = normalize_worker_key_part(f"@{MatrixID.parse(old_user_id).username}")
+    requester = normalize_worker_key_part(encode_worker_requester_part(old_user_id))
+    old_requester = re.compile(re.escape(requester) + "[_-]")
     return [
         f"{path} looks like a worker of {old_user_id}, but its worker key is unknown, so it stays in place."
         for path in sorted(workers.iterdir())
-        if not path.name.startswith(".") and path.name not in found and requester in path.name
+        if not path.name.startswith(".") and path.name not in known and old_requester.search(path.name)
     ]
 
 
@@ -394,7 +448,7 @@ def _private_instance_steps(runtime_paths: RuntimePaths, rename: _AccountRename)
         for old_root, new_root, owner_key in zip(old_roots, new_roots, owner_keys, strict=True):
             if not os.path.lexists(old_root):
                 continue
-            steps.append(_move(old_root, new_root, "the private instance"))
+            steps += _move(old_root, new_root, "the private instance", rename)
             if owner_key is not None:
                 record = new_root / PRIVATE_INSTANCE_RECORD_FILENAME
                 steps.append(
@@ -426,7 +480,7 @@ def _personal_room_steps(runtime_paths: RuntimePaths, agent: str, rename: _Accou
         destination = path
         if _field(record, "user_id") == rename.old_user_id:
             destination = path.with_name(f"{personal_room_digest(rename.new_user_id)}.json")
-            steps.append(_move(path, destination, "the personal-room record"))
+            steps += _move(path, destination, "the personal-room record", rename)
         steps.append(
             FileRewrite(
                 destination,

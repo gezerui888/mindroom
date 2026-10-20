@@ -565,6 +565,7 @@ depends_on = [
 visibility = [
     "mindroom.api.config_lifecycle",
     "mindroom.bot",
+    "mindroom.cli.agents",
     "mindroom.cli.main",
     "mindroom.commands.config_commands",
     "mindroom.orchestration.config_lifecycle",
@@ -4769,9 +4770,24 @@ depends_on = [
 visibility = ["mindroom.cli.main"]
 
 [[modules]]
+path = "mindroom.cli.agents"
+depends_on = [
+    # Mostly deferred imports, so `mindroom --help` does not load the rename engine.
+    "mindroom.agent_rename.account_files",
+    "mindroom.cli.config",
+    "mindroom.config.main",
+    "mindroom.constants",
+    "mindroom.desktop.native_config",
+    "mindroom.event_journal.opening",
+    "mindroom.matrix.state",
+]
+visibility = ["mindroom.cli.main"]
+
+[[modules]]
 path = "mindroom.cli.main"
 depends_on = [
     "mindroom.api.auth",
+    "mindroom.cli.agents",
     "mindroom.cli.api",
     "mindroom.cli.config_bundle",
     "mindroom.cli.config_reload",

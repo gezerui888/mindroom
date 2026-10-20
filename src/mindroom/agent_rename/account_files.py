@@ -58,7 +58,7 @@ _REQUESTER_OAUTH_STORES = ("*/*_credentials.sqlite3",)
 _WORKER_OAUTH_STORES = ("credentials/*_credentials.sqlite3", ".shared_credentials/*_credentials.sqlite3")
 
 
-def rewrite_worker_key(worker_key: str, *, old_user_id: str, new_user_id: str) -> str | None:
+def _rewrite_worker_key(worker_key: str, *, old_user_id: str, new_user_id: str) -> str | None:
     """Return ``worker_key`` with its requester changed from ``old_user_id`` to ``new_user_id``.
 
     Requester keys read ``v1:<tenant>:user:<requester>`` and ``v1:<tenant>:user_agent:<requester>:<agent>``,
@@ -93,7 +93,7 @@ class _AccountRename:
     discard_new_identity_state: bool
 
     def worker_key(self, worker_key: str) -> str | None:
-        return rewrite_worker_key(worker_key, old_user_id=self.old_user_id, new_user_id=self.new_user_id)
+        return _rewrite_worker_key(worker_key, old_user_id=self.old_user_id, new_user_id=self.new_user_id)
 
     def strings(self, value: object) -> object:
         """Return ``value`` with the old ID replaced in every string inside it, by the server's boundary rule."""

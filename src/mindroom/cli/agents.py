@@ -1,0 +1,387 @@
+"""`mindroom agents` commands that change an agent's identity on disk."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path  # noqa: TC003 - Typer reads the option annotations at runtime
+from typing import TYPE_CHECKING
+
+import typer
+from rich.markup import escape
+
+from mindroom.constants import matrix_state_file, runtime_matrix_homeserver, runtime_matrix_ssl_verify
+
+from .config import activate_cli_runtime, console, format_validation_errors, load_config_quiet
+
+if TYPE_CHECKING:
+    import httpx
+
+    from mindroom.agent_rename.steps import ApplyResult, RenamePlan
+    from mindroom.config.main import Config
+    from mindroom.constants import RuntimePaths
+    from mindroom.matrix.state import MatrixAccount
+
+_LOGIN_CHECK_DEVICE_NAME = "mindroom rename check"
+_LOGIN_CHECK_TIMEOUT_SECONDS = 30.0
+_REJECTED_LOGIN_STATUSES = frozenset({401, 403})
+_UNDO_FAILED_EXIT_CODE = 2
+
+
+@dataclass(frozen=True)
+class _Adoption:
+    """One agent's stored account and the ID the server renamed it to."""
+
+    agent: str
+    old_user_id: str
+    new_user_id: str
+    password: str | None
+
+
+def rename_account(
+    agent: str = typer.Argument(..., help="The agent's name in the config."),
+    new_user_id: str = typer.Argument(..., help="The Matrix ID the server renamed the agent's account to."),
+    apply: bool = typer.Option(False, "--apply", help="Make the changes; without it the plan is only printed."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Apply without asking for confirmation."),
+    discard_new_principal: bool = typer.Option(
+        False,
+        "--discard-new-principal",
+        help=(
+            "Delete what MindRoom created under the new ID when it ran after the server rename: "
+            "its event journal rows and new-ID state that holds no credentials."
+        ),
+    ),
+    skip_login_check: bool = typer.Option(
+        False,
+        "--skip-login-check",
+        help="Apply without first logging in as the new ID with the stored password.",
+    ),
+    config_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--config",
+        "-c",
+        help="Use this config file path.",
+    ),
+    storage_path: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--storage-path",
+        "-s",
+        help="Base directory for persistent MindRoom data.",
+    ),
+) -> None:
+    """Adopt an agent's Matrix account after the server renamed it.
+
+    Run it with MindRoom stopped, after the homeserver renamed the account in place
+    (for example with Tuwunel's `query user-id-rewrite`). It moves credentials, workers,
+    and other state kept under the old Matrix ID to the new one, rewrites the event journal,
+    and replaces the old ID in the config. The agent's name in the config stays.
+    """
+    from mindroom.agent_rename.steps import (  # noqa: PLC0415 - keeps the rename engine out of CLI import time
+        RenameApplyError,
+        RenameRefusedError,
+        RenameUndoError,
+    )
+
+    runtime_paths = activate_cli_runtime(path=config_path, storage_path=storage_path)
+    config = _load_config_or_exit(runtime_paths)
+    try:
+        _rename_account(
+            runtime_paths,
+            config,
+            agent=agent,
+            new_user_id=new_user_id,
+            apply=apply,
+            yes=yes,
+            discard_new_principal=discard_new_principal,
+            skip_login_check=skip_login_check,
+        )
+    except RenameRefusedError as exc:
+        _say(str(exc), label="[red]Refused:[/red] ")
+        raise typer.Exit(1) from None
+    except RenameApplyError as exc:
+        _say(str(exc), label="[red]Not applied:[/red] ")
+        raise typer.Exit(1) from None
+    except RenameUndoError as exc:
+        _say(str(exc), label="[red]Undo failed:[/red] ")
+        _say(f"Do not start MindRoom before restoring the remaining steps listed in {exc.manifest} by hand.")
+        raise typer.Exit(_UNDO_FAILED_EXIT_CODE) from None
+
+
+def _say(text: str, *, label: str = "") -> None:
+    """Print ``text`` literally after an optional styled ``label``.
+
+    Lines are never wrapped, so paths stay copyable, and ``:name:`` emoji codes stay text:
+    Matrix IDs followed by a colon, like ``@old:x:``, contain them.
+    """
+    console.print(f"{label}{escape(text)}", soft_wrap=True, emoji=False)
+
+
+def _load_config_or_exit(runtime_paths: RuntimePaths) -> Config:
+    """Load the config, or exit with its errors.
+
+    Unlike other commands, a missing config is not seeded from a template: that would be a write,
+    and without a config there is no agent to rename.
+    """
+    from mindroom.config.main import CONFIG_LOAD_USER_ERROR_TYPES  # noqa: PLC0415
+
+    config_path = runtime_paths.config_path
+    if not config_path.exists():
+        _say(f"No config at {config_path}.", label="[red]Error:[/red] ")
+        raise typer.Exit(1)
+    try:
+        return load_config_quiet(runtime_paths, tolerate_plugin_load_errors=True)
+    except CONFIG_LOAD_USER_ERROR_TYPES as exc:
+        format_validation_errors(exc, config_path)
+        raise typer.Exit(1) from None
+
+
+def _rename_account(
+    runtime_paths: RuntimePaths,
+    config: Config,
+    *,
+    agent: str,
+    new_user_id: str,
+    apply: bool,
+    yes: bool,
+    discard_new_principal: bool,
+    skip_login_check: bool,
+) -> None:
+    from mindroom.agent_rename.guard import require_supported_backends, stopped_runtime  # noqa: PLC0415
+
+    adoption = _adoption(runtime_paths, config, agent=agent, new_user_id=new_user_id)
+    if adoption is None:
+        _say("Already adopted; nothing to do.")
+        return
+    require_supported_backends(config, runtime_paths)
+    if not apply:
+        # Taking MindRoom's locks would create lock files, so a dry run plans without them.
+        _print_plan(_plan(runtime_paths, config, adoption, discard_new_principal=discard_new_principal), adoption)
+        _say("Dry run: nothing was changed. Rerun with --apply to make these changes.")
+        _say(
+            "--apply plans again under MindRoom's locks. Some event journal collisions only show up then; "
+            "if one does, everything is undone and the command refuses.",
+        )
+        return
+    with stopped_runtime(runtime_paths):
+        if not skip_login_check:
+            _check_login(runtime_paths, adoption)
+        plan = _plan(runtime_paths, config, adoption, discard_new_principal=discard_new_principal)
+        _print_plan(plan, adoption)
+        if not yes and not typer.confirm("Apply this plan?"):
+            _say("Nothing was changed.")
+            raise typer.Exit(1)
+        result = _apply(plan)
+        _say(f"agent {agent} now uses {adoption.new_user_id}.", label="[green]Adopted:[/green] ")
+        _say(f"Backups: {result.backup_dir}. Its manifest.json lists every change, for restoring by hand.")
+        for warning in result.warnings:
+            _say(warning, label="[yellow]Warning:[/yellow] ")
+        _print_leftovers(runtime_paths, adoption)
+
+
+def _stored_accounts(runtime_paths: RuntimePaths) -> dict[str, MatrixAccount]:
+    """Read the stored Matrix accounts; ``MatrixState.load`` can rewrite a legacy file, which a dry run must not."""
+    import yaml  # noqa: PLC0415
+
+    from mindroom import yaml_io  # noqa: PLC0415
+    from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
+    from mindroom.matrix.state import MatrixState  # noqa: PLC0415
+
+    path = matrix_state_file(runtime_paths)
+    try:
+        data = yaml_io.safe_load(path.read_bytes()) if path.exists() else None
+        return MatrixState.model_validate(data or {}).accounts
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        msg = f"Cannot read {path}: {exc}"
+        raise RenameRefusedError(msg) from exc
+
+
+def _adoption(runtime_paths: RuntimePaths, config: Config, *, agent: str, new_user_id: str) -> _Adoption | None:
+    """Check the request and return it, or ``None`` when the stored account already has the new ID."""
+    from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
+    from mindroom.matrix.identity import (  # noqa: PLC0415
+        MatrixID,
+        managed_account_key,
+        parse_historical_matrix_user_id,
+    )
+
+    state_path = matrix_state_file(runtime_paths)
+    accounts = _stored_accounts(runtime_paths)
+    domain = config.get_domain(runtime_paths)
+    user_ids = {
+        key: MatrixID.from_username(account.username, account.domain or domain).full_id
+        for key, account in accounts.items()
+    }
+    account_key = managed_account_key(agent)
+    old_user_id = user_ids.get(account_key)
+    # Checked before anything that can refuse, so a rerun after a successful apply is a no-op.
+    if old_user_id == new_user_id:
+        return None
+    if agent not in config.agents:
+        msg = f"{agent} is not an agent in {runtime_paths.config_path}."
+        raise RenameRefusedError(msg)
+    if old_user_id is None:
+        msg = f"{state_path} holds no account {account_key}, so there is no Matrix account to adopt."
+        raise RenameRefusedError(msg)
+    try:
+        parse_historical_matrix_user_id(new_user_id)
+    except ValueError as exc:
+        msg = f"{new_user_id} is not a Matrix user ID ({exc})."
+        raise RenameRefusedError(msg) from exc
+    old_domain = MatrixID.parse(old_user_id).domain
+    if MatrixID.parse(new_user_id).domain != old_domain:
+        msg = f"{new_user_id} is not on {old_domain}, the server of {old_user_id}; a rename in place keeps the server."
+        raise RenameRefusedError(msg)
+    owner = next((key for key, user_id in user_ids.items() if user_id == new_user_id), None)
+    if owner is not None:
+        msg = f"{new_user_id} is already the stored account {owner} in {state_path}."
+        raise RenameRefusedError(msg)
+    return _Adoption(agent, old_user_id, new_user_id, accounts[account_key].password)
+
+
+def _check_login(runtime_paths: RuntimePaths, adoption: _Adoption) -> None:
+    """Refuse unless the homeserver accepts the new ID with the stored password, then log that session out again.
+
+    Plain HTTP on purpose: MindRoom's Matrix login creates a local crypto store for the ID,
+    which would collide with the one MindRoom creates when it logs in after the rename.
+    """
+    import httpx  # noqa: PLC0415
+
+    from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
+
+    new_user_id = adoption.new_user_id
+    if adoption.password is None:
+        msg = (
+            f"{matrix_state_file(runtime_paths)} holds no password for agent_{adoption.agent}, so the login check "
+            "cannot run; pass --skip-login-check once the server renamed the account."
+        )
+        raise RenameRefusedError(msg)
+    homeserver = runtime_matrix_homeserver(runtime_paths).rstrip("/")
+    login = {
+        "type": "m.login.password",
+        "identifier": {"type": "m.id.user", "user": new_user_id},
+        "password": adoption.password,
+        "initial_device_display_name": _LOGIN_CHECK_DEVICE_NAME,
+    }
+    verify = runtime_matrix_ssl_verify(runtime_paths=runtime_paths)
+    with httpx.Client(verify=verify, timeout=_LOGIN_CHECK_TIMEOUT_SECONDS) as client:
+        try:
+            response = client.post(f"{homeserver}/_matrix/client/v3/login", json=login)
+        except httpx.HTTPError as exc:
+            msg = f"Cannot reach {homeserver} for the login check ({exc}); retry, or pass --skip-login-check."
+            raise RenameRefusedError(msg) from exc
+        if response.status_code in _REJECTED_LOGIN_STATUSES:
+            msg = (
+                f"The server does not accept {new_user_id} with the stored password; "
+                "rename the account on the server first."
+            )
+            raise RenameRefusedError(msg)
+        if not response.is_success:
+            msg = f"The login check for {new_user_id} failed with HTTP {response.status_code}; retry, or pass --skip-login-check."
+            raise RenameRefusedError(msg)
+        _log_out(client, homeserver, response)
+
+
+def _log_out(client: httpx.Client, homeserver: str, login: httpx.Response) -> None:
+    """End the login check's session; if that fails, only a stray device stays behind, so it warns."""
+    import httpx  # noqa: PLC0415
+
+    try:
+        token = login.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        client.post(f"{homeserver}/_matrix/client/v3/logout", headers=headers).raise_for_status()
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        _say(
+            f"Could not log the login check out ({exc}); "
+            f"remove its device {_LOGIN_CHECK_DEVICE_NAME!r} from the account by hand.",
+            label="[yellow]Warning:[/yellow] ",
+        )
+
+
+def _plan(
+    runtime_paths: RuntimePaths,
+    config: Config,
+    adoption: _Adoption,
+    *,
+    discard_new_principal: bool,
+) -> RenamePlan:
+    from mindroom.agent_rename.account_files import account_file_steps  # noqa: PLC0415
+    from mindroom.agent_rename.config_edit import config_value_steps  # noqa: PLC0415
+    from mindroom.agent_rename.journal import journal_account_steps  # noqa: PLC0415
+    from mindroom.agent_rename.steps import RenamePlan  # noqa: PLC0415
+    from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415
+
+    old_user_id, new_user_id = adoption.old_user_id, adoption.new_user_id
+    journal_steps = journal_account_steps(
+        event_journal_sqlite_path(runtime_paths.storage_root),
+        agent=adoption.agent,
+        old_user_id=old_user_id,
+        new_user_id=new_user_id,
+        discard_new_principal=discard_new_principal,
+    )
+    file_steps, reports = account_file_steps(
+        runtime_paths,
+        agent=adoption.agent,
+        old_user_id=old_user_id,
+        new_user_id=new_user_id,
+        config=config,
+        discard_new_identity_state=discard_new_principal,
+    )
+    config_steps = config_value_steps(runtime_paths.config_path, old_value=old_user_id, new_value=new_user_id)
+    # The journal edit goes first: some of its collisions only show up when it runs,
+    # and a failing first step leaves nothing to undo.
+    steps = (*journal_steps, *file_steps, *config_steps)
+    return RenamePlan(storage_root=runtime_paths.storage_root, steps=steps, reports=tuple(reports))
+
+
+def _print_plan(plan: RenamePlan, adoption: _Adoption) -> None:
+    _say(
+        f"Plan to adopt {adoption.new_user_id} for agent {adoption.agent}, "
+        f"whose stored account is {adoption.old_user_id}:",
+    )
+    for line in plan.describe():
+        _say(f"  - {line}")
+
+
+def _apply(plan: RenamePlan) -> ApplyResult:
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from mindroom.agent_rename.steps import apply_plan  # noqa: PLC0415
+    from mindroom.workers.backend import WorkerBackendError  # noqa: PLC0415
+    from mindroom.workers.runtime import shutdown_primary_worker_manager  # noqa: PLC0415
+
+    try:
+        return apply_plan(plan, kind="rename-account", now=datetime.now(UTC))
+    finally:
+        # Retiring an old Docker worker leases the process-wide worker manager; shut it down so the command exits.
+        try:
+            shutdown_primary_worker_manager()
+        except WorkerBackendError as exc:
+            _say(str(exc), label="[yellow]Warning:[/yellow] ")
+
+
+def _print_leftovers(runtime_paths: RuntimePaths, adoption: _Adoption) -> None:
+    """Print what in the storage directory still names the old ID, split by whether the plan reported it."""
+    from mindroom.agent_rename.scan import scan_leftovers  # noqa: PLC0415
+    from mindroom.credentials.manager import scoped_credentials_dir_part  # noqa: PLC0415
+    from mindroom.desktop.native_config import native_config_path  # noqa: PLC0415
+
+    storage = runtime_paths.storage_root
+    old_user_id = adoption.old_user_id
+    # The plan reports a desktop bridge pinned to the old ID as staying.
+    # It reports the old crypto store too, but the scan never enters encryption_keys.
+    report = scan_leftovers(
+        storage,
+        needles=(old_user_id, scoped_credentials_dir_part(old_user_id)),
+        expected=frozenset({native_config_path(storage)}),
+    )
+    if not report.expected and not report.unexpected:
+        _say(f"Leftover scan: nothing in {storage} names {old_user_id} any more.")
+        return
+    _say(f"Leftover scan: places in {storage} that still name {old_user_id}")
+    if report.expected:
+        _say("  Reported above as staying:")
+        for line in report.expected:
+            _say(f"    - {line}")
+    if report.unexpected:
+        _say("  Not reported by the plan, or not scanned:")
+        for line in report.unexpected:
+            _say(f"    - {line}")

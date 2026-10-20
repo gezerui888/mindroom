@@ -31,7 +31,7 @@ _MAX_DATA_FILE_BYTES = 5 * 1024 * 1024
 
 
 @dataclass(frozen=True)
-class LeftoverReport:
+class _LeftoverReport:
     """What still names the old identity, as sorted lines ready to print.
 
     ``expected`` holds the paths the rename itself reported as staying; ``unexpected`` holds every other path,
@@ -43,7 +43,7 @@ class LeftoverReport:
     expected: tuple[str, ...]
 
 
-def scan_leftovers(storage_root: Path, *, needles: tuple[str, ...], expected: frozenset[Path]) -> LeftoverReport:
+def scan_leftovers(storage_root: Path, *, needles: tuple[str, ...], expected: frozenset[Path]) -> _LeftoverReport:
     """Report every place under ``storage_root`` that still names one of ``needles``.
 
     A needle that starts with ``@`` and contains ``:`` is a Matrix user ID and matches only as a whole ID,
@@ -57,7 +57,7 @@ def scan_leftovers(storage_root: Path, *, needles: tuple[str, ...], expected: fr
     expected_paths = {_relative_to(storage_root, path) for path in expected}
     unexpected = {line for path, line in found if not _is_expected(path, expected_paths)}
     unexpected.update(_scan_journal(storage_root, wanted))
-    return LeftoverReport(
+    return _LeftoverReport(
         unexpected=tuple(sorted(unexpected)),
         expected=tuple(sorted({line for path, line in found if _is_expected(path, expected_paths)})),
     )

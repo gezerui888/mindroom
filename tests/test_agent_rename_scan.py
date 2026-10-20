@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from mindroom.agent_rename.scan import LeftoverReport, scan_leftovers
+from mindroom.agent_rename.scan import _LeftoverReport, scan_leftovers
 from mindroom.credentials.manager import scoped_credentials_dir_part
 from mindroom.event_journal import EventJournalStore, EventKind, encode_thread_id
 from mindroom.event_journal.opening import event_journal_sqlite_path
@@ -33,7 +33,7 @@ def _write(root: Path, relative: str, content: str | bytes) -> Path:
     return path
 
 
-def _scan(root: Path, *expected: Path) -> LeftoverReport:
+def _scan(root: Path, *expected: Path) -> _LeftoverReport:
     return scan_leftovers(root, needles=NEEDLES, expected=frozenset(expected))
 
 
@@ -71,7 +71,7 @@ async def test_finds_paths_files_and_journal_cells(tmp_path: Path) -> None:
 
     report = _scan(tmp_path)
 
-    assert report == LeftoverReport(
+    assert report == _LeftoverReport(
         unexpected=(
             "config.yml",
             f"credentials/{CREDENTIALS_PART}.json",
@@ -95,7 +95,7 @@ def test_expected_paths_are_listed_separately(tmp_path: Path) -> None:
 
     report = _scan(tmp_path, desktop, Path("kept"), tmp_path / "elsewhere" / "stray.json")
 
-    assert report == LeftoverReport(
+    assert report == _LeftoverReport(
         unexpected=("keptover/other.json", "stray.json"),
         expected=("desktop_bridge/native_config.json", "kept/a/history.json", "kept/b.yaml"),
     )
@@ -173,7 +173,7 @@ def test_symlinks_are_never_followed(tmp_path: Path) -> None:
     (root / "linked-dir").symlink_to(outside / "dir", target_is_directory=True)
     (root / "linked-file.json").symlink_to(outside / "file.json")
 
-    assert _scan(root) == LeftoverReport(unexpected=(), expected=())
+    assert _scan(root) == _LeftoverReport(unexpected=(), expected=())
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads files whatever their mode")

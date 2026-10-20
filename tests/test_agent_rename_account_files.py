@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from mindroom.agent_rename import account_files
-from mindroom.agent_rename.account_files import account_file_steps, rewrite_worker_key
+from mindroom.agent_rename.account_files import _rewrite_worker_key, account_file_steps
 from mindroom.agent_rename.steps import (
     DropPath,
     FinalAction,
@@ -198,14 +198,14 @@ class _FakeLease:
 
 def test_rewrite_worker_key_rewrites_both_requester_scopes() -> None:
     """Both requester scopes get the new requester; other users and requester-less scopes keep their keys."""
-    rewrite = partial(rewrite_worker_key, old_user_id=OLD, new_user_id=NEW)
+    rewrite = partial(_rewrite_worker_key, old_user_id=OLD, new_user_id=NEW)
 
     assert rewrite("v1:default:user:~@old:x") == "v1:default:user:~@new:x"
     assert rewrite("v1:acme:user_agent:~@old:x:code") == "v1:acme:user_agent:~@new:x:code"
     for scope in ("user", "user_agent"):
         assert rewrite(_key(scope, OLD)) == _key(scope, NEW)
     # The requester goes through the same encoder as live keys, so characters it escapes are escaped.
-    assert rewrite_worker_key("v1:default:user:~@old:x", old_user_id=OLD, new_user_id="@n=1:x") == (
+    assert _rewrite_worker_key("v1:default:user:~@old:x", old_user_id=OLD, new_user_id="@n=1:x") == (
         "v1:default:user:~@n%3D1:x"
     )
     # A different user whose ID merely starts with the old one keeps its keys.
@@ -218,7 +218,7 @@ def test_rewrite_worker_key_rewrites_both_requester_scopes() -> None:
 
 def test_rewrite_worker_key_keeps_the_legacy_unprefixed_requester() -> None:
     """OAuth stores from before the `~` requester prefix keep that spelling, which MindRoom still accepts."""
-    rewrite = partial(rewrite_worker_key, old_user_id=OLD, new_user_id=NEW)
+    rewrite = partial(_rewrite_worker_key, old_user_id=OLD, new_user_id=NEW)
 
     assert rewrite("v1:default:user:@old:x") == "v1:default:user:@new:x"
     assert rewrite("v1:default:user_agent:@old:x:code") == "v1:default:user_agent:@new:x:code"

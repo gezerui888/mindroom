@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
 BACKUPS_DIRECTORY_NAME = "agent-rename-backups"
-MANIFEST_NAME = "manifest.json"
+_MANIFEST_NAME = "manifest.json"
 _PRIVATE_DIRECTORY_MODE = 0o700
 
 
@@ -107,7 +107,7 @@ class MovePath:
         """Move ``source`` to ``destination``; a move stores no backup."""
         _move(self.source, self.destination)
 
-    def undo(self, backup: Path) -> None:  # noqa: ARG002
+    def _undo(self, backup: Path) -> None:  # noqa: ARG002
         """Move ``destination`` back to ``source``."""
         _move(self.destination, self.source)
 
@@ -136,7 +136,7 @@ class SqliteEdit:
             self.edit(source)
             source.execute("COMMIT")
 
-    def undo(self, backup: Path) -> None:
+    def _undo(self, backup: Path) -> None:
         """Copy the backup over the database and drop its stale WAL and shared-memory files."""
         for suffix in ("-wal", "-shm"):
             Path(f"{self.database}{suffix}").unlink(missing_ok=True)
@@ -159,7 +159,7 @@ class FileRewrite:
         rewritten = self.rewrite(self.path.read_bytes())
         _write_atomic(self.path, rewritten, mode=self.path.stat().st_mode & 0o777)
 
-    def undo(self, backup: Path) -> None:
+    def _undo(self, backup: Path) -> None:
         """Atomically restore the copy from ``backup``."""
         _restore_copy(backup / self.path.name, self.path)
 
@@ -177,7 +177,7 @@ class DropPath:
         _make_private_directory(backup)
         _move(self.path, backup / self.path.name)
 
-    def undo(self, backup: Path) -> None:
+    def _undo(self, backup: Path) -> None:
         """Move the path back out of ``backup``."""
         _move(backup / self.path.name, self.path)
 
@@ -194,7 +194,7 @@ class FinalAction:
         """Run the action."""
         self.action()
 
-    def undo(self, backup: Path) -> None:
+    def _undo(self, backup: Path) -> None:
         """Do nothing: final actions are never undone."""
 
 
@@ -246,7 +246,7 @@ def _write_manifest(plan: RenamePlan, *, kind: str, now: datetime, backup_dir: P
         "created_at": now.isoformat(),
         "steps": [_manifest_entry(step, _step_backup(backup_dir, index)) for index, step in enumerate(plan.steps)],
     }
-    _write_atomic(backup_dir / MANIFEST_NAME, json.dumps(manifest, indent=2).encode(), mode=0o600)
+    _write_atomic(backup_dir / _MANIFEST_NAME, json.dumps(manifest, indent=2).encode(), mode=0o600)
 
 
 def _step_backup(backup_dir: Path, index: int) -> Path:
@@ -263,9 +263,9 @@ def _undo_completed(
     """Undo completed steps in reverse order, stopping at the first undo that fails."""
     for index, step in reversed(completed):
         try:
-            step.undo(_step_backup(backup_dir, index))
+            step._undo(_step_backup(backup_dir, index))
         except Exception as undo_failure:
-            manifest = backup_dir / MANIFEST_NAME
+            manifest = backup_dir / _MANIFEST_NAME
             msg = (
                 f"{failed.description} failed ({failure}), and undoing {step.description} failed ({undo_failure}). "
                 f"Restore the remaining steps by hand from {backup_dir} (manifest: {manifest})."

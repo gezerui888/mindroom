@@ -6762,6 +6762,7 @@ expose = [
     "visible_workspace_roots",
     "written_by_other_workers",
     "worker_dir_name",
+    "worker_key_agent_name",
     "worker_log_id",
     "worker_root_path",
     "worker_scope_allows_shared_only_integrations",
@@ -9341,9 +9342,25 @@ visibility = [
 [[modules]]
 path = "mindroom.agent_rename.account_files"
 depends_on = [
+    "mindroom.agent_rename.workers",
     "mindroom.constants",
     "mindroom.desktop.native_config",
     "mindroom.matrix.client_session",
     "mindroom.private_storage.private_instance_identity_store",
     "mindroom.tool_system.worker_routing",
 ]
+
+# Moves the worker roots whose worker keys a rename changes; shared by account and agent renames.
+[[modules]]
+path = "mindroom.agent_rename.workers"
+depends_on = ["mindroom.tool_system.worker_routing"]
+
+# Moves the files keyed by an agent's config name when the agent is renamed.
+[[modules]]
+path = "mindroom.agent_rename.entity_files"
+depends_on = ["mindroom.agent_rename.workers", "mindroom.tool_system.worker_routing"]
+
+# The providers `mindroom agents rename` plans with.
+[[interfaces]]
+expose = ["entity_credential_steps", "rewrite_worker_key_agent"]
+from = ["mindroom.agent_rename.entity_files"]

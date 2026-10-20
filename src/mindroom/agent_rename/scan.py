@@ -73,7 +73,7 @@ def scan_leftovers(
     A path is expected when it equals one of ``expected`` or lies inside one; absolute paths under the storage root
     and paths relative to it both work. Journal cells are never expected.
     Symlinks are not followed, and files that cannot be read or are too large are named instead of silently passed,
-    and so are JSON and YAML files that do not parse when a name is looked for.
+    and so are JSON and YAML files that do not parse although their text holds a name.
     """
     wanted = _Needles(tuple(needle for needle in needles if needle), tuple(name for name in names if name))
     found = _scan_files(storage_root, wanted)
@@ -104,6 +104,10 @@ class _Needles:
         """Whether the whole of ``text`` is a spelling of any name."""
         return any(_names_agent(text, name) for name in self.names)
 
+    def may_hold_name(self, text: str) -> bool:
+        """Whether ``text`` holds a part that every spelling of some name contains, so a value in it can be one."""
+        return any(part in text for name in self.names for part in _spelling_parts(name))
+
 
 @cache
 def _spellings(name: str) -> re.Pattern[str]:
@@ -127,6 +131,17 @@ def _spellings(name: str) -> re.Pattern[str]:
         """,
         re.VERBOSE | re.DOTALL,
     )
+
+
+@cache
+def _spelling_parts(name: str) -> tuple[str, ...]:
+    """Return texts of which each spelling of ``name`` contains at least one.
+
+    Every spelling holds the name itself, except the OAuth directory, which trims ``_`` from the ends of the name and
+    cuts it to 80 characters.
+    MindRoom writes names into JSON and YAML unescaped, since agent names hold only letters, digits and ``_``.
+    """
+    return (name, scoped_credentials_dir_part(name))
 
 
 def _names_agent(text: str, name: str) -> bool:
@@ -194,7 +209,9 @@ def _scan_data_file(path: Path, relative: Path, needles: _Needles) -> str | None
         return f"{relative.as_posix()}: cannot read ({error.strerror})"
     if needles.named_in(text):
         return relative.as_posix()
-    if not needles.names:
+    # Only a file whose text holds a name is parsed, so data files that never name the agent, such as a workspace's
+    # tsconfig.json with comments, are not listed as unscanned.
+    if not needles.may_hold_name(text):
         return None
     try:
         document = _parse(text, path.suffix.lower())

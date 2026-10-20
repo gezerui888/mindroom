@@ -522,9 +522,33 @@ def test_files_that_cannot_be_read_as_data_are_named(tmp_path: Path) -> None:
     assert scan_leftovers(tmp_path, needles=NEEDLES, expected=frozenset()).unexpected == ()
 
 
+def test_files_without_the_name_are_not_parsed(tmp_path: Path) -> None:
+    """A JSON or YAML file whose text never holds the name cannot name the agent, so it is passed without a line.
+
+    Workspaces hold such files that no JSON or YAML parser reads, like a tsconfig with comments or a Helm template.
+    """
+    _write(tmp_path, "agents/other/workspace/tsconfig.json", '{\n  // compiler options\n  "strict": true,\n}\n')
+    _write(tmp_path, "agents/other/workspace/chart/templates/deploy.yaml", "{{- if .Values.enabled }}\nkind: x\n")
+    _write(tmp_path, "agents/other/workspace/data.json", '{"agent": "helper"')
+
+    assert _scan_names(tmp_path) == _LeftoverReport(unexpected=(), expected=())
+
+
+def test_files_naming_the_agent_only_through_its_oauth_directory_are_parsed(tmp_path: Path) -> None:
+    """The OAuth directory of a name that starts with ``_`` drops the ``_``; such a file is still checked."""
+    name = "_code"
+    _write(tmp_path, "records/broken.json", f'{{"directory": "{scoped_credentials_dir_part(name)}"')
+    _write(tmp_path, "records/fine.json", json.dumps({"directory": scoped_credentials_dir_part(name)}))
+
+    assert _scan_names(tmp_path, names=(name,)).unexpected == (
+        "records/broken.json: not scanned for names, it is not valid JSON or YAML",
+        "records/fine.json",
+    )
+
+
 def test_deeply_nested_json_is_named_not_crashed_on(tmp_path: Path) -> None:
     """A document nested deeper than the JSON parser allows is listed like any other file that cannot be checked."""
-    _write(tmp_path, "records/deep.json", "[" * 100_000 + "]" * 100_000)
+    _write(tmp_path, "records/deep.json", "[" * 100_000 + '"code"' + "]" * 100_000)
 
     assert _scan_names(tmp_path).unexpected == (
         "records/deep.json: not scanned for names, it is not valid JSON or YAML",

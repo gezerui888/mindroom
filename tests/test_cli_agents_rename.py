@@ -425,9 +425,15 @@ def test_files_the_scan_cannot_parse_are_listed_without_failing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A JSON file that does not parse cannot be checked for the name; it is listed, and the rename still succeeds."""
+    """A JSON file that holds the name but does not parse is listed, and the rename still succeeds.
+
+    Data files in the moved workspace whose text never holds the name are not parsed, so they add no line.
+    """
     runtime_paths = _install(tmp_path, monkeypatch)
-    (tracking_dir(runtime_paths) / "broken.json").write_text("{not json", encoding="utf-8")
+    (tracking_dir(runtime_paths) / "broken.json").write_text(f'{{"agent": "{OLD}"', encoding="utf-8")
+    workspace = agent_state_root_path(runtime_paths.storage_root, OLD) / "workspace"
+    (workspace / "tsconfig.json").write_text('{\n  // compiler options\n  "strict": true,\n}\n', encoding="utf-8")
+    (workspace / "deploy.yaml").write_text("{{- if .Values.enabled }}\nkind: x\n", encoding="utf-8")
 
     result = _invoke(runtime_paths, "--apply", "--yes")
 

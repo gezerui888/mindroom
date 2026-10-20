@@ -15,29 +15,40 @@ import os
 import sqlite3
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import yaml
 
 from mindroom import yaml_io
 from mindroom.agent_rename.entity_files import rewrite_worker_key_agent
-from mindroom.agent_rename.sqlite_read import read_only_connection
+from mindroom.agent_rename.sqlite_read import quote_identifier, read_only_connection
 from mindroom.agent_rename.steps import DropPath, FileRewrite, RenameRefusedError, SqliteEdit
 from mindroom.agent_rename.workers import move_steps
 from mindroom.automations.threads import automations_tracking_root
-from mindroom.constants import primary_records_dir, tracking_dir, workspace_avatar_path
+from mindroom.constants import (
+    config_relative_path,
+    primary_records_dir,
+    resolve_session_state_root,
+    tracking_dir,
+    workspace_avatar_path,
+)
 from mindroom.custom_tools.todo_state import state_root as todo_state_root
+from mindroom.delegation.state import DELEGATION_STATE_KEY
 from mindroom.dynamic_workflows.store import owner_dir_name
+from mindroom.history.session_context import TEAM_STATE_ROOT_DIRNAME
 from mindroom.script_runs.models import ScriptRunState
 from mindroom.tool_system.worker_routing import (
     SHARED_DIRECTORIES_DIRNAME,
     agent_state_root_path,
     agent_workspace_root_path,
+    private_instances_root_path,
+    private_root_name,
+    resolve_agent_state_storage_path,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from pathlib import Path
+    from collections.abc import Callable, Iterator
 
     from mindroom.agent_rename.steps import Step
     from mindroom.config.main import Config
@@ -52,6 +63,12 @@ _DELEGATION_EXPORTS = (".mindroom/delegations/*/*/run.json", ".mindroom/delegati
 # dynamic_workflows/store.py keeps workflows in dynamic_workflows/<scope>/<owner dir>/<workflow id>/.
 _WORKFLOWS_DIRNAME = "dynamic_workflows"
 _AGENT_WORKFLOW_SCOPE = "agent"
+# report_publishing/store.py's _public_report_path: each public link's record names its artifact's storage path.
+_PUBLIC_REPORTS = ("report_publishing", "public_reports", "pub_*.json")
+# Agno's statuses of a run that has not finished (agno/run/base.py's RunStatus).
+_UNFINISHED_RUN_STATUSES = ("PENDING", "RUNNING", "PAUSED")
+# A state root keeps its session database in sessions/<name>.db (session_storage/agent_storage.py's subdir).
+_SESSION_DATABASES = "sessions/*.db"
 # The run states of a background script that has not finished (script_runs/store.py's _TERMINAL_RUN_STATES).
 _UNFINISHED_SCRIPT_STATES = (ScriptRunState.STARTING.value, ScriptRunState.RUNNING.value)
 
@@ -93,9 +110,10 @@ def _json_codec(
 # Written like durable_write.py's write_json_file_durable with its defaults.
 _JSON = _json_codec()
 # Written like write_json_file_durable(indent=2, sort_keys=True): override records, ledgers and trigger records.
-_JSON_RECORDS = _json_codec(indent=2, sort_keys=True)
-# Written like custom_tools/todo_state.py's locked_update_json and dynamic workflow runs.
-_JSON_LINES = _json_codec(indent=2, sort_keys=True, newline=True)
+_JSON_INDENTED = _json_codec(indent=2, sort_keys=True)
+# The same with a trailing newline, like custom_tools/todo_state.py's locked_update_json, dynamic workflow runs
+# and public report records.
+_JSON_INDENTED_NEWLINE = _json_codec(indent=2, sort_keys=True, newline=True)
 # Written like delegation/records.py's _json_bytes.
 _JSON_EXPORT = _json_codec(sort_keys=True, compact=True, newline=True)
 # Written like oauth/state.py's _save_state_store.
@@ -297,23 +315,35 @@ def _workflow_revision(revision: object, *, rename: _NameRename) -> object:
     return {**record, "participants": [_with_names(participant, rename, ("agent",)) for participant in participants]}
 
 
+def _moved_artifact_path(path: object, *, old_dir: str, new_dir: str) -> object:
+    """Return a storage-relative artifact path below the old workflow owner directory as one below the new."""
+    # Artifact paths are relative to the storage root (dynamic_workflows/store.py's _relative_artifact_path).
+    old_prefix, new_prefix = (
+        f"{_WORKFLOWS_DIRNAME}/{_AGENT_WORKFLOW_SCOPE}/{directory}/" for directory in (old_dir, new_dir)
+    )
+    if isinstance(path, str) and path.startswith(old_prefix):
+        return new_prefix + path.removeprefix(old_prefix)
+    return path
+
+
+def _published_report(report: object, *, old_dir: str, new_dir: str) -> object:
+    """Point a public report record at its workflow artifact in the moved owner directory."""
+    record = _object(report)
+    if record is None or "artifact_path" not in record:
+        return report
+    return {**record, "artifact_path": _moved_artifact_path(record["artifact_path"], old_dir=old_dir, new_dir=new_dir)}
+
+
 def _workflow_run(run: object, *, rename: _NameRename, old_dir: str, new_dir: str) -> object:
     """Rename the agent as owner of a workflow run, and the owner directory in its artifact paths and report URL."""
     record = _object(_with_names(run, rename, ("owner_id",)))
     if record is None:
         return run
     renamed = dict(record)
-    # Artifact paths are relative to the storage root (dynamic_workflows/store.py's _relative_artifact_path).
-    old_prefix, new_prefix = (
-        f"{_WORKFLOWS_DIRNAME}/{_AGENT_WORKFLOW_SCOPE}/{directory}/" for directory in (old_dir, new_dir)
-    )
     artifacts = _object(record.get("artifacts"))
     if artifacts is not None:
         renamed["artifacts"] = {
-            name: new_prefix + path.removeprefix(old_prefix)
-            if isinstance(path, str) and path.startswith(old_prefix)
-            else path
-            for name, path in artifacts.items()
+            name: _moved_artifact_path(path, old_dir=old_dir, new_dir=new_dir) for name, path in artifacts.items()
         }
     # Built like dynamic_workflows/store.py's _private_report_url.
     report_url = record.get("report_url")
@@ -451,7 +481,8 @@ def entity_file_steps(
     ``shared_directories/<OLD>``. Then the JSON and YAML records naming the agent are rewritten at their final place,
     field by field; files inside the agent's state root are addressed below ``agents/<NEW>/``, which moves first.
     Then the SQLite stores are edited, and the records bound to the old name's storage are dropped.
-    ``config`` names the agents whose workspaces may hold delegation exports naming the agent.
+    ``config`` names the agents whose workspaces may hold delegation exports naming the agent, and its string
+    values are checked for paths into the agent's shared directories.
     Refuses when a destination already exists or a record already names the new agent where the old would go.
     """
     rename = _NameRename(old_name, new_name)
@@ -483,7 +514,15 @@ def entity_file_steps(
         *_gateway_selection_steps(storage, rename),
         *_drop_steps(runtime_paths, rename),
     ]
-    return steps, [*workflow_reports, *script_reports, *_call_reports(storage, rename)]
+    reports = [
+        *workflow_reports,
+        *script_reports,
+        *_call_reports(storage, rename),
+        *_unfinished_delegation_reports(runtime_paths, rename),
+        *_shared_directory_config_reports(runtime_paths, config, rename),
+        *_private_delegation_export_reports(runtime_paths, config, rename),
+    ]
+    return steps, reports
 
 
 def _call_reports(storage_root: Path, rename: _NameRename) -> list[str]:
@@ -496,6 +535,179 @@ def _call_reports(storage_root: Path, rename: _NameRename) -> list[str]:
     ]
 
 
+def _holds_name(value: object, name: str) -> bool:
+    """Whether ``value`` holds ``name`` as a string, or as a key, anywhere inside it."""
+    if isinstance(value, str):
+        return value == name
+    if isinstance(value, dict):
+        return any(key == name or _holds_name(item, name) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_holds_name(item, name) for item in value)
+    return False
+
+
+def _delegation_states(value: object) -> Iterator[object]:
+    """Yield every delegation state saved in a run, its member runs included (delegation/state.py's DelegationState)."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key == DELEGATION_STATE_KEY:
+                yield item
+            else:
+                yield from _delegation_states(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _delegation_states(item)
+
+
+def _saved_delegation_names(run_data: object, name: str) -> bool:
+    """Whether a run's saved JSON holds a delegation state naming ``name``; older releases encoded it twice."""
+    try:
+        run = json.loads(run_data) if isinstance(run_data, str) else None
+        if isinstance(run, str):
+            run = json.loads(run)
+    except (RecursionError, ValueError):
+        return False
+    return any(_holds_name(state, name) for state in _delegation_states(run))
+
+
+def _unfinished_delegation_sessions(database: Path, name: str) -> list[str]:
+    """Return the session of each unfinished run in a session database whose saved delegation state names ``name``."""
+    sessions: list[str] = []
+    with read_only_connection(database) as connection:
+        tables = [table for (table,) in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+        for table in tables:
+            columns = {column for (column,) in connection.execute("SELECT name FROM pragma_table_info(?)", (table,))}
+            if not table.endswith("_runs") or not {"session_id", "status", "run_data"} <= columns:
+                continue
+            rows = connection.execute(
+                f"SELECT session_id, run_data FROM {quote_identifier(table)} "  # noqa: S608
+                "WHERE status IN (?, ?, ?) AND instr(run_data, ?) > 0",
+                (*_UNFINISHED_RUN_STATUSES, name),
+            ).fetchall()
+            sessions += [str(session_id) for session_id, run_data in rows if _saved_delegation_names(run_data, name)]
+    return sessions
+
+
+def _session_databases(runtime_paths: RuntimePaths, name: str) -> list[Path]:
+    """Return the session databases of every agent, team scope and private instance."""
+    storage = runtime_paths.storage_root
+    roots = (
+        # agents/<agent>, teams/<store> (history/session_context.py) and private_instances/<scope>/<agent>.
+        (agent_state_root_path(storage, name).parent, "*"),
+        (storage / TEAM_STATE_ROOT_DIRNAME, "*"),
+        (private_instances_root_path(storage), "*/*"),
+    )
+    return sorted(
+        database
+        for root, state_roots in roots
+        for database in resolve_session_state_root(root, runtime_paths).glob(f"{state_roots}/{_SESSION_DATABASES}")
+    )
+
+
+def _unfinished_delegation_reports(runtime_paths: RuntimePaths, rename: _NameRename) -> list[str]:
+    """Report saved delegations that have not finished and name the agent, which the rename leaves as they are.
+
+    A parent run keeps its children, their storage bindings and record locators in its metadata; they name the
+    agent as caller or child, so such a delegation cannot resume after the rename. Finished ones stay as history.
+    """
+    sessions: list[str] = []
+    unreadable: list[str] = []
+    for database in _session_databases(runtime_paths, rename.old):
+        try:
+            sessions += _unfinished_delegation_sessions(database, rename.old)
+        except sqlite3.Error as exc:
+            unreadable.append(f"{database} ({exc})")
+    reports = []
+    if sessions:
+        reports.append(
+            f"{len(sessions)} unfinished delegations name agent {rename.old} in their saved runs, which the rename "
+            f"leaves as they are, so they cannot resume under {rename.new}; ask again in sessions "
+            f"{', '.join(sorted(set(sessions)))}.",
+        )
+    if unreadable:
+        reports.append(
+            f"These session databases could not be read to look for unfinished delegations: {', '.join(unreadable)}.",
+        )
+    return reports
+
+
+def _config_strings(value: object, place: str = "") -> Iterator[tuple[str, str]]:
+    """Yield each string value inside a config dump with its dotted place."""
+    if isinstance(value, str):
+        yield place, value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield from _config_strings(item, f"{place}.{key}" if place else str(key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _config_strings(item, f"{place}[{index}]")
+
+
+def _points_inside(value: str, directory: Path, runtime_paths: RuntimePaths) -> bool:
+    """Whether a config value, read as MindRoom reads configured paths, names ``directory`` or a path inside it."""
+    if value.splitlines() != [value]:
+        return False
+    try:
+        path = config_relative_path(value, runtime_paths)
+    except (RuntimeError, ValueError):
+        return False
+    return Path(os.path.normpath(path)).is_relative_to(os.path.normpath(directory))
+
+
+def _shared_directory_config_reports(runtime_paths: RuntimePaths, config: Config, rename: _NameRename) -> list[str]:
+    """Report config values pointing inside the agent's shared directories, which the config edit does not change."""
+    owned = runtime_paths.storage_root / SHARED_DIRECTORIES_DIRNAME / rename.old
+    if not os.path.lexists(owned):
+        return []
+    places = [
+        f"{place} ({value})"
+        for place, value in _config_strings(config.model_dump(mode="json", exclude_unset=True))
+        if _points_inside(value, owned, runtime_paths)
+    ]
+    if not places:
+        return []
+    new_owned = runtime_paths.storage_root / SHARED_DIRECTORIES_DIRNAME / rename.new
+    return [
+        f"These config values point inside {owned}, which moves to {new_owned}; "
+        f"the config edit does not change them: {', '.join(places)}.",
+    ]
+
+
+def _private_delegation_export_reports(runtime_paths: RuntimePaths, config: Config, rename: _NameRename) -> list[str]:
+    """Report delegation exports in private agents' workspaces that name the agent; they are not rewritten."""
+    scopes = private_instances_root_path(runtime_paths.storage_root)
+    if not scopes.is_dir():
+        return []
+    exports: list[Path] = []
+    for name, agent in config.agents.items():
+        if agent.private is None:
+            continue
+        for scope in sorted(scopes.iterdir()):
+            # A private workspace sits at <scope>/<agent>/<private root> (tool_system/worker_routing.py).
+            workspace = scope / name / private_root_name(name, agent.private.root)
+            for export in sorted(path for pattern in _DELEGATION_EXPORTS for path in workspace.glob(pattern)):
+                record = _read_json(export)
+                if _delegation_names(record, rename=rename) != record:
+                    exports.append(export)
+    if not exports:
+        return []
+    return [
+        f"These delegation exports in private workspaces keep naming agent {rename.old}, as MindRoom never rewrites "
+        f"a settled record's exports: {', '.join(str(export) for export in exports)}.",
+    ]
+
+
+def _flush_scope_key(runtime_paths: RuntimePaths, name: str) -> str:
+    """Return the key memory auto-flush progress keeps a shared agent's conversations under.
+
+    Computed like memory/auto_flush.py's _flush_scopes: the state root runtime_resolution.py's resolve_agent_storage
+    resolves for a shared agent, relative to the resolved storage root.
+    """
+    storage_root = runtime_paths.storage_root.expanduser().resolve()
+    state_root = resolve_agent_state_storage_path(agent_name=name, base_storage_path=runtime_paths.storage_root)
+    return state_root.resolve().relative_to(storage_root).as_posix()
+
+
 def _tracking_steps(runtime_paths: RuntimePaths, rename: _NameRename, moves: _Moves) -> list[Step]:
     """Rewrite the records below ``tracking/`` that name the agent."""
     tracking = tracking_dir(runtime_paths)
@@ -504,7 +716,7 @@ def _tracking_steps(runtime_paths: RuntimePaths, rename: _NameRename, moves: _Mo
     steps = _rewrite_steps(
         modes,
         moves.after(modes),
-        _JSON_RECORDS,
+        _JSON_INDENTED,
         partial(_agent_modes, rename=rename, where=str(modes)),
         f"{label} the conversation modes {moves.after(modes)}",
     )
@@ -517,15 +729,15 @@ def _tracking_steps(runtime_paths: RuntimePaths, rename: _NameRename, moves: _Mo
             partial(_delegation_state, rename=rename),
             f"{label} the delegation record {moves.after(state)}",
         )
-    # memory/auto_flush.py keys each scope by its state root relative to the storage root.
-    old_scope, new_scope = (
-        _records_dir(runtime_paths, name).relative_to(tracking).as_posix() for name in (rename.old, rename.new)
+    auto_flush = partial(
+        _auto_flush,
+        old_scope=_flush_scope_key(runtime_paths, rename.old),
+        new_scope=_flush_scope_key(runtime_paths, rename.new),
     )
-    auto_flush = partial(_auto_flush, old_scope=old_scope, new_scope=new_scope)
     for filename, codec, transform, what in (
-        ("thread_models.json", _JSON_RECORDS, _thread_models, "the thread model choices"),
+        ("thread_models.json", _JSON_INDENTED, _thread_models, "the thread model choices"),
         ("memory_auto_flush.json", _JSON, auto_flush, "the memory auto-flush progress"),
-        ("shared_directories.json", _JSON_RECORDS, _shared_directories, "the shared directory records"),
+        ("shared_directories.json", _JSON_INDENTED, _shared_directories, "the shared directory records"),
     ):
         path = tracking / filename
         bound = partial(transform, rename=rename, where=str(path))
@@ -568,13 +780,19 @@ def _todo_steps(runtime_paths: RuntimePaths, rename: _NameRename) -> list[Step]:
     steps: list[Step] = []
     # custom_tools/todo_state.py's todos_path: threads/<key>/todos.json.
     for todos in sorted(todo_root.glob("threads/*/todos.json")):
-        steps += _rewrite_steps(todos, todos, _JSON_LINES, partial(_todos, rename=rename), f"{label} the todos {todos}")
+        steps += _rewrite_steps(
+            todos,
+            todos,
+            _JSON_INDENTED_NEWLINE,
+            partial(_todos, rename=rename),
+            f"{label} the todos {todos}",
+        )
     # custom_tools/todo_poke.py's _POKE_STATE_FILENAME.
     pokes = todo_root / "poke_state.json"
     steps += _rewrite_steps(
         pokes,
         pokes,
-        _JSON_LINES,
+        _JSON_INDENTED_NEWLINE,
         partial(_poke_state, rename=rename, where=str(pokes)),
         f"{label} the todo poke history {pokes}",
     )
@@ -608,7 +826,7 @@ def _workflow_steps(storage_root: Path, rename: _NameRename, moves: _Moves) -> t
         steps += _rewrite_steps(
             run,
             moves.after(run),
-            _JSON_LINES,
+            _JSON_INDENTED_NEWLINE,
             partial(_workflow_run, rename=rename, old_dir=old_owner.name, new_dir=new_owner.name),
             f"{label} run {moves.after(run)}",
         )
@@ -617,6 +835,16 @@ def _workflow_steps(storage_root: Path, rename: _NameRename, moves: _Moves) -> t
             reports.append(
                 f"Report links of dynamic workflows of {rename.old} already sent, like {report_url}, stop working; "
                 f"the reports are now served below /reports/private/{_AGENT_WORKFLOW_SCOPE}/{new_owner.name}/.",
+            )
+    if os.path.lexists(old_owner):
+        *directories, pattern = _PUBLIC_REPORTS
+        for published in sorted(storage_root.joinpath(*directories).glob(pattern)):
+            steps += _rewrite_steps(
+                published,
+                published,
+                _JSON_INDENTED_NEWLINE,
+                partial(_published_report, old_dir=old_owner.name, new_dir=new_owner.name),
+                f"Point the public report {published} at the moved dynamic workflows of agent {rename.old}",
             )
     return steps, reports
 
@@ -630,7 +858,7 @@ def _external_trigger_steps(runtime_paths: RuntimePaths, rename: _NameRename) ->
     return _rewrite_steps(
         triggers,
         triggers,
-        _JSON_RECORDS,
+        _JSON_INDENTED,
         partial(_external_triggers, rename=rename),
         f"Rename agent {rename.old} to {rename.new} in the external triggers {triggers}",
     )

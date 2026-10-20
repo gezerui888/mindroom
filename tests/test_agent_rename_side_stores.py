@@ -11,6 +11,9 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
+from agno.run.agent import RunOutput
+from agno.run.base import RunStatus
+from agno.session.agent import AgentSession
 
 from mindroom.agent_modes import resolve_agent_mode, set_agent_mode
 from mindroom.agent_rename.entity_state import entity_state_steps
@@ -28,7 +31,8 @@ from mindroom.agent_rename.steps import (
     apply_plan,
 )
 from mindroom.automations.threads import automations_tracking_root
-from mindroom.config.agent import AgentConfig
+from mindroom.config.agent import AgentConfig, AgentPrivateConfig
+from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import resolve_avatar_path, tracking_dir, workspace_avatar_path
@@ -37,7 +41,7 @@ from mindroom.custom_tools.todo_poke import _parse_thread_snapshot, _poke_record
 from mindroom.custom_tools.todo_state import locked_update_json, read_json, state_root, todos_path
 from mindroom.delegation.records import DelegationMetadata, DelegationRecordOwner
 from mindroom.delegation.sessions import SubagentSessionError, load_subagent
-from mindroom.delegation.state import DelegationChild
+from mindroom.delegation.state import DELEGATION_STATE_KEY, DelegationChild, DelegationState
 from mindroom.delegation.storage import freeze_delegation_storage
 from mindroom.desktop.pairing import DesktopPairingError, claim_desktop_pairing, create_desktop_pairing
 from mindroom.durable_write import write_json_file_durable
@@ -57,8 +61,10 @@ from mindroom.mcp_gateway.types import GatewayOwner
 from mindroom.memory.auto_flush import _flush_scopes
 from mindroom.oauth.providers import OAuthProviderError
 from mindroom.oauth.state import issue_opaque_oauth_state, read_opaque_oauth_state
+from mindroom.report_publishing.store import PublishableReport, ReportPublishingStore
 from mindroom.script_runs.models import ScriptRunRecord, ScriptRunState, ScriptToolGrant
 from mindroom.script_runs.store import ScriptRunStore
+from mindroom.session_storage.agent_storage import create_state_storage
 from mindroom.shared_directories.store import (
     SharedDirectory,
     add_shared_directory_member,
@@ -73,7 +79,7 @@ from mindroom.tool_system.worker_routing import (
     serialize_tool_execution_identity,
 )
 from tests.agent_rename_helpers import SQLITE_SIDE_FILES, sqlite_rows, tree_snapshot
-from tests.conftest import test_runtime_paths
+from tests.conftest import seed_session, test_runtime_paths
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -152,6 +158,8 @@ class _Install:
     oauth_tokens: dict[str, str]
     # Subagent handles by (caller, child).
     subagents: dict[tuple[str, str], str]
+    # Public report slugs of each workflow owner's run report.
+    published: dict[str, str]
 
 
 def _poke_scope(agent: str, requester_id: str | None) -> _TodoPokeScope:
@@ -324,6 +332,7 @@ def _install(tmp_path: Path) -> _Install:  # noqa: PLR0915
     locked_update_json(todo_root / "poke_state.json", lambda data: data.update(scopes=scopes))
 
     store = DynamicWorkflowStore(storage)
+    published = {}
     for owner, participant in ((OLD, HELPER), (HELPER, OLD), (PREFIX, HELPER)):
         workflow_id = f"{owner.replace('_', '-')}-flow"
         store.create_workflow(
@@ -348,7 +357,15 @@ def _install(tmp_path: Path) -> _Install:  # noqa: PLR0915
             requested_by=ALICE,
             base_url="https://mindroom.example",
         )
-        store.fail_workflow_run(run, error="no input")
+        failed = store.fail_workflow_run(run, error="no input")
+        report = PublishableReport(
+            source_type="dynamic_workflow_run",
+            source={"workflow_id": workflow_id, "run_id": failed.run_id, "scope": "agent"},
+            artifact_path=store.run_report_html_artifact_path(failed),
+            title=store.run_report_title(failed),
+            requested_by=ALICE,
+        )
+        published[owner] = ReportPublishingStore(storage).publish_report(source=report, published_by=ALICE).slug
 
     triggers = {
         record.trigger_id: record.model_dump(mode="json")
@@ -421,7 +438,7 @@ def _install(tmp_path: Path) -> _Install:  # noqa: PLR0915
     )
 
     delegations = asyncio.run(_write_async_stores(runtime_paths, config))
-    return _Install(runtime_paths, delegations, pairing_tokens, oauth_tokens, subagents)
+    return _Install(runtime_paths, delegations, pairing_tokens, oauth_tokens, subagents, published)
 
 
 def _plan(runtime_paths: RuntimePaths, *, old: str = OLD, new: str = NEW) -> tuple[list[Step], list[str]]:
@@ -762,6 +779,146 @@ def test_side_records_for_the_old_name_are_dropped(tmp_path: Path) -> None:
     prefix_state = read_opaque_oauth_state(runtime_paths, kind="pending_oauth", token=install.oauth_tokens[PREFIX])
     assert prefix_state["agent_name"] == PREFIX
     assert list((storage / BACKUPS_DIRECTORY_NAME).rglob(f"{install.subagents[OLD, HELPER]}.json"))
+
+
+def test_published_workflow_reports_follow_the_agent(tmp_path: Path) -> None:
+    """Public links to the agent's workflow reports keep serving them from the moved workflow directory."""
+    install, _ = _renamed(tmp_path)
+    storage = install.runtime_paths.storage_root
+    publishing = ReportPublishingStore(storage)
+
+    report = publishing.get_public_report(install.published[OLD])
+    assert report.artifact_path.startswith(f"dynamic_workflows/agent/{NEW}/code-flow/artifacts/")
+    assert publishing.report_asset_path(report).is_file()
+    for owner in (HELPER, PREFIX):
+        other = publishing.get_public_report(install.published[owner])
+        assert other.artifact_path.startswith(f"dynamic_workflows/agent/{owner}/")
+        assert publishing.report_asset_path(other).is_file()
+
+
+def _paused_delegation(run_id: str, session_id: str, *, caller: str, child: str, status: RunStatus) -> RunOutput:
+    """Return a parent run whose saved delegation state, as the delegation driver persists it, waits on a child."""
+    config = _config(OLD)
+    child_record = DelegationChild(
+        delegation_id=f"delegation-{run_id}",
+        parent_tool_call_id="call",
+        caller_agent_name=caller,
+        child_agent_name=child,
+        task="Investigate",
+        session_id=f"child-{session_id}",
+        run_id=f"child-{run_id}",
+        model_name="default",
+        depth=1,
+        execution_identity=serialize_tool_execution_identity(_identity(child)),
+        storage_bindings=freeze_delegation_storage(config, [caller, child]),
+        status="paused",
+    )
+    state = DelegationState(children=[child_record], storage_bindings=freeze_delegation_storage(config, [caller]))
+    return RunOutput(
+        run_id=run_id,
+        agent_id=caller,
+        session_id=session_id,
+        user_id=ALICE,
+        status=status,
+        metadata={DELEGATION_STATE_KEY: state.to_dict()},
+    )
+
+
+def test_unfinished_delegations_naming_the_agent_are_reported(tmp_path: Path) -> None:
+    """Saved delegations that wait on the agent or that it waits on cannot resume, so they are reported."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    runs = {
+        OLD: [_paused_delegation("r1", "s-caller", caller=OLD, child=HELPER, status=RunStatus.paused)],
+        HELPER: [
+            _paused_delegation("r2", "s-child", caller=HELPER, child=OLD, status=RunStatus.paused),
+            _paused_delegation("r3", "s-child", caller=HELPER, child=OLD, status=RunStatus.paused),
+            _paused_delegation("r4", "s-done", caller=HELPER, child=OLD, status=RunStatus.completed),
+        ],
+        PREFIX: [_paused_delegation("r5", "s-prefix", caller=PREFIX, child=HELPER, status=RunStatus.paused)],
+    }
+    for agent, agent_runs in runs.items():
+        storage = create_state_storage(
+            agent,
+            agent_state_root_path(runtime_paths.storage_root, agent),
+            subdir="sessions",
+            session_table=f"{agent}_sessions",
+        )
+        for session_id in sorted({run.session_id for run in agent_runs}):
+            session_runs = [run for run in agent_runs if run.session_id == session_id]
+            seed_session(storage, AgentSession(session_id=session_id, agent_id=agent, user_id=ALICE, runs=session_runs))
+
+    broken = agent_state_root_path(runtime_paths.storage_root, "broken") / "sessions" / "broken.db"
+    broken.parent.mkdir(parents=True)
+    broken.write_bytes(b"not a database")
+
+    _, reports = entity_file_steps(runtime_paths, config=_config(OLD), old_name=OLD, new_name=NEW)
+
+    [report, unreadable] = [report for report in reports if "delegation" in report]
+    assert f"could not be read to look for unfinished delegations: {broken}" in unreadable
+    assert "3 unfinished delegations" in report
+    assert "s-caller, s-child" in report
+    assert "s-done" not in report
+    assert "s-prefix" not in report
+
+
+def test_config_paths_into_moved_shared_directories_are_reported(tmp_path: Path) -> None:
+    """Config values pointing inside the agent's shared directories are reported, as the config edit keeps them."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    create_shared_directory(runtime_paths, owner=OLD, name="notes")
+    create_shared_directory(runtime_paths, owner=PREFIX, name="drafts")
+    config = _config(OLD).model_copy(
+        update={
+            "knowledge_bases": {
+                "notes": KnowledgeBaseConfig(path="${MINDROOM_STORAGE_PATH}/shared_directories/code/notes"),
+                "drafts": KnowledgeBaseConfig(path="${MINDROOM_STORAGE_PATH}/shared_directories/code_team/drafts"),
+            },
+        },
+    )
+
+    _, reports = entity_file_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
+
+    [report] = [report for report in reports if "shared_directories" in report]
+    assert "knowledge_bases.notes.path" in report
+    assert "knowledge_bases.drafts.path" not in report
+
+
+def test_private_delegation_exports_naming_the_agent_are_reported(tmp_path: Path) -> None:
+    """Exports in a private child's workspace name the agent as caller; they stay and are reported."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    config = _config(OLD).model_copy(
+        update={
+            "agents": {
+                **_config(OLD).agents,
+                "secret": AgentConfig(
+                    display_name="Secret",
+                    private=AgentPrivateConfig(per="user", root="secret_data"),
+                ),
+            },
+        },
+    )
+    metadata = DelegationMetadata(
+        caller_agent_name=OLD,
+        child_agent_name="secret",
+        requester_id=ALICE,
+        parent_run_id="parent-run",
+        parent_tool_call_id="parent-call",
+        source_room_id=ROOM,
+        source_thread_id=THREAD,
+        model_name="test-model",
+        task="code asks secret",
+    )
+    owner = DelegationRecordOwner(config, runtime_paths)
+    handle = asyncio.run(
+        owner.start(metadata, caller_execution_identity=_identity(OLD), child_execution_identity=_identity("secret")),
+    )
+    export = handle.child_workspace / handle.scoped_path / "run.json"
+    assert export.is_file()
+
+    steps, reports = entity_file_steps(runtime_paths, config=config, old_name=OLD, new_name=NEW)
+
+    assert not [step for step in steps if isinstance(step, FileRewrite) and step.path == export]
+    [report] = [report for report in reports if "private" in report]
+    assert str(export) in report
 
 
 def test_prefix_agent_untouched(tmp_path: Path) -> None:

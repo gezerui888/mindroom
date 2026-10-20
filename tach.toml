@@ -7570,6 +7570,7 @@ depends_on = [
     "mindroom.tool_jobs.resources",
 ]
 visibility = [
+    "mindroom.agent_rename.side_stores",
     "mindroom.agent_rename.teams",
     "mindroom.delegation.execution",
     "mindroom.ai",
@@ -9376,7 +9377,9 @@ depends_on = [
     "mindroom.agent_rename.workers",
     "mindroom.automations.threads",
     "mindroom.constants",
+    "mindroom.delegation.state",
     "mindroom.dynamic_workflows",
+    "mindroom.history.session_context",
     "mindroom.tool_system.worker_routing",
 ]
 

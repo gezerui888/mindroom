@@ -200,6 +200,12 @@ The disk is back as it was, apart from the backup directory.
 If an undo fails as well, the command prints `Undo failed:` and exits 2.
 Do not start MindRoom.
 Restore the remaining steps by hand from the manifest it names, as described below, or restore your snapshot.
+Ctrl-C is ignored while the command undoes steps, because restoring a large journal takes a while.
+
+If the command itself is killed during `--apply`, for example by `kill -9`, an out-of-memory kill, or a power loss, nothing is undone.
+`matrix_state.yaml` is written after every other reversible step, so after a kill it still names the old ID and a rerun does not report `Already adopted`.
+Restore from the manifest as described below, or restore your snapshot, before you run the command again.
+Do not add `--discard-new-principal` to get past the refusal the rerun prints: it would delete the journal rows the killed run had already moved to the new principal.
 
 ## Restoring from `agent-rename-backups`
 

@@ -117,26 +117,24 @@ def account_file_steps(
 ) -> tuple[list[Step], list[str]]:
     """Return the steps that move ``agent``'s files from ``old_user_id`` to ``new_user_id``, and report lines.
 
-    Covers ``matrix_state.yaml``, the requester's OAuth directory, workers and private-instance scopes whose keys
-    name the old requester, personal-room records, and Matrix send intents of the old sender.
+    Covers the requester's OAuth directory, workers and private-instance scopes whose keys name the old requester,
+    personal-room records, and Matrix send intents of the old sender; ``matrix_state_steps`` covers the account.
     ``config`` is only used when a Docker worker is retired after apply.
-    Refuses when ``matrix_state.yaml`` holds no account for ``agent`` or a destination already exists.
+    Refuses when a destination already exists.
     MindRoom creates new-ID state when it runs after the server rename; with ``discard_new_identity_state``
     a destination holding no credentials is dropped into the backup before the move instead.
     """
     rename = _AccountRename(old_user_id, new_user_id, discard_new_identity_state)
     oauth_steps, requester_keys = _requester_oauth_steps(runtime_paths.storage_root, rename)
     worker_steps, worker_reports = _worker_steps(runtime_paths, config, rename, requester_keys=requester_keys)
-    matrix_state_steps, matrix_state_reports = _matrix_state_steps(runtime_paths, agent, rename)
     steps: list[Step] = [
-        *matrix_state_steps,
         *oauth_steps,
         *worker_steps,
         *_private_instance_steps(runtime_paths, rename),
         *_personal_room_steps(runtime_paths, agent, rename),
         *_message_send_intent_steps(runtime_paths, rename),
     ]
-    return steps, [*matrix_state_reports, *worker_reports, *_reports(runtime_paths, old_user_id)]
+    return steps, [*worker_reports, *_reports(runtime_paths, old_user_id)]
 
 
 def _move(source: Path, destination: Path, label: str, rename: _AccountRename) -> list[Step]:
@@ -206,14 +204,14 @@ def _field(value: object, name: str) -> object:
     return cast("dict[str, object]", value).get(name) if isinstance(value, dict) else None
 
 
-def _matrix_state_steps(
-    runtime_paths: RuntimePaths,
-    agent: str,
-    rename: _AccountRename,
-) -> tuple[list[Step], list[str]]:
-    """Point the stored account at the new localpart, unless its username was already changed by hand.
+def matrix_state_steps(runtime_paths: RuntimePaths, *, agent: str, new_user_id: str) -> tuple[list[Step], list[str]]:
+    """Return the step that points ``agent``'s stored account at ``new_user_id``, and report lines.
 
-    A hand-changed account already logged in as the new ID, so its device and token stay.
+    MindRoom takes the agent's Matrix ID from this username, so the step belongs last among the reversible ones:
+    a run killed before it still shows the old ID.
+    An account whose username was already changed by hand logged in as the new ID, so it gets no step
+    and keeps its device and token.
+    Refuses when ``matrix_state.yaml`` holds no account for ``agent``.
     """
     path = matrix_state_file(runtime_paths)
     account_key = managed_account_key(agent)
@@ -222,9 +220,9 @@ def _matrix_state_steps(
     if not isinstance(accounts, dict) or account_key not in accounts:
         msg = f"{path} holds no account {account_key}, so there is no Matrix account to adopt."
         raise RenameRefusedError(msg)
-    username = MatrixID.parse(rename.new_user_id).username
+    username = MatrixID.parse(new_user_id).username
     if _field(accounts[account_key], "username") == username:
-        return [], [f"{path} already names {rename.new_user_id} for {account_key}; its device and access token stay."]
+        return [], [f"{path} already names {new_user_id} for {account_key}; its device and access token stay."]
     step = FileRewrite(
         path,
         partial(_adopt_matrix_account, account_key=account_key, username=username),

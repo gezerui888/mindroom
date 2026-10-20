@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from mindroom.agent_rename import account_files
-from mindroom.agent_rename.account_files import _rewrite_worker_key, account_file_steps
+from mindroom.agent_rename.account_files import _rewrite_worker_key, account_file_steps, matrix_state_steps
 from mindroom.agent_rename.steps import (
     DropPath,
     FinalAction,
@@ -101,7 +101,8 @@ def _install(tmp_path: Path) -> RuntimePaths:
 
 
 def _steps(runtime_paths: RuntimePaths, *, discard: bool = False) -> tuple[list[Step], list[str]]:
-    return account_file_steps(
+    """Return the file steps, then the matrix_state.yaml step, in the order the CLI plans them."""
+    steps, reports = account_file_steps(
         runtime_paths,
         agent=AGENT,
         old_user_id=OLD,
@@ -109,6 +110,8 @@ def _steps(runtime_paths: RuntimePaths, *, discard: bool = False) -> tuple[list[
         config=Config(),
         discard_new_identity_state=discard,
     )
+    account_steps, account_reports = matrix_state_steps(runtime_paths, agent=AGENT, new_user_id=NEW)
+    return [*steps, *account_steps], [*account_reports, *reports]
 
 
 def _apply(runtime_paths: RuntimePaths, *, discard: bool = False) -> list[str]:

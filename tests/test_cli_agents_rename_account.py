@@ -287,6 +287,34 @@ def test_apply_adopts_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, s
     assert f"Leftover scan: nothing in {storage} names {OLD} any more." in result.output
 
 
+def test_matrix_state_is_the_last_reversible_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: _MatrixServer,
+) -> None:
+    """The new username marks a finished adoption, so it is written after every other reversible step.
+
+    A run killed before that step leaves the old username, so the rerun does not report the account adopted.
+    Final actions, which are never undone, still come after it.
+    """
+    runtime_paths = _install(tmp_path, monkeypatch)
+    monkeypatch.setenv("MINDROOM_WORKER_BACKEND", "docker")
+
+    result = _invoke(runtime_paths)
+
+    assert result.exit_code == 0, result.output
+    steps = [
+        line.removeprefix("  - ")
+        for line in result.output.splitlines()
+        if line.startswith("  - ") and not line.startswith("  - report: ")
+    ]
+    assert steps[0].startswith("Rewrite the event journal")
+    assert steps[-3] == f"Replace {OLD} with {NEW} in {runtime_paths.config_path}"
+    assert steps[-2].startswith(f"Set the username of agent_{AGENT}")
+    assert steps[-1].startswith("Retire the old Docker worker")
+    assert server.requests == []
+
+
 def test_refuses_while_runtime_lock_held(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

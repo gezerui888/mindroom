@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import signal
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta, timezone
@@ -302,6 +303,39 @@ def test_keyboard_interrupt_undoes_completed_steps(tmp_path: Path) -> None:
     restored = _without_backups(tree_snapshot(storage))
     restored.pop("journal.db")
     assert restored == original
+
+
+def test_interrupt_during_undo_is_an_undo_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ctrl-C is ignored while undoing, and an interrupt that still escapes an undo becomes ``RenameUndoError``.
+
+    Undoing the journal copies the whole database back, so an operator may press Ctrl-C again;
+    the command must then still name the manifest and say not to start MindRoom.
+    """
+    storage = _make_storage(tmp_path)
+    handlers_during_undo: list[object] = []
+
+    def interrupted_undo(self: MovePath, backup: Path) -> None:  # noqa: ARG001
+        handlers_during_undo.append(signal.getsignal(signal.SIGINT))
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(MovePath, "_undo", interrupted_undo)
+    plan = RenamePlan(
+        storage_root=storage,
+        steps=(
+            MovePath(storage / "agents" / "old", storage / "agents" / "new", "move agent dir"),
+            FileRewrite(storage / "accounts.json", _fail_rewrite, "rewrite accounts"),
+        ),
+        reports=(),
+    )
+    handler_before = signal.getsignal(signal.SIGINT)
+
+    with pytest.raises(RenameUndoError, match=r"undoing move agent dir failed \(KeyboardInterrupt\)") as caught:
+        apply_plan(plan, kind="rename-account", now=NOW)
+
+    assert caught.value.manifest == storage / BACKUPS / "20261019T214558Z-rename-account" / "manifest.json"
+    assert isinstance(caught.value.__cause__, KeyboardInterrupt)
+    assert handlers_during_undo == [signal.SIG_IGN]
+    assert signal.getsignal(signal.SIGINT) is handler_before
 
 
 def test_move_refuses_existing_destination(tmp_path: Path) -> None:

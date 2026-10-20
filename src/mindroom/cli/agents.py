@@ -399,10 +399,10 @@ def _plan(
     *,
     discard_new_principal: bool,
 ) -> RenamePlan:
-    from mindroom.agent_rename.account_files import account_file_steps  # noqa: PLC0415
+    from mindroom.agent_rename.account_files import account_file_steps, matrix_state_steps  # noqa: PLC0415
     from mindroom.agent_rename.config_edit import config_value_steps  # noqa: PLC0415
     from mindroom.agent_rename.journal import journal_account_steps  # noqa: PLC0415
-    from mindroom.agent_rename.steps import RenamePlan  # noqa: PLC0415
+    from mindroom.agent_rename.steps import FinalAction, RenamePlan  # noqa: PLC0415
     from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415
 
     old_user_id, new_user_id = adoption.old_user_id, adoption.new_user_id
@@ -422,10 +422,24 @@ def _plan(
         discard_new_identity_state=discard_new_principal,
     )
     config_steps = config_value_steps(runtime_paths.config_path, old_value=old_user_id, new_value=new_user_id)
+    account_steps, account_reports = matrix_state_steps(runtime_paths, agent=adoption.agent, new_user_id=new_user_id)
+    final_steps = [step for step in file_steps if isinstance(step, FinalAction)]
     # The journal edit goes first: some of its collisions only show up when it runs,
     # and a failing first step leaves nothing to undo.
-    steps = (*journal_steps, *file_steps, *config_steps)
-    return RenamePlan(storage_root=runtime_paths.storage_root, steps=steps, reports=tuple(reports))
+    # The username goes last among the reversible steps: it is what marks the account adopted,
+    # so a run killed before it never looks finished. Final actions always run after every reversible step.
+    steps = (
+        *journal_steps,
+        *(step for step in file_steps if not isinstance(step, FinalAction)),
+        *config_steps,
+        *account_steps,
+        *final_steps,
+    )
+    return RenamePlan(
+        storage_root=runtime_paths.storage_root,
+        steps=steps,
+        reports=(*account_reports, *reports),
+    )
 
 
 def _print_plan(plan: RenamePlan, adoption: _Adoption) -> None:

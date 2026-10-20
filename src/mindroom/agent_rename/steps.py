@@ -13,16 +13,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import tempfile
-from contextlib import closing, suppress
+import threading
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from datetime import datetime
 
 BACKUPS_DIRECTORY_NAME = "agent-rename-backups"
@@ -253,6 +255,28 @@ def _step_backup(backup_dir: Path, index: int) -> Path:
     return backup_dir / f"{index:03d}"
 
 
+@contextmanager
+def _sigint_ignored() -> Iterator[None]:
+    """Ignore Ctrl-C inside the block, then restore the previous handler.
+
+    Only the main thread may change signal handlers, so in any other thread this does nothing.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        yield
+    finally:
+        # None means the handler was not installed from Python; the default action is the closest restore.
+        signal.signal(signal.SIGINT, signal.SIG_DFL if previous is None else previous)
+
+
+def _describe_failure(failure: BaseException) -> str:
+    """Return the failure's message, or its type for exceptions without one, like ``KeyboardInterrupt``."""
+    return str(failure) or type(failure).__name__
+
+
 def _undo_completed(
     completed: list[tuple[int, Step]],
     *,
@@ -260,17 +284,24 @@ def _undo_completed(
     failed: Step,
     failure: BaseException,
 ) -> None:
-    """Undo completed steps in reverse order, stopping at the first undo that fails."""
-    for index, step in reversed(completed):
-        try:
-            step._undo(_step_backup(backup_dir, index))
-        except Exception as undo_failure:
-            manifest = backup_dir / _MANIFEST_NAME
-            msg = (
-                f"{failed.description} failed ({failure}), and undoing {step.description} failed ({undo_failure}). "
-                f"Restore the remaining steps by hand from {backup_dir} (manifest: {manifest})."
-            )
-            raise RenameUndoError(manifest, msg) from undo_failure
+    """Undo completed steps in reverse order, stopping at the first undo that fails.
+
+    Undoing the journal copies the whole database back, which can take long enough for a second Ctrl-C,
+    so Ctrl-C is ignored meanwhile. Any failure while undoing, an interrupt included, raises ``RenameUndoError``,
+    which tells the operator to restore by hand before starting MindRoom.
+    """
+    with _sigint_ignored():
+        for index, step in reversed(completed):
+            try:
+                step._undo(_step_backup(backup_dir, index))
+            except BaseException as undo_failure:
+                manifest = backup_dir / _MANIFEST_NAME
+                msg = (
+                    f"{failed.description} failed ({_describe_failure(failure)}), "
+                    f"and undoing {step.description} failed ({_describe_failure(undo_failure)}). "
+                    f"Restore the remaining steps by hand from {backup_dir} (manifest: {manifest})."
+                )
+                raise RenameUndoError(manifest, msg) from undo_failure
 
 
 def apply_plan(plan: RenamePlan, *, kind: str, now: datetime) -> ApplyResult:

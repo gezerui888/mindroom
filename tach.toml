@@ -4776,6 +4776,7 @@ depends_on = [
     # Mostly deferred imports, so `mindroom --help` does not load the rename engine.
     "mindroom.agent_rename.account_files",
     "mindroom.agent_rename.config_edit",
+    "mindroom.agent_rename.journal",
     "mindroom.cli.config",
     "mindroom.config.main",
     "mindroom.constants",
@@ -9434,8 +9435,17 @@ depends_on = [
 ]
 
 [[interfaces]]
-expose = ["team_steps"]
+expose = ["renamed_ad_hoc_scope_id", "team_steps"]
 from = ["mindroom.agent_rename.teams"]
+
+# Rewrites the event journal for both rename commands.
+[[modules]]
+path = "mindroom.agent_rename.journal"
+depends_on = ["mindroom.agent_rename.teams"]
+
+[[interfaces]]
+expose = ["journal_account_steps", "journal_entity_steps", "other_principal_user_ids"]
+from = ["mindroom.agent_rename.journal"]
 
 # Edits the config, its includes, and its `.env` as text for both rename commands.
 [[modules]]

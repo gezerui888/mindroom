@@ -62,7 +62,7 @@ def team_steps(runtime_paths: RuntimePaths, *, config: Config, old_name: str, ne
         scope_id = _stored_scope_id(store)
         if scope_id is None or scope_id in config.teams:
             continue
-        new_scope_id = _renamed_ad_hoc_scope_id(scope_id, store=store, old_name=old_name, new_name=new_name)
+        new_scope_id = renamed_ad_hoc_scope_id(scope_id, old_name=old_name, new_name=new_name, where=str(store))
         if new_scope_id is not None:
             steps += _ad_hoc_team_steps(teams_root, scope_id, new_scope_id, old_name=old_name, new_name=new_name)
     return steps
@@ -122,10 +122,11 @@ def _stored_scope_id(store: Path) -> str | None:
     )
 
 
-def _renamed_ad_hoc_scope_id(scope_id: str, *, store: Path, old_name: str, new_name: str) -> str | None:
+def renamed_ad_hoc_scope_id(scope_id: str, *, old_name: str, new_name: str, where: str) -> str | None:
     """Return the id the ad-hoc scope ``scope_id`` gets, or ``None`` when it has no member named ``old_name``.
 
-    Refuses when the scope already has ``new_name`` as a member, since renaming would merge the two.
+    Refuses when the scope already has ``new_name`` as a member, since renaming would merge the two;
+    ``where`` names the store holding the scope in that refusal.
     """
     if not scope_id.startswith(_AD_HOC_PREFIX):
         return None
@@ -135,7 +136,7 @@ def _renamed_ad_hoc_scope_id(scope_id: str, *, store: Path, old_name: str, new_n
     if old_name not in members:
         return None
     if new_name in members:
-        msg = f"Cannot rename the team history scope {scope_id} in {store}: {new_name} is already one of its members."
+        msg = f"Cannot rename the team history scope {scope_id} in {where}: {new_name} is already one of its members."
         raise RenameRefusedError(msg)
     # Without agent configs no member counts as private, so this is the id before the requester suffix.
     renamed = ad_hoc_team_scope_id([new_name if member == old_name else member for member in members], {})

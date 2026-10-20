@@ -428,3 +428,4 @@ entity_state_steps  # Planned by `mindroom agents rename`, whose command is not 
 matrix_state_key_step  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/entity_state.py)
 memory_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/memory.py)
 team_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/teams.py)
+journal_entity_steps  # Planned by `mindroom agents rename`, whose command is not added yet (src/mindroom/agent_rename/journal.py)

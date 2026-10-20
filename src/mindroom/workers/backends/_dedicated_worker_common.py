@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, cast
 
@@ -29,12 +30,12 @@ from mindroom.tool_system.worker_routing import (
     visible_workspace_roots,
     worker_key_agent_name,
     worker_log_id,
+    written_by_other_workers,
 )
 from mindroom.workers.backend import WorkerBackendError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-    from pathlib import Path
 
     from mindroom.agent_policy import ResolvedAgentPolicy
     from mindroom.tool_system.worker_routing import WorkerScope
@@ -454,13 +455,15 @@ def plan_skill_directory_mounts(
     worker_visible_shared_storage_root: Path,
     resolved_agent_policies: Mapping[str, ResolvedAgentPolicy],
     config_data: Mapping[str, object],
+    worker_roots: Path = Path("workers"),
 ) -> tuple[SharedDirectoryMount, ...]:
     """Return read-only mounts of the skill directories with scripts that the agents one dedicated worker serves list.
 
     Their scripts then run in the worker at their path below its storage mount. A skill
     directory outside the storage root cannot be mounted, and one below it is mounted
-    only when it is a real directory reached without links, because container
-    runtimes follow links in mount sources.
+    only when it is a real directory reached without links, outside every directory
+    other sandbox workers write, because container runtimes follow links in mount
+    sources each time they mount them.
     """
     # Skill loading is heavy, and the slim tool registry imports the worker backends.
     from mindroom.tool_system.skills import skill_directories_with_scripts  # noqa: PLC0415
@@ -481,6 +484,13 @@ def plan_skill_directory_mounts(
         if not directory.is_relative_to(storage_root):
             continue
         relative_path = directory.relative_to(storage_root)
+        if written_by_other_workers(relative_path, worker_roots):
+            logger.error(
+                "Refusing to mount a skill directory inside a directory other sandbox workers write",
+                worker=worker_log_id(worker_key),
+                directory=str(relative_path),
+            )
+            continue
         try:
             with open_directory_within_root(storage_root, relative_path):
                 pass

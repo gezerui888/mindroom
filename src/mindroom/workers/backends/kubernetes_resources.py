@@ -1863,6 +1863,7 @@ class KubernetesResourceManager:
                 worker_visible_shared_storage_root=worker_visible_storage_root,
                 resolved_agent_policies=self.resolved_agent_policies,
                 config_data=self.config_snapshot,
+                worker_roots=Path(self.config.storage_subpath_prefix),
             ),
         )
 

@@ -214,6 +214,7 @@ def test_workers_mount_the_scripted_skills_their_agents_list_read_only(tmp_path:
     """A worker sees each skill with scripts its agents list at the path below the storage mount, and nothing else."""
     runtime_paths = test_runtime_paths(tmp_path)
     bundle = runtime_paths.storage_root / "config-bundle" / "skills"
+    zeta = _skill(bundle, "zeta", script=True)
     audit = _skill(bundle, "audit", script=True)
     _skill(bundle, "guide", script=False)
     deploy = _skill(bundle, "deploy", script=True)
@@ -221,10 +222,12 @@ def test_workers_mount_the_scripted_skills_their_agents_list_read_only(tmp_path:
     elsewhere = tmp_path / "elsewhere"
     _skill(elsewhere, "lint", script=True)
     set_plugin_skill_roots([bundle, elsewhere])
-    skills_by_agent = {"alice": ["audit", "guide", "lint"], "bob": ["deploy"], "dave": []}
+    skills_by_agent = {"alice": ["zeta", "audit", "guide", "lint"], "bob": ["deploy"], "dave": []}
 
+    # Sorted, so the mount layout does not depend on directory listing order.
     assert _plan_skills(runtime_paths, resolve_unscoped_worker_key("alice"), skills_by_agent) == (
         SharedDirectoryMount(audit, _WORKER_ROOT / "config-bundle" / "skills" / "audit", read_only=True),
+        SharedDirectoryMount(zeta, _WORKER_ROOT / "config-bundle" / "skills" / "zeta", read_only=True),
     )
     assert _plan_skills(runtime_paths, resolve_unscoped_worker_key("bob"), skills_by_agent) == (
         SharedDirectoryMount(deploy, _WORKER_ROOT / "config-bundle" / "skills" / "deploy", read_only=True),
@@ -247,3 +250,20 @@ def test_a_skill_directory_reached_through_a_link_is_not_mounted(tmp_path: Path)
 
     assert mounts == ()
     assert [entry["directory"] for entry in logs if entry["log_level"] == "warning"] == ["config-bundle/skills/audit"]
+
+
+@pytest.mark.usefixtures("_restore_plugin_skill_roots")
+def test_a_skill_directory_other_workers_write_is_not_mounted(tmp_path: Path) -> None:
+    """A worker could swap a directory it writes for a link before a later mount, so such a skill is refused."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    shared = runtime_paths.storage_root / "shared_directories" / "team" / "skills"
+    _skill(shared, "audit", script=True)
+    set_plugin_skill_roots([shared])
+
+    with capture_logs() as logs:
+        mounts = _plan_skills(runtime_paths, resolve_unscoped_worker_key("alice"), {"alice": ["audit"]})
+
+    assert mounts == ()
+    assert [entry["directory"] for entry in logs if entry["log_level"] == "error"] == [
+        "shared_directories/team/skills/audit",
+    ]

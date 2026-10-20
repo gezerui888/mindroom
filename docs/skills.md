@@ -128,8 +128,8 @@ Agents see their available skills in the system prompt and load details with the
 With `execute=True` it returns the shell command that runs the script, with `args` and `timeout`, and the agent runs that command with its own `shell` tool, so the script runs where the agent's shell commands run, such as its worker, in its workspace, with the shell's environment, approval, tool hooks, and output limits.
 The script's `#!` line picks its interpreter, so a script needs no executable bit.
 An agent without the `shell` tool loaded can read skill scripts but gets no command for them.
-Dedicated Docker and Kubernetes workers mount the directory of each plugin or user skill with scripts that their agents list, read-only, at the path the command names, and bundled skills ship in the worker image.
-A skill directory outside the storage root cannot be mounted, and a `static_runner` runner sees no plugin or user skill directories, so there `get_skill_script` gives no command and the agent can still read the script.
+Dedicated Docker and Kubernetes workers mount the directory of each plugin or user skill with scripts that their agents list, read-only, at the path the command names.
+Bundled skills and skill directories outside the storage root cannot be mounted, and a `static_runner` runner sees no plugin or user skill directories, so for a shell there `get_skill_script` gives no command and the agent can still read the script.
 
 Added, removed, or edited `SKILL.md` files take effect on the agent's next request, within about a second.
 A workspace skill created during a turn becomes available on the next agent run, not in the same response.

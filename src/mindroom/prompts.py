@@ -134,7 +134,7 @@ Keep it simple: max 5 options with clear, concise labels.
 SKILLS_TOOL_USAGE_PROMPT = """When using skills, access them via the skill tools:
 - get_skill_instructions(...)
 - get_skill_reference(...)
-- get_skill_script(...)
+- get_skill_script(...), whose execute=true returns the shell command that runs a script, for you to run with your shell tool
 Do not open a global skill's SKILL.md directly with file tools; creating or editing your own workspace skills with file tools is fine.
 """
 

@@ -240,8 +240,8 @@ def _create_worker_agent(tmp_path: Path, skill: _Skill, backend_name: str) -> _S
     )
 
 
-async def _call(agent: Agent, function_name: str, arguments: dict[str, object]) -> str:
-    """Call one of the agent's functions the way a model's tool call runs it, prepared for the run with its hooks."""
+async def _function(agent: Agent, function_name: str) -> Function:
+    """Return one of the agent's functions as Agno prepares it for a run, with its hooks."""
     run_output = RunOutput(run_id="run", agent_id="general", agent_name="General", session_id=_SESSION_ID)
     run_context = RunContext(run_id="run", session_id=_SESSION_ID)
     session = AgentSession(session_id=_SESSION_ID, agent_id="general", created_at=1, updated_at=1)
@@ -253,6 +253,12 @@ async def _call(agent: Agent, function_name: str, arguments: dict[str, object]) 
         session=session,
     )
     [function] = [tool for tool in tools if isinstance(tool, Function) and tool.name == function_name]
+    return function
+
+
+async def _call(agent: Agent, function_name: str, arguments: dict[str, object]) -> str:
+    """Call one of the agent's functions the way a model's tool call runs it."""
+    function = await _function(agent, function_name)
     execution = await FunctionCall(function=function, arguments=arguments, call_id="call-1").aexecute()
     assert execution.status == "success", execution.error
     return str(execution.result)
@@ -369,17 +375,22 @@ async def test_skill_scripts_get_a_command_for_the_worker_that_mounts_them(
         ("static_runner", "plugin"),
         # The shared runner does not see a configured skill below the storage root either.
         ("static_runner", "plugin_below_storage"),
+        # Bundled skills are where this process has MindRoom installed, which no worker mounts.
+        ("docker", "bundled"),
+        ("kubernetes", "bundled"),
+        ("static_runner", "bundled"),
     ],
 )
 @pytest.mark.asyncio
 async def test_skill_scripts_a_worker_cannot_see_are_refused(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     worker_calls: list[_WorkerCall],
     backend_name: str,
     origin: str,
 ) -> None:
-    """A script whose directory the agent's worker does not mount runs nothing there, and can still be read."""
-    skill = _write_skill(tmp_path, origin)
+    """A script whose directory the agent's worker does not mount gets no command, and can still be read."""
+    skill = _write_skill(tmp_path, origin, monkeypatch)
     setup = _create_worker_agent(tmp_path, skill, backend_name)
 
     refused = await _get_skill_script(setup.agent, execute=True)
@@ -393,26 +404,14 @@ async def test_skill_scripts_a_worker_cannot_see_are_refused(
     assert read["content"] == _SCRIPT
 
 
-@pytest.mark.parametrize(
-    ("backend_name", "origin"),
-    [
-        ("docker", "bundled"),
-        ("kubernetes", "bundled"),
-        ("static_runner", "bundled"),
-        ("static_runner", "workspace"),
-    ],
-)
 @pytest.mark.asyncio
-async def test_skill_scripts_get_a_command_where_every_worker_sees_them(
+async def test_a_shared_runner_gets_a_workspace_script_at_its_host_path(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     worker_calls: list[_WorkerCall],
-    backend_name: str,
-    origin: str,
 ) -> None:
-    """Worker images ship the bundled skills, and the shared runner sees workspaces, where this host has them."""
-    skill = _write_skill(tmp_path, origin, monkeypatch)
-    setup = _create_worker_agent(tmp_path, skill, backend_name)
+    """The shared runner sees the agents' workspaces where this host has them."""
+    skill = _write_skill(tmp_path, "workspace")
+    setup = _create_worker_agent(tmp_path, skill, "static_runner")
 
     reply = await _get_skill_script(setup.agent, execute=True)
 
@@ -439,11 +438,15 @@ async def test_an_unlisted_skill_script_gets_no_command(
     assert worker_calls == []
 
 
-@pytest.mark.parametrize("origin", ["workspace", "plugin"])
+@pytest.mark.parametrize("origin", ["workspace", "plugin", "bundled"])
 @pytest.mark.asyncio
-async def test_a_local_shell_runs_the_command_on_this_host(tmp_path: Path, origin: str) -> None:
+async def test_a_local_shell_runs_the_command_on_this_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+) -> None:
     """With a local shell, the command runs on this host as the agent's shell commands do, in the agent's workspace."""
-    skill = _write_skill(tmp_path, origin)
+    skill = _write_skill(tmp_path, origin, monkeypatch)
     setup = _create_agent(tmp_path, skill, tools=["shell"])
 
     command, output = await _run_script(setup.agent)
@@ -518,3 +521,18 @@ async def test_a_shell_that_needs_approval_still_gets_the_command(tmp_path: Path
 
     assert reply["command"] == shlex.join(["/bin/sh", str(skill.script), "book.xlsx"])
     assert not skill.ran_here
+
+
+@pytest.mark.asyncio
+async def test_the_skill_tools_say_that_scripts_run_through_the_shell(tmp_path: Path) -> None:
+    """The tool description and the skill guidance tell the model that execute=True gives it a command to run."""
+    skill = _write_skill(tmp_path, "plugin")
+    setup = _create_agent(tmp_path, skill, tools=["shell"])
+
+    function = await _function(setup.agent, "get_skill_script")
+
+    assert "never runs the script" in str(function.description)
+    assert "run_shell_command" in str(function.description)
+    instructions = setup.agent.instructions
+    assert isinstance(instructions, list)
+    assert any("returns the shell command" in str(line) for line in instructions)

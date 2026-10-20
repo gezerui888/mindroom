@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import json5
 from agno.skills import LocalSkills, Skills
@@ -66,6 +66,11 @@ _NO_SHELL_ERROR = (
 _RUN_WITH_SHELL = (
     "get_skill_script does not run scripts itself: run this command with your shell tool (run_shell_command), "
     "with this timeout."
+)
+_GET_SKILL_SCRIPT_DESCRIPTION = (
+    "Read a script from a skill, or with execute=True get the shell command that runs it with args. "
+    "This never runs the script: run the returned command with your shell tool (run_shell_command) "
+    "and the returned timeout."
 )
 _UNSEEN_SCRIPT_ERROR = (
     "Your shell runs in a worker that cannot see this skill's directory, so its scripts cannot run there; "
@@ -157,11 +162,6 @@ class _WorkspaceSkillsLoader(_MindroomSkillsLoader):
         return _load_workspace_skills(self.workspace_root, self.refused)
 
 
-# Bundled skills ship with MindRoom, workspace skills live in the agent's workspace,
-# and configured skills come from plugins and the user skills directory.
-_SkillOrigin = Literal["bundled", "workspace", "configured"]
-
-
 @dataclass(frozen=True)
 class SkillScriptLocation:
     """Where the agent's shell tool, which runs its skill scripts, finds them."""
@@ -172,21 +172,20 @@ class SkillScriptLocation:
     # that call instead of agent creation.
     worker_storage_root: Callable[[], Path | None] | None = None
 
-    def visible_path(self, path: Path, origin: _SkillOrigin) -> Path | None:
+    def visible_path(self, path: Path, *, workspace: bool) -> Path | None:
         """Return where the shell finds ``path``, or None when its worker cannot see it.
 
-        Worker images ship the bundled skills where this process has them. Dedicated workers mount
-        workspaces, and the directories of the configured skills with scripts that their agents list,
-        at their place below the storage mount, and a shared runner sees workspaces where this process
-        does but no configured skill directory.
+        Dedicated workers mount workspaces, and the directories of the configured skills with scripts that
+        their agents list, at their place below the storage mount, and a shared runner sees workspaces where
+        this process does. No worker sees a skill outside the storage root, such as a bundled one.
         """
-        if self.worker_storage_root is None or origin == "bundled":
+        if self.worker_storage_root is None:
             return path
         if not path.is_relative_to(self.storage_root):
             return None
         worker_root = self.worker_storage_root()
         if worker_root is None:
-            return path if origin == "workspace" else None
+            return path if workspace else None
         return worker_root / path.relative_to(self.storage_root)
 
 
@@ -210,6 +209,9 @@ class _MindroomSkills(Skills):
     def get_tools(self) -> list[Function]:
         """Return skill access tools with MindRoom's reserved output-path argument."""
         tools = super().get_tools()
+        for tool in tools:
+            if tool.name == "get_skill_script":
+                tool.description = _GET_SKILL_SCRIPT_DESCRIPTION
         if self._output_file_policy is None:
             return tools
         return [wrap_function_for_output_files(tool, self._output_file_policy) for tool in tools]
@@ -288,7 +290,8 @@ class _MindroomSkills(Skills):
     # AGNO_COMPAT: Skills runs a skill script in the process that holds the Skills object.
     # Reason: Agno 3.0.9 Skills._get_skill_script runs a script as a subprocess of the primary process and has no hook
     #   to run it elsewhere, so it returns the command that runs the script instead, for the agent to run with its own
-    #   shell tool, which takes it wherever the agent's shell commands go, with their approval, hooks, and limits.
+    #   shell tool, which takes it wherever the agent's shell commands go, with their approval, hooks, and limits;
+    #   get_tools replaces Agno's tool description, which says execute=True runs the script.
     # Upstream issue: Tracking gap; no issue for choosing where skill scripts run has been identified.
     # Upstream PR: None identified.
     # Remove when: Skills lets an application supply how a script runs; refusing to run one without a shell tool,
@@ -325,14 +328,8 @@ class _MindroomSkills(Skills):
         if self._script_location is None:
             return json.dumps({"error": _NO_SHELL_ERROR, **reply})
         script = Path(skill.source_path) / "scripts" / script_path
-        origin: _SkillOrigin = (
-            "workspace"
-            if skill.name in self._workspace_roots_by_skill
-            else "bundled"
-            if script.is_relative_to(_get_bundled_skills_dir().resolve())
-            else "configured"
-        )
-        visible_script = self._script_location.visible_path(script, origin)
+        workspace = skill.name in self._workspace_roots_by_skill
+        visible_script = self._script_location.visible_path(script, workspace=workspace)
         if visible_script is None:
             return json.dumps({"error": _UNSEEN_SCRIPT_ERROR, **reply})
         try:

@@ -11,6 +11,7 @@ import base64
 import os
 import re
 from contextlib import ExitStack, contextmanager
+from html import escape
 from html.parser import HTMLParser
 from pathlib import PureWindowsPath
 from typing import TYPE_CHECKING, Any
@@ -60,8 +61,9 @@ logger = get_logger(__name__)
 
 GRAPH_URL = "https://graph.microsoft.com/v1.0"
 _GRAPH_HOST = "graph.microsoft.com"
-# Windows zone names ("W. Europe Standard Time", "UTC-11") and IANA names ("America/New_York").
-_TIME_ZONE = re.compile(r"[A-Za-z][A-Za-z0-9 ._+/-]{0,63}")
+# Windows zone names ("W. Europe Standard Time", "Central Standard Time (Mexico)", "UTC-11") and IANA names
+# ("America/New_York"); the name only goes into JSON bodies, never a URL or OData string.
+_TIME_ZONE = re.compile(r"[A-Za-z][A-Za-z0-9 ._+/()-]{0,63}")
 _DEFAULT_TIMEOUT_SECONDS = 60.0
 _CHUNK_BYTES = 1024 * 1024
 _OFFSET = re.compile(r"[0-9]{1,10}")
@@ -120,6 +122,7 @@ def page_path(page_token: object, collection_suffix: str) -> str:
 
     Graph may phrase a next link differently from the first request, for example by drive instead of `/me`,
     so a token is checked by shape: a relative Graph path ending in the collection, with a query and no `..`.
+    httpx sends a path's percent escapes unchanged and Graph may decode `%2e` to a dot, so the path may hold none.
     """
     token = page_token if isinstance(page_token, str) else ""
     path, _, query = token.partition("?")
@@ -129,6 +132,7 @@ def page_path(page_token: object, collection_suffix: str) -> str:
         or path.startswith("//")
         or not path.endswith(collection_suffix)
         or ".." in path
+        or "%2e" in path.lower()
         or any(character in "#\\ " or ord(character) < 32 for character in token)
     ):
         msg = "page_token must be the next_page_token this function returned."
@@ -225,6 +229,11 @@ def html_to_text(html: str) -> str:
     parser.close()
     lines = "".join(parser.parts).split("\n")
     return "\n".join(" ".join(line.replace(_HTML_CELL_BREAK, " | ").split()) for line in lines).strip("\n")
+
+
+def text_to_html(text: str) -> str:
+    """Return plain text as an HTML body that keeps its text and line breaks and shows any markup in it literally."""
+    return escape("\n".join(text.splitlines())).replace("\n", "<br>")
 
 
 def _unsafe_filename(name: str) -> bool:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import html
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +18,7 @@ from mindroom.custom_tools.microsoft_graph import (
     next_page_token,
     page_path,
     path_segment,
+    text_to_html,
 )
 from mindroom.oauth.microsoft import microsoft_teams_oauth_provider
 
@@ -95,7 +95,7 @@ def _text_body(text: object) -> dict[str, object]:
     """Return text as an escaped HTML message body, so model text is never rendered as markup and keeps its lines."""
     if not isinstance(text, str) or not text.strip():
         raise MicrosoftGraphError(code="invalid_argument", message="text must not be empty.")
-    content = html.escape("\n".join(text.splitlines())).replace("\n", "<br>")
+    content = text_to_html(text)
     size = len(content.encode("utf-8"))
     if size > _MAX_MESSAGE_BYTES:
         msg = f"text is {size} bytes in UTF-8 once HTML-escaped; a Teams message holds at most {_MAX_MESSAGE_BYTES}."
@@ -400,7 +400,8 @@ class MicrosoftTeamsTools(Toolkit):
         """Post a new message in one Teams channel, as the requester and visible to everyone in the channel.
 
         Before calling, tell the requester the team and channel names and the exact text, because an approval
-        prompt may show only IDs. The text is sent as plain text, up to 28,000 bytes.
+        prompt may show only IDs. Any HTML in the text shows literally, and the text keeps its line breaks, up to
+        28,000 bytes once HTML-escaped, so <, >, &, quotes, and line breaks count extra.
 
         Args:
             team_id: The team's id from microsoft_teams_list_teams.
@@ -423,7 +424,9 @@ class MicrosoftTeamsTools(Toolkit):
         """Reply in the thread of one Teams channel post, as the requester and visible to everyone in the channel.
 
         Before calling, tell the requester the team and channel names, which post the reply answers, and the exact
-        text, because an approval prompt may show only IDs. The text is sent as plain text, up to 28,000 bytes.
+        text, because an approval prompt may show only IDs. Any HTML in the text shows literally, and the text
+        keeps its line breaks, up to 28,000 bytes once HTML-escaped, so <, >, &, quotes, and line breaks count
+        extra.
 
         Args:
             team_id: The team's id from microsoft_teams_list_teams.
@@ -445,7 +448,8 @@ class MicrosoftTeamsTools(Toolkit):
         """Send a message in one existing Teams chat, as the requester and visible to every chat member.
 
         Before calling, tell the requester the chat's topic or members and the exact text, because an approval
-        prompt may show only IDs. The text is sent as plain text, up to 28,000 bytes.
+        prompt may show only IDs. Any HTML in the text shows literally, and the text keeps its line breaks, up to
+        28,000 bytes once HTML-escaped, so <, >, &, quotes, and line breaks count extra.
 
         Args:
             chat_id: The chat's id from microsoft_teams_list_chats.

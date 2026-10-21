@@ -219,6 +219,9 @@ def test_write_descriptions_ask_to_tell_the_requester_first(tmp_path: Path, monk
     assert "untrusted" in _description(tools, "outlook_mail_get_message")
     assert "read the draft with outlook_mail_get_message" in _description(tools, "outlook_mail_send_draft")
     assert "goes to the original's reply_to addresses when it has them" in _description(tools, "outlook_mail_reply")
+    for name in ("outlook_mail_send", "outlook_mail_create_draft"):
+        to = Function.from_callable(getattr(tools, name)).to_dict()["parameters"]["properties"]["to"]
+        assert "Sam Example <sam@contoso.com>" in to["description"], name
 
 
 def test_search_without_a_query_lists_the_newest_messages(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -587,6 +590,24 @@ def test_attachments_over_the_request_limit_are_refused_before_encoding(
     assert graph.requests == []
 
 
+def test_a_non_ascii_body_is_measured_as_the_bytes_sent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # "é" is two bytes in the UTF-8 request body, so this message is just under the request limit.
+    body = "é" * ((outlook_mail._MAX_REQUEST_BYTES - 1000) // 2)
+    tools, graph = _tools(tmp_path, monkeypatch, _Graph())
+
+    result = _payload(tools.outlook_mail_send(["sam@contoso.com"], "Notes", body))
+
+    assert result == {"sent": True, "status": "ok", "tool": "outlook_mail"}
+    [request] = graph.requests
+    assert _body(request)["message"]["body"]["content"] == body
+    assert int(request.headers["content-length"]) <= outlook_mail._MAX_REQUEST_BYTES
+
+    over = _payload(tools.outlook_mail_send(["sam@contoso.com"], "Notes", body + "é" * 1000))
+
+    assert over["code"] == "too_large"
+    assert len(graph.requests) == 1
+
+
 def test_an_attachment_outside_the_workspace_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     (tmp_path / "secret.txt").write_bytes(b"secret")
     tools, graph = _tools(tmp_path, monkeypatch, _Graph())
@@ -606,6 +627,11 @@ def test_an_attachment_outside_the_workspace_is_refused(tmp_path: Path, monkeypa
         (["sam smith@contoso.com"], None),
         (["sam@contoso.com\x00"], None),
         (["x" * 250 + "@contoso.com"], None),
+        (["Sam Example <not-an-email>"], None),
+        (["Sam Example <sam@contoso.com> extra"], None),
+        (["Sam Example <a@b@contoso.com>"], None),
+        (["Sam Example <" + "x" * 250 + "@contoso.com>"], None),
+        (["Sam\x00Example <sam@contoso.com>"], None),
         ("sam@contoso.com", None),
         ([1], None),
         (["sam@contoso.com"], ["bad"]),
@@ -626,6 +652,35 @@ def test_invalid_recipients_are_refused_before_any_request(
     ):
         assert _payload(result)["code"] == "invalid_argument"
     assert graph.requests == []
+
+
+@pytest.mark.parametrize(
+    ("recipient", "email_address"),
+    [
+        ("sam@contoso.com", {"address": "sam@contoso.com"}),
+        ("Sam Example <sam@contoso.com>", {"name": "Sam Example", "address": "sam@contoso.com"}),
+        (" Sam Example  < sam@contoso.com > ", {"name": "Sam Example", "address": "sam@contoso.com"}),
+        ("<sam@contoso.com>", {"address": "sam@contoso.com"}),
+        ('"Smith, Sam" <sam@contoso.com>', {"name": "Smith, Sam", "address": "sam@contoso.com"}),
+    ],
+)
+def test_recipients_accept_bare_addresses_and_the_form_read_results_show(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    recipient: str,
+    email_address: dict[str, str],
+) -> None:
+    mail = _Graph()
+    mail.write = httpx.Response(201, json=_message(isDraft=True))
+    tools, graph = _tools(tmp_path, monkeypatch, mail)
+
+    assert _payload(tools.outlook_mail_send([recipient], "s", "b", cc=[recipient]))["status"] == "ok"
+    assert _payload(tools.outlook_mail_create_draft([recipient], "s", "b", cc=[recipient]))["status"] == "ok"
+
+    sent, draft = (_body(request) for request in graph.requests)
+    for message in (sent["message"], draft):
+        assert message["toRecipients"] == [{"emailAddress": email_address}]
+        assert message["ccRecipients"] == [{"emailAddress": email_address}]
 
 
 @pytest.mark.parametrize(("subject", "body"), [(None, "b"), ("s", None), ("s", 3)])

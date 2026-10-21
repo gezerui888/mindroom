@@ -19,9 +19,12 @@ from mindroom.custom_tools.microsoft_graph import (
     graph_tool_result,
     html_to_text,
     next_page_token,
+    page_path,
     path_segment,
     read_upload_source,
     share_id,
+    text_to_html,
+    time_zone_name,
 )
 from mindroom.oauth.microsoft import microsoft_files_oauth_provider
 from mindroom.redaction import redact_sensitive_text
@@ -389,6 +392,29 @@ def test_path_segments_refuse_anything_that_changes_the_path(value: object) -> N
     assert excinfo.value.code == "invalid_argument"
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "W. Europe Standard Time",
+        "Central Standard Time (Mexico)",
+        "Pacific Standard Time (Mexico)",
+        "UTC-11",
+        "America/New_York",
+        "Etc/GMT+5",
+    ],
+)
+def test_time_zone_names_accept_windows_and_iana_names(value: str) -> None:
+    assert time_zone_name(value) == value
+
+
+@pytest.mark.parametrize("value", ["", " UTC", "UTC ", "Europe/Berlin;x", "(Mexico)", "Europe/Berlin\n", 7, None])
+def test_time_zone_names_refuse_anything_else(value: object) -> None:
+    with pytest.raises(MicrosoftGraphError) as excinfo:
+        time_zone_name(value)
+
+    assert excinfo.value.code == "invalid_argument"
+
+
 def test_share_ids_encode_the_whole_link() -> None:
     encoded = share_id(SHARE_LINK)
 
@@ -583,6 +609,37 @@ def test_next_page_tokens_only_continue_graph_v1_collections(link: str | None, t
 
 
 @pytest.mark.parametrize(
+    ("page_token", "suffix"),
+    [
+        ("/me/drive/root/children?$skiptoken=a", "/children"),
+        ("/me/todo/lists/AAMk-1=/tasks?$skip=50&$filter=a%2Eb", "/tasks"),
+    ],
+)
+def test_page_paths_continue_their_own_collection(page_token: str, suffix: str) -> None:
+    assert page_path(page_token, suffix) == page_token
+
+
+@pytest.mark.parametrize(
+    "page_token",
+    [
+        "/me/todo/lists/../../planner/tasks?x=1",
+        "/me/todo/lists/%2e%2e/%2e%2e/planner/tasks?x=1",
+        "/me/todo/lists/%2E%2e/%2e%2E/planner/tasks?x=1",
+        "/me/todo/lists/.%2E/x/tasks?x=1",
+        "/me/todo/lists/AAMk-1=/tasks",
+        "//evil.example.com/tasks?x=1",
+        "https://graph.microsoft.com/v1.0/me/todo/lists/AAMk-1=/tasks?x=1",
+        "",
+    ],
+)
+def test_page_paths_refuse_tokens_that_can_leave_the_collection(page_token: str) -> None:
+    with pytest.raises(MicrosoftGraphError) as excinfo:
+        page_path(page_token, "/tasks")
+
+    assert excinfo.value.code == "invalid_page_token"
+
+
+@pytest.mark.parametrize(
     ("html", "text"),
     [
         ("Plain notes", "Plain notes"),
@@ -619,3 +676,25 @@ def test_next_page_tokens_only_continue_graph_v1_collections(link: str | None, t
 )
 def test_html_to_text_keeps_readable_text_and_line_breaks(html: str, text: str) -> None:
     assert html_to_text(html) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "html"),
+    [
+        ("Plain notes", "Plain notes"),
+        (
+            'Ship <b>today</b> & tell "everyone" it\'s done',
+            "Ship &lt;b&gt;today&lt;/b&gt; &amp; tell &quot;everyone&quot; it&#x27;s done",
+        ),
+        ("one\ntwo\r\nthree\rfour", "one<br>two<br>three<br>four"),
+        ("blank\n\nline\n", "blank<br><br>line"),
+    ],
+)
+def test_text_to_html_escapes_markup_and_keeps_line_breaks(text: str, html: str) -> None:
+    assert text_to_html(text) == html
+
+
+def test_text_to_html_reads_back_as_the_same_text() -> None:
+    text = "Tom <tom@contoso.com> wrote:\n1 < 2 & 3 > 2\n\nThanks"
+
+    assert html_to_text(text_to_html(text)) == text

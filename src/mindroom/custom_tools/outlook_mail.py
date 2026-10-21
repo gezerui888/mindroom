@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import html
 import json
 import mimetypes
 import re
@@ -26,6 +25,7 @@ from mindroom.custom_tools.microsoft_graph import (
     page_path,
     path_segment,
     read_upload_source,
+    text_to_html,
 )
 from mindroom.oauth.microsoft import outlook_mail_oauth_provider
 
@@ -75,6 +75,8 @@ _ATTACHMENT_TYPES = {
     "microsoft.graph.referenceAttachment": "reference",
 }
 _EMAIL = re.compile(r"[^@\s\x00-\x1f\x7f]+@[^@\s\x00-\x1f\x7f]+")
+# The `Name <address>` form read results show for a named address.
+_NAMED_EMAIL = re.compile(r"(?P<name>[^<>\x00-\x1f\x7f]*)<(?P<address>[^<>]*)>")
 _MAX_EMAIL_CHARS = 254
 # Most filesystems cap one name at 255 bytes.
 _MAX_FILENAME_BYTES = 200
@@ -159,17 +161,18 @@ def _recipients(value: object, field_name: str) -> list[dict[str, dict[str, str]
         if not isinstance(raw, str):
             msg = f"{field_name} must be a list of email addresses."
             raise _invalid(msg)
-        address = raw.strip()
+        text = raw.strip()
+        named = _NAMED_EMAIL.fullmatch(text)
+        name, address = (named["name"].strip(), named["address"].strip()) if named else ("", text)
+        if len(name) >= 2 and name[0] == name[-1] == '"':
+            # An RFC 5322 quoted display name, such as "Smith, Sam", keeps its text without the quotes.
+            name = name[1:-1].strip()
         if len(address) > _MAX_EMAIL_CHARS or not _EMAIL.fullmatch(address):
             msg = f"{field_name} has an invalid email address: {raw[:100]!r}."
             raise _invalid(msg)
-        recipients.append({"emailAddress": {"address": address}})
+        email = {"name": name, "address": address} if name else {"address": address}
+        recipients.append({"emailAddress": email})
     return recipients
-
-
-def _comment(body: str) -> str:
-    """Return plain text as the HTML Graph inserts above the quoted message, keeping its characters and line breaks."""
-    return html.escape("\n".join(body.splitlines())).replace("\n", "<br>")
 
 
 def _check_request_size(size: int) -> None:
@@ -183,7 +186,8 @@ def _check_request_size(size: int) -> None:
 
 
 def _check_payload_size(payload: Mapping[str, object]) -> None:
-    _check_request_size(len(json.dumps(payload).encode()))
+    # Measure the body as httpx encodes it: UTF-8 text without escapes or spaces.
+    _check_request_size(len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()))
 
 
 def _filename(name: object) -> str:
@@ -492,7 +496,7 @@ class OutlookMailTools(Toolkit):
         outlook_mail_send_draft, or the requester can open its web_link to edit it first.
 
         Args:
-            to: Recipient email addresses, such as sam@contoso.com.
+            to: Recipient email addresses, such as sam@contoso.com or Sam Example <sam@contoso.com>.
             subject: The subject line.
             body: The message text, sent as plain text.
             cc: Email addresses to copy.
@@ -540,7 +544,7 @@ class OutlookMailTools(Toolkit):
         OneDrive and put a link in the body. The sent message is saved in Sent Items.
 
         Args:
-            to: Recipient email addresses, such as sam@contoso.com.
+            to: Recipient email addresses, such as sam@contoso.com or Sam Example <sam@contoso.com>.
             subject: The subject line.
             body: The message text, sent as plain text.
             cc: Email addresses to copy.
@@ -586,7 +590,7 @@ class OutlookMailTools(Toolkit):
         def operation(session: GraphSession) -> Mapping[str, object]:
             action = "replyAll" if reply_all else "reply"
             path = f"/me/messages/{path_segment(message_id, 'message_id')}/{action}"
-            session.request("POST", path, json={"comment": _comment(body)})
+            session.request("POST", path, json={"comment": text_to_html(body)})
             return {"message_id": message_id, "reply_all": reply_all, "sent": True}
 
         return self._call(operation, validate=validate)

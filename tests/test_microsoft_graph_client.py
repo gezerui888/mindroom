@@ -590,6 +590,8 @@ def test_next_page_tokens_only_continue_graph_v1_collections(link: str | None, t
         ("Paragraph<br><br>after a blank line", "Paragraph\n\nafter a blank line"),
         ("<p>First</p><p>Second &amp; third</p>", "First\nSecond & third"),
         ("<ul><li>one</li><li>two</li></ul>", "one\ntwo"),
+        ("<p>a   b</p>\n\n\n<p></p><p>c</p>", "a b\nc"),
+        ('<attachment id="ee8d"></attachment>', ""),
         ("Tom &lt;tom@contoso.com&gt;&nbsp;wrote", "Tom <tom@contoso.com> wrote"),
         (
             "<html><head><title>Note</title><style>p { color: red; }</style></head>"
@@ -601,6 +603,7 @@ def test_next_page_tokens_only_continue_graph_v1_collections(link: str | None, t
             "<table><tr><th>Name</th><th>Value</th></tr>\n<tr><td> Alpha </td> <td>1</td><td></td><td>x</td></tr></table>",
             "Name | Value\nAlpha | 1 | | x",
         ),
+        ('<p>see</p><img src="https://graph.microsoft.com/x" alt="chart">', "see\n[image]"),
         ('<p>Ship it <emoji id="1f44d_thumbsup" alt="\U0001f44d" title="Thumbs up"></emoji></p>', "Ship it \U0001f44d"),
         (
             '<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="1616965872000">'

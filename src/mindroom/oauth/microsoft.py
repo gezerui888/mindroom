@@ -18,6 +18,7 @@ __all__ = [
     "ACCOUNT_LOOKUP_TIMEOUT_SECONDS",
     "GRAPH_ME_URL",
     "microsoft_files_oauth_provider",
+    "microsoft_meetings_oauth_provider",
     "microsoft_oauth_provider",
     "microsoft_onenote_oauth_provider",
     "microsoft_teams_oauth_provider",
@@ -180,6 +181,16 @@ def microsoft_teams_oauth_provider() -> OAuthProvider:
             "ChatMessage.Send",
         ),
         status_capabilities=("read and send Teams channel and chat messages",),
+    )
+
+
+def microsoft_meetings_oauth_provider() -> OAuthProvider:
+    """Return the Teams meeting transcripts provider; `OnlineMeetingTranscript.Read.All` needs admin consent."""
+    return microsoft_oauth_provider(
+        provider_id="microsoft_meetings",
+        display_name="Microsoft Teams Meetings",
+        scopes=("OnlineMeetings.Read", "OnlineMeetingTranscript.Read.All"),
+        status_capabilities=("find Teams meetings and read their transcripts",),
     )
 
 

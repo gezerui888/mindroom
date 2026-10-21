@@ -4,7 +4,7 @@ icon: fontawesome/brands/microsoft
 
 # Microsoft 365
 
-The Microsoft 365 tools reach OneDrive, SharePoint, Outlook mail and calendars, Microsoft To Do, Teams, and OneNote through Microsoft Graph as the person who asked.
+The Microsoft 365 tools reach OneDrive, SharePoint, Outlook mail and calendars, Microsoft To Do, Teams, OneNote, and the organization directory through Microsoft Graph as the person who asked.
 Each requester connects their own Microsoft account, so agents see and change only what that person can.
 OAuth connection mechanics shared with other providers are on [OAuth Integration Framework](../oauth-framework.md).
 
@@ -17,6 +17,7 @@ OAuth connection mechanics shared with other providers are on [OAuth Integration
 | `microsoft_teams` | Teams channels and chats the requester belongs to | `microsoft_teams` | `Team.ReadBasic.All`, `Channel.ReadBasic.All`, `ChannelMessage.Read.All`, `ChannelMessage.Send`, `Chat.Read`, `ChatMessage.Send` |
 | `microsoft_meetings` | Transcripts of Teams meetings the requester organized or was invited to | `microsoft_meetings` | `OnlineMeetings.Read`, `OnlineMeetingTranscript.Read.All` |
 | `microsoft_onenote` | The requester's OneNote notebooks, sections, and pages | `microsoft_onenote` | `Notes.ReadWrite.All` |
+| `microsoft_people` | People, managers, and direct reports in the requester's organization directory | `microsoft_people` | `User.Read.All` |
 
 Every provider also requests `User.Read`, to label the connected account, and `offline_access`, to stay connected.
 
@@ -33,6 +34,7 @@ An administrator registers one app in Microsoft Entra for the MindRoom installat
 
 `ChannelMessage.Read.All`, which `microsoft_teams` requests, always needs administrator consent, so nobody can connect Teams until an administrator chooses **Grant admin consent** on the app's **API permissions** page.
 `OnlineMeetingTranscript.Read.All`, which `microsoft_meetings` requests, likewise always needs administrator consent.
+`User.Read.All`, which `microsoft_people` requests, likewise always needs administrator consent before anyone can connect the people directory.
 
 For a local installation, the redirect URIs are `http://localhost:8765/api/oauth/<provider ID>/callback`, such as `http://localhost:8765/api/oauth/microsoft_files/callback`.
 A hosted installation must set `MINDROOM_PUBLIC_URL` or `MINDROOM_BASE_URL`, from which MindRoom derives each redirect URI, and the URIs registered on the app must match exactly.
@@ -58,7 +60,7 @@ To use a different app for one tool, store its credentials in that tool's `<prov
 Set `MICROSOFT_TENANT_ID` to the directory (tenant) ID or a verified domain of your organization.
 It defaults to `organizations`, which accepts any work or school account, and an app registered for your organization only requires the tenant to be set.
 Setting it to your tenant ID or domain limits sign-in to that tenant's accounts.
-`consumers` or `common` admit personal Microsoft accounts, which reach OneDrive, Outlook mail and calendars, and Microsoft To Do but not SharePoint, Teams, or OneNote, whose `Notes.ReadWrite.All` personal accounts cannot grant.
+`consumers` or `common` admit personal Microsoft accounts, which reach OneDrive, Outlook mail and calendars, and Microsoft To Do but not SharePoint, Teams, the people directory, or OneNote, whose `Notes.ReadWrite.All` personal accounts cannot grant.
 Changing the tenant makes existing connections ask their users to connect again.
 
 ## Configure
@@ -76,6 +78,7 @@ agents:
       - microsoft_teams
       - microsoft_meetings
       - microsoft_onenote
+      - microsoft_people
 ```
 
 | Option | Tool | Type | Default | Notes |
@@ -88,7 +91,7 @@ agents:
 | `write` | `microsoft_onenote` | `boolean` | `true` | Allows creating pages and appending text to pages; with `false`, those functions are not offered. |
 
 The scopes stay the same with `write: false`, so turning writes back on does not need new consent.
-`microsoft_meetings` only reads, so it has no `write` option.
+`microsoft_meetings` and `microsoft_people` only read, so they have no `write` option.
 
 ## Connect An Account
 
@@ -257,6 +260,23 @@ Page text leaves out the title, shows images as `[image]`, and separates table c
 Listings and page text return a `next_page_token` while more follows; passing it back with the same notebook, section, or page continues.
 Created and appended text keeps its line breaks, and HTML in it shows literally instead of as formatting.
 
+## People
+
+| Function | Changes data | Purpose |
+| --- | --- | --- |
+| `microsoft_people_search` | no | Find people in the organization directory by name or by the beginning of their email address, up to 50 results. |
+| `microsoft_people_get_profile` | no | Read one person's profile and their manager. |
+| `microsoft_people_list_direct_reports` | no | List the people who report directly to one person. |
+
+Agents use these functions to turn a name the requester mentions into a person and an email address for the mail, calendar, and Teams tools.
+Each person comes back with their id, name, email address, job title, department, office location, and business phones; mobile phones and other personal fields are never read.
+The email address is the person's primary email address, or their sign-in name when they have none.
+Profile and direct report lookups take a person's id, email address, or sign-in name, or `me` for the requester, so "who is my manager" needs no email address.
+Search matches names by whole words or their beginnings in any order, and email addresses from their beginning, and someone added to the directory in the last few minutes may not show up yet.
+A person without a manager, or whose manager is a contact instead of a user, comes back with `manager` set to `null`, and direct report listings leave out contacts.
+Direct report listings return a `next_page_token` while more results exist; passing it back continues the same listing.
+Guest accounts cannot search the directory.
+
 ## Approvals For Writes
 
 The tools run without approval unless you add [tool approval](../tool-approval.md) rules, which show a Matrix approval card before each change:
@@ -313,7 +333,7 @@ To give an agent read access only, set `write: false` on the tool.
 | Result | Cause and fix |
 | --- | --- |
 | `AADSTS50011` on the Microsoft sign-in page | The redirect URI is not registered on the app; add the exact URI from [Set Up The Microsoft Entra App](#set-up-the-microsoft-entra-app). |
-| `AADSTS65001` or a consent prompt the requester cannot approve | The tenant requires administrator consent, which Teams and Teams meeting transcripts always do; an administrator grants it on the app's **API permissions** page. |
+| `AADSTS65001` or a consent prompt the requester cannot approve | The tenant requires administrator consent, which Teams, Teams meeting transcripts, and the people directory always do; an administrator grants it on the app's **API permissions** page. |
 | `AADSTS50194` | The app is registered for one organization; set `MICROSOFT_TENANT_ID`. |
 | `invalid_tenant` | `MICROSOFT_TENANT_ID` is not a tenant ID, a verified domain, `organizations`, `common`, or `consumers`. |
 | `forbidden` | The connected account lacks access to that item, which reconnecting does not fix. |

@@ -21,6 +21,7 @@ __all__ = [
     "microsoft_meetings_oauth_provider",
     "microsoft_oauth_provider",
     "microsoft_onenote_oauth_provider",
+    "microsoft_people_oauth_provider",
     "microsoft_teams_oauth_provider",
     "microsoft_todo_oauth_provider",
     "microsoft_token_url",
@@ -201,4 +202,14 @@ def microsoft_onenote_oauth_provider() -> OAuthProvider:
         display_name="Microsoft OneNote",
         scopes=("Notes.ReadWrite.All",),
         status_capabilities=("read, create, and append to OneNote pages",),
+    )
+
+
+def microsoft_people_oauth_provider() -> OAuthProvider:
+    """Return the organization directory provider."""
+    return microsoft_oauth_provider(
+        provider_id="microsoft_people",
+        display_name="Microsoft 365 People",
+        scopes=("User.Read.All",),
+        status_capabilities=("look up people, their managers, and their direct reports in the directory",),
     )

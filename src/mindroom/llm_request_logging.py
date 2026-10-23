@@ -116,9 +116,12 @@ def _model_params(model: Model) -> dict[str, _JSONValue]:
 
 def _write_jsonl_line(path: Path, payload: dict[str, _JSONValue]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # One write per record: with a separate newline write, a large record reaches the file in more than one
+    # write(2) (text chunks of about 8 KiB before Python 3.14, the 128 KiB buffer on 3.14), so another model call's
+    # record could land between them on the same line. Each record gets its own O_APPEND handle, and on a local
+    # file system the kernel appends each write(2) whole, so one write per record keeps every record on its own line.
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(redact_sensitive_data(payload)))
-        handle.write("\n")
+        handle.write(json.dumps(redact_sensitive_data(payload)) + "\n")
 
 
 def _json_safe(value: object) -> _JSONValue:

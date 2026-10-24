@@ -7,12 +7,14 @@ from typing import TYPE_CHECKING, Any
 from agno.metrics import RunMetrics
 from agno.run.base import RunStatus
 
+from mindroom.budgets.pricing import format_cost_usd, run_cost_usd
 from mindroom.constants import AI_RUN_METADATA_KEY
-from mindroom.model_usage import context_input_tokens_from_counts
+from mindroom.model_usage import context_input_tokens_from_counts, uncached_input_tokens_from_counts
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from mindroom.budgets.pricing import PricedModel
     from mindroom.config.main import Config
     from mindroom.config.models import ModelConfig
     from mindroom.history.types import PreparedHistoryState
@@ -231,6 +233,39 @@ def _native_context_counts(
     return None
 
 
+def _uncached_input_tokens(
+    metrics: RunMetrics | None,
+    usage_payload: dict[str, Any] | None,
+    *,
+    provider: str | None,
+    configured_provider: str | None,
+    model_id: str | None,
+) -> int | None:
+    """Split new input from cache reads per model, since providers count cache tokens differently."""
+    entries = [entry for entries in ((metrics.details if metrics else None) or {}).values() for entry in entries]
+    if entries:
+        return sum(
+            uncached_input_tokens_from_counts(
+                input_tokens=entry.input_tokens,
+                cache_read_tokens=entry.cache_read_tokens,
+                cache_write_tokens=entry.cache_write_tokens,
+                provider=entry.provider,
+                configured_provider=None,
+                model_id=entry.id,
+            )
+            or 0
+            for entry in entries
+        )
+    return uncached_input_tokens_from_counts(
+        input_tokens=_int_usage_value(usage_payload, "input_tokens"),
+        cache_read_tokens=_int_usage_value(usage_payload, "cache_read_tokens"),
+        cache_write_tokens=_int_usage_value(usage_payload, "cache_write_tokens"),
+        provider=provider,
+        configured_provider=configured_provider,
+        model_id=model_id,
+    )
+
+
 def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     *,
     config: Config,
@@ -240,6 +275,7 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     status: RunStatus | str | None,
     model: str | None,
     model_provider: str | None,
+    prices: Mapping[tuple[str, str], PricedModel],
     metrics: RunMetrics | dict[str, Any] | None = None,
     metrics_fallback: dict[str, Any] | None = None,
     context_metrics: RunMetrics | None = None,
@@ -257,6 +293,7 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     mid-run (for example via `switch_thread_model`), and this metadata must
     describe the model that actually produced the response.
     `context_metrics` belongs to that model run before team-member billing is aggregated.
+    `prices` maps recorded (provider, model ID) identities to prices for the reply's cost.
     """
     model_config = config.models.get(model_name)
     model_id = model or (model_config.id if model_config is not None else None)
@@ -331,7 +368,25 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
         model_payload["provider"] = provider
     payload["model"] = model_payload
     if usage_payload:
+        uncached_input_tokens = _uncached_input_tokens(
+            metrics if isinstance(metrics, RunMetrics) else None,
+            usage_payload,
+            provider=provider,
+            configured_provider=model_config.provider if model_config is not None else None,
+            model_id=model_id,
+        )
+        if uncached_input_tokens is not None:
+            usage_payload["uncached_input_tokens"] = uncached_input_tokens
         payload["usage"] = usage_payload
+    cost = run_cost_usd(
+        metrics if isinstance(metrics, RunMetrics) else None,
+        usage_payload,
+        model_provider=model_provider,
+        model_id=model_id,
+        prices=prices,
+    )
+    if cost is not None:
+        payload["cost"] = {"usd": format_cost_usd(cost)}
     context_payload = _build_context_payload(
         context_input_tokens=resolved_context_input_tokens,
         cache_read_tokens=resolved_context_cache_read_tokens,

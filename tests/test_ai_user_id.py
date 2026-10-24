@@ -13,7 +13,7 @@ import pytest
 from agno.agent import Agent as AgnoAgent
 from agno.db.sqlite import SqliteDb
 from agno.media import File
-from agno.metrics import RunMetrics
+from agno.metrics import ModelMetrics, RunMetrics
 from agno.models.message import Message
 from agno.models.response import ModelResponse, ToolExecution
 from agno.models.vertexai.claude import Claude as VertexAIClaude
@@ -51,9 +51,10 @@ from mindroom.ai_run_metadata import (
     build_model_request_metrics_fallback,
 )
 from mindroom.bot import AgentBot
+from mindroom.budgets.pricing import PricedModel
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
-from mindroom.config.models import DebugConfig, ModelConfig
+from mindroom.config.models import DebugConfig, ModelConfig, ModelPricing
 from mindroom.constants import (
     AI_RUN_METADATA_KEY,
     MATRIX_EVENT_ID_METADATA_KEY,
@@ -199,6 +200,7 @@ def test_serialize_metrics_preserves_zero_usage_fields_from_metrics() -> None:
 def test_ai_run_metadata_prefers_provider_counters_over_estimate_for_cache_token_providers() -> None:
     """Cache-token providers report context as raw input plus cache read/write, not the estimate."""
     metadata = build_ai_run_metadata_content(
+        prices={},
         config=_metadata_config("vertexai_claude", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
@@ -223,6 +225,7 @@ def test_ai_run_metadata_prefers_provider_counters_over_estimate_for_cache_token
 def test_ai_run_metadata_context_uses_raw_input_for_non_cache_token_providers() -> None:
     """Providers whose input counter already includes cached tokens report raw input as the context."""
     metadata = build_ai_run_metadata_content(
+        prices={},
         config=_metadata_config("openai", "test-model"),
         model_name="default",
         run_id="run-1",
@@ -245,6 +248,7 @@ def test_ai_run_metadata_context_uses_raw_input_for_non_cache_token_providers() 
 def test_ai_run_metadata_context_falls_back_to_estimate_without_provider_counters() -> None:
     """Without any provider usage counters, the pre-flight estimate still populates the context block."""
     metadata = build_ai_run_metadata_content(
+        prices={},
         config=_metadata_config("anthropic", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
@@ -268,6 +272,7 @@ def test_ai_run_metadata_context_falls_back_to_estimate_without_provider_counter
 def test_ai_run_metadata_context_regression_cached_prefix_sample() -> None:
     """Regression: a 49,886-token cached prefix must not be reported as a 30,210-token context."""
     metadata = build_ai_run_metadata_content(
+        prices={},
         config=_metadata_config("vertexai_claude", "claude-sonnet-5"),
         model_name="default",
         run_id="run-1",
@@ -288,6 +293,91 @@ def test_ai_run_metadata_context_regression_cached_prefix_sample() -> None:
     assert context["uncached_input_tokens"] == 1_777
     assert "cache_write_input_tokens" not in context
     assert context["window_tokens"] == 200_000
+
+
+def test_ai_run_metadata_records_reply_cost_as_a_decimal_string() -> None:
+    """Matrix event JSON forbids floats, so the reply's cost travels as a decimal string."""
+    metadata = build_ai_run_metadata_content(
+        config=_metadata_config("openai", "test-model"),
+        model_name="default",
+        run_id="run-1",
+        session_id="session-1",
+        status="completed",
+        model="test-model",
+        model_provider="OpenAI",
+        metrics=RunMetrics(input_tokens=1_000, output_tokens=10),
+        prices={("OpenAI", "test-model"): PricedModel(ModelPricing(input=2, output=8), input_includes_cache=True)},
+    )
+
+    assert metadata[AI_RUN_METADATA_KEY]["cost"] == {"usd": "0.00208"}
+
+
+def test_ai_run_metadata_omits_cost_without_prices() -> None:
+    """A reply on a model without prices carries no cost."""
+    metadata = build_ai_run_metadata_content(
+        config=_metadata_config("openai", "test-model"),
+        model_name="default",
+        run_id="run-1",
+        session_id="session-1",
+        status="completed",
+        model="test-model",
+        model_provider="OpenAI",
+        metrics=RunMetrics(input_tokens=1_000, output_tokens=10),
+        prices={},
+    )
+
+    assert "cost" not in metadata[AI_RUN_METADATA_KEY]
+
+
+def test_ai_run_metadata_splits_uncached_input_per_model() -> None:
+    """A team mixing providers counts each model's new input by that provider's cache accounting."""
+    metrics = RunMetrics(
+        input_tokens=1_100,
+        cache_read_tokens=1_300,
+        cache_write_tokens=10,
+        details={
+            "model": [
+                ModelMetrics(id="gpt-6-luna", provider="OpenAI", input_tokens=1_000, cache_read_tokens=400),
+                ModelMetrics(
+                    id="claude-sonnet-5-5",
+                    provider="Anthropic",
+                    input_tokens=100,
+                    cache_read_tokens=900,
+                    cache_write_tokens=10,
+                ),
+            ],
+        },
+    )
+    metadata = build_ai_run_metadata_content(
+        prices={},
+        config=_metadata_config("openai", "gpt-6-luna"),
+        model_name="default",
+        run_id="run-1",
+        session_id="session-1",
+        status="completed",
+        model="gpt-6-luna",
+        model_provider="OpenAI",
+        metrics=metrics,
+    )
+
+    assert metadata[AI_RUN_METADATA_KEY]["usage"]["uncached_input_tokens"] == 600 + 110
+
+
+def test_ai_run_metadata_splits_uncached_input_from_streamed_counters() -> None:
+    """Without per-model details the run's own model decides how cache reads are counted."""
+    metadata = build_ai_run_metadata_content(
+        prices={},
+        config=_metadata_config("openai", "gpt-6-luna"),
+        model_name="default",
+        run_id="run-1",
+        session_id="session-1",
+        status="completed",
+        model="gpt-6-luna",
+        model_provider="OpenAI",
+        metrics={"input_tokens": 1_674, "cache_read_tokens": 1_408, "output_tokens": 31},
+    )
+
+    assert metadata[AI_RUN_METADATA_KEY]["usage"]["uncached_input_tokens"] == 266
 
 
 def test_append_knowledge_availability_notice_rendering() -> None:

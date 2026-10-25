@@ -101,6 +101,9 @@ class CandidateCheckpoint:
     #: The collection whose publication retired this one and brought it level
     #: with itself; None for a candidate a refresh is building.
     retired_by: str | None = None
+    #: Paths whose rows may differ from ``retired_by``'s, each recorded before
+    #: a refresh changes its rows.
+    diverged: frozenset[str] = frozenset()
     #: Rows replays deleted from the retired collections since a refresh last
     #: copied the published index whole; their vector index keeps each.
     churn: int = 0
@@ -116,15 +119,15 @@ class CandidateCheckpoint:
         return len(self.completed)
 
     def mirrors(self, state: PublishedIndexState | None) -> bool:
-        """Return whether this is the retired collection, still level with the index ``state`` publishes.
+        """Return whether this is the retired collection, equal to the index ``state`` publishes outside ``diverged``.
 
         Publication keeps the collection it retires as the next candidate once
         that collection holds the new index's rows again, and records which
-        collection it matches. A refresh clears that record durably before it
-        drops or writes any file's rows, so the record alone proves the match.
-        Claims could not: a forced rebuild produces the same claims over
-        vectors the operator stopped trusting, and a write that crashes before
-        its claim leaves rows no claim describes.
+        collection it matches. A refresh records every path in ``diverged``
+        before it drops or writes that path's rows, so the record proves where
+        the two can differ. Claims could not: a forced rebuild produces the
+        same claims over vectors the operator stopped trusting, and a write
+        that crashes before its claim leaves rows no claim describes.
         """
         return state is not None and self.retired_by is not None and state.collection == self.retired_by
 
@@ -185,6 +188,7 @@ def _snapshot_payload(checkpoint: CandidateCheckpoint) -> dict[str, object]:
         "created_at": checkpoint.created_at,
         "updated_at": checkpoint.updated_at,
         "retired_by": checkpoint.retired_by,
+        "diverged": sorted(checkpoint.diverged),
         "churn": checkpoint.churn,
     }
 
@@ -240,6 +244,7 @@ def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None
     created_at = payload.get("created_at")
     updated_at = payload.get("updated_at")
     retired_by = payload.get("retired_by")
+    raw_diverged = payload.get("diverged")
     churn = payload.get("churn")
     return CandidateCheckpoint(
         collection=collection,
@@ -252,6 +257,9 @@ def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None
         created_at=created_at if isinstance(created_at, str) else "",
         updated_at=updated_at if isinstance(updated_at, str) else "",
         retired_by=retired_by if isinstance(retired_by, str) and retired_by else None,
+        diverged=frozenset(
+            path for path in (raw_diverged if isinstance(raw_diverged, list) else ()) if isinstance(path, str)
+        ),
         churn=churn if isinstance(churn, int) and not isinstance(churn, bool) and churn > 0 else 0,
     )
 
@@ -280,9 +288,13 @@ def _apply_journal_entry(
     entry: Mapping[str, object],
     completed: dict[str, FileSignature],
     failed: dict[str, CandidateFailure],
+    diverged: set[str],
 ) -> None:
     relative_path = entry.get("path")
     if not isinstance(relative_path, str) or not relative_path:
+        return
+    if entry.get("diverged") is True:
+        diverged.add(relative_path)
         return
     if entry.get("removed") is True:
         completed.pop(relative_path, None)
@@ -314,13 +326,15 @@ def load_candidate_checkpoint(base_storage_path: Path) -> CandidateCheckpoint | 
 
     completed = dict(checkpoint.completed)
     failed = dict(checkpoint.failed)
+    diverged = set(checkpoint.diverged)
     entries = _journal_entries(_candidate_journal_path(base_storage_path))
     for entry in entries:
-        _apply_journal_entry(entry, completed, failed)
+        _apply_journal_entry(entry, completed, failed, diverged)
     return replace(
         checkpoint,
         completed=completed,
         failed=failed,
+        diverged=frozenset(diverged),
         replayed_journal_entries=len(entries),
     )
 
@@ -348,6 +362,7 @@ def append_candidate_journal(
     completed: Iterable[tuple[str, FileSignature]] = (),
     failed: Iterable[tuple[str, CandidateFailure]] = (),
     removed: Iterable[str] = (),
+    diverged: Iterable[str] = (),
 ) -> None:
     """Append per-file candidate updates without rewriting the snapshot."""
     lines: list[str] = []
@@ -368,6 +383,7 @@ def append_candidate_journal(
             ),
         )
     lines.extend(json.dumps({"path": relative_path, "removed": True}, sort_keys=True) for relative_path in removed)
+    lines.extend(json.dumps({"path": relative_path, "diverged": True}, sort_keys=True) for relative_path in diverged)
     if not lines:
         return
     base_storage_path.mkdir(parents=True, exist_ok=True)

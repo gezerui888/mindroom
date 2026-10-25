@@ -1423,7 +1423,7 @@ class KnowledgeManager:
         return _OpenedCandidate(
             checkpoint=checkpoint,
             collection=collection,
-            uncopied=frozenset() if mirrors else None,
+            uncopied=checkpoint.diverged if mirrors else None,
             resumed=True,
         )
 
@@ -1620,8 +1620,7 @@ class KnowledgeManager:
         """Remove candidate vectors and checkpoint entries for gone or stale paths."""
         if not relative_paths:
             return
-        await self._end_mirror(run)
-        run.diverged.update(relative_paths)
+        await self._record_diverged(run, relative_paths)
         await asyncio.to_thread(delete_source_path_vectors, run.collection, relative_paths)
         for relative_path in relative_paths:
             run.completed.pop(relative_path, None)
@@ -1634,12 +1633,22 @@ class KnowledgeManager:
         )
         run.journal_appends += len(relative_paths)
 
-    async def _end_mirror(self, run: _CandidateRun) -> None:
-        """Durably stop a kept collection passing as level with the published index, before it changes."""
-        if run.checkpoint.retired_by is None:
+    async def _record_diverged(self, run: _CandidateRun, relative_paths: Sequence[str]) -> None:
+        """Journal paths whose rows the run is about to change, when it copies the published collection.
+
+        The entry lands before the rows change, so an interrupted refresh
+        leaves a kept collection that still records exactly where it can
+        differ from the published one, and the next refresh can still bring
+        the published one level and keep it.
+        """
+        if run.copy_of is None:
             return
-        run.checkpoint = replace(run.checkpoint, retired_by=None)
-        await self._compact_candidate_checkpoint(run, force=True)
+        new_paths = [relative_path for relative_path in relative_paths if relative_path not in run.diverged]
+        if not new_paths:
+            return
+        await asyncio.to_thread(append_candidate_journal, self._base_storage_path, diverged=tuple(new_paths))
+        run.journal_appends += len(new_paths)
+        run.diverged.update(new_paths)
 
     async def _restamp_candidate_paths(
         self,
@@ -1788,6 +1797,7 @@ class KnowledgeManager:
                 # completed files: status subtracts completed from this to
                 # report how much work is still outstanding.
                 total_files=run.total_files,
+                diverged=frozenset(run.diverged),
             ),
         )
         run.journal_appends = 0
@@ -1924,8 +1934,7 @@ class KnowledgeManager:
                 await self._compact_candidate_checkpoint(run, force=True)
 
             if plan.pending:
-                await self._end_mirror(run)
-                run.diverged.update(map(self._relative_path, plan.pending))
+                await self._record_diverged(run, [self._relative_path(file_path) for file_path in plan.pending])
 
                 async def _record_file(file_path: Path, active_run: _CandidateRun = run) -> None:
                     await self._persist_candidate_batch(active_run, (file_path,))
@@ -1982,6 +1991,11 @@ class KnowledgeManager:
                 )
                 continue
 
+            unclaimed = sorted(run.diverged - run.completed.keys())
+            if unclaimed:
+                # A crash between a file's rows and its claim leaves rows no
+                # claim describes; publication must neither serve nor replay them.
+                await asyncio.to_thread(delete_source_path_vectors, run.collection, unclaimed)
             await self._publish_candidate(run, candidate_source_signature)
             return
 

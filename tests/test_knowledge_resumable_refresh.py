@@ -640,6 +640,7 @@ async def test_interrupted_cold_build_resumes_same_candidate_without_reembedding
     checkpoint = load_candidate_checkpoint(_storage_path(config, runtime_paths))
     assert checkpoint is not None
     assert len(checkpoint.completed) == interrupt_after
+    assert checkpoint.diverged == frozenset(), "a build copying nothing has nothing to record as diverged"
     interrupted_collection = checkpoint.collection
     # Only durably completed files may be skipped on resume; vectors that were
     # merely batch-embedded in memory are legitimately re-embedded.
@@ -3728,6 +3729,54 @@ async def test_replays_that_delete_as_many_rows_as_the_index_holds_make_both_col
 
 
 @pytest.mark.asyncio
+async def test_failed_refreshes_between_changes_keep_dead_index_entries_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: _RecordingEmbedder,
+) -> None:
+    """A failed refresh must not reset the count of rows its kept collection's vector index still holds dead."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 4)
+    large = docs_path / "large.md"
+    large.write_text(_overlapping_body(300), encoding="utf-8")
+    config = _config(tmp_path, docs_path, chunk_size=500)
+    dead: dict[str, int] = {}
+    original_delete = _FakeCollection.delete
+    original_create = _FakeClient.create_collection
+
+    def _counting_delete(self: _FakeCollection, *, where: dict[str, object]) -> None:
+        before = len(_FakeVectorDb.store.get(self.name, []))
+        original_delete(self, where=where)
+        dead[self.name] = dead.get(self.name, 0) + before - len(_FakeVectorDb.store.get(self.name, []))
+
+    def _fresh_create(self: _FakeClient, name: str, metadata: dict[str, object] | None = None) -> _FakeCollection:
+        dead[name] = 0
+        return original_create(self, name, metadata)
+
+    monkeypatch.setattr(_FakeCollection, "delete", _counting_delete)
+    monkeypatch.setattr(_FakeClient, "create_collection", _fresh_create)
+    await _manager(config).reindex_all()
+    first = _published_state(config, runtime_paths_for(config))
+    assert first is not None
+    assert first.collection is not None
+    large_rows = sum(record.metadata["source_path"] == "large.md" for record in _FakeVectorDb.store[first.collection])
+
+    for version in range(1, 13):
+        large.write_text(_overlapping_body(300).replace("token0000", f"tokenv{version:03d}"), encoding="utf-8")
+        embedder.fail_everything = _AUTH_FAILURE
+        assert not (await _manager(config).reindex_all()).published
+        embedder.fail_everything = None
+        assert (await _manager(config).reindex_all()).published
+        (docs_path / names[version % len(names)]).write_text(f"small change {version}", encoding="utf-8")
+        assert (await _manager(config).reindex_all()).published
+
+        for name, records in _FakeVectorDb.store.items():
+            assert dead.get(name, 0) <= len(records) + 2 * large_rows, (
+                f"{name} holds {dead.get(name, 0)} dead entries over {len(records)} live rows after {version} cycles"
+            )
+
+
+@pytest.mark.asyncio
 async def test_a_refresh_that_fails_on_the_kept_collection_leaves_the_published_index_whole(
     tmp_path: Path,
     embedder: _RecordingEmbedder,
@@ -3751,8 +3800,12 @@ async def test_a_refresh_that_fails_on_the_kept_collection_leaves_the_published_
     assert state.status == "complete"
     assert state.collection == published
     assert _rows(published) == published_rows, "a failed refresh changed the published index"
+    assert get_knowledge_index_status("docs", config=config, runtime_paths=runtime_paths).candidate is not None, (
+        "a kept collection holding unpublished changes is a build in progress"
+    )
 
     embedder.fail_everything = None
+    _FakeVectorDb.writes = []
     assert (await _manager(config).reindex_all()).published
     state = _published_state(config, runtime_paths)
     assert state is not None
@@ -3760,6 +3813,11 @@ async def test_a_refresh_that_fails_on_the_kept_collection_leaves_the_published_
     rows = _rows(state.collection)
     assert sorted(path for _identifier, path, _text in rows) == sorted([*names[:2], *names[3:]])
     assert "second change" in {text for _identifier, _path, text in rows}, "the change was lost"
+    kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
+    assert kept is not None
+    assert kept.collection == published, "the failure cost the collection the next refresh resumes"
+    assert sum(_FakeVectorDb.writes) == 1, "recovering from the failure copied the published index again"
+    assert _rows(published) == rows
 
 
 class _Crash(BaseException):
@@ -3980,15 +4038,15 @@ async def test_an_interrupted_forced_rebuild_never_brings_back_the_vectors_it_re
 
 
 @pytest.mark.asyncio
-async def test_a_kept_collection_holding_an_unpublished_change_is_not_kept_again(
+async def test_a_kept_collection_holding_an_unpublished_change_still_brings_the_published_one_level(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Once the kept collection records a change the published index lacks, it no longer mirrors it.
+    """A change recorded before a crash must be replayed when the kept collection is finally published.
 
-    Treating it as a copy anyway would keep the published collection with the
-    kept one's claims but its own older rows, so a later publication would
-    serve stale text under a current claim.
+    Missing it would keep the published collection with the kept one's claims
+    but its own older rows, so a later publication would serve stale text
+    under a current claim.
     """
     docs_path = tmp_path / "docs"
     names = _write_corpus(docs_path, 3)
@@ -4017,15 +4075,15 @@ async def test_a_kept_collection_holding_an_unpublished_change_is_not_kept_again
 
 
 @pytest.mark.asyncio
-async def test_a_kept_collection_interrupted_while_indexing_a_new_file_is_not_kept_again(
+async def test_rows_a_crash_wrote_before_their_claim_are_never_published_or_replayed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rows a crash wrote before their claim must not outlive the next copy.
+    """A new file's rows land before its claim, so a crash in between leaves rows no claim describes.
 
-    A new file's rows land before its claim, so a crash in between leaves the
-    claims unchanged. Only the record cleared before the write stops the
-    candidate from passing as still level with the published index.
+    The path was recorded as diverged before its rows were written, so once the
+    file is gone the next publication drops those rows instead of serving them
+    or copying them into the collection it keeps.
     """
     docs_path = tmp_path / "docs"
     names = _write_corpus(docs_path, 3)
@@ -4050,26 +4108,25 @@ async def test_a_kept_collection_interrupted_while_indexing_a_new_file_is_not_ke
             await _manager(config).reindex_all()
     (docs_path / "added.md").unlink()
 
-    for change, name in enumerate(names[1:]):
-        (docs_path / name).write_text(f"change {change}", encoding="utf-8")
-        assert (await _manager(config).reindex_all()).published
+    (docs_path / names[1]).write_text("change 0", encoding="utf-8")
+    assert (await _manager(config).reindex_all()).published
 
     assert not [
         name
         for name, records in _FakeVectorDb.store.items()
         if any(record.metadata["source_path"] == "added.md" for record in records)
-    ], "rows of a file that left the corpus survived in a kept collection"
+    ], "rows of a file that left the corpus were published or kept"
 
 
 @pytest.mark.asyncio
-async def test_a_kept_collection_that_dropped_a_removed_file_before_a_crash_is_not_kept_again(
+async def test_a_removed_file_a_crashed_refresh_dropped_is_dropped_from_the_published_collection_too(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Dropping a removed file makes the kept collection differ from the published one, which a later publish keeps.
 
-    Treated as level, the published collection would be kept with the removed
-    file's rows, and a later refresh would publish them again.
+    Without replaying that drop, the published collection would be kept with
+    the removed file's rows, and a later refresh would publish them again.
     """
     docs_path = tmp_path / "docs"
     names = _write_corpus(docs_path, 3)
@@ -4097,22 +4154,22 @@ async def test_a_kept_collection_that_dropped_a_removed_file_before_a_crash_is_n
 
 
 @pytest.mark.asyncio
-async def test_a_second_interruption_never_revives_a_kept_collection_holding_unclaimed_rows(
+async def test_a_second_interruption_never_loses_the_record_of_unclaimed_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Once a refresh starts changing the kept collection, nothing it later records may make it pass as level again.
+    """The record of where the kept collection diverged must be on disk before the rows change and survive restarts.
 
     Removing the file a crash left unclaimed rows for restores the original
-    claims and corpus size, so only a record cleared before the write tells
-    the next refresh that the collection diverged.
+    claims and corpus size, so only that record tells a later refresh to drop
+    those rows.
     """
     docs_path = tmp_path / "docs"
     names = _write_corpus(docs_path, 3)
     config = _config(tmp_path, docs_path)
     storage = _storage_path(config, runtime_paths_for(config))
     original_write = knowledge_manager_module.write_source_rows
-    recorded_while_writing: list[str | None] = []
+    recorded_while_writing: list[frozenset[str]] = []
 
     def _crash_after_writing(
         collection: KnowledgeCollection,
@@ -4121,9 +4178,9 @@ async def test_a_second_interruption_never_revives_a_kept_collection_holding_unc
         signature: FileSignature,
         rows: Sequence[tuple[KnowledgeChunk, Sequence[float]]],
     ) -> None:
-        # A killed process runs no cleanup, so the record must already be gone from disk here.
+        # A killed process runs no cleanup, so the record must already be on disk here.
         checkpoint = load_candidate_checkpoint(storage)
-        recorded_while_writing.append(None if checkpoint is None else checkpoint.retired_by)
+        recorded_while_writing.append(frozenset() if checkpoint is None else checkpoint.diverged)
         original_write(collection, relative_path=relative_path, signature=signature, rows=rows)
         raise _Crash
 
@@ -4136,7 +4193,7 @@ async def test_a_second_interruption_never_revives_a_kept_collection_holding_unc
         patch.setattr(knowledge_manager_module, "write_source_rows", _crash_after_writing)
         with pytest.raises(_Crash):
             await _manager(config).reindex_all()
-    assert recorded_while_writing == [None], "the kept collection still passed as level while it was written"
+    assert recorded_while_writing == [frozenset({"added.md"})], "the rows changed before their path was recorded"
     (docs_path / "added.md").unlink()
     with monkeypatch.context() as patch:
         patch.setattr(KnowledgeManager, "_publish_candidate", _crash_before_publishing)

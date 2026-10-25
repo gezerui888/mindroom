@@ -80,7 +80,11 @@ def _candidate_status_for_key(
     state: registry.PublishedIndexState | None,
 ) -> KnowledgeCandidateStatus | None:
     checkpoint = load_candidate_checkpoint(registry.published_index_storage_path(key))
-    if checkpoint is None or checkpoint.settings != key.indexing_settings or checkpoint.mirrors(state):
+    if (
+        checkpoint is None
+        or checkpoint.settings != key.indexing_settings
+        or (checkpoint.mirrors(state) and not checkpoint.diverged)
+    ):
         return None
     return KnowledgeCandidateStatus(
         collection=checkpoint.collection,

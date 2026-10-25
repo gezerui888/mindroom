@@ -2016,17 +2016,19 @@ class KnowledgeManager:
                     relative_paths=sorted(run.diverged),
                 ),
             )
-            await asyncio.to_thread(
-                save_candidate_checkpoint,
-                self._base_storage_path,
-                CandidateCheckpoint(
-                    collection=run.copy_of,
-                    settings=self._indexing_settings,
-                    target_revision=run.baseline_revision,
-                    total_files=len(run.completed),
-                    completed=dict(run.completed),
-                    retired_by=run.collection.name,
-                    churn=run.checkpoint.churn + deleted,
+            await _shielded_write(
+                asyncio.to_thread(
+                    save_candidate_checkpoint,
+                    self._base_storage_path,
+                    CandidateCheckpoint(
+                        collection=run.copy_of,
+                        settings=self._indexing_settings,
+                        target_revision=run.baseline_revision,
+                        total_files=len(run.completed),
+                        completed=dict(run.completed),
+                        retired_by=run.collection.name,
+                        churn=run.checkpoint.churn + deleted,
+                    ),
                 ),
             )
         except Exception:

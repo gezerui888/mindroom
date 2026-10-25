@@ -3854,6 +3854,43 @@ async def test_a_failure_after_the_kept_checkpoint_lands_still_spares_the_collec
 
 
 @pytest.mark.asyncio
+async def test_cancellation_waits_for_the_kept_checkpoint_to_land(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled refresh releases the base, so a still-running write could overwrite the next refresh's checkpoint."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    await _manager(config).reindex_all()
+    original_save = knowledge_manager_module.save_candidate_checkpoint
+    saving, release = Event(), Event()
+
+    def _slow_save(base_storage_path: Path, checkpoint: CandidateCheckpoint) -> CandidateCheckpoint:
+        if checkpoint.retired_by is not None:
+            saving.set()
+            assert release.wait(10)
+        return original_save(base_storage_path, checkpoint)
+
+    monkeypatch.setattr(knowledge_manager_module, "save_candidate_checkpoint", _slow_save)
+    (docs_path / names[0]).write_text("first change", encoding="utf-8")
+    refresh = asyncio.create_task(_manager(config).reindex_all())
+    try:
+        assert await asyncio.to_thread(saving.wait, 10)
+        refresh.cancel()
+        done, _pending = await asyncio.wait({refresh}, timeout=0.2)
+        assert not done, "cancellation escaped while the kept checkpoint was still being written"
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+    kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
+    assert kept is not None
+    assert kept.retired_by is not None
+
+
+@pytest.mark.asyncio
 async def test_changed_chunking_rebuilds_every_vector_instead_of_resuming_the_kept_collection(
     tmp_path: Path,
     embedder: _RecordingEmbedder,

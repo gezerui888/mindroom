@@ -3896,7 +3896,7 @@ async def test_a_refresh_failing_before_it_reconciles_leaves_the_kept_collection
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The failure path still compacts the checkpoint, which must not erase what the kept collection targets."""
+    """The failure path still compacts the checkpoint, which must keep the record of a collection nothing changed."""
     docs_path = tmp_path / "docs"
     names = _write_corpus(docs_path, 3)
     config = _config(tmp_path, docs_path)
@@ -4021,8 +4021,8 @@ async def test_a_kept_collection_interrupted_while_indexing_a_new_file_is_not_ke
     """Rows a crash wrote before their claim must not outlive the next copy.
 
     A new file's rows land before its claim, so a crash in between leaves the
-    claims unchanged. The candidate then targets more files than it claims,
-    which is what stops it from passing as still level with the published index.
+    claims unchanged. Only the record cleared before the write stops the
+    candidate from passing as still level with the published index.
     """
     docs_path = tmp_path / "docs"
     names = _write_corpus(docs_path, 3)

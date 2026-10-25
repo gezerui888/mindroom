@@ -3700,6 +3700,7 @@ async def test_replays_that_delete_as_many_rows_as_the_index_holds_make_both_col
     worn = kept.collection
     published = _published_state(config, runtime_paths)
     assert published is not None
+    assert kept.churn > len(_FakeVectorDb.store[worn]), "this refresh must find more dead entries than live rows"
     large.write_text(_overlapping_body(300).replace("token0000", "tokenv003"), encoding="utf-8")
     _FakeVectorDb.writes = []
 
@@ -3888,6 +3889,32 @@ async def test_cancellation_waits_for_the_kept_checkpoint_to_land(
     kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
     assert kept is not None
     assert kept.retired_by is not None
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_failing_before_it_reconciles_leaves_the_kept_collection_kept(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure path still compacts the checkpoint, which must not erase what the kept collection targets."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    await _publish_twice(config, docs_path, names)
+
+    async def _fail_to_list(*_args: object, **_kwargs: object) -> None:
+        message = "source listing failed"
+        raise RuntimeError(message)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(KnowledgeManager, "_reconcile_candidate", _fail_to_list)
+        with pytest.raises(RuntimeError, match="source listing failed"):
+            await _manager(config).reindex_all()
+
+    kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
+    assert kept is not None
+    assert kept.mirrors(_published_state(config, runtime_paths)), "a failure before any change ended the mirror"
 
 
 @pytest.mark.asyncio

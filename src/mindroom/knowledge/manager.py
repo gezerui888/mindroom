@@ -1393,7 +1393,7 @@ class KnowledgeManager:
         # A candidate mirroring the published index is the collection the last
         # publication retired and brought level with it.
         mirrors = checkpoint.mirrors(persisted_state)
-        if mirrors and checkpoint.churn >= await asyncio.to_thread(row_count, collection):
+        if mirrors and checkpoint.churn > await asyncio.to_thread(row_count, collection):
             # Each replay leaves the rows it deleted in the vector index as dead
             # entries. Once they outnumber the live rows, copy afresh and keep
             # nothing, because the published collection absorbed the same
@@ -1512,6 +1512,9 @@ class KnowledgeManager:
             # Rows this process just copied need no vector-existence probe: the
             # copy already reported which paths actually received them.
             verified=set(opened.reused),
+            # Until reconciliation measures the corpus, a compaction on the way
+            # out must keep what the checkpoint already targets.
+            total_files=checkpoint.total_files,
             journal_appends=checkpoint.replayed_journal_entries,
             resumed=opened.resumed,
             copy_of=None if opened.uncopied is None else published_collection,

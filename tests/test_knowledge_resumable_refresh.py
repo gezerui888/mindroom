@@ -3650,6 +3650,48 @@ async def test_a_refresh_after_the_first_copy_writes_only_the_rows_that_changed(
     untouched = set(names[3:39])
     assert [row for row in _rows(retired) if row[1] in untouched] == [row for row in cold_rows if row[1] in untouched]
     assert _rows(published) == _rows(retired), "the collection kept for the next refresh missed the change"
+    kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
+    assert kept is not None
+    assert kept.collection == published
+    assert kept.churn == 5, "each refresh's replayed files must count toward the next whole copy"
+
+
+@pytest.mark.asyncio
+async def test_replays_adding_up_to_the_corpus_make_the_next_refreshes_copy_both_collections_afresh(
+    tmp_path: Path,
+    embedder: _RecordingEmbedder,
+) -> None:
+    """Replaced vectors stay in a collection's vector index, so churn must eventually cost a whole copy again."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 4)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    storage = _storage_path(config, runtime_paths)
+    worn, published = await _publish_twice(config, docs_path, names)
+    kept = load_candidate_checkpoint(storage)
+    assert kept is not None
+    save_candidate_checkpoint(storage, replace(kept, churn=len(kept.completed)))
+    (docs_path / names[1]).write_text("second change", encoding="utf-8")
+    _FakeVectorDb.writes = []
+    embedder.embedded_texts.clear()
+
+    assert (await _manager(config).reindex_all()).published
+
+    assert embedder.embedded_texts == ["second change"]
+    assert sum(_FakeVectorDb.writes) == 4, "the worn collection was resumed instead of copied afresh"
+    state = _published_state(config, runtime_paths)
+    assert state is not None
+    assert state.collection == worn
+    assert published not in _FakeVectorDb.store, "the published collection shares the churn, so it must not be kept"
+    assert load_candidate_checkpoint(storage) is None
+
+    (docs_path / names[2]).write_text("third change", encoding="utf-8")
+    assert (await _manager(config).reindex_all()).published
+
+    fresh = load_candidate_checkpoint(storage)
+    assert fresh is not None
+    assert fresh.collection == worn
+    assert fresh.churn == 1
 
 
 @pytest.mark.asyncio

@@ -98,6 +98,9 @@ class CandidateCheckpoint:
     #: The collection whose publication retired this one and brought it level
     #: with itself; None for a candidate a refresh is building.
     retired_by: str | None = None
+    #: Files replayed into a retired collection since a refresh last copied the
+    #: published index whole, bounding the replaced vectors its index retains.
+    churn: int = 0
     #: Journal entries replayed when this checkpoint was loaded. Not persisted:
     #: it exists so a resumed run inherits the compaction bound instead of
     #: restarting the count and letting the journal grow without limit across
@@ -201,6 +204,7 @@ def _snapshot_payload(checkpoint: CandidateCheckpoint) -> dict[str, object]:
         "created_at": checkpoint.created_at,
         "updated_at": checkpoint.updated_at,
         "retired_by": checkpoint.retired_by,
+        "churn": checkpoint.churn,
     }
 
 
@@ -255,6 +259,7 @@ def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None
     created_at = payload.get("created_at")
     updated_at = payload.get("updated_at")
     retired_by = payload.get("retired_by")
+    churn = payload.get("churn")
     return CandidateCheckpoint(
         collection=collection,
         settings=settings,
@@ -266,6 +271,7 @@ def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None
         created_at=created_at if isinstance(created_at, str) else "",
         updated_at=updated_at if isinstance(updated_at, str) else "",
         retired_by=retired_by if isinstance(retired_by, str) and retired_by else None,
+        churn=churn if isinstance(churn, int) and not isinstance(churn, bool) and churn > 0 else 0,
     )
 
 

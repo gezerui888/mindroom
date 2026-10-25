@@ -219,7 +219,7 @@ class _CandidateRun:
     resumed: bool = False
     published: bool = False
     #: The published collection this candidate began as a row-for-row copy of,
-    #: apart from ``diverged``; None when its start is not known to match one.
+    #: apart from ``diverged``, for publication to keep; None to delete it.
     copy_of: str | None = None
     #: Paths whose rows may differ from ``copy_of``'s: left out of the copy,
     #: dropped, or written since.
@@ -234,7 +234,7 @@ class _OpenedCandidate:
     collection: KnowledgeCollection
     reused: dict[str, FileSignature] = field(default_factory=dict)
     #: Published paths the copy left out, when every published row names its
-    #: path; None when the candidate is not a copy of the published collection.
+    #: path; None when publication must not keep the published collection.
     uncopied: frozenset[str] | None = None
     resumed: bool = False
 
@@ -1388,12 +1388,27 @@ class KnowledgeManager:
             # Rebuilt without a copy: whatever lost this collection may equally
             # have damaged the published one, and a full rebuild is the safe repair.
             return await self._rebuild_candidate_collection(checkpoint, published_collection=None)
+        # A candidate mirroring the published index is the collection the last
+        # publication retired and brought level with it.
+        mirrors = checkpoint.mirrors(persisted_state)
+        if mirrors and checkpoint.churn >= len(checkpoint.completed):
+            # Each replay leaves the vectors it replaced in the vector index as
+            # deleted entries. Once the files replayed since the last whole copy
+            # add up to the corpus, copy afresh and keep nothing, because the
+            # published collection absorbed the same changes; the next refresh
+            # copies again and keeps this fresh copy.
+            logger.info(
+                "Copying the published knowledge index afresh to shed replaced vectors",
+                base_id=self.base_id,
+                collection=checkpoint.collection,
+                churn=checkpoint.churn,
+            )
+            opened = await self._rebuild_candidate_collection(checkpoint, published_collection=checkpoint.retired_by)
+            return replace(opened, uncopied=None)
         return _OpenedCandidate(
             checkpoint=checkpoint,
             collection=open_collection(self._collections, checkpoint.collection),
-            # A candidate mirroring the published index is the collection the
-            # last publication retired and brought level with it.
-            uncopied=frozenset() if checkpoint.mirrors(persisted_state) else None,
+            uncopied=frozenset() if mirrors else None,
             resumed=True,
         )
 
@@ -2009,6 +2024,7 @@ class KnowledgeManager:
                     total_files=len(run.completed),
                     completed=dict(run.completed),
                     retired_by=run.collection.name,
+                    churn=run.checkpoint.churn + len(run.diverged),
                 ),
             )
         except Exception:

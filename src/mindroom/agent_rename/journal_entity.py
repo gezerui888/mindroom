@@ -20,6 +20,7 @@ from mindroom.agent_rename.journal import PRINCIPAL_COLUMNS, format_counts, prin
 from mindroom.agent_rename.sqlite_read import quote_identifier, read_only_connection, text_columns
 from mindroom.agent_rename.steps import RenameRefusedError, SqliteEdit
 from mindroom.agent_rename.teams import renamed_ad_hoc_scope_id
+from mindroom.delegation.state import delegation_card_id
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -113,6 +114,39 @@ def journal_entity_steps(
         return []
     description = f"Rewrite the event journal {database}: {'; '.join(parts)}"
     return [SqliteEdit(database=database, edit=partial(_rename_entity, rename=rename), description=description)]
+
+
+def pending_member_card_reports(database: Path, *, old_name: str) -> list[str]:
+    """Report the undecided approval cards of delegation calls the agent made as a team member.
+
+    A team holds the card of a member's ``run_subagent`` or ``continue_subagent`` call under the id
+    ``<member>:<call id>`` (delegation/state.py's ``delegation_card_id``), and its approval card in Matrix shows that id,
+    so the rename leaves it as it is; the team then no longer finds the member it names, so the call cannot resume.
+    """
+    if not database.exists():
+        return []
+    prefix = delegation_card_id(old_name, "")
+    try:
+        with read_only_connection(database) as connection:
+            if "tool_call_id" not in text_columns(connection).get("approval_continuation_calls", ()):
+                return []
+            # substr instead of LIKE: `_` in an agent name is a LIKE wildcard.
+            rows = connection.execute(
+                "SELECT DISTINCT approval_id FROM approval_continuation_calls "
+                "WHERE substr(tool_call_id, 1, ?) = ? AND decision IS NULL ORDER BY approval_id",
+                (len(prefix), prefix),
+            ).fetchall()
+    except (sqlite3.Error, OSError) as exc:
+        msg = f"Cannot read the event journal {database}: {exc}"
+        raise RenameRefusedError(msg) from exc
+    if not rows:
+        return []
+    approvals = ", ".join(str(approval_id) for (approval_id,) in rows)
+    return [
+        f"{len(rows)} paused team approvals wait on delegation calls agent {old_name} made as a member, whose cards "
+        f"are named after it and which the rename leaves as they are, so they cannot resume: {approvals}. "
+        "Approve or deny them before renaming.",
+    ]
 
 
 @dataclass(frozen=True)

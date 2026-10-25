@@ -5022,6 +5022,7 @@ depends_on = [
     "mindroom.constants",
     "mindroom.event_journal.opening",
     "mindroom.matrix_identifiers",
+    "mindroom.session_storage.schema",
     "mindroom.tool_system.worker_routing",
 ]
 visibility = ["mindroom.cli.main"]
@@ -9688,10 +9689,10 @@ from = ["mindroom.agent_rename.journal"]
 # Renames an agent's journal principal and every journal value keyed by its config name.
 [[modules]]
 path = "mindroom.agent_rename.journal_entity"
-depends_on = ["mindroom.agent_rename.journal", "mindroom.agent_rename.teams"]
+depends_on = ["mindroom.agent_rename.journal", "mindroom.agent_rename.teams", "mindroom.delegation.state"]
 
 [[interfaces]]
-expose = ["journal_entity_steps"]
+expose = ["journal_entity_steps", "pending_member_card_reports"]
 from = ["mindroom.agent_rename.journal_entity"]
 
 # Edits the config, its includes, and its `.env` as text for both rename commands.

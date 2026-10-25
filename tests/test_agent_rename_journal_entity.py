@@ -6,7 +6,7 @@ import json
 import sqlite3
 import time
 from contextlib import closing
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
@@ -14,9 +14,9 @@ from uuid import UUID, uuid4
 import pytest
 
 from mindroom import reply_lifecycle as rl
-from mindroom.agent_rename.journal_entity import journal_entity_steps
+from mindroom.agent_rename.journal_entity import journal_entity_steps, pending_member_card_reports
 from mindroom.agent_rename.steps import RenamePlan, RenameRefusedError, SqliteEdit, apply_plan
-from mindroom.delegation.state import DelegationChild
+from mindroom.delegation.state import DelegationChild, delegation_card_id
 from mindroom.event_journal import (
     ApprovalCall,
     ApprovalContinuation,
@@ -614,6 +614,37 @@ def _restore_team_document(stored: str, member_names: tuple[str, ...]) -> TeamSt
         state=segment.team_state,
         tool_trace=segment.tool_trace,
     )
+
+
+@pytest.mark.asyncio
+async def test_undecided_cards_of_the_agents_member_delegations_are_reported(tmp_path: Path) -> None:
+    """A team keeps the card of a member's delegation call under ``<member>:<call id>``, which the rename leaves.
+
+    Only undecided cards of the agent are reported; decided ones and those of the agent whose name extends it are not.
+    """
+    database = event_journal_sqlite_path(tmp_path)
+    store = EventJournalStore.open_sqlite(database)
+    try:
+        helper = store.principal(HELPER_PRINCIPAL)
+        await _admit_source(helper, "$team-source")
+        continuation = replace(
+            _team_continuation(),
+            calls=(
+                replace(_call(delegation_card_id(OLD, "call-1"), OLD), decision=None),
+                _call(delegation_card_id(OLD, "call-2"), OLD),
+                replace(_call(delegation_card_id(PREFIX, "call-3"), PREFIX), decision=None),
+            ),
+        )
+        assert await paused_for_approval(helper, continuation, text="waiting") is not None
+    finally:
+        await store.close()
+
+    [report] = pending_member_card_reports(database, old_name=OLD)
+
+    assert report.startswith(f"1 paused team approvals wait on delegation calls agent {OLD} made as a member")
+    assert report.endswith(": team-approval. Approve or deny them before renaming.")
+    assert pending_member_card_reports(database, old_name=HELPER) == []
+    assert pending_member_card_reports(tmp_path / "missing.db", old_name=OLD) == []
 
 
 @pytest.mark.asyncio

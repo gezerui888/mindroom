@@ -107,7 +107,7 @@ def _agent_rename(runtime_paths: RuntimePaths, config: Config, *, old: str, new:
     from mindroom.matrix_identifiers import agent_username_localpart  # noqa: PLC0415
 
     _require_renamable_agent(runtime_paths, config, old)
-    _require_new_name(config, old=old, new=new)
+    _require_new_name(runtime_paths, config, old=old, new=new)
     accounts = stored_accounts(runtime_paths)
     domain = config.get_domain(runtime_paths)
     account = accounts.get(managed_account_key(old))
@@ -142,15 +142,30 @@ def _require_renamable_agent(runtime_paths: RuntimePaths, config: Config, old: s
         msg = f"{old} is not a configured agent in {runtime_paths.config_path}."
     elif config.agents[old].private is not None:
         msg = f"agent {old} is private (agents.{old}.private is set); renaming private agents is not supported yet."
+    elif (instance := config.personal_agent_instance(old)) is not None:
+        msg = (
+            f"agent {old} is the personal agent of {instance.user_id}, generated from "
+            f"personal_agents.{instance.template}; renaming personal agents is not supported yet."
+        )
+    elif _keeps_runs_apart(old):
+        msg = f"agent {old} keeps its runs in a table not named after its sessions table, so it cannot be renamed."
     else:
         return
     raise RenameRefusedError(msg)
 
 
-def _require_new_name(config: Config, *, old: str, new: str) -> None:
+def _keeps_runs_apart(name: str) -> bool:
+    """Whether the session database of ``name`` names its runs table unlike every other, as ``agno_runs`` is."""
+    from mindroom.session_storage.schema import TableNames  # noqa: PLC0415
+
+    names = TableNames(name)
+    return names.runs != f"{names.sessions}_runs"
+
+
+def _require_new_name(runtime_paths: RuntimePaths, config: Config, *, old: str, new: str) -> None:
     """Refuse a new name the config would reject, or one MindRoom would mistake for another agent's.
 
-    Worker keys spell an agent with ``normalize_worker_key_part``, and team runs tell members apart by Agno's
+    Worker keys spell an agent with ``normalize_worker_key_part``, and team documents tell members apart by Agno's
     ``url_safe_string`` id, so a name that matches the old one or another agent there would share their state.
     """
     from agno.utils.string import url_safe_string  # noqa: PLC0415
@@ -173,6 +188,10 @@ def _require_new_name(config: Config, *, old: str, new: str) -> None:
         msg = f"{new} is already a configured agent."
     elif new in config.teams:
         msg = f"{new} is already a configured team."
+    elif (personal := _personal_agent_name_holder(runtime_paths, config, new)) is not None:
+        msg = personal
+    elif _keeps_runs_apart(new):
+        msg = f"{new} would keep its runs in a table not named after its sessions table; choose another new name."
     elif worker_twin is not None:
         msg = (
             f"{new} is written {worker_spelling} in worker keys, like agent {worker_twin}, so they would share workers."
@@ -182,6 +201,22 @@ def _require_new_name(config: Config, *, old: str, new: str) -> None:
     else:
         return
     raise RenameRefusedError(msg)
+
+
+def _personal_agent_name_holder(runtime_paths: RuntimePaths, config: Config, name: str) -> str | None:
+    """Say what of personal agents holds ``name`` already, or return ``None`` when nothing does.
+
+    A template's key must not be an agent's, and the roster names every personal agent, pending ones included,
+    so the config would no longer load with ``name`` taken from either.
+    """
+    from mindroom.config.personal_agents import personal_agent_roster_path, read_personal_agent_roster  # noqa: PLC0415
+
+    if name in config.personal_agents:
+        return f"{name} is already a personal agent template (personal_agents.{name})."
+    entry = next((entry for entry in read_personal_agent_roster(runtime_paths) if entry.agent_name == name), None)
+    if entry is None:
+        return None
+    return f"{name} is the personal agent of {entry.user_id} in {personal_agent_roster_path(runtime_paths)}."
 
 
 def _refuse_journal_without_account(runtime_paths: RuntimePaths, old: str) -> None:
@@ -317,7 +352,7 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
     )
     from mindroom.agent_rename.entity_state import entity_state_steps, matrix_state_key_step  # noqa: PLC0415
     from mindroom.agent_rename.indexes import index_steps  # noqa: PLC0415
-    from mindroom.agent_rename.journal_entity import journal_entity_steps  # noqa: PLC0415
+    from mindroom.agent_rename.journal_entity import journal_entity_steps, pending_member_card_reports  # noqa: PLC0415
     from mindroom.agent_rename.links import link_steps  # noqa: PLC0415
     from mindroom.agent_rename.memory import memory_steps  # noqa: PLC0415
     from mindroom.agent_rename.side_stores import entity_file_steps  # noqa: PLC0415
@@ -386,7 +421,13 @@ def _rename_plan(runtime_paths: RuntimePaths, config: Config, rename: _AgentRena
     return RenamePlan(
         storage_root=storage,
         steps=steps,
-        reports=(*side_reports, *worker_reports, *worker_root_reports, *index_reports),
+        reports=(
+            *side_reports,
+            *pending_member_card_reports(event_journal_sqlite_path(storage), old_name=old),
+            *worker_reports,
+            *worker_root_reports,
+            *index_reports,
+        ),
         staying=(*side_staying, *unknown_roots, *index_staying),
     )
 

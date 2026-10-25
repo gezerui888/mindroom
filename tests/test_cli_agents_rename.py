@@ -28,6 +28,7 @@ from mindroom.cli.agents import load_config_or_exit
 from mindroom.cli.main import app
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
+from mindroom.config.personal_agents import PersonalAgentRosterEntry, personal_agent_roster_path
 from mindroom.constants import matrix_state_file, tracking_dir
 from mindroom.event_journal import EventJournalStore, IngestionBatchAdmission
 from mindroom.event_journal.opening import event_journal_sqlite_path
@@ -523,6 +524,83 @@ def test_refusals_change_nothing(
 
         assert result.exit_code == 1, result.output
         assert reason in result.output
+    assert tree_snapshot(tmp_path) == before
+
+
+# A personal-agent template, an agent whose session database keeps its runs apart, and the template's roster.
+PERSONAL_CONFIG = (
+    CONFIG.replace("teams:\n", "  agno:\n    display_name: Agno\nteams:\n")
+    + """\
+personal_agents:
+  buddy:
+    agent:
+      display_name: Buddy
+"""
+)
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "reason"),
+    [
+        (
+            "buddy_alice",
+            "pal",
+            "agent buddy_alice is the personal agent of @alice:x, generated from personal_agents.buddy; "
+            "renaming personal agents is not supported yet.",
+        ),
+        (OLD, "buddy", "buddy is already a personal agent template (personal_agents.buddy)."),
+        (OLD, "buddy_alice", "buddy_alice is already a configured agent."),
+        (OLD, "buddy_bob", "buddy_bob is the personal agent of @bob:x in"),
+        ("agno", "atlas", "agent agno keeps its runs in a table not named after its sessions table"),
+        (OLD, "agno", "agno is already a configured agent."),
+    ],
+)
+def test_personal_agents_and_their_names_are_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    old: str,
+    new: str,
+    reason: str,
+) -> None:
+    """A personal agent is not in the YAML the rename edits, and its roster names stay taken, pending ones too."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    runtime_paths.config_path.write_text(PERSONAL_CONFIG, encoding="utf-8")
+    roster = [
+        PersonalAgentRosterEntry(
+            template="buddy",
+            user_id=f"@{user}:x",
+            username=user,
+            agent_name=f"buddy_{user}",
+            matrix_username=None,
+            user_display_name=user.title(),
+            source_room_id="!lobby:x",
+            pending=pending,
+        )
+        for user, pending in (("alice", False), ("bob", True))
+    ]
+    personal_agent_roster_path(runtime_paths).write_text(
+        json.dumps({"entries": [entry.model_dump(mode="json") for entry in roster]}),
+        encoding="utf-8",
+    )
+    before = tree_snapshot(tmp_path)
+
+    for args in ((), ("--apply", "--yes")):
+        result = _invoke(runtime_paths, *args, old=old, new=new)
+
+        assert result.exit_code == 1, result.output
+        assert reason in " ".join(result.output.split())
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_new_name_keeping_runs_apart_is_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one storage name whose runs table is not named after its sessions table is refused as the new name."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    before = tree_snapshot(tmp_path)
+
+    result = _invoke(runtime_paths, old=OLD, new="agno")
+
+    assert result.exit_code == 1, result.output
+    assert "agno would keep its runs in a table not named after its sessions table" in " ".join(result.output.split())
     assert tree_snapshot(tmp_path) == before
 
 

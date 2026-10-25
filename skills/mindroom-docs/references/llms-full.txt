@@ -20440,7 +20440,7 @@ The command keeps whatever Matrix ID `matrix_state.yaml` holds for the agent.
 That is why a Matrix rename goes first: the new ID then travels with the agent to its new key.
 
 The command renames a configured agent.
-It refuses the router, teams, and private agents, see [Refusals and limits](#refusals-and-limits).
+It refuses the router, teams, private agents, and personal agents, see [Refusals and limits](#refusals-and-limits).
 It supports the SQLite event journal and the `static_runner` or `docker` worker backend.
 Any other setup is refused: Postgres and Kubernetes with `not supported yet`, and an unknown `MINDROOM_WORKER_BACKEND` with `Unsupported worker backend: <value>`.
 
@@ -20448,12 +20448,13 @@ Any other setup is refused: Postgres and Kubernetes with `not supported yet`, an
 
 - It uses letters, digits, and `_` only.
 - It is not `router`, `user`, or `_shared`.
-- It is not the name of another agent or team.
+- It is not the name of another agent or team, a `personal_agents` template, or a personal agent in `tracking/personal_agents.json`, including one still being set up.
+- It is not `agno`, the one name whose session database keeps its runs in a table not named after its sessions table.
 - It does not collide after normalization.
   Worker keys write a name without leading and trailing `_`.
-  Agno ids lowercase a name, turn `_` into `-`, and split camel case, so `MyAgent` and `my_agent` both become `my-agent`.
+  Team member ids lowercase a name, turn `_` into `-`, and split camel case, so `MyAgent` and `my_agent` both become `my-agent`.
   The worker key check includes the agent's own old name, so `nova` cannot become `_nova`.
-  The Agno id check skips the agent being renamed, so it only refuses a new name whose id another agent already has.
+  The member id check skips the agent being renamed, so it only refuses a new name whose id another agent already has.
   With agents `nova` and `crew`, renaming `crew` to `Nova` is refused.
   Colliding names would share workers or confuse team runs.
 
@@ -20683,6 +20684,10 @@ Read them before you start MindRoom.
 - **Paused delegations.**
   A delegation that had not finished keeps the old name in its saved run, so it cannot resume.
   The plan lists the sessions, and you ask again there.
+- **Paused team approvals of the agent's delegations.**
+  When the agent, as a team member, started a subagent that waits for approval, the team keeps that approval card under `<OLD>:<call id>`, which the approval card in Matrix shows too.
+  The card keeps that id, so the team no longer finds its member and the call cannot resume.
+  The plan lists the approvals; approve or deny them before renaming.
 - **Legacy files.**
   Files that older MindRoom versions kept under the name stay: dispatch obligations, session databases directly under the storage directory, the old memory search index, an imported handled-turn ledger, and the retired learning database in the moved state directory.
 - **The mem0 history database.**
@@ -20723,6 +20728,9 @@ The completed steps are undone first.
 - **Not supported.**
   - Teams: `<name> is a team; renaming teams is not supported yet.`
   - Private agents, those with `agents.<OLD>.private` set: `renaming private agents is not supported yet`.
+  - Personal agents, generated from a `personal_agents` template: `renaming personal agents is not supported yet`.
+    Their names come from `tracking/personal_agents.json`, not from the config the command edits.
+  - The agent `agno`, whose session database keeps its runs in `agno_runs`.
   - The router: `router is MindRoom's router, which cannot be renamed.`
   - An event journal on Postgres: `The event_journal.backend 'postgres' is not supported yet`.
   - The Kubernetes worker backend: `The worker backend 'kubernetes' is not supported yet`.

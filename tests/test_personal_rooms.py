@@ -5,10 +5,11 @@
 
 import asyncio
 import json
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import nio
 import pytest
@@ -20,6 +21,7 @@ from mindroom.background_tasks import wait_for_background_tasks
 from mindroom.config.agent import AgentPrivateConfig
 from mindroom.config.main import Config
 from mindroom.config.matrix import MindRoomUserConfig
+from mindroom.config.reload_status import ConfigReloadStatus
 from mindroom.constants import ORIGINAL_SENDER_KEY, ROUTER_AGENT_NAME, SOURCE_KIND_KEY
 from mindroom.dispatch_callback_outcome import TurnDispatchOutcome
 from mindroom.event_journal import EventClass, EventKind
@@ -42,8 +44,10 @@ from mindroom.matrix.personal_rooms import (
     PersonalRoomService,
     PersonalRoomValidationError,
 )
+from mindroom.matrix.room_member_joins import RoomMemberJoin
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.users import AgentMatrixUser
+from mindroom.personal_agents import _append_personal_agent_roster_entry
 from mindroom.personal_room_lifecycle import PersonalRoomLifecycle, PersonalRoomTarget
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.tool_system.worker_routing import agent_state_root_path
@@ -51,6 +55,8 @@ from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import TEST_PASSWORD, install_runtime_journal_support, test_runtime_paths
 from tests.identity_helpers import persist_entity_accounts
 from tests.journal_helpers import admit_dispatch_event
+from tests.test_personal_agents_config import BASE as PERSONAL_AGENTS_BASE
+from tests.test_personal_agents_config import _entry as personal_agent_entry
 from tests.test_room_member_hooks import _dispatch_member, _room_member_event
 
 pytestmark = pytest.mark.usefixtures("enforce_turn_authorization")
@@ -451,6 +457,58 @@ async def test_service_accounts_and_denied_humans_are_excluded(tmp_path: Path, m
 
 
 @pytest.mark.asyncio
+async def test_generated_agent_service_serves_only_its_owner(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A user's own agent applies its template's personal-room settings, and only for that user."""
+    server = MatrixServer()
+    paths = test_runtime_paths(tmp_path)
+    state = MatrixState.load(paths)
+    state.add_room("lobby", "!lobby:localhost", "#lobby:localhost", "Lobby")
+    state.save(paths)
+    entry = personal_agent_entry("@alice:localhost", source_room_id="!lobby:localhost")
+    _append_personal_agent_roster_entry(paths, entry)
+    data = deepcopy(PERSONAL_AGENTS_BASE)
+    # Bob may use alice's agent, so only ownership keeps him from a personal room through it.
+    data["personal_agents"]["mind"]["agent"]["access"] = {"users": ["@bob:localhost"]}
+    config = Config.validate_with_runtime(data, paths)
+    runtime = SimpleNamespace(config=config, client=server, agent_reply_memberships=AgentReplyMembershipIndex())
+    monkeypatch.setattr("mindroom.matrix.personal_rooms.send_message_result", server.deliver)
+    owner = PersonalRoomService("mind_alice", runtime, paths, AsyncMock(return_value=True))
+    assert owner._allowed("@bob:localhost", "!lobby:localhost")
+    assert owner._current_settings("@alice:localhost", "!lobby:localhost") is config.personal_rooms
+    assert owner._current_settings("@bob:localhost", "!lobby:localhost") is None
+    assert await owner.ensure("@bob:localhost", "!lobby:localhost", server) is None
+    assert not server.state
+    assert await owner.ensure("@alice:localhost", "!lobby:localhost", server) is not None
+
+
+@pytest.mark.asyncio
+async def test_generated_agent_service_serves_its_owners_bridge_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bridge alias of the owner gets a personal room from the owner's agent, keyed by the alias account."""
+    server = MatrixServer()
+    server.lobby_members.add("@bridge_alice:localhost")
+    paths = test_runtime_paths(tmp_path)
+    state = MatrixState.load(paths)
+    state.add_room("lobby", "!lobby:localhost", "#lobby:localhost", "Lobby")
+    state.save(paths)
+    _append_personal_agent_roster_entry(
+        paths,
+        personal_agent_entry("@alice:localhost", source_room_id="!lobby:localhost"),
+    )
+    data = deepcopy(PERSONAL_AGENTS_BASE)
+    data["authorization"] = {"aliases": {"@alice:localhost": ["@bridge_alice:localhost"]}}
+    config = Config.validate_with_runtime(data, paths)
+    runtime = SimpleNamespace(config=config, client=server, agent_reply_memberships=AgentReplyMembershipIndex())
+    monkeypatch.setattr("mindroom.matrix.personal_rooms.send_message_result", server.deliver)
+    owner = PersonalRoomService("mind_alice", runtime, paths, AsyncMock(return_value=True))
+    room_id = await owner.ensure("@bridge_alice:localhost", "!lobby:localhost", server)
+    assert room_id is not None
+    assert server.membership(room_id, "@bridge_alice:localhost") == "invite"
+
+
+@pytest.mark.asyncio
 async def test_owner_invited_agents_keep_the_room_valid(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An owner may bring other MindRoom agents into a personal room."""
     server = MatrixServer()
@@ -650,11 +708,42 @@ async def test_a_shared_room_is_never_treated_as_a_personal_room(
 
 
 @pytest.mark.asyncio
-async def test_an_imported_room_still_refuses_an_unattested_agent(
+async def test_an_unattested_agent_is_removed_from_an_imported_room(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Agents are welcome only in rooms MindRoom created; an imported roster stays exact."""
+    """Agents are welcome only in rooms MindRoom created; an imported room removes one instead of failing."""
+    server = MatrixServer()
+    owner = service(tmp_path, server, monkeypatch, welcome="")
+    room_id = await owner.ensure("@alice:localhost", "!lobby:localhost", server)
+    path = personal_room_record_path(owner.runtime_paths, "helper", "@alice:localhost")
+    record = read_personal_room(path)
+    record.adoption = PersonalRoomAdoption(
+        creator_user_id=server.user_id,
+        agent_user_id=server.user_id,
+        additional_user_ids=["@mindroom_general:localhost"],
+    )
+    write_personal_room(path, record)
+    owner.runtime.config.agents["general"] = owner.runtime.config.agents["helper"].model_copy()
+    server.set_member(room_id, "@mindroom_general:localhost", "join")
+    server.set_member(room_id, "@mindroom_router:localhost", "join")
+
+    assert await owner.ensure("@alice:localhost", "!lobby:localhost", server) == room_id
+
+    assert server.kicks == [(room_id, "@mindroom_router:localhost")]
+    notices = [message["content"]["body"] for message in server.messages.values() if message["room_id"] == room_id]
+    assert notices == [
+        "This room is private to @alice:localhost, so I removed @mindroom_router:localhost. "
+        "To work with other people, use a shared room.",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_agent_invited_into_an_imported_room_is_removed_when_the_invite_is_seen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removal does not wait for the next reconciliation, and a person in an imported room is still left alone."""
     server = MatrixServer()
     owner = service(tmp_path, server, monkeypatch, welcome="")
     room_id = await owner.ensure("@alice:localhost", "!lobby:localhost", server)
@@ -662,11 +751,28 @@ async def test_an_imported_room_still_refuses_an_unattested_agent(
     record = read_personal_room(path)
     record.adoption = PersonalRoomAdoption(creator_user_id=server.user_id, agent_user_id=server.user_id)
     write_personal_room(path, record)
-    server.set_member(room_id, "@mindroom_router:localhost", "join")
+    room = nio.MatrixRoom(room_id, server.user_id)
+    room.add_member("@alice:localhost", None, None)
+    for user_id in ("@mindroom_router:localhost", "@bob:localhost"):
+        server.set_member(room_id, user_id, "invite")
+        room.add_member(user_id, None, None, invited=True)
+        await owner.guest_membership_event(room, user_id, "invite")
 
-    with pytest.raises(RuntimeError, match="ownership"):
-        await owner.ensure("@alice:localhost", "!lobby:localhost", server)
-    assert not server.kicks
+    assert server.kicks == [(room_id, "@mindroom_router:localhost")]
+    assert server.membership(room_id, "@bob:localhost") == "invite"
+    assert not owner._guest_removal_retries
+
+    # With a person outside the roster, the room fails closed: an agent stays,
+    # and since only a person can fix that, nothing is retried or logged as an error.
+    owner.runtime.config.agents["general"] = owner.runtime.config.agents["helper"].model_copy()
+    server.set_member(room_id, "@mindroom_general:localhost", "invite")
+    room.add_member("@mindroom_general:localhost", None, None, invited=True)
+    with capture_logs() as logs:
+        await owner.guest_membership_event(room, "@mindroom_general:localhost", "invite")
+
+    assert server.membership(room_id, "@mindroom_general:localhost") == "invite"
+    assert not owner._guest_removal_retries
+    assert [entry["log_level"] for entry in logs if entry["log_level"] in {"warning", "error"}] == ["warning"]
 
 
 @pytest.mark.asyncio
@@ -674,7 +780,10 @@ async def test_an_imported_room_with_unattested_people_names_them_and_removes_no
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Reconciliation reports who is outside an imported roster as a warning and leaves them for a person to fix."""
+    """Reconciliation reports who is outside an imported roster as a warning and leaves them for a person to fix.
+
+    An agent among them stays too, because the room fails closed as a whole.
+    """
     server = MatrixServer()
     router, target = bots(tmp_path, server, monkeypatch, welcome="")
     room_id = await target.personal_rooms.ensure("@alice:localhost", "!lobby:localhost", server)
@@ -684,11 +793,12 @@ async def test_an_imported_room_with_unattested_people_names_them_and_removes_no
     write_personal_room(path, record)
     server.set_member(room_id, "@eve:localhost", "invite")
     server.set_member(room_id, "@bob:localhost", "join")
+    server.set_member(room_id, "@mindroom_router:localhost", "join")
 
     with pytest.raises(PersonalRoomRosterMismatchError, match="ownership") as raised:
         await target.personal_rooms.ensure("@alice:localhost", "!lobby:localhost", server)
     assert raised.value.room_id == room_id
-    assert raised.value.unexpected_user_ids == ("@bob:localhost", "@eve:localhost")
+    assert raised.value.unexpected_user_ids == ("@bob:localhost", "@eve:localhost", "@mindroom_router:localhost")
 
     with capture_logs() as logs:
         await router._personal_room_lifecycle._reconcile()
@@ -700,7 +810,7 @@ async def test_an_imported_room_with_unattested_people_names_them_and_removes_no
         "user_id": "@alice:localhost",
         "room_id": "!lobby:localhost",
         "personal_room_id": room_id,
-        "unexpected_user_ids": ("@bob:localhost", "@eve:localhost"),
+        "unexpected_user_ids": ("@bob:localhost", "@eve:localhost", "@mindroom_router:localhost"),
     }
     assert not server.kicks
     assert (server.membership(room_id, "@eve:localhost"), server.membership(room_id, "@bob:localhost")) == (
@@ -896,6 +1006,93 @@ def bots(tmp_path: Path, server: MatrixServer, monkeypatch: pytest.MonkeyPatch, 
     router.orchestrator = SimpleNamespace(agent_bots={"router": router, "helper": target})
     target._first_sync_done = True
     return router, target
+
+
+def _template_router(tmp_path: Path, profile: object, status: str = "applied") -> tuple[Any, Config, Any, Mock]:
+    """A router whose personal_rooms.agent names a template, with a stub reload lifecycle in the given status."""
+    paths = test_runtime_paths(tmp_path)
+    state = MatrixState.load(paths)
+    state.add_room("lobby", "!lobby:localhost", "#lobby:localhost", "Lobby")
+    state.save(paths)
+    config = Config.validate_with_runtime(deepcopy(PERSONAL_AGENTS_BASE), paths)
+    user = AgentMatrixUser(
+        agent_name=ROUTER_AGENT_NAME,
+        user_id="@mindroom_router:localhost",
+        display_name="Router",
+        password=TEST_PASSWORD,
+    )
+    router = make_test_agent_bot(user, tmp_path / "router", config=config, runtime_paths=paths)
+    router.client = SimpleNamespace(user_id=user.user_id, get_displayname=AsyncMock(return_value=profile))
+    config_reload = SimpleNamespace(request_reload=Mock(), status=ConfigReloadStatus(status=status))
+    router.orchestrator = SimpleNamespace(agent_bots={ROUTER_AGENT_NAME: router}, config_reload=config_reload)
+    return router, config, paths, config_reload.request_reload
+
+
+_ALICE_JOIN = RoomMemberJoin(
+    "!lobby:localhost",
+    "$join",
+    "@alice:localhost",
+    "@alice:localhost",
+    None,
+    None,
+    "join",
+    None,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "display_name"),
+    [
+        (nio.ProfileGetDisplayNameResponse("Alice A."), "Alice A."),
+        (nio.ProfileGetDisplayNameError("missing", "M_NOT_FOUND"), None),
+    ],
+)
+async def test_router_provisions_a_joining_users_agent_and_reloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile: object,
+    display_name: str | None,
+) -> None:
+    """A lobby join with a template target creates that user's agent under their display name, then reloads."""
+    router, config, paths, request_reload = _template_router(tmp_path, profile)
+    provision = AsyncMock(return_value=("mind_alice", True))
+    monkeypatch.setattr("mindroom.bot.provision_personal_agent", provision)
+
+    await router._personal_room_lifecycle.baseline_join(_ALICE_JOIN)
+
+    router.client.get_displayname.assert_awaited_once_with("@alice:localhost")
+    provision.assert_awaited_once_with(
+        config,
+        paths,
+        template="mind",
+        user_id="@alice:localhost",
+        user_display_name=display_name,
+        source_user_id="@alice:localhost",
+        source_room_id="!lobby:localhost",
+    )
+    request_reload.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed", "status", "reloads"),
+    [(True, "pending", True), (False, "pending", False), (False, "applied", True), (False, "failed", True)],
+)
+async def test_router_reprovisioning_never_supersedes_a_queued_reload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed: bool,
+    status: str,
+    reloads: bool,
+) -> None:
+    """An agent whose roster entry already existed asks for a reload only when none is queued, so retries cannot restart its wait."""
+    router, _, _, request_reload = _template_router(tmp_path, nio.ProfileGetDisplayNameResponse("Alice"), status)
+    monkeypatch.setattr("mindroom.bot.provision_personal_agent", AsyncMock(return_value=("mind_alice", changed)))
+
+    await router._personal_room_lifecycle.baseline_join(_ALICE_JOIN)
+
+    assert request_reload.called is reloads
 
 
 @pytest.mark.asyncio
@@ -1289,8 +1486,12 @@ async def test_pending_welcome_refuses_changed_device(tmp_path: Path, monkeypatc
         await owner.ensure("@alice:localhost", "!lobby:localhost", server)
     server.fail_send = False
     server.device_id = "OTHER"
-    with pytest.raises(RuntimeError, match="device"):
+    with pytest.raises(PersonalRoomValidationError, match="device"):
         await owner.ensure("@alice:localhost", "!lobby:localhost", server)
+    # The owner's join must settle rather than hold the room's event lane, since the old device never returns.
+    server.set_member("!personal1:localhost", "@alice:localhost", "join")
+    with pytest.raises(PersonalRoomValidationError, match="device"):
+        await owner.owner_membership_event("!personal1:localhost", "@alice:localhost", "join")
     assert not server.messages
 
 

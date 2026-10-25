@@ -120,7 +120,7 @@ def test_membership_revocation_during_preparation_stops_tool_body(
     monkeypatch.setattr(
         agents,
         "build_agent_toolkit",
-        _native_dispatch_builder("hook", async_body, paused, release, events),
+        _native_dispatch_builder(monkeypatch, "hook", async_body, paused, release, events),
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(
@@ -150,7 +150,6 @@ def test_membership_revocation_during_preparation_stops_tool_body(
             assert isinstance(event, nio.RoomMemberEvent)
             memberships.apply_member_event(
                 config,
-                snapshot.runtime_paths,
                 "!project:example.com",
                 event,
                 control_user_id="@router:example.org",
@@ -428,7 +427,7 @@ def test_removing_the_opt_in_during_preparation_stops_the_tool_body(
     assert gateway_client.post(SELECTION, headers={**alice, "Origin": ORIGIN}, json=choices).status_code == 200
     paused, release = threading.Event(), threading.Event()
     events: list[str] = []
-    build = _native_dispatch_builder("hook", False, paused, release, events, agent="shared")
+    build = _native_dispatch_builder(monkeypatch, "hook", False, paused, release, events, agent="shared")
     monkeypatch.setattr(agents, "build_agent_toolkit", build)
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(
@@ -604,7 +603,7 @@ def test_deselection_during_preparation_stops_provider_body(
     monkeypatch.setattr(
         agents,
         "build_agent_toolkit",
-        _native_dispatch_builder(phase, async_body, paused, release, events),
+        _native_dispatch_builder(monkeypatch, phase, async_body, paused, release, events),
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(

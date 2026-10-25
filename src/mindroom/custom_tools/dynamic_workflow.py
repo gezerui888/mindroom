@@ -5,13 +5,16 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import nio
-from agno.run.agent import RunOutput, RunStatus
 from agno.tools import Toolkit
 
+from mindroom.agent_loop.build import prompt_for_turn
+from mindroom.agent_loop.run import run_agent
+from mindroom.agent_loop.spec import RunContext, UnstoredSession
 from mindroom.approval.tool_approval import tool_may_require_approval
 from mindroom.authorization import responder_candidate_entities_from_cached_room
 from mindroom.budgets.monitor import budget_model
@@ -49,7 +52,10 @@ from mindroom.dynamic_workflows.validation import (
 )
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.helper_usage import get_helper_usage_owner, record_helper_usage
+from mindroom.llm.messages import Message
+from mindroom.llm.runs import RunRecord
 from mindroom.response_turn import ResponsePausedForApproval
+from mindroom.run_storage import TerminalRecord
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.tool_system.automation_approval import NEVER_PREAPPROVE_TOOLKITS, build_automation_approval_config
 from mindroom.tool_system.catalog import TOOL_METADATA, ensure_tool_registry_loaded
@@ -57,19 +63,17 @@ from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
     build_execution_identity_from_runtime_context,
     get_tool_runtime_context,
-    tool_runtime_context,
 )
 from mindroom.tool_system.skills import SKILL_READ_FUNCTION_NAMES
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from agno.agent import Agent
-
+    from mindroom.agent_loop.build import AgentBuild
     from mindroom.agent_modes import AgentMode
     from mindroom.config.main import Config
     from mindroom.delegation.state import DelegationChild, SubagentPersona
-    from mindroom.dynamic_workflows.runner import AsyncParticipantExecutor, ParticipantExecutor
+    from mindroom.dynamic_workflows.runner import ParticipantExecutor
     from mindroom.dynamic_workflows.store import DynamicWorkflowRun
 
 # Agent-infrastructure toolkits that are built outside the tool registry and presume
@@ -207,7 +211,7 @@ class DynamicWorkflowTools(Toolkit):
     def _register_functions(self) -> None:
         register_toolkit_functions(
             self,
-            sync_entrypoints={
+            entrypoints={
                 "create_workflow": self.create_workflow,
                 "validate_workflow": self.validate_workflow,
                 "update_workflow": self.update_workflow,
@@ -215,15 +219,6 @@ class DynamicWorkflowTools(Toolkit):
                 "get_workflow_run": self.get_workflow_run,
                 "list_workflows": self.list_workflows,
                 "list_workflow_revisions": self.list_workflow_revisions,
-            },
-            async_entrypoints={
-                "create_workflow": self.acreate_workflow,
-                "validate_workflow": self.avalidate_workflow,
-                "update_workflow": self.aupdate_workflow,
-                "run_workflow": self.arun_workflow,
-                "get_workflow_run": self.aget_workflow_run,
-                "list_workflows": self.alist_workflows,
-                "list_workflow_revisions": self.alist_workflow_revisions,
             },
             descriptions=_TOOL_DESCRIPTIONS,
             parameters=_TOOL_PARAMETERS,
@@ -263,7 +258,7 @@ class DynamicWorkflowTools(Toolkit):
             minimal_valid_spec_example=_MINIMAL_SPEC_EXAMPLE,
         )
 
-    def create_workflow(
+    async def create_workflow(
         self,
         spec: dict[str, Any],
         scope: str = "agent",
@@ -296,7 +291,7 @@ class DynamicWorkflowTools(Toolkit):
             name=summary.name,
         )
 
-    def validate_workflow(self, spec: dict[str, Any]) -> str:
+    async def validate_workflow(self, spec: dict[str, Any]) -> str:
         """Validate a declarative Dynamic Workflow spec without saving it."""
         context = get_tool_runtime_context()
         if context is None:
@@ -310,7 +305,7 @@ class DynamicWorkflowTools(Toolkit):
             return self._payload("error", message=str(exc))
         return self._payload("ok", workflow_id=validated["id"], name=validated["name"])
 
-    def update_workflow(
+    async def update_workflow(
         self,
         workflow_id: str,
         patch: dict[str, Any],
@@ -343,37 +338,7 @@ class DynamicWorkflowTools(Toolkit):
             name=summary.name,
         )
 
-    def run_workflow(
-        self,
-        workflow_id: str,
-        input: dict[str, Any],  # noqa: A002
-        scope: str = "agent",
-    ) -> str:
-        """Run a Dynamic Workflow and persist step outputs plus report artifacts."""
-        context = get_tool_runtime_context()
-        if context is None:
-            return self._context_error()
-        state = _WorkflowRun(f"{workflow_id}:{uuid4().hex}")
-        try:
-            store, owner_id = dynamic_workflow_store_and_owner(context, scope)
-            service = DynamicWorkflowService(
-                store,
-                participant_executor=_participant_executor(context, state),
-                spec_validator=lambda spec: state.requests.update(_validate_workflow_policy_for_context(context, spec)),
-            )
-            run = service.run_workflow(
-                workflow_id=workflow_id,
-                scope=scope,
-                owner_id=owner_id,
-                input_data=input,
-                requested_by=context.requester_id,
-                base_url=context.runtime_paths.env_value("MINDROOM_PUBLIC_URL"),
-            )
-        except DynamicWorkflowError as exc:
-            return self._payload("error", workflow_id=workflow_id, message=str(exc))
-        return self._run_payload(run, step_count=len(run.steps))
-
-    def get_workflow_run(
+    async def get_workflow_run(
         self,
         workflow_id: str,
         run_id: str,
@@ -396,7 +361,7 @@ class DynamicWorkflowTools(Toolkit):
             return self._payload("error", workflow_id=workflow_id, run_id=run_id, message=str(exc))
         return self._run_payload(run, steps=run.steps)
 
-    def list_workflows(self, scope: str = "agent") -> str:
+    async def list_workflows(self, scope: str = "agent") -> str:
         """List Dynamic Workflows available in one scope."""
         context = get_tool_runtime_context()
         if context is None:
@@ -422,7 +387,7 @@ class DynamicWorkflowTools(Toolkit):
             ],
         )
 
-    def list_workflow_revisions(self, workflow_id: str, scope: str = "agent") -> str:
+    async def list_workflow_revisions(self, workflow_id: str, scope: str = "agent") -> str:
         """List immutable revisions for one Dynamic Workflow."""
         context = get_tool_runtime_context()
         if context is None:
@@ -438,30 +403,7 @@ class DynamicWorkflowTools(Toolkit):
             return self._payload("error", workflow_id=workflow_id, message=str(exc))
         return self._payload("ok", workflow_id=workflow_id, revisions=revisions)
 
-    async def acreate_workflow(
-        self,
-        spec: dict[str, Any],
-        scope: str = "agent",
-        reason: str | None = None,
-    ) -> str:
-        """Create a Dynamic Workflow from a declarative workflow spec."""
-        return self.create_workflow(spec, scope=scope, reason=reason)
-
-    async def avalidate_workflow(self, spec: dict[str, Any]) -> str:
-        """Validate a declarative Dynamic Workflow spec without saving it."""
-        return self.validate_workflow(spec)
-
-    async def aupdate_workflow(
-        self,
-        workflow_id: str,
-        patch: dict[str, Any],
-        reason: str,
-        scope: str = "agent",
-    ) -> str:
-        """Create and publish a new Dynamic Workflow revision from a patch."""
-        return self.update_workflow(workflow_id, patch, reason, scope=scope)
-
-    async def arun_workflow(
+    async def run_workflow(
         self,
         workflow_id: str,
         input: dict[str, Any],  # noqa: A002
@@ -476,10 +418,10 @@ class DynamicWorkflowTools(Toolkit):
             store, owner_id = dynamic_workflow_store_and_owner(context, scope)
             service = DynamicWorkflowService(
                 store,
-                async_participant_executor=_aparticipant_executor(context, state),
+                participant_executor=_participant_executor(context, state),
                 spec_validator=lambda spec: state.requests.update(_validate_workflow_policy_for_context(context, spec)),
             )
-            run = await service.arun_workflow(
+            run = await service.run_workflow(
                 workflow_id=workflow_id,
                 scope=scope,
                 owner_id=owner_id,
@@ -491,39 +433,8 @@ class DynamicWorkflowTools(Toolkit):
             return self._payload("error", workflow_id=workflow_id, message=str(exc))
         return self._run_payload(run, step_count=len(run.steps))
 
-    async def aget_workflow_run(
-        self,
-        workflow_id: str,
-        run_id: str,
-        scope: str = "agent",
-    ) -> str:
-        """Read one Dynamic Workflow run record."""
-        return self.get_workflow_run(workflow_id, run_id, scope=scope)
-
-    async def alist_workflows(self, scope: str = "agent") -> str:
-        """List Dynamic Workflows available in one scope."""
-        return self.list_workflows(scope=scope)
-
-    async def alist_workflow_revisions(self, workflow_id: str, scope: str = "agent") -> str:
-        """List immutable revisions for one Dynamic Workflow."""
-        return self.list_workflow_revisions(workflow_id, scope=scope)
-
 
 def _participant_executor(context: ToolRuntimeContext, state: _WorkflowRun) -> ParticipantExecutor:
-    def execute(
-        *,
-        participant: dict[str, object],
-        prompt: str,
-        input_data: dict[str, object],
-        step_outputs: dict[str, object],
-    ) -> ParticipantOutput:
-        del input_data, step_outputs
-        return asyncio.run(_aexecute_participant(context, participant, prompt, state))
-
-    return execute
-
-
-def _aparticipant_executor(context: ToolRuntimeContext, state: _WorkflowRun) -> AsyncParticipantExecutor:
     async def execute(
         *,
         participant: dict[str, object],
@@ -532,12 +443,12 @@ def _aparticipant_executor(context: ToolRuntimeContext, state: _WorkflowRun) -> 
         step_outputs: dict[str, object],
     ) -> ParticipantOutput:
         del input_data, step_outputs
-        return await _aexecute_participant(context, participant, prompt, state)
+        return await _execute_participant(context, participant, prompt, state)
 
     return execute
 
 
-async def _aexecute_participant(
+async def _execute_participant(
     context: ToolRuntimeContext,
     participant: dict[str, object],
     prompt: str,
@@ -545,12 +456,12 @@ async def _aexecute_participant(
 ) -> ParticipantOutput:
     if participant["kind"] == "room_agent":
         return ParticipantOutput(
-            await _aexecute_room_agent_participant(context, participant, prompt, run_scope=state.scope),
+            await _execute_room_agent_participant(context, participant, prompt, run_scope=state.scope),
         )
-    return await _aexecute_subagent_participant(context, participant, prompt, state)
+    return await _execute_subagent_participant(context, participant, prompt, state)
 
 
-async def _aexecute_room_agent_participant(
+async def _execute_room_agent_participant(
     context: ToolRuntimeContext,
     participant: dict[str, object],
     prompt: str,
@@ -572,12 +483,11 @@ async def _aexecute_room_agent_participant(
     # Imported lazily to avoid the create_agent -> dynamic_workflow toolkit cycle.
     from mindroom.agents import create_agent  # noqa: PLC0415
 
-    agent = create_agent(
+    build = create_agent(
         agent_name,
         context.config,
         context.runtime_paths,
         execution_identity=execution_identity,
-        session_id=session_id,
         hook_registry=context.hook_registry,
         knowledge=None,
         active_model_name=active_model_name,
@@ -585,7 +495,7 @@ async def _aexecute_room_agent_participant(
         persist_runtime_state=False,
         disable_runtime_capabilities=True,
     )
-    return await _arun_agent(participant_context, agent, prompt)
+    return await _run_room_agent_turn(participant_context, build, prompt)
 
 
 def _available_room_agent_names(context: ToolRuntimeContext) -> set[str]:
@@ -633,7 +543,7 @@ def _validate_room_agent_reference_for_context(
     return agent_name
 
 
-async def _aexecute_subagent_participant(
+async def _execute_subagent_participant(
     context: ToolRuntimeContext,
     participant: dict[str, object],
     prompt: str,
@@ -884,7 +794,6 @@ def _resolve_participant_toolkits(context: ToolRuntimeContext, tool_names: list[
             runtime_overrides=entity_view.tool_runtime_overrides(tool_name),
             tool_config_overrides=authored_overrides.get(tool_name),
             execution_identity=execution_identity,
-            session_id=context.session_id,
         )
         if toolkit is None:
             msg = f"Dynamic Workflow participant tool '{tool_name}' is not available in this runtime."
@@ -913,7 +822,7 @@ def _participant_run_config(
     """Return the participant policy: approval by default, with the caller's allowed tools pre-approved.
 
     A participant may read the skills it names whenever its caller could without approval;
-    reading or running a skill's scripts still needs an operator rule.
+    reading a skill's scripts still needs an operator rule.
     """
     return build_automation_approval_config(
         context.config,
@@ -956,43 +865,42 @@ def _workflow_allowed_tools(context: ToolRuntimeContext) -> frozenset[str]:
     return frozenset(tool.strip() for tool in raw_allowed if isinstance(tool, str) and tool.strip())
 
 
-async def _arun_agent(context: ToolRuntimeContext, agent: Agent, prompt: str) -> object:
-    # Stream the run: the room agent runs on its configured model within the workflow's runtime
-    # budget, and the Anthropic/Vertex SDK refuses a non-streaming request whose budget could
-    # exceed 10 minutes. Consuming the event stream drives tool calls; yield_run_output makes
-    # the final RunOutput the last streamed item, which works without a db.
-    final_output: RunOutput | None = None
+async def _run_room_agent_turn(context: ToolRuntimeContext, build: AgentBuild, prompt: str) -> object:
+    """Run one turn of a room agent on the prompt alone and return its answer.
+
+    Like every agent turn it streams, which the Anthropic and Vertex SDKs require of a request whose budget could
+    exceed 10 minutes. The participant keeps no history, so the usage of its turn, however the turn ends, counts
+    against the conversation that runs the workflow. Its build offers no tools, so the turn runs without loop
+    hooks: it makes no tool call for a tool policy to wrap or a notice to follow.
+    """
     usage_owner = get_helper_usage_owner()
     invocation_id = uuid4().hex
-    with tool_runtime_context(context):
-        event_stream = agent.arun(
-            prompt,
+    events = run_agent(
+        replace(build.spec, system_message=prompt_for_turn(build)),
+        [Message(role="user", content=prompt)],
+        ctx=RunContext(
             run_id=invocation_id,
+            session=UnstoredSession(context.session_id),
             user_id=context.requester_id,
-            session_id=context.session_id,
-            stream=True,
-            stream_events=True,
-            yield_run_output=True,
-        )
-        async for event in event_stream:
-            if isinstance(event, RunOutput):
-                final_output = event
-                if usage_owner is not None and agent.db is None:
-                    await record_helper_usage(
-                        event,
-                        owner=usage_owner,
-                        invocation_id=invocation_id,
-                        kind="dynamic_workflow",
-                        requester_id=context.requester_id,
-                    )
-    if final_output is None:
-        msg = "Dynamic Workflow participant run produced no output."
-        raise DynamicWorkflowExecutionError(msg)
-    content = final_output.content if final_output.content is not None else ""
-    if final_output.status != RunStatus.completed:
-        message = str(content) if content else f"Agent run ended with status {final_output.status.value}."
-        raise DynamicWorkflowExecutionError(message)
-    return content
+        ),
+        persist=(
+            None
+            if usage_owner is None
+            else partial(
+                record_helper_usage,
+                owner=usage_owner,
+                invocation_id=invocation_id,
+                kind="dynamic_workflow",
+                requester_id=context.requester_id,
+            )
+        ),
+        request_template=build.request_template,
+    )
+    finished = TerminalRecord(RunRecord)
+    async for event in events:
+        finished.collect(event)
+    content = finished.terminal(invocation_id).content
+    return content if content is not None else ""
 
 
 def _resolve_participant_model_name(

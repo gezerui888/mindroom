@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
+from collections.abc import AsyncIterator, Iterator  # noqa: TC003 - Agno reads tool annotations at runtime.
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import pytest
+from agno.run import RunContext  # noqa: TC002 - Agno reads tool annotations at runtime.
 from agno.tools import Toolkit
 from agno.tools.function import Function
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from mindroom import agents, constants
 from mindroom.api.config_lifecycle import ApiSnapshot
@@ -31,7 +34,9 @@ from mindroom.mcp_gateway.oauth import GatewayOAuthProvider
 from mindroom.mcp_gateway.selection import GatewaySelections
 from mindroom.mcp_gateway.types import GatewayOwner
 from mindroom.oauth.providers import OAuthConnectionRequired
+from mindroom.tool_system.agno_toolkits import adapt_function
 from mindroom.tool_system.catalog import TOOL_METADATA, ConfigField, ensure_tool_registry_loaded
+from mindroom.tool_system.invocation import DETACHED_SESSION_ID
 from mindroom.tool_system.registry_state import BUILTIN_TOOL_METADATA, BUILTIN_TOOL_REGISTRY, TOOL_REGISTRY
 from mindroom.tool_system.runtime_context import (
     get_tool_runtime_context,
@@ -362,7 +367,6 @@ async def test_same_named_function_uses_selected_toolkit_schema_and_entrypoint(
                 "properties": {"date": {"type": "string"}},
                 "required": ["date"],
             },
-            instructions="Use ISO dates.",
         ),
     }
     files = Toolkit(name="files")
@@ -375,7 +379,6 @@ async def test_same_named_function_uses_selected_toolkit_schema_and_entrypoint(
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
             },
-            instructions="Use an absolute path.",
         ),
     }
     entries = {
@@ -457,6 +460,58 @@ def _replace_calculator(monkeypatch: pytest.MonkeyPatch, toolkit: Toolkit) -> No
 
 
 @pytest.mark.asyncio
+async def test_search_describes_each_function_as_its_schema_does(
+    context: AgentToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A function described only by its docstring is listed with the description its schema carries."""
+
+    def add(a: float, b: float) -> float:
+        """Add two numbers."""
+        return a + b
+
+    def negate(a: float) -> float:
+        """Negate a number."""
+        return -a
+
+    toolkit = Toolkit(name="calculator", tools=[add, negate])
+    assert [function.description for function in toolkit.get_async_functions().values()] == [None, None]
+    _replace_calculator(monkeypatch, toolkit)
+
+    result = await gateway.search_tools(context, toolkit="calculator")
+
+    assert "error" not in result
+    assert [(item["function"], item["description"]) for item in result["results"]] == [
+        ("add", "Add two numbers."),
+        ("negate", "Negate a number."),
+    ]
+    for item in result["results"]:
+        schema = await gateway.get_tool(context, toolkit="calculator", function=item["function"])
+        assert "error" not in schema
+        assert schema["description"] == item["description"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_calls_share_the_detached_session(
+    context: AgentToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway calls belong to no conversation, so a tool that keys state by session sees one session across them."""
+
+    def session(run_context: RunContext | None = None) -> str:
+        """Return the session the call runs under."""
+        return "no run context" if run_context is None else run_context.session_id
+
+    _replace_calculator(monkeypatch, Toolkit(name="calculator", tools=[session]))
+
+    results = [
+        await gateway.invoke_tool(context, toolkit="calculator", function="session", arguments={}) for _ in range(2)
+    ]
+
+    assert results == [{"result": DETACHED_SESSION_ID}, {"result": DETACHED_SESSION_ID}]
+
+
+@pytest.mark.asyncio
 async def test_missing_connection_is_redacted_with_portal_link(
     context: AgentToolContext,
     monkeypatch: pytest.MonkeyPatch,
@@ -485,7 +540,7 @@ async def test_authored_confirmation_never_runs_body(
     context: AgentToolContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Authored confirmation never runs body."""
+    """An authored confirmation hides the function from search and never runs its body."""
 
     def account() -> str:
         pytest.fail("Approval-required body ran")
@@ -493,14 +548,15 @@ async def test_authored_confirmation_never_runs_body(
     toolkit = Toolkit(name="calculator", tools=[account])
     toolkit.functions["account"].requires_confirmation = True
     _replace_calculator(monkeypatch, toolkit)
+    assert await gateway.search_tools(context, toolkit="calculator") == {"results": []}
     result = await gateway.invoke_tool(context, toolkit="calculator", function="account", arguments={})
     assert "result" not in result
     assert "error" in result
     assert result["error"]["code"] == "approval_required"
 
 
-def test_schema_cache_fallback_allows_required_list_rebuild() -> None:
-    """Uncacheable input must still reach normal preparation that rebuilds required fields."""
+def test_schema_preparation_rebuilds_an_unusable_required_list() -> None:
+    """A self-referencing authored ``required`` list is rebuilt from the signature, and the source keeps its own."""
 
     def echo(text: str) -> str:
         return text
@@ -513,7 +569,7 @@ def test_schema_cache_fallback_allows_required_list_rebuild() -> None:
         parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": required},
     )
 
-    payload = gateway._schema_payload("helper", "example", function)
+    payload = gateway._schema_payload("helper", "example", adapt_function(function))
 
     assert payload["inputSchema"]["required"] == ["text"]
     assert function.parameters["required"][0] is function.parameters["required"]
@@ -534,6 +590,7 @@ async def test_schema_and_result_bounds(context: AgentToolContext, monkeypatch: 
     assert result["error"]["code"] == "result_too_large"
     toolkit.functions["large"] = Function(
         name="large",
+        entrypoint=large,
         parameters={"description": "x" * 32768},
         skip_entrypoint_processing=True,
     )
@@ -884,7 +941,7 @@ async def test_cache_cannot_skip_hooks_or_tool_body(
     context: AgentToolContext,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cache cannot skip hooks or tool body."""
+    """A function that asks Agno to cache its results still runs its hooks and its body on every call."""
     events = []
 
     @hook("tool:before_call")
@@ -915,11 +972,11 @@ async def test_cache_cannot_skip_hooks_or_tool_body(
             ),
         ],
     )
-    assert await gateway.invoke_tool(context, toolkit="calculator", function="account", arguments={}) == {
-        "result": "fresh",
-    }
-    assert toolkit.functions["account"].cache_results is False
-    assert events == [("before", "@alice:example.org"), ("body", "called"), ("after", "@alice:example.org")]
+    for _ in range(2):
+        assert await gateway.invoke_tool(context, toolkit="calculator", function="account", arguments={}) == {
+            "result": "fresh",
+        }
+    assert events == [("before", "@alice:example.org"), ("body", "called"), ("after", "@alice:example.org")] * 2
 
 
 @pytest.mark.asyncio
@@ -928,10 +985,19 @@ async def test_search_total_size_includes_unicode_and_escaped_text(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Search total size includes unicode and escaped text."""
+
+    def body() -> str:
+        return "unused"
+
     toolkit = Toolkit(name="calculator", auto_register=False)
     for index in range(10):
         name = f"tool_{index}" + "界" * 100
-        toolkit.functions[name] = Function(name=name, description="\u0001" * 256, skip_entrypoint_processing=True)
+        toolkit.functions[name] = Function(
+            name=name,
+            description="\u0001" * 256,
+            entrypoint=body,
+            skip_entrypoint_processing=True,
+        )
     _replace_calculator(monkeypatch, toolkit)
     result = await gateway.search_tools(context, toolkit="calculator", limit=10)
     assert "results" in result
@@ -1246,9 +1312,102 @@ async def test_mcp_selected_catalog_preserves_filters_and_never_initializes_othe
             arguments={},
             manager=manager,
         )
-        assert "hello" in json.dumps(result)
+        assert result == {"result": "hello"}
     finally:
         await manager.shutdown()
+
+
+async def _invoke_mcp_echo(
+    context: AgentToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+    planned: CallToolResult,
+) -> InvocationResult:
+    """Invoke the MCP server's ``echo`` tool through the gateway, the server answering with ``planned``."""
+    _patch_manager(monkeypatch)
+    monkeypatch.setattr(_FakeClientSession, "tool_list", [_tool("echo")])
+    monkeypatch.setattr(_FakeClientSession, "planned_tool_pages", [])
+    monkeypatch.setattr(_FakeClientSession, "planned_tool_results", [planned])
+    context = _mcp_context(context)
+    manager = MCPServerManager(context.runtime_paths)
+    try:
+        await manager.sync_servers(context.config, discover=False)
+        return await gateway.invoke_tool(
+            context,
+            toolkit="mcp_example",
+            function="example_echo",
+            arguments={},
+            manager=manager,
+        )
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_a_tool_image_reaches_the_gateway_client_as_a_reference_beside_the_text(
+    context: AgentToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An image result fits the result limit: the client gets the text and a reference to the image, not its bytes."""
+    image = ImageContent(type="image", data=base64.b64encode(b"\x89PNG" * 20000).decode(), mime_type="image/png")
+    planned = CallToolResult(content=[TextContent(type="text", text="captured"), image])
+
+    assert await _invoke_mcp_echo(context, monkeypatch, planned) == {
+        "result": {"content": "captured", "attachments": [{"kind": "image", "mime_type": "image/png"}]},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["plain", "async", "sync stream", "async stream"])
+async def test_a_tool_runs_through_the_gateway_only_after_the_selection_check(
+    context: AgentToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """Every kind of tool runs to the end of its result, with the selection checked again after the hooks load."""
+    events: list[str] = []
+
+    def no_plugins(*_args: object, **_kwargs: object) -> list[object]:
+        events.append("hooks loaded")
+        return []
+
+    monkeypatch.setattr("mindroom.mcp_gateway.tools.load_plugins", no_plugins)
+
+    def plain() -> str:
+        """Answer at once."""
+        events.append("tool ran")
+        return "first second"
+
+    async def plain_async() -> str:
+        """Answer at once."""
+        events.append("tool ran")
+        return "first second"
+
+    def sync_stream() -> Iterator[str]:
+        """Stream a result in parts."""
+        events.append("tool ran")
+        yield "first "
+        yield "second"
+
+    async def async_stream() -> AsyncIterator[str]:
+        """Stream a result in parts."""
+        events.append("tool ran")
+        yield "first "
+        yield "second"
+
+    tool = {"plain": plain, "async": plain_async, "sync stream": sync_stream, "async stream": async_stream}[kind]
+    _replace_calculator(monkeypatch, Toolkit(name="calculator", tools=[tool]))
+
+    result = await gateway.invoke_tool(
+        context,
+        toolkit="calculator",
+        function=tool.__name__,
+        arguments={},
+        require_current_config=lambda: events.append("selection checked"),
+    )
+
+    assert result == {"result": "first second"}
+    # Selecting and routing check the selection before the hooks load; the entrypoint checks it again, just before the tool.
+    assert events[events.index("hooks loaded") :] == ["hooks loaded", "selection checked", "tool ran"]
 
 
 @pytest.mark.asyncio

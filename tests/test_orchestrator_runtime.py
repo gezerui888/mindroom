@@ -99,7 +99,7 @@ from mindroom.runtime_state import (
 from mindroom.startup_errors import EventJournalHoldLostError, PermanentStartupError
 from mindroom.tool_jobs.runtime import ToolJobRuntime, get_background_runtime
 from mindroom.tool_system.metadata import TOOL_METADATA
-from mindroom.tool_system.skills import _get_plugin_skill_roots, set_plugin_skill_roots
+from mindroom.tool_system.skills import get_plugin_skill_roots, set_plugin_skill_roots
 from tests.bot_helpers import (
     AgentBotTestBase,
     _configured_team_test_config,
@@ -642,6 +642,7 @@ class TestAgentBot(AgentBotTestBase):
     async def test_orchestrator_main_reraises_permanent_startup_error(self, tmp_path: Path) -> None:
         """Permanent startup errors should stop the process and surface the failure."""
         reset_runtime_state()
+        sys.setswitchinterval(0.005)
         blocking_event = asyncio.Event()
         mock_orchestrator = _mock_runtime_orchestrator()
         mock_orchestrator.start = AsyncMock(side_effect=PermanentMatrixStartupError("boom"))
@@ -662,6 +663,8 @@ class TestAgentBot(AgentBotTestBase):
             await main(log_level="INFO", runtime_paths=self._runtime_paths(tmp_path), api=False)
 
         mock_orchestrator.stop.assert_awaited_once()
+        # Startup shortens the GIL switch interval before the orchestrator starts.
+        assert sys.getswitchinterval() == pytest.approx(0.001)
         state = get_runtime_state()
         assert state.phase == "idle"
         assert state.detail is None
@@ -5406,7 +5409,7 @@ class TestMultiAgentOrchestrator:
             authorization_changed=False,
         )
 
-        original_plugin_skill_roots = _get_plugin_skill_roots()
+        original_plugin_skill_roots = get_plugin_skill_roots()
         set_plugin_skill_roots([])
         try:
             with (
@@ -5424,7 +5427,7 @@ class TestMultiAgentOrchestrator:
             assert orchestrator.config is current_config
             assert orchestrator.hook_registry is old_hook_registry
             assert "updated_plugin_tool" not in TOOL_METADATA
-            assert _get_plugin_skill_roots() == []
+            assert get_plugin_skill_roots() == []
         finally:
             set_plugin_skill_roots(original_plugin_skill_roots)
 
@@ -5477,7 +5480,7 @@ class TestMultiAgentOrchestrator:
             authorization_changed=False,
         )
 
-        original_plugin_skill_roots = _get_plugin_skill_roots()
+        original_plugin_skill_roots = get_plugin_skill_roots()
         original_plugin_cache = plugin_module._PLUGIN_CACHE.copy()
         original_module_cache = plugin_module._MODULE_IMPORT_CACHE.copy()
         original_modules = set(sys.modules)

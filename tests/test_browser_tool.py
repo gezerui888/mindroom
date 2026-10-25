@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import ipaddress
 import json
 import os
@@ -60,7 +61,12 @@ from tests.browser_egress_helpers import (
     socks5_connect,
 )
 from tests.browser_lifecycle_helpers import LifecycleBrowser
-from tests.conftest import make_conversation_reader_mock, make_relation_lookup, test_runtime_paths
+from tests.conftest import (
+    SETTLE_TIMEOUT_SECONDS,
+    make_conversation_reader_mock,
+    make_relation_lookup,
+    test_runtime_paths,
+)
 from tests.test_worker_computer_runtime import FakeDisplay
 
 if TYPE_CHECKING:
@@ -85,6 +91,32 @@ DESKTOP_MEDIA = EncryptedDesktopMedia(
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
 )
+
+
+def _is_public_address(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _offline_test_browsers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail TCP dials to public addresses as an offline host would, so no test browser reaches the internet.
+
+    Chromium keeps making its own requests (account sign-in, device check-in, component updates) despite
+    Playwright's ``--disable-background-networking``, and the destination relay dials them for a browser without an
+    egress proxy. The pages these tests load come from local servers or through a local stand-in egress proxy.
+    """
+    connect = socket.socket.connect
+
+    def offline_connect(sock: socket.socket, address: tuple[Any, ...]) -> None:
+        inet = sock.type == socket.SOCK_STREAM and sock.family in {socket.AF_INET, socket.AF_INET6}
+        if inet and _is_public_address(address[0]):
+            raise OSError(errno.ENETUNREACH, f"network disabled in tests: {address[0]}")
+        connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", offline_connect)
 
 
 @pytest.mark.parametrize(
@@ -1460,7 +1492,7 @@ async def test_computer_browser_owns_destination_proxy_lifetime(
     opening = asyncio.create_task(tool.browser("start"))
     try:
         if outcome == "cancel_launch":
-            await asyncio.wait_for(adapter.reached.wait(), 2)
+            await asyncio.wait_for(adapter.reached.wait(), SETTLE_TIMEOUT_SECONDS)
             opening.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await opening
@@ -2964,7 +2996,7 @@ async def test_worker_cancelled_startup_releases_partial_resources(
     task = asyncio.create_task(
         runtime.run_browser_call("binding", lambda _: BrowserSession(execute, browser.aclose), [], {}),
     )
-    await asyncio.wait_for(adapter.reached.wait(), timeout=1)
+    await asyncio.wait_for(adapter.reached.wait(), timeout=SETTLE_TIMEOUT_SECONDS)
     task.cancel()
     if phase == "driver_start":
         await asyncio.sleep(0)
@@ -3110,12 +3142,12 @@ async def test_repeated_start_cancellation_keeps_cleanup_owned_until_runtime_clo
     task = asyncio.create_task(
         runtime.run_browser_call("binding", lambda _: BrowserSession(execute, close_browser), [], {}),
     )
-    await asyncio.wait_for(adapter.reached.wait(), timeout=1)
+    await asyncio.wait_for(adapter.reached.wait(), timeout=SETTLE_TIMEOUT_SECONDS)
     task.cancel()
     await asyncio.sleep(0)
     task.cancel()
     await asyncio.sleep(0)
-    await asyncio.wait_for(closing_browser.wait(), timeout=1)
+    await asyncio.wait_for(closing_browser.wait(), timeout=SETTLE_TIMEOUT_SECONDS)
     task.cancel()
     closing = asyncio.create_task(runtime.close())
     with pytest.raises(TimeoutError):
@@ -3124,7 +3156,7 @@ async def test_repeated_start_cancellation_keeps_cleanup_owned_until_runtime_clo
     adapter.proceed.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.wait_for(closing, timeout=1)
+    await asyncio.wait_for(closing, timeout=SETTLE_TIMEOUT_SECONDS)
     assert adapter.live_resources == set()
 
 
@@ -3166,7 +3198,7 @@ async def test_established_browser_teardown_survives_repeated_cancellation(
     else:
         operation = runtime.run_browser_call("replacement", factory, [], {"action": "status"})
     task = asyncio.create_task(operation)
-    await asyncio.wait_for(adapters[0].reached.wait(), timeout=1)
+    await asyncio.wait_for(adapters[0].reached.wait(), timeout=SETTLE_TIMEOUT_SECONDS)
     try:
         for _ in range(3):
             task.cancel()
@@ -3204,7 +3236,7 @@ async def test_cancelled_profile_stop_blocks_replacement_until_resources_exit(
     await browser.browser("start")
     old.pause_at = phase
     stopping = asyncio.create_task(browser.browser("stop"))
-    await asyncio.wait_for(old.reached.wait(), timeout=1)
+    await asyncio.wait_for(old.reached.wait(), timeout=SETTLE_TIMEOUT_SECONDS)
     restarting = asyncio.create_task(browser.browser("start"))
     try:
         for _ in range(3):
@@ -3290,7 +3322,7 @@ async def test_failed_profile_teardown_blocks_reuse_and_retries_before_replaceme
         old.checkpoint = checkpoint
         old.pause_at = phase
         restarting = asyncio.create_task(browser.browser("start"))
-        await asyncio.wait_for(old.reached.wait(), timeout=1)
+        await asyncio.wait_for(old.reached.wait(), timeout=SETTLE_TIMEOUT_SECONDS)
         replacement = asyncio.create_task(browser.browser("start"))
         try:
             for _ in range(3):

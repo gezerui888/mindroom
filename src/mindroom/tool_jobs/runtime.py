@@ -12,12 +12,15 @@ from operator import attrgetter
 from typing import TYPE_CHECKING, Any, Literal
 from uuid import uuid4
 
+from mindroom.ai_runtime import finalize_queued_notice_response_turn_async, queued_message_signal_context
+from mindroom.approval.receipt_readers import without_approval_receipt
 from mindroom.background_tasks import (
     run_blocking_until_complete,
     run_coroutine_until_complete,
     wait_for_future_until_complete,
 )
 from mindroom.dispatch_source import SILENT_SCHEDULE_SOURCE_KIND
+from mindroom.failure_text import failure_text
 from mindroom.logging_config import get_logger
 from mindroom.tool_jobs.background_after import validate_wait_seconds
 from mindroom.tool_jobs.control import (
@@ -28,18 +31,17 @@ from mindroom.tool_jobs.control import (
 )
 from mindroom.tool_jobs.instances import tool_job_instance
 from mindroom.tool_jobs.resources import execution_resources
-from mindroom.tool_system.call_record import without_tool_call_recording
+from mindroom.tool_system.call_record import recording_tool_calls
 from mindroom.tool_system.progress import cap_progress, tool_progress_reporter
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, parse_tool_execution_identity_payload
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
 
-    from agno.tools.function import Function
-
     from mindroom.constants import RuntimePaths
     from mindroom.event_journal import SavedToolJob, ToolJobStore
     from mindroom.tool_jobs.conversation import ConversationKey
+    from mindroom.tool_jobs.execution_authority import JobTool
 
 type _OutcomeStatus = Literal["completed", "failed", "cancelled", "denied", "interrupted"]
 # A running job that waits for human decisions on the approval cards it posted is `awaiting_approval`.
@@ -52,7 +54,10 @@ _JOB_SUMMARY_MAX_CHARS = 500
 # A reattaching call must name exactly the operation its job was admitted for.
 _ADMITTED_OPERATION = attrgetter("tool_name", "toolkit_name", "kind", "source_event_id", "source_kind", "adapter")
 # Ended jobs, read or not, are deleted this long after their last change, once their originating turn has finished.
-ENDED_JOB_RETENTION = timedelta(days=30)
+_ENDED_JOB_RETENTION = timedelta(days=30)
+# A job whose own call returned its result inline is never listed or reported once it ended, so after its turn only a
+# reread by its exact ID reads it; it is deleted after this shorter margin instead.
+_INLINE_JOB_RETENTION = timedelta(days=1)
 logger = get_logger(__name__)
 # A ToolResultPayload encoded by `tool_jobs.results`; the runtime stores it without reading it.
 type EncodedResultPayload = dict[str, Any]
@@ -308,7 +313,7 @@ class ToolJobRuntime:
         store: ToolJobStore,
         *,
         authorize: Callable[[BackgroundJob], bool],
-        authorize_execution: Callable[[ToolExecutionIdentity, Function, Mapping[str, Any]], None],
+        authorize_execution: Callable[[ToolExecutionIdentity, JobTool, Mapping[str, Any]], None],
         cancel: _Cleanup,
         denied: Callable[[BackgroundJob], bool],
     ) -> None:
@@ -554,12 +559,6 @@ class ToolJobRuntime:
                 await self._publish(entry, _updated(entry.job, status=status))
 
     async def _run(self, entry: _Entry, operation: _Operation) -> None:
-        # The notice implementation imports Agno/storage; keep the job/control import surface light.
-        from mindroom.ai_runtime import (  # noqa: PLC0415
-            finalize_queued_notice_response_turn_async,
-            queued_message_signal_context,
-        )
-
         outcome = None
         returned = False
         loop = asyncio.get_running_loop()
@@ -577,9 +576,12 @@ class ToolJobRuntime:
                 with (
                     # A newer human message releases replies, never the background work they wait for.
                     pending_human_messages_context(None),
+                    # The job is not part of an approval continuation that starts it: a run the job resumes with
+                    # approvals of its own never reads that continuation's receipt.
+                    without_approval_receipt(),
                     tool_progress_reporter(report_progress),
                     # The reply span that started the job may end first; the job owns its calls' outcome.
-                    without_tool_call_recording(),
+                    recording_tool_calls(None),
                     job_control_context(entry.control),
                     queued_message_signal_context(None) as notice,
                 ):
@@ -590,7 +592,7 @@ class ToolJobRuntime:
                         returned = True
                         await finalize_queued_notice_response_turn_async(notice)
             except Exception as error:
-                outcome = BackgroundOutcome("failed", str(error))
+                outcome = BackgroundOutcome("failed", failure_text(error))
             except asyncio.CancelledError:
                 if (task := asyncio.current_task()) is not None and task.cancelling():
                     raise  # Requested cancellation: runtime-owned, or external teardown.
@@ -821,7 +823,7 @@ class ToolJobRuntime:
         except Exception as error:
             return BackgroundOutcome(
                 "failed",
-                f"Job cleanup failed; external side effects may still be active: {error}",
+                f"Job cleanup failed; external side effects may still be active: {failure_text(error)}",
             )
         return outcome
 
@@ -864,13 +866,13 @@ class ToolJobRuntime:
     async def expire_ended(
         self,
         *,
-        before: datetime,
+        now: datetime,
         source_finished: Callable[[BackgroundJob], Awaitable[bool]],
     ) -> list[BackgroundJob]:
         """Delete old ended jobs, read or not, whose originating turn has finished, which never lets their call run again.
 
-        A finished turn saved a non-`None` result for the call, its outcome or the job's handle, Agno runs a call again
-        only when its saved result is `None`, and `source_finished` refuses while the job's session has an open approval
+        A finished turn saved the call's outcome or the job's handle as its result, only a paused run resumes and then
+        runs just the calls it waits for, and `source_finished` refuses while the job's session has an open approval
         continuation. An unread result this old is not worth reporting any more.
         Returns the deleted jobs.
         """
@@ -879,7 +881,7 @@ class ToolJobRuntime:
             if self._closed or self._shutdown_task is not None:
                 return deleted
             candidates = [
-                await self._snapshot(entry) for entry in self._entries.values() if self._expirable(entry, before)
+                await self._snapshot(entry) for entry in self._entries.values() if self._expirable(entry, now)
             ]
         for job in candidates:
             if not await source_finished(job):
@@ -888,7 +890,7 @@ class ToolJobRuntime:
                 if self._closed or self._shutdown_task is not None:
                     return deleted
                 entry = self._entries.get(job.job_id)
-                if entry is None or entry.job.updated_at != job.updated_at or not self._expirable(entry, before):
+                if entry is None or entry.job.updated_at != job.updated_at or not self._expirable(entry, now):
                     continue
                 # A cancelled caller cannot separate the landed deletion from forgetting the job.
                 await run_coroutine_until_complete(self._store.delete(job.job_id))
@@ -896,13 +898,14 @@ class ToolJobRuntime:
                 deleted.append(job)
         return deleted
 
-    def _expirable(self, entry: _Entry, before: datetime) -> bool:
+    def _expirable(self, entry: _Entry, now: datetime) -> bool:
         job = entry.job
+        retention = _INLINE_JOB_RETENTION if job.returned_inline else _ENDED_JOB_RETENTION
         return (
             job.status in TERMINAL_STATUSES
             and entry.claim is None
             and entry.saved
-            and datetime.fromisoformat(job.updated_at) < before
+            and datetime.fromisoformat(job.updated_at) < now - retention
         )
 
     async def quiesce(self) -> None:

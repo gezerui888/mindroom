@@ -3,9 +3,9 @@
 Schedule agents or teams to do one-time or recurring work, such as reminders, daily reports, or periodic checks, using natural language.
 Create schedules with the `!schedule` chat command or let an agent create them with the `scheduler` tool.
 
-<video controls playsinline preload="metadata" aria-label="A scheduled task posts a morning brief" style="width: 100%" poster="https://github.com/user-attachments/assets/4ba7b6f1-e2be-4b2a-a38a-e7a7bb49826e" data-poster-light="https://github.com/user-attachments/assets/4ba7b6f1-e2be-4b2a-a38a-e7a7bb49826e" data-poster-dark="https://github.com/user-attachments/assets/38261697-8f2a-478d-a256-32559e107315">
-  <source src="https://github.com/user-attachments/assets/e59e09c8-c8c7-4e90-8e3c-30b8f18b6de2" type="video/mp4" media="(prefers-color-scheme: dark)">
-  <source src="https://github.com/user-attachments/assets/fdbc3860-9301-4d62-907a-857c818d4e73" type="video/mp4">
+<video controls playsinline preload="metadata" aria-label="A scheduled task posts a morning brief" style="width: 100%" poster="https://github.com/user-attachments/assets/ada165aa-24ad-407f-9831-30928126d091" data-poster-light="https://github.com/user-attachments/assets/ada165aa-24ad-407f-9831-30928126d091" data-poster-dark="https://github.com/user-attachments/assets/01a8d67f-f1ed-4c6a-b2df-a1681149722e">
+  <source src="https://github.com/user-attachments/assets/99f7e664-131d-4831-9c7e-64a2d95b2b6b" type="video/mp4" media="(prefers-color-scheme: dark)">
+  <source src="https://github.com/user-attachments/assets/67fd537c-d810-4a3c-b5a5-d8e307708d56" type="video/mp4">
 </video>
 
 ## Commands
@@ -97,9 +97,9 @@ Use `!list_schedules` to find task IDs.
 
 ## [`scheduler`]
 
-<video controls playsinline preload="metadata" aria-label="A check asked for in conversation becomes a weekly scheduled task" style="width: 100%" poster="https://github.com/user-attachments/assets/5750a5bc-e5cb-4112-86ac-21ed044fa5d1" data-poster-light="https://github.com/user-attachments/assets/5750a5bc-e5cb-4112-86ac-21ed044fa5d1" data-poster-dark="https://github.com/user-attachments/assets/6194d6c7-89e7-4e66-8810-048efc3b3001">
-  <source src="https://github.com/user-attachments/assets/2fa5d666-16bd-4864-b27f-fb212609e2a1" type="video/mp4" media="(prefers-color-scheme: dark)">
-  <source src="https://github.com/user-attachments/assets/7a68cee9-24d4-43cf-84de-599405fd16d7" type="video/mp4">
+<video controls playsinline preload="metadata" aria-label="A check asked for in conversation becomes a weekly scheduled task" style="width: 100%" poster="https://github.com/user-attachments/assets/7221a1d4-2429-4591-8b6f-aca242cc152b" data-poster-light="https://github.com/user-attachments/assets/7221a1d4-2429-4591-8b6f-aca242cc152b" data-poster-dark="https://github.com/user-attachments/assets/70ad19a8-6728-4344-9e6d-0258c43b5173">
+  <source src="https://github.com/user-attachments/assets/3377307e-268f-4ae0-a0e6-061dd16c1627" type="video/mp4" media="(prefers-color-scheme: dark)">
+  <source src="https://github.com/user-attachments/assets/4423fd02-b6c9-4cf5-bf10-ae50149ebd2e" type="video/mp4">
 </video>
 
 The `scheduler` tool lets an agent create, edit, list, and cancel the same tasks as the chat commands.
@@ -311,12 +311,13 @@ Agents append to `MEMORY.md` and their `context_files` far more often than they 
 `prompt_curation` checks their total size daily and, once it passes the trigger, asks the agent for a gradual cut.
 
 1. The check measures `MEMORY.md` plus the agent's `context_files` with the estimate behind `static_prompt_tokens` (characters / 4); for a private agent these are `MEMORY.md` and `private.context_files` in the requester's private root, because agent-level `context_files` load from the workspace every requester shares.
-2. Above `trigger_tokens`, it posts a prompt with exact numbers, for example "bring them to at most 46876 tokens in total, but not below 44272", a cut between `min_reduction` and `max_reduction` (10 to 15%).
-3. The prompt asks the agent to commit the files to git first, keep each fact once in the file that owns it, move detail and history verbatim into `memory/` topic files with one-line pointers, and never invent facts.
+2. Above `trigger_tokens`, or when the preload has to withhold part of `MEMORY.md` because it passes `memory.file.max_entrypoint_lines` (default `200`) or `memory.file.max_entrypoint_tokens`, it posts a prompt with exact numbers, for example "bring them to at most 19800 tokens in total, but not below 18700", a cut between `min_reduction` and `max_reduction` (10 to 15%).
+3. The prompt asks the agent to commit the files to git first, take lines out of a `MEMORY.md` over either preload cap first (the prompt shows its line and token counts against both caps), fold each later correction into the entry it corrects, keep each fact once in the file that owns it, move detail and history verbatim into `memory/` topic files with one-line pointers, and otherwise never invent facts or change their meaning.
 4. Once the run ends, verify measures the files again; when any of these holds, it lists them in the thread and mentions the agent once to re-check its change against that commit:
     - a file can no longer be read safely;
     - a file shrank by more than 25%;
     - the files total less than the floor, or did not shrink;
+    - `MEMORY.md` was over the line cap and still has as many lines;
     - a file is no longer valid UTF-8;
     - total memory content (the files plus `memory/**`) dropped by more than `max_content_loss` of the files' size, which means detail was deleted instead of moved.
 
@@ -328,7 +329,7 @@ Verify never changes the files; the agent's answer to a re-check is not verified
 |---|---|---|
 | `cron` | `0 4 * * *` | When to check |
 | `room` | first configured room | Where to post the prompt |
-| `trigger_tokens` | `50000` (min 1) | Post the prompt once the files exceed this many estimated tokens |
+| `trigger_tokens` | `20000` (min 1) | Post the prompt once the files exceed this many estimated tokens; a `MEMORY.md` the preload cannot show whole also posts it |
 | `min_reduction` | `0.10` (at most `0.25`) | Smallest cut the prompt asks for; no file may shrink more than 25%, so no pass can be asked for more |
 | `max_reduction` | `0.15` | Largest cut before verify asks for a re-check |
 | `max_content_loss` | `0.05` | Largest net drop in total memory content, as a fraction of the files' size, before verify asks for a re-check |

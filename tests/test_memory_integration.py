@@ -3,20 +3,27 @@
 from __future__ import annotations
 
 from collections.abc import Generator  # noqa: TC003
+from dataclasses import replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from agno.models.ollama import Ollama
 
-from mindroom.ai import ai_response
+from mindroom.ai import _memory_conversation, ai_response
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
+from mindroom.delegation.personas import inline_persona
+from mindroom.dispatch_source import ScheduledHistoryBudget
+from mindroom.history.session_context import ScopeSessionContext
+from mindroom.history.types import HistoryScope, ScopeSummary
 from mindroom.hooks import render_transient_context
-from mindroom.memory import MemoryPromptParts
-from tests.conftest import make_turn_context
+from mindroom.memory import ConversationRef, MemoryPromptParts
+from mindroom.session_storage.types import ConversationSession
+from tests.conftest import install_model_providers, make_turn_context
+from tests.fakes.scripted_model import ScriptedModel, answer
 from tests.identity_helpers import persist_entity_accounts
 
 if TYPE_CHECKING:
@@ -34,11 +41,11 @@ class TestMemoryIntegration:
         )
 
     @pytest.fixture
-    def mock_agent_run(self) -> AsyncMock:
-        """Mock the agent run function."""
-        mock = AsyncMock()
-        mock.return_value = MagicMock(content="Test response")
-        return mock
+    def model(self, monkeypatch: pytest.MonkeyPatch) -> ScriptedModel:
+        """Answer the agent's one request with the scripted provider."""
+        model = ScriptedModel([answer("Test response")])
+        install_model_providers(monkeypatch, {"default": model})
+        return model
 
     @pytest.fixture
     def mock_memory_functions(self) -> Generator[AsyncMock, None, None]:
@@ -67,58 +74,54 @@ class TestMemoryIntegration:
     @pytest.mark.asyncio
     async def test_ai_response_with_memory(
         self,
-        mock_agent_run: AsyncMock,
+        model: ScriptedModel,
         mock_memory_functions: AsyncMock,
         tmp_path: Path,
         config: Config,
     ) -> None:
-        """Test that AI response uses memory enhancement."""
+        """Test that AI response uses memory enhancement and names the turn's conversation for file memory."""
         mock_build = mock_memory_functions
+        config.memory.backend = "file"
         runtime_paths = self._runtime_paths(tmp_path)
         persist_entity_accounts(config, runtime_paths)
 
-        with (
-            patch("mindroom.ai_runtime.cached_agent_run", mock_agent_run),
-            patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
-            patch("mindroom.ai.create_agent", return_value=MagicMock()),
-        ):
-            response = await ai_response(
-                make_turn_context("general", session_id="test_session", room_id="!test:room"),
-                prompt="What is 2+2?",
-                runtime_paths=runtime_paths,
-                config=config,
-            )
+        response = await ai_response(
+            make_turn_context("general", session_id="test_session", room_id="!test:room"),
+            prompt="What is 2+2?",
+            runtime_paths=runtime_paths,
+            config=config,
+        )
 
-            # Verify response
-            assert response == "Test response"
+        # Verify response
+        assert response == "Test response"
 
-            # Verify memory enhancement was applied
-            mock_build.assert_called_once_with(
-                "What is 2+2?",
-                "general",
-                tmp_path,
-                config,
-                runtime_paths,
-                execution_identity=None,
-            )
+        # Verify memory enhancement was applied
+        mock_build.assert_called_once_with(
+            "What is 2+2?",
+            "general",
+            tmp_path,
+            config,
+            runtime_paths,
+            execution_identity=None,
+            conversation=ConversationRef("test_session", (None, None)),
+        )
 
-            # Verify enhanced prompt was used
-            mock_agent_run.assert_called_once()
-            call_args = mock_agent_run.call_args[0]
-            assert len(call_args[1]) == 2
-            assert call_args[1][0].role == "user"
-            assert call_args[1][0].content == render_transient_context(("[Enhanced memory] What is 2+2?",))
-            assert call_args[1][0].add_to_agent_memory is False
-            assert call_args[1][1].role == "user"
-            assert call_args[1][1].content == "What is 2+2?"
-            assert call_args[1][1].add_to_agent_memory is True
+        # The recalled memory follows the prompt as transient context the run never stores.
+        [request] = model.requests
+        _system, prompt, transient = request.messages
+        assert prompt.role == "user"
+        assert prompt.content == "What is 2+2?"
+        assert prompt.add_to_agent_memory is True
+        assert transient.role == "user"
+        assert transient.content == render_transient_context(("[Enhanced memory] What is 2+2?",))
+        assert transient.add_to_agent_memory is False
 
-            # Note: Memory storage now happens at the bot level, not in ai_response
+        # Note: Memory storage now happens at the bot level, not in ai_response
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("model")
     async def test_ai_response_without_room_id(
         self,
-        mock_agent_run: AsyncMock,
         mock_memory_functions: AsyncMock,
         tmp_path: Path,
         config: Config,
@@ -127,29 +130,25 @@ class TestMemoryIntegration:
         mock_build = mock_memory_functions
         runtime_paths = self._runtime_paths(tmp_path)
 
-        with (
-            patch("mindroom.ai_runtime.cached_agent_run", mock_agent_run),
-            patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
-            patch("mindroom.ai.create_agent", return_value=MagicMock()),
-        ):
-            await ai_response(
-                make_turn_context("general", session_id="test_session", room_id=None),
-                prompt="Hello",
-                runtime_paths=runtime_paths,
-                config=config,
-            )
+        await ai_response(
+            make_turn_context("general", session_id="test_session", room_id=None),
+            prompt="Hello",
+            runtime_paths=runtime_paths,
+            config=config,
+        )
 
-            # Verify memory enhancement remains agent-scoped
-            mock_build.assert_called_once_with(
-                "Hello",
-                "general",
-                tmp_path,
-                config,
-                runtime_paths,
-                execution_identity=None,
-            )
+        # Verify memory enhancement remains agent-scoped; mem0 inlines no MEMORY.md to keep.
+        mock_build.assert_called_once_with(
+            "Hello",
+            "general",
+            tmp_path,
+            config,
+            runtime_paths,
+            execution_identity=None,
+            conversation=None,
+        )
 
-            # Note: Memory storage now happens at the bot level, not in ai_response
+        # Note: Memory storage now happens at the bot level, not in ai_response
 
     @pytest.mark.asyncio
     async def test_ai_response_error_handling(self, tmp_path: Path, config: Config) -> None:
@@ -173,7 +172,12 @@ class TestMemoryIntegration:
             assert "Error: Model error" in response
 
     @pytest.mark.asyncio
-    async def test_memory_persistence_across_calls(self, tmp_path: Path, config: Config) -> None:
+    async def test_memory_persistence_across_calls(
+        self,
+        tmp_path: Path,
+        config: Config,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Test that memory persists across multiple AI calls."""
         # This is more of a documentation test showing expected behavior
         mock_memory = AsyncMock()
@@ -181,12 +185,8 @@ class TestMemoryIntegration:
         # First call - no memories
         mock_memory.search.return_value = {"results": []}
 
-        with (
-            patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory),
-            patch("mindroom.ai_runtime.cached_agent_run", AsyncMock(return_value=MagicMock(content="First response"))),
-            patch("mindroom.providers.model_loading.get_model_instance", return_value=Ollama(id="test-model")),
-            patch("mindroom.ai.create_agent", return_value=MagicMock()),
-        ):
+        install_model_providers(monkeypatch, {"default": ScriptedModel([answer("First response"), answer("A is 1.")])})
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             # First interaction
             await ai_response(
                 make_turn_context("general", session_id="session1"),
@@ -213,3 +213,50 @@ class TestMemoryIntegration:
 
             # Memory search should have been called
             mock_memory.search.assert_called_with("What is A?", filters={"user_id": "agent_general"}, top_k=3)
+
+
+@pytest.mark.parametrize(
+    "history_limit",
+    [{"num_history_runs": 5}, {"max_tool_calls_from_history": 3}, {"compaction": {"enabled": False}}],
+)
+def test_memory_conversation_skips_turns_without_a_cached_system_prompt_to_keep(
+    history_limit: dict[str, object],
+) -> None:
+    """Only a file-memory conversation whose system prompt can stay cached keeps a MEMORY.md copy.
+
+    A persona recalls no memory, a minimal agent reads it on demand, and a replay limit shifts the history; without
+    compaction, fitting a long conversation into the context window drops its oldest runs, which acts as one.
+    """
+    session = ConversationSession(
+        session_id="thread",
+        kind="agent",
+        owner_id="general",
+        summary=ScopeSummary(text=" Earlier work. ", updated_at=datetime.now(UTC)),
+    )
+    scope_context = ScopeSessionContext(
+        scope=HistoryScope("agent", "general"),
+        storage=MagicMock(),
+        session=session,
+        session_id="thread",
+    )
+    ctx = make_turn_context("general", session_id="thread")
+    mem0 = TestMemoryIntegration._config()
+    config = Config(
+        agents={"general": AgentConfig(display_name="General")},
+        models={"default": ModelConfig(provider="openai", id="test-model")},
+        memory={"backend": "file"},
+    )
+    limited = Config(
+        agents={"general": AgentConfig(display_name="General", **history_limit)},
+        models={"default": ModelConfig(provider="openai", id="test-model")},
+        memory={"backend": "file"},
+    )
+
+    assert _memory_conversation(ctx, config, scope_context) == ConversationRef("thread", ("Earlier work.", None))
+    assert _memory_conversation(ctx, mem0, scope_context) is None
+    assert _memory_conversation(replace(ctx, agent_mode="minimal"), config, scope_context) is None
+    assert _memory_conversation(ctx, limited, scope_context) is None
+    scheduled = replace(ctx, scheduled_history_budget=ScheduledHistoryBudget(limit=0, source_event_id="$schedule"))
+    assert _memory_conversation(scheduled, config, scope_context) is None
+    persona = replace(ctx, persona=inline_persona("You are a reviewer.", None, None, None))
+    assert _memory_conversation(persona, config, scope_context) is None

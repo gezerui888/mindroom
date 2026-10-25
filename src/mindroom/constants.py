@@ -17,10 +17,14 @@ from dotenv import dotenv_values
 
 from mindroom import runtime_env_policy
 from mindroom.atomic_file import atomic_write_bytes_at
+from mindroom.providers.names import provider_route
 
 # Agent names
 ROUTER_AGENT_NAME = "router"
 ROUTER_DISPLAY_NAME = "RouterAgent"
+AGENT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_]+$")
+# "_shared" is the requester-store directory part for `user` scope in CredentialsManager.for_primary_runtime_scope.
+RESERVED_ENTITY_NAMES = frozenset({ROUTER_AGENT_NAME, "user", "_shared"})
 VISIBLE_ROUTER_VOICE_ECHO_KEY = "com.mindroom.visible_router_voice_echo"
 CONFIG_CONFIRMATION_REACTION_KEY = "com.mindroom.config_confirmation_reaction"
 DEFAULT_MINDROOM_URL = "http://127.0.0.1:8765"
@@ -30,6 +34,9 @@ DEFAULT_MATRIX_HOMESERVER = "https://mindroom.chat"
 # timeline and forces a limited-sync gap backfill.
 CLASSIC_SYNC_TIMELINE_LIMIT = 5000
 DEFAULT_COMPACTION_TIMEOUT_SECONDS = 600.0
+# Idle time after which a thread's provider prompt cache counts as cold; most provider prompt caches expire
+# within an hour idle.
+PROMPT_CACHE_IDLE_SECONDS = 3600
 DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES = 50 * 1024
 DEFAULT_TOOL_OUTPUT_MAX_BYTES = 64 * 1024 * 1024
 # Largest attachment MindRoom retains, received from Matrix or registered by a tool;
@@ -42,8 +49,6 @@ KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_ENV = "MINDROOM_KNOWLEDGE_REFRESH_SUBPROCES
 # Generous enough for a cold full index of a large corpus, short enough that a
 # wedged child cannot outlive the day.
 DEFAULT_KNOWLEDGE_REFRESH_SUBPROCESS_TIMEOUT_SECONDS = 3600.0
-_STANDARD_HISTORY_ROLES = frozenset({"user", "assistant", "tool"})
-_PROMPT_HISTORY_STORAGE_ROLES = frozenset({"system", "developer"})
 
 # Search order for existing files: env var > ./config.yaml > ~/.mindroom/config.yaml
 _CONFIG_SEARCH_PATHS = [Path("config.yaml"), Path.home() / ".mindroom" / "config.yaml"]
@@ -75,15 +80,6 @@ WORKER_RUNTIME_PATH_ENV_NAMES = frozenset(
     },
 )
 WORKSPACE_HOME_CONTRACT_ENV_NAMES = _WORKSPACE_HOME_IDENTITY_ENV_NAMES | WORKER_RUNTIME_PATH_ENV_NAMES
-
-
-def prompt_roles_for_history_storage(system_message_role: str = "system") -> frozenset[str]:
-    """Return prompt roles that should be stripped before durable history storage."""
-    roles = set(_PROMPT_HISTORY_STORAGE_ROLES)
-    configured_role = system_message_role.strip()
-    if configured_role and configured_role not in _STANDARD_HISTORY_ROLES:
-        roles.add(configured_role)
-    return frozenset(roles)
 
 
 def workspace_home_identity_env(workspace: Path | str) -> dict[str, str]:
@@ -206,6 +202,11 @@ def resolve_session_state_root(state_root: Path, runtime_paths: RuntimePaths) ->
         msg = "Session state root must stay within the session storage root"
         raise ValueError(msg)
     return resolved_session_state_root
+
+
+def llm_request_log_dir(configured: str | None, storage_root: Path) -> Path:
+    """Return the LLM request-log directory: the configured one as given, else ``<storage_root>/logs/llm_requests``."""
+    return Path(configured) if configured else storage_root / "logs" / "llm_requests"
 
 
 def _copy_process_env(process_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -1203,13 +1204,8 @@ _CHROMADB_PY314_PATCHED = False
 
 
 def env_key_for_provider(provider: str) -> str | None:
-    """Get the environment variable name for a provider's API key.
-
-    Handles the gemini→google alias so callers don't need to.
-    """
-    if provider == "gemini":
-        return PROVIDER_ENV_KEYS.get("google")
-    return PROVIDER_ENV_KEYS.get(provider)
+    """Get the environment variable name for a provider's API key, resolving provider aliases such as ``gemini``."""
+    return PROVIDER_ENV_KEYS.get(provider_route(provider))
 
 
 def patch_chromadb_for_python314() -> None:

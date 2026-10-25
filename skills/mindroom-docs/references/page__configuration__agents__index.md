@@ -77,16 +77,14 @@ agents:
 | `thread_mode` | string | `"thread"` | `thread` replies in Matrix threads; `room` sends plain room messages with one continuous conversation per room, which suits bridges (Telegram, Signal, WhatsApp) and mobile clients |
 | `room_thread_modes` | map | `{}` | Per-room `thread` or `room` overrides keyed by room key, alias, or Matrix room ID; see [Thread Mode Resolution](https://docs.mindroom.chat/configuration/threads/#thread-mode-resolution) |
 | `markdown` | bool | `null` | Instruct the agent to format replies as Markdown |
-| `learning` | bool | `null` | Enable [Agno Learning](https://docs.mindroom.chat/memory/#agno-learning), a persistent profile of user preferences |
-| `learning_mode` | string | `null` | `always` learns after every turn; `agentic` lets the agent decide through a tool call |
 | `knowledge_graph` | bool | `null` | Build a [knowledge graph](https://docs.mindroom.chat/knowledge-graph/) from this agent's conversations and give it the `knowledge_graph` tool |
-| `memory_backend` | string | `null` | `mem0`, `file`, or `none`, overriding `memory.backend`; `none` disables memory but not `learning`. See [Memory](https://docs.mindroom.chat/memory/) |
+| `memory_backend` | string | `null` | `mem0`, `file`, or `none`, overriding `memory.backend`; `none` disables memory. See [Memory](https://docs.mindroom.chat/memory/) |
 | `memory_search` | object | `null` | File-memory search override (`mode`, `include`, `include_entrypoint`) when the backend is `file`; omitted fields inherit `memory.search`. See [Searching file memory](https://docs.mindroom.chat/memory/#searching-file-memory) |
 | `automations` | list | `null` | Automations such as `prompt_curation`, `dreaming`, or one a plugin provides; `null` inherits the `defaults.automations` entries the agent can run and `[]` turns them off. See [Automations](https://docs.mindroom.chat/scheduling/#automations) |
 | `knowledge_bases` | list | `[]` | Keys under top-level `knowledge_bases`, each at most once; see [Knowledge Bases](https://docs.mindroom.chat/knowledge/) |
 | `context_files` | list | `[]` | Workspace files preloaded into the prompt; see [File-Based Context Loading](#file-based-context-loading) |
 | `private` | object | `null` | Give each requester a separate copy of the agent's state; see [Private Instances](#private-instances) |
-| `num_history_runs`, `num_history_messages`, `compress_tool_results`, `max_tool_calls_from_history` | | | See [History Settings](https://docs.mindroom.chat/configuration/history/#history-settings) |
+| `num_history_runs`, `num_history_messages`, `max_tool_calls_from_history` | | | See [History Settings](https://docs.mindroom.chat/configuration/history/#history-settings) |
 | `compaction` | object | `defaults.compaction` | Per-agent compaction overrides; `enabled: false` turns automatic compaction off. See [Agent Compaction Settings](https://docs.mindroom.chat/configuration/history/#agent-compaction-settings) |
 | `max_tool_calls_per_turn` | int, >= 1 | `null` | Tool calls one turn may execute. Further calls return a tool error, and after this many plus two model requests the turn ends with the text produced so far, which also stops loops of unknown or malformed tool calls |
 | `show_tool_calls` | bool | `null` | Show tool-call markers and trace metadata in Matrix messages; see [Tool Calls During Streaming](https://docs.mindroom.chat/streaming/#tool-calls-during-streaming) |
@@ -132,6 +130,7 @@ agents:
 
 Here every user gets their own `mind_data/` root, seeded from `./mind_template/` (for example `SOUL.md`, `USER.md`, `MEMORY.md`, and a `memory/` folder), while `company_docs` stays shared by everyone.
 Private roots live at `<storage>/private_instances/<requester scope>/<agent>/<private.root>/`, not next to `config.yaml`, and dedicated workers mount only that root.
+A private agent is still one Matrix account, so use [personal agents](https://docs.mindroom.chat/personal-agents/) when each person needs an agent of their own that others can mention or add to a team.
 
 How a private agent behaves:
 
@@ -192,7 +191,6 @@ The `defaults` section sets values every agent inherits unless it sets its own, 
 ```yaml
 defaults:
   tools: [scheduler]
-  learning_mode: agentic
   max_tool_calls_per_turn: 200
   worker_tools: [shell, file, python]
   enable_streaming: true
@@ -204,12 +202,9 @@ These defaults apply to each agent that leaves the same field unset:
 | Field | Default |
 |-------|---------|
 | `markdown` | `true` |
-| `learning` | `true` |
-| `learning_mode` | `always` |
 | `cheap_model` | `null`; ignored for an agent whose `model` is the same. See [Cold-Cache Model](https://docs.mindroom.chat/configuration/models/#cold-cache-model) |
 | `knowledge_graph` | `false` |
 | `num_history_runs`, `num_history_messages`, `max_tool_calls_from_history` | `null` (no limit) |
-| `compress_tool_results` | `false` |
 | `compaction` | enabled; see [Agent Compaction Settings](https://docs.mindroom.chat/configuration/history/#agent-compaction-settings) |
 | `max_tool_calls_per_turn` | `1000` |
 | `show_tool_calls` | `true` |

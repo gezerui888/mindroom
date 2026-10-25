@@ -3,9 +3,9 @@
 This page explains who may talk to agents, teams, and the router, who may administer MindRoom and manage credentials, and who may open the dashboard.
 Use it to give people access to an agent, to work out why an agent ignored someone, or to map bridged identities to one person.
 
-<video controls playsinline preload="metadata" aria-label="New colleagues are invited to a room, and the agent answers everyone in it" style="width: 100%" poster="https://github.com/user-attachments/assets/83b9f414-40f7-4fe5-8f1d-62304b641b87" data-poster-light="https://github.com/user-attachments/assets/83b9f414-40f7-4fe5-8f1d-62304b641b87" data-poster-dark="https://github.com/user-attachments/assets/d4b50091-0d28-4185-8ecb-3f2615542e74">
-  <source src="https://github.com/user-attachments/assets/83081f1a-9caf-476a-b147-3c5f93762471" type="video/mp4" media="(prefers-color-scheme: dark)">
-  <source src="https://github.com/user-attachments/assets/5eb23908-4555-42ca-8b38-a2636097339b" type="video/mp4">
+<video controls playsinline preload="metadata" aria-label="New colleagues are invited to a room, and the agent answers everyone in it" style="width: 100%" poster="https://github.com/user-attachments/assets/e9d474d9-2d94-4c2a-be48-35c50edc1fd9" data-poster-light="https://github.com/user-attachments/assets/e9d474d9-2d94-4c2a-be48-35c50edc1fd9" data-poster-dark="https://github.com/user-attachments/assets/f6949b71-2746-4d4e-84ed-3a7ccb676d57">
+  <source src="https://github.com/user-attachments/assets/20b4d748-efd8-4423-a23e-f8153d3cf845" type="video/mp4" media="(prefers-color-scheme: dark)">
+  <source src="https://github.com/user-attachments/assets/d25d59e5-02a4-4fd0-86ef-108cf1f24a6e" type="video/mp4">
 </video>
 
 See also [Rooms & Spaces](https://docs.mindroom.chat/rooms/), [Routing & Responder Selection](https://docs.mindroom.chat/configuration/router/), and [Threads, Replies & Participation](https://docs.mindroom.chat/configuration/threads/).
@@ -114,7 +114,7 @@ Accepting an invitation never grants permission to interact; every later message
 ### Agents mentioning other agents
 
 When an agent or team reply, including a message an agent sends with `matrix_api`, mentions another agent or team, the mentioned entity acts for the person or configured bot account who requested the reply.
-It responds only when its own `access` admits that requester, and it uses the requester's credentials, private instances, memory, learning, and approvals.
+It responds only when its own `access` admits that requester, and it uses the requester's credentials, private instances, memory, and approvals.
 A mention wakes the mentioned entity only after the reply finishes (not when it was stopped or failed) and only while the requester is a joined member of the room.
 Agents stop waking each other once a conversation has [`defaults.max_consecutive_agent_replies`](https://docs.mindroom.chat/configuration/agents/#defaults) consecutive agent or team messages since a person last wrote there, and resume after the next message from a person.
 In a room-level conversation, the count covers the room's messages outside threads.
@@ -162,8 +162,8 @@ Dashboard access follows deployment authentication; the Matrix `administrators` 
 
 - Standalone: `MINDROOM_API_KEY` protects the dashboard and its API; without it, access is unauthenticated, so set it before exposing an instance beyond a trusted local network.
 - Hosted (Supabase): the user's platform sign-in is validated, and the instance owner account is enforced when configured.
-- [Trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/): every gateway-authenticated user may change configuration unless Connections is enabled, which adds an `administrators` check; see its [Security Boundary](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#security-boundary).
-- [Matrix sign-in from MindRoom Chat](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#matrix-sign-in-from-mindroom-chat): with the Connections portal enabled, a user in `administrators` who opens Connections from Chat also reaches the dashboard without the API key, but only outside hosted platform mode and when the homeserver binds OpenID tokens to this deployment; everyone else keeps the authentication above.
+- [Trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/): every gateway-authenticated user may change configuration unless `MINDROOM_CONNECTIONS_AGENT` is set, which adds an `administrators` check; see its [Security Boundary](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#security-boundary).
+- [Connections from MindRoom Chat](https://docs.mindroom.chat/connections-portal/#sessions-and-dashboard-access): a user in `administrators` who opens Connections from Chat also reaches the dashboard without the API key, but only outside hosted platform mode and when the homeserver binds OpenID tokens to this deployment; everyone else keeps the authentication above.
 
 Standalone deployments should set `MINDROOM_OWNER_USER_ID` so dashboard requests made with the API key act as the owner's Matrix identity for credential management.
 Browser changes made with a dashboard sign-in or trusted upstream identity must come from the dashboard's own origin; see [Browser Mutation Protection](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#browser-mutation-protection).

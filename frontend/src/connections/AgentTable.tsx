@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useMemo, useState } from "react";
+import { Fragment, useMemo, useState } from "react";
 import {
   type ColumnDef,
   type ExpandedState,
@@ -9,50 +9,29 @@ import {
   useReactTable,
 } from "@tanstack/react-table";
 import { ChevronDown, ChevronRight, Search } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
-import { sharedAgentNote } from "./accountCopy";
 import { AgentTools } from "./AgentTools";
-import { AgentAvatar } from "./AgentAvatar";
-import { EgressServiceRows } from "./EgressServiceRows";
+import { AgentIdentity } from "./AgentAvatar";
+import { keyCounts, keysSetText } from "./egressRowText";
 import { STACKED, STACKED_CELL, STACKED_LABEL } from "./stackedTable";
 import type { AgentConnections, ConnectionStatus } from "./types";
 import type { McpSelectionState } from "./useMcpSelection";
 
-/** Whether each agent's account is connected, by agent and provider, once its status has loaded. */
-type ConnectedAccounts = Record<string, boolean>;
-
-type AgentTableRow = AgentConnections & {
-  mcp: McpSelectionState;
-  accounts: ConnectedAccounts;
-};
-
-const accountKey = (agentName: string, provider: string) =>
-  `${agentName}/${provider}`;
+type AgentTableRow = AgentConnections & { mcp: McpSelectionState };
 
 /**
  * How many of an agent's accounts and keys are set, out of all of them: its
- * connectable services plus its egress services. A service counts as connected
- * by the catalog, until its status loads (when the agent is opened) and says
- * otherwise, as after a connect or disconnect, and again once the catalog is
- * read anew.
+ * connectable services plus its egress services, as its state says.
  */
 function accountCounts(agent: AgentTableRow) {
-  // A service that only limits paths is neither an account nor a key.
-  const egress = (agent.egress_services ?? []).filter(
-    (service) => !service.restrict_only,
-  );
+  const keys = keyCounts(agent.egress_services ?? []);
   const connectedServices = agent.services.filter(
-    (service) =>
-      agent.accounts[accountKey(agent.agent_name, service.provider)] ??
-      service.connected,
+    (service) => service.connected === true,
   );
   return {
-    set:
-      egress.filter((service) => service.configured).length +
-      connectedServices.length,
-    total: agent.services.length + egress.length,
+    set: keys.set + connectedServices.length,
+    total: agent.services.length + keys.total,
   };
 }
 
@@ -86,6 +65,7 @@ const columns: ColumnDef<AgentTableRow>[] = [
           type="button"
           className="flex w-full items-center gap-3 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           aria-label={`${row.getIsExpanded() ? "Collapse" : "Expand"} ${agent.agent_display_name}`}
+          aria-describedby={`agent-${agent.agent_name}-type`}
           aria-expanded={row.getIsExpanded()}
           aria-controls={
             row.getIsExpanded() ? `agent-tools-${agent.agent_name}` : undefined
@@ -103,22 +83,14 @@ const columns: ColumnDef<AgentTableRow>[] = [
               aria-hidden="true"
             />
           )}
-          <AgentAvatar key={agent.agent_name} agent={agent} />
-          <span id={`agent-${agent.agent_name}`} className="font-medium">
-            {agent.agent_display_name}
-          </span>
+          <AgentIdentity
+            agent={agent}
+            displayName={agent.agent_display_name}
+            nameId={`agent-${agent.agent_name}`}
+          />
         </button>
       );
     },
-  },
-  {
-    id: "type",
-    header: "Type",
-    cell: ({ row }) => (
-      <Badge variant="secondary" className="font-normal">
-        {row.original.is_shared ? "Shared" : "Personal"}
-      </Badge>
-    ),
   },
   {
     id: "tools",
@@ -127,6 +99,16 @@ const columns: ColumnDef<AgentTableRow>[] = [
       const { set, total } = accountCounts(row.original);
       const count = row.original.tools.length;
       const tools = `${count} ${count === 1 ? "tool" : "tools"}`;
+      // The agent's state fills in `egress_services`, null included, so nothing is counted before it arrives.
+      if (row.original.egress_services === undefined)
+        return (
+          <span className="text-muted-foreground tabular-nums">
+            {tools} /{" "}
+            {row.original.state_unavailable
+              ? "Could not check accounts"
+              : "Checking accounts…"}
+          </span>
+        );
       // An agent that shows no keys, as while Agent Keys is off, counts only accounts.
       const counted = Array.isArray(row.original.egress_services)
         ? total === 1
@@ -136,7 +118,7 @@ const columns: ColumnDef<AgentTableRow>[] = [
           ? "account"
           : "accounts";
       return (
-        <span className="text-muted-foreground">
+        <span className="text-muted-foreground tabular-nums">
           {/* An agent with no accounts or keys to set only counts its tools. */}
           {total === 0 ? tools : `${tools} / ${set} of ${total} ${counted} set`}
         </span>
@@ -191,60 +173,30 @@ const columns: ColumnDef<AgentTableRow>[] = [
   },
 ];
 
-/** An agent's brokered API keys and accounts, when the viewer may use its egress credentials. */
-function AgentEgress({
-  agent,
-  onChanged,
-}: {
-  agent: AgentConnections;
-  onChanged: () => void;
-}) {
+/**
+ * How many of an agent's API keys and accounts are set, when the viewer may
+ * use its egress credentials, with a link to where they are set: the Agent
+ * Keys page, the one place that manages them.
+ */
+function AgentEgress({ agent }: { agent: AgentConnections }) {
   const services = agent.egress_services;
-  // An array, even an empty one, marks an agent that can use egress credentials.
+  // An array, even an empty one, marks an agent that can use egress credentials; nothing shows until its state loads.
   if (!Array.isArray(services)) return null;
-  // The catalog gives the agent's scope only through its services, which all share it.
-  const shared = services.some((service) => service.is_shared);
   // Nobody who can change none of an agent's services manages it; with no services there is no telling.
   const viewOnly =
     services.length > 0 && services.every((service) => !service.can_manage);
   return (
-    <div className="border-t border-border/60">
-      <div className="flex flex-wrap items-center justify-between gap-2 px-5 pt-4">
-        <h3 className="text-xs font-medium text-muted-foreground">
-          API keys and accounts
-        </h3>
-        <a
-          href={`/connections/egress#egress-agent-${agent.agent_name}`}
-          className="text-xs font-medium text-primary underline-offset-4 hover:underline"
-        >
-          {viewOnly ? "View services" : "Manage services"}
-        </a>
-      </div>
-      {shared && (
-        <p className="px-5 pt-2 text-xs text-muted-foreground">
-          {sharedAgentNote(
-            services.some((service) => service.can_manage),
-            agent.managers,
-          )}
-        </p>
-      )}
-      {services.length ? (
-        <EgressServiceRows
-          agentName={agent.agent_name}
-          services={services}
-          onChanged={onChanged}
-          agent={{
-            displayName: agent.agent_display_name,
-            shared,
-            managers: agent.managers,
-            services,
-          }}
-        />
-      ) : (
-        <p className="px-5 py-4 text-sm text-muted-foreground">
-          No services are set up for this agent yet.
-        </p>
-      )}
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border/60 px-5 py-3">
+      <h3 className="text-sm font-medium">API keys and accounts</h3>
+      <span className="text-sm text-muted-foreground tabular-nums">
+        {keysSetText(services)}
+      </span>
+      <a
+        href={`/connections/egress#egress-agent-${agent.agent_name}`}
+        className="ml-auto text-xs font-medium text-primary underline-offset-4 hover:underline"
+      >
+        {viewOnly ? "View services" : "Manage services"}
+      </a>
     </div>
   );
 }
@@ -254,35 +206,22 @@ export function AgentTable({
   mcp,
   refreshVersion,
   onConnectionChange,
-  onEgressChange,
+  onAccountStatus,
 }: {
   agents: AgentConnections[];
   mcp: McpSelectionState;
   refreshVersion: number;
   onConnectionChange: () => void;
-  onEgressChange: () => void;
+  /** Told each time one of an agent's account statuses loads. */
+  onAccountStatus: (
+    agentName: string,
+    provider: string,
+    status: ConnectionStatus,
+  ) => void;
 }) {
   const [expanded, setExpanded] = useState<ExpandedState>({});
   const [search, setSearch] = useState("");
   const [scope, setScope] = useState("all");
-  const [accounts, setAccounts] = useState<ConnectedAccounts>({});
-  // Statuses count only until the catalog arrives again: an agent that is
-  // closed cannot load its status again, so a fresh catalog replaces them,
-  // and a status that loads after it still corrects it.
-  const [accountsCatalog, setAccountsCatalog] = useState(agents);
-  if (accountsCatalog !== agents) {
-    setAccountsCatalog(agents);
-    setAccounts({});
-  }
-  const onAccountStatus = useCallback(
-    (agentName: string, provider: string, status: ConnectionStatus) =>
-      setAccounts((known) =>
-        known[accountKey(agentName, provider)] === status.connected
-          ? known
-          : { ...known, [accountKey(agentName, provider)]: status.connected },
-      ),
-    [],
-  );
   const data = useMemo(
     () =>
       agents
@@ -298,8 +237,8 @@ export function AgentTable({
                   )
                 : true,
         )
-        .map((agent) => ({ ...agent, mcp, accounts })),
-    [agents, scope, mcp, accounts],
+        .map((agent) => ({ ...agent, mcp })),
+    [agents, scope, mcp],
   );
   const table = useReactTable({
     data,
@@ -376,7 +315,8 @@ export function AgentTable({
                   <th
                     key={header.id}
                     scope="col"
-                    className="px-5 py-3 font-medium"
+                    // The Agent column is as wide as an open agent's Tool column, so the columns after it line up.
+                    className={`px-5 py-3 font-medium ${header.column.id === "agent" ? "w-[44%]" : ""}`}
                   >
                     {flexRender(
                       header.column.columnDef.header,
@@ -419,7 +359,7 @@ export function AgentTable({
                       <section
                         id={`agent-tools-${row.original.agent_name}`}
                         aria-labelledby={`agent-${row.original.agent_name}`}
-                        className="border-l-2 border-primary/30 bg-background"
+                        className="bg-background"
                       >
                         <AgentTools
                           agent={row.original}
@@ -428,10 +368,7 @@ export function AgentTable({
                           onConnectionChange={onConnectionChange}
                           onAccountStatus={onAccountStatus}
                         />
-                        <AgentEgress
-                          agent={row.original}
-                          onChanged={onEgressChange}
-                        />
+                        <AgentEgress agent={row.original} />
                       </section>
                     </td>
                   </tr>
@@ -451,10 +388,13 @@ export function AgentTable({
           </tbody>
         </table>
       </div>
-      <p className="border-t px-5 py-3 text-xs text-muted-foreground">
-        {table.getRowModel().rows.length} of {agents.length} agents · Expand an
-        agent to manage its connections and tools.
-      </p>
+      {/* Only a search or filter leaves agents out, so only then is there a count to give. */}
+      {table.getRowModel().rows.length > 0 &&
+        table.getRowModel().rows.length < agents.length && (
+          <p className="border-t px-5 py-3 text-xs text-muted-foreground tabular-nums">
+            Showing {table.getRowModel().rows.length} of {agents.length} agents
+          </p>
+        )}
     </section>
   );
 }

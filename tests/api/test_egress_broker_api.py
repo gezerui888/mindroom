@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -11,26 +12,31 @@ import yaml
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
+from mindroom.api import egress_broker as egress_broker_api
 from mindroom.api import egress_status, oauth
 from mindroom.api.connection_agents import build_connection_agent_target
 from mindroom.config.egress_broker import EgressService
 from mindroom.constants import EXECUTION_ENV_TOOL_NAMES
 from mindroom.credentials.manager import get_runtime_credentials_manager
-from mindroom.egress_broker import secrets
+from mindroom.egress_broker import env, secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
+from mindroom.egress_broker.oauth_source import resolve_oauth_token
+from mindroom.egress_broker.tokens import WorkerClaims
 from mindroom.egress_broker.user_services import save_user_service
 from mindroom.tool_system import sandbox_proxy
-from tests.api.test_api import (
-    _trusted_upstream_jwks,
-    _trusted_upstream_jwt,
-    _trusted_upstream_jwt_key,
-    _trusted_upstream_strict_jwt_env,
+from mindroom.tool_system.worker_routing import ToolExecutionIdentity, WorkerScope, resolve_worker_target
+from tests.api.conftest import (
+    trusted_upstream_env,
+    trusted_upstream_jwks,
+    trusted_upstream_jwt,
+    trusted_upstream_jwt_key,
 )
 from tests.api.test_egress_credentials_api import (
     _finish_oauth,
     _oauth_block,
     _oauth_services,
     _use_fake_oauth_providers,
+    track_concurrent_calls,
 )
 
 if TYPE_CHECKING:
@@ -56,7 +62,7 @@ def egress_config_file(tmp_path: Path) -> Generator[Path, None, None]:
             "test_agent": {
                 "display_name": "Test Agent",
                 "role": "A test agent",
-                "tools": ["shell"],
+                "tools": ["shell", "egress_credentials"],
                 "instructions": ["Test instruction"],
                 "rooms": ["test_room"],
                 "worker_scope": "shared",
@@ -256,6 +262,11 @@ def _agent(tools: list[str], **extra: Any) -> dict[str, Any]:  # noqa: ANN401
     return {"display_name": "Agent", "role": "", "tools": tools, "include_default_tools": False, **extra}
 
 
+def _keys_agent(tools: list[str], **extra: Any) -> dict[str, Any]:  # noqa: ANN401
+    """Return an agent with exactly `tools` and the `egress_credentials` tool, which opts it into Agent Keys."""
+    return _agent([*tools, "egress_credentials"], **extra)
+
+
 def _key_targets(client: TestClient, agent_name: str | None = None) -> tuple[list[str], bool]:
     response = client.get("/api/egress-broker/services", params=_scope_params(agent_name))
     assert response.status_code == 200, response.text
@@ -266,17 +277,19 @@ def test_services_listing_names_the_agents_whose_keys_the_dashboard_sets(egress_
     """The listing names the shared agents that reach the broker by their resolved tools, a preset's included.
 
     Agents whose keys belong to each requester (`user`, `user_agent`, private) are left out, and so is an agent
-    without a command tool. Every scope the panel selects gets the same answer.
+    without a command tool or without the `egress_credentials` tool. Every scope the panel selects gets the same answer.
     """
     client = _client_with_agents(
         egress_config_file,
         {
-            "preset_team": _agent(["openclaw_compat"], worker_scope="shared"),
-            "calculator_team": _agent(["calculator"], worker_scope="shared"),
-            "per_user": _agent(["shell"], worker_scope="user"),
-            "per_agent": _agent(["python"], worker_scope="user_agent"),
-            "mine": _agent(["shell"], private={"per": "user_agent"}),
-            "notes": _agent(["calculator"]),
+            "preset_team": _keys_agent(["openclaw_compat"], worker_scope="shared"),
+            "calculator_team": _keys_agent(["calculator"], worker_scope="shared"),
+            "shell_team": _agent(["shell"], worker_scope="shared"),
+            "per_user": _keys_agent(["shell"], worker_scope="user"),
+            "per_agent": _keys_agent(["python"], worker_scope="user_agent"),
+            "mine": _keys_agent(["shell"], private={"per": "user_agent"}),
+            "notes": _keys_agent(["calculator"]),
+            "coder": _agent(["shell"]),
         },
     )
 
@@ -288,14 +301,14 @@ def test_services_listing_names_agents_by_the_tools_that_get_the_broker_environm
     egress_config_file: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An agent uses the broker when it has any tool the sandbox proxy gives the broker environment.
+    """An agent with `egress_credentials` uses the broker when it has any tool the sandbox proxy gives the broker env.
 
     Both read one list, so a tool added there makes its agents eligible without a second edit.
     """
-    assert egress_status.EXECUTION_ENV_TOOL_NAMES is sandbox_proxy.EXECUTION_ENV_TOOL_NAMES
+    assert env.EXECUTION_ENV_TOOL_NAMES is sandbox_proxy.EXECUTION_ENV_TOOL_NAMES
     tools = sorted({*EXECUTION_ENV_TOOL_NAMES, "calculator"})
-    monkeypatch.setattr(egress_status, "EXECUTION_ENV_TOOL_NAMES", frozenset(tools))
-    agents = {f"{tool}_team": _agent([tool], worker_scope="shared") for tool in tools}
+    monkeypatch.setattr(env, "EXECUTION_ENV_TOOL_NAMES", frozenset(tools))
+    agents = {f"{tool}_team": _keys_agent([tool], worker_scope="shared") for tool in tools}
 
     assert _key_targets(_client_with_agents(egress_config_file, agents)) == (sorted(agents), False)
 
@@ -303,16 +316,20 @@ def test_services_listing_names_agents_by_the_tools_that_get_the_broker_environm
 @pytest.mark.parametrize(
     ("agents", "has_personal_agents"),
     [
-        ({"per_user": _agent(["shell"], worker_scope="user")}, True),
-        ({"per_agent": _agent(["python"], worker_scope="user_agent")}, True),
-        ({"mine": _agent(["shell"], private={"per": "user_agent"})}, True),
+        ({"per_user": _keys_agent(["shell"], worker_scope="user")}, True),
+        ({"per_agent": _keys_agent(["python"], worker_scope="user_agent")}, True),
+        ({"mine": _keys_agent(["shell"], private={"per": "user_agent"})}, True),
         (
-            {"team": _agent(["shell"], worker_scope="shared"), "notes": _agent(["calculator"], worker_scope="user")},
+            {
+                "team": _keys_agent(["shell"], worker_scope="shared"),
+                "notes": _keys_agent(["calculator"], worker_scope="user"),
+            },
             False,
         ),
-        ({"coder": _agent(["shell"])}, False),
+        ({"coder": _keys_agent(["shell"])}, False),
+        ({"per_user": _agent(["shell"], worker_scope="user")}, False),
     ],
-    ids=["user", "user_agent", "private", "shared-and-calculator", "unscoped"],
+    ids=["user", "user_agent", "private", "shared-and-calculator", "unscoped", "user-without-egress-tool"],
 )
 def test_services_listing_says_whether_an_agent_with_per_user_keys_reaches_the_broker(
     egress_config_file: Path,
@@ -330,26 +347,12 @@ def test_services_listing_says_whether_an_agent_with_per_user_keys_reaches_the_b
 def test_services_listing_says_whether_the_personal_page_is_served(
     egress_config_file: Path,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
-    """The page where each user sets per-user keys is served only behind signed trusted upstream auth.
-
-    Trusted upstream auth without JWT does not serve it: the personal API answers 403 without a verified identity.
-    """
-    from tests.api.conftest import trusted_upstream_headers  # noqa: PLC0415
-
-    trusted_env = {
-        "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
-        "MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER": "X-Trusted-User",
-        "MINDROOM_TRUSTED_UPSTREAM_EMAIL_HEADER": "X-Trusted-Email",
-        "MINDROOM_TRUSTED_UPSTREAM_MATRIX_USER_ID_HEADER": "X-Trusted-Matrix-User",
-    }
-    private_key = _trusted_upstream_jwt_key()
-    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda _client: _trusted_upstream_jwks(private_key))
+    """The page where each user sets per-user keys is served while users can sign in from Chat or a signed upstream."""
+    private_key = trusted_upstream_jwt_key()
+    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda _client: trusted_upstream_jwks(private_key))
     signed_headers = {
-        "X-Trusted-User": "owner",
-        "X-Trusted-Email": "owner@example.com",
-        "X-Trusted-Jwt": _trusted_upstream_jwt(
+        "X-Trusted-Jwt": trusted_upstream_jwt(
             private_key,
             email="owner@example.com",
             matrix_user_id="@owner:example.org",
@@ -357,33 +360,32 @@ def test_services_listing_says_whether_the_personal_page_is_served(
         ),
     }
 
+    no_chat = {"MINDROOM_CONNECTIONS_ALLOWED_ORIGINS": "[]"}
     standalone = _admin_client(egress_config_file).get("/api/egress-broker/services")
-    unsigned = _admin_client(egress_config_file, **trusted_env).get(
-        "/api/egress-broker/services",
-        headers=trusted_upstream_headers(matrix_user_id="@owner:example.org"),
-    )
+    no_sign_in = _admin_client(egress_config_file, **no_chat).get("/api/egress-broker/services")
     signed = _admin_client(
         egress_config_file,
-        **_trusted_upstream_strict_jwt_env(tmp_path, matrix_user_id_claim="matrix_user_id"),
+        **trusted_upstream_env(),
+        **no_chat,
     ).get("/api/egress-broker/services", headers=signed_headers)
 
-    for response in (standalone, unsigned, signed):
+    for response in (standalone, no_sign_in, signed):
         assert response.status_code == 200, response.text
-    assert standalone.json()["personal_page_served"] is False
-    assert unsigned.json()["personal_page_served"] is False
+    assert standalone.json()["personal_page_served"] is True
+    assert no_sign_in.json()["personal_page_served"] is False
     assert signed.json()["personal_page_served"] is True
 
 
 def test_services_listing_says_whether_an_agent_without_a_scope_reaches_the_broker(egress_config_file: Path) -> None:
     """All agents without a scope share the global keys, so one of them reaching the broker is enough."""
-    client = _client_with_agents(egress_config_file, {"coder": _agent(["openclaw_compat"]), "notes": _agent([])})
+    client = _client_with_agents(egress_config_file, {"coder": _keys_agent(["openclaw_compat"]), "notes": _agent([])})
 
     assert _key_targets(client) == ([], True)
 
 
 def test_services_listing_follows_the_default_worker_scope(egress_config_file: Path) -> None:
     """An agent without a worker scope of its own takes the default one, which decides where its keys live."""
-    agents = {"inherits": _agent(["shell"]), "team": _agent(["shell"], worker_scope="shared")}
+    agents = {"inherits": _keys_agent(["shell"]), "team": _keys_agent(["shell"], worker_scope="shared")}
 
     assert _key_targets(_client_with_agents(egress_config_file, agents, worker_scope="user_agent")) == (["team"], False)
     assert _key_targets(_client_with_agents(egress_config_file, agents, worker_scope="shared")) == (
@@ -698,6 +700,51 @@ def _connect(client: TestClient, name: str, provider: str, agent_name: str | Non
     _finish_oauth(client, response, provider)
 
 
+def _allow(client: TestClient, name: str, agent_name: str | None = None) -> Any:  # noqa: ANN401
+    """Let Agent Keys use the service's connected account in the selected scope, confirming the approval bypass."""
+    return client.put(
+        f"/api/egress-broker/services/{name}/oauth-reuse",
+        params=_scope_params(agent_name),
+        json={"acknowledge_approval_bypass": True},
+    )
+
+
+def _connect_and_allow(client: TestClient, name: str, provider: str, agent_name: str | None = None) -> None:
+    _connect(client, name, provider, agent_name)
+    response = _allow(client, name, agent_name)
+    assert response.status_code == 204, response.text
+
+
+def _broker_reads(requester_id: str, scope: WorkerScope | None, agent: str, service: str, provider: str) -> object:
+    """Return what the broker resolves for `service` in a tool call by `requester_id` on `agent` under `scope`."""
+    from mindroom.api import main  # noqa: PLC0415
+
+    paths = main._app_runtime_paths(main.app)
+    identity = ToolExecutionIdentity(
+        channel="matrix",
+        agent_name=agent,
+        requester_id=requester_id,
+        room_id="!room:example.org",
+        thread_id=None,
+        resolved_thread_id=None,
+        session_id=None,
+        tenant_id=None,
+        account_id=None,
+    )
+    target = resolve_worker_target(scope, agent, identity)
+    # An unscoped call's token names the worker it was routed to.
+    claims = WorkerClaims.from_worker_target(replace(target, worker_key=target.worker_key or "v1:local:unscoped:w"))
+    assert claims is not None
+    return resolve_oauth_token(
+        service=service,
+        provider_id=provider,
+        config=main._app_context(main.app).runtime_config,
+        runtime_paths=paths,
+        credentials_manager=get_runtime_credentials_manager(paths),
+        worker_target=claims.to_worker_target(),
+    )
+
+
 def test_services_status_has_key_and_oauth_parts(oauth_broker_client: TestClient) -> None:
     """Each service reports its key and OAuth sources; plain services carry no OAuth block."""
     github = _service(oauth_broker_client, "github")
@@ -714,9 +761,9 @@ def test_connect_stores_the_account_and_a_key_takes_precedence(
     oauth_broker_client: TestClient,
     agent_name: str | None,
 ) -> None:
-    """A connected account shows in the scope it was connected for, and an explicit key takes over."""
+    """A connected account Agent Keys may use shows in the scope it was connected for, and an explicit key takes over."""
     params = _scope_params(agent_name)
-    _connect(oauth_broker_client, "drive", "google_drive", agent_name)
+    _connect_and_allow(oauth_broker_client, "drive", "google_drive", agent_name)
 
     drive = _service(oauth_broker_client, "drive", agent_name)
     assert drive["active_source"] == "oauth"
@@ -780,9 +827,12 @@ def test_requester_scoped_provider_status_follows_the_dashboard_requester(
     egress_config_file: Path,
     agent_name: str | None,
 ) -> None:
-    """With the opt-in, a GitHub-style connection belongs to the dashboard user, so the panel shows it everywhere."""
+    """With the opt-in, a GitHub-style connection belongs to the dashboard user, so the panel shows it everywhere.
+
+    So does allowing Agent Keys to use it, wherever it was allowed.
+    """
     _opt_in_to_shared_workers(egress_config_file)
-    _connect(oauth_broker_client, "gh", "github", agent_name)
+    _connect_and_allow(oauth_broker_client, "gh", "github", agent_name)
 
     for scope in (None, "test_agent"):
         gh = _service(oauth_broker_client, "gh", scope)
@@ -796,6 +846,81 @@ def test_requester_scoped_provider_status_follows_the_dashboard_requester(
     )
     assert response.status_code == 200, response.text
     assert _service(oauth_broker_client, "gh", agent_name)["oauth"]["connected"] is False
+
+
+@pytest.mark.parametrize(("agent_name", "scope"), [(None, None), ("test_agent", "shared")], ids=["unscoped", "shared"])
+def test_an_opt_in_set_on_the_panel_is_the_one_the_broker_reads(
+    oauth_broker_client: TestClient,
+    agent_name: str | None,
+    scope: WorkerScope | None,
+) -> None:
+    """Allowing a scope's account on the panel unlocks it for every user of that scope, and stopping locks it again."""
+    _connect(oauth_broker_client, "drive", "google_drive", agent_name)
+    agent = agent_name or "any_unscoped_agent"
+    off = secrets.SecretMissing(provider="google_drive", reuse_off=True)
+
+    before = _broker_reads("@alice:example.org", scope, agent, "drive", "google_drive")
+    allowed = _allow(oauth_broker_client, "drive", agent_name)
+    after = [_broker_reads(user, scope, agent, "drive", "google_drive") for user in ("@alice:example.org", "@bob:x.y")]
+    listed = _service(oauth_broker_client, "drive", agent_name)
+    stopped = oauth_broker_client.delete(
+        "/api/egress-broker/services/drive/oauth-reuse",
+        params=_scope_params(agent_name),
+    )
+
+    assert before == off
+    assert (allowed.status_code, stopped.status_code) == (204, 204), (allowed.text, stopped.text)
+    assert after[0] == after[1]
+    assert isinstance(after[0], secrets.Secret)
+    assert (listed["oauth"]["reuse_enabled"], listed["active_source"]) == (True, "oauth")
+    assert _broker_reads("@alice:example.org", scope, agent, "drive", "google_drive") == off
+
+
+def test_a_requester_scoped_opt_in_on_the_panel_is_the_dashboard_users_own(
+    oauth_broker_client: TestClient,
+    egress_config_file: Path,
+) -> None:
+    """Allowing GitHub on the panel unlocks the dashboard user's own account only, in every scope they use."""
+    _opt_in_to_shared_workers(egress_config_file)
+    _connect_and_allow(oauth_broker_client, "gh", "github")
+
+    owner = _broker_reads("@owner:example.org", "shared", "test_agent", "gh", "github")
+    other = _broker_reads("@alice:example.org", "shared", "test_agent", "gh", "github")
+
+    assert isinstance(owner, secrets.Secret)
+    assert other == secrets.SecretMissing(provider="github", reuse_off=True, requester_owned=True)
+
+
+def test_allowing_an_account_on_the_panel_requires_acknowledging_the_approval_bypass(
+    oauth_broker_client: TestClient,
+) -> None:
+    """The panel's enable needs the same confirmation as the personal page's (422 without it)."""
+    url = "/api/egress-broker/services/drive/oauth-reuse"
+
+    responses = [
+        oauth_broker_client.put(url),
+        oauth_broker_client.put(url, json={}),
+        oauth_broker_client.put(url, json={"acknowledge_approval_bypass": False}),
+    ]
+
+    assert [response.status_code for response in responses] == [422] * 3
+    assert _service(oauth_broker_client, "drive")["oauth"]["reuse_enabled"] is False
+
+
+@pytest.mark.parametrize("method", ["put", "delete"])
+@pytest.mark.parametrize(("name", "expected"), [("unknown", 404), ("github", 404), ("ghost", 404), ("gh", 409)])
+def test_allowing_and_stopping_an_account_on_the_panel_use_the_account_route_gates(
+    oauth_broker_client: TestClient,
+    method: str,
+    name: str,
+    expected: int,
+) -> None:
+    """A service without a usable provider is a 404, and a GitHub-style account in a shared sandbox a 409."""
+    body = {"json": {"acknowledge_approval_bypass": True}} if method == "put" else {}
+
+    response = getattr(oauth_broker_client, method)(f"/api/egress-broker/services/{name}/oauth-reuse", **body)
+
+    assert response.status_code == expected, response.text
 
 
 @pytest.mark.parametrize("action", ["connect", "disconnect"])
@@ -849,7 +974,7 @@ def test_personal_connection_stored_before_a_service_account_can_still_be_discon
     oauth_broker_client: TestClient,
 ) -> None:
     """The broker keeps injecting a stored personal token, so the operator must be able to revoke it."""
-    _connect(oauth_broker_client, "drive", "google_drive")
+    _connect_and_allow(oauth_broker_client, "drive", "google_drive")
     _enable_service_account()
     assert _service(oauth_broker_client, "drive")["active_source"] == "oauth"
 
@@ -977,3 +1102,25 @@ def test_key_status_is_read_off_the_event_loop(
     assert oauth_broker_client.get("/api/egress-broker/services").status_code == 200
     assert on_loop
     assert not any(on_loop)
+
+
+def test_services_load_every_status_at_once(oauth_broker_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Like the personal listing, the panel loads its services concurrently instead of one hop after another."""
+    counts = track_concurrent_calls(monkeypatch, egress_broker_api, "egress_service_status", limit=4, total=4)
+    response = oauth_broker_client.get("/api/egress-broker/services")
+    assert response.status_code == 200, response.text
+    assert [service["name"] for service in response.json()["services"]] == ["drive", "gh", "ghost", "github"]
+    assert counts == [0, 4]
+
+
+def test_services_load_at_most_the_status_load_limit_at_once(
+    oauth_broker_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The panel shares the personal listing's limit on service status loads running at once."""
+    monkeypatch.setattr(egress_status, "_STATUS_LOAD_LIMIT", 2)
+    counts = track_concurrent_calls(monkeypatch, egress_broker_api, "egress_service_status", limit=2, total=4)
+    response = oauth_broker_client.get("/api/egress-broker/services")
+    assert response.status_code == 200, response.text
+    assert [service["name"] for service in response.json()["services"]] == ["drive", "gh", "ghost", "github"]
+    assert counts == [0, 2]

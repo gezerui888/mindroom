@@ -7,9 +7,11 @@ import base64
 import hashlib
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from html.parser import HTMLParser
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
@@ -23,14 +25,18 @@ from structlog.testing import capture_logs
 
 from mindroom import agents, constants
 from mindroom.api import config_lifecycle, main
-from mindroom.api.mcp_gateway import GatewayRuntime, gateway_lifespan, install_gateway_routes
+from mindroom.api.connections_session_cookie import connections_session_cookie, issue_connections_session
+from mindroom.api.mcp_gateway import GatewayRuntime, gateway_cors_origins, gateway_lifespan, install_gateway_routes
 from mindroom.config.main import Config
+from mindroom.config.plugin import PluginEntryConfig
+from mindroom.hooks import EVENT_TOOL_BEFORE_CALL, ToolBeforeCallContext, hook
 from mindroom.mcp_gateway import admission
+from mindroom.mcp_gateway import tools as gateway_tools
 from mindroom.tool_system.worker_routing import get_tool_execution_identity
-from tests.api.test_api import _trusted_upstream_jwks, _trusted_upstream_jwt, _trusted_upstream_jwt_key
+from tests.api.conftest import trusted_upstream_jwks, trusted_upstream_jwt, trusted_upstream_jwt_key
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     import httpx
@@ -59,14 +65,12 @@ class _Inputs(HTMLParser):
 @pytest.fixture
 def signed_headers(monkeypatch: pytest.MonkeyPatch) -> Callable[[str], dict[str, str]]:
     """Exercise production JWT verification with locally signed identities."""
-    key = _trusted_upstream_jwt_key()
-    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda _client: _trusted_upstream_jwks(key))
+    key = trusted_upstream_jwt_key()
+    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda _client: trusted_upstream_jwks(key))
 
     def headers(user: str = "alice") -> dict[str, str]:
         return {
-            "X-Trusted-User": user,
-            "X-Trusted-Email": f"{user}@example.org",
-            "X-Trusted-Jwt": _trusted_upstream_jwt(
+            "X-Trusted-Jwt": trusted_upstream_jwt(
                 key,
                 user_id=user,
                 email=f"{user}@example.org",
@@ -88,9 +92,6 @@ def gateway_app(tmp_path: Path, enforce_turn_authorization: None) -> FastAPI:  #
         "MATRIX_HOMESERVER": "https://example.org",
         "MINDROOM_API_KEY": "owner-key",
         "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
-        "MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER": "X-Trusted-User",
-        "MINDROOM_TRUSTED_UPSTREAM_EMAIL_HEADER": "X-Trusted-Email",
-        "MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT": "true",
         "MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER": "X-Trusted-Jwt",
         "MINDROOM_TRUSTED_UPSTREAM_JWKS_URL": "https://issuer.example.org/jwks",
         "MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE": "mindroom-dashboard",
@@ -232,6 +233,17 @@ def _list(client: TestClient, token: str | None = None, **headers: str) -> httpx
     )
 
 
+def test_gateway_runs_without_a_connections_agent(gateway_app: FastAPI) -> None:
+    """`MINDROOM_CONNECTIONS_AGENT` only preselects an agent, so the gateway is on without it."""
+    paths = config_lifecycle.require_api_state(gateway_app).snapshot.runtime_paths
+    env = {name: value for name, value in paths.process_env.items() if name != "MINDROOM_CONNECTIONS_AGENT"}
+    assert gateway_cors_origins(replace(paths, process_env=env), "/mcp/oauth/token") == ("*",)
+    assert (
+        gateway_cors_origins(replace(paths, process_env={**env, "MINDROOM_MCP_GATEWAY_ENABLED": "false"}), "/mcp")
+        is None
+    )
+
+
 @pytest.mark.parametrize("personal_agent", ["personal", "my_assistant"])
 def test_initialize_identifies_configured_personal_agent(
     gateway_app: FastAPI,
@@ -332,6 +344,7 @@ def test_agent_selection_diagnostics(
 
 
 def _native_dispatch_builder(
+    monkeypatch: pytest.MonkeyPatch,
     phase: str,
     async_body: bool,
     paused: threading.Event,
@@ -339,11 +352,32 @@ def _native_dispatch_builder(
     events: list[str],
     agent: str = "personal",
 ) -> Callable[..., Toolkit]:
+    """Return a toolkit builder that pauses a gateway call in ``phase``: its build, its connect, or its tool hook."""
+
     def pause(at: str) -> None:
         if phase != at:
             return
         paused.set()
         assert release.wait(10), "Dispatch was never released"
+
+    @hook(EVENT_TOOL_BEFORE_CALL)
+    async def pause_in_hook(ctx: ToolBeforeCallContext) -> None:
+        assert ctx.tool_name in {"account", "async_account"}
+        await asyncio.to_thread(pause, "hook")
+
+    monkeypatch.setattr(
+        gateway_tools,
+        "load_plugins",
+        lambda *_args, **_kwargs: [
+            SimpleNamespace(
+                name="pause",
+                entry_config=PluginEntryConfig(path="pause.py"),
+                plugin_order=0,
+                discovered_hooks=(pause_in_hook,),
+                discovered_automations=(),
+            ),
+        ],
+    )
 
     def account() -> str:
         identity = get_tool_execution_identity()
@@ -356,17 +390,10 @@ def _native_dispatch_builder(
     async def async_account() -> str:
         return account()
 
-    async def before(name: str, func: Callable[..., Awaitable[str]], args: dict[str, object]) -> str:
-        assert name in {"account", "async_account"}
-        await asyncio.to_thread(pause, "hook")
-        return await func(**args)
-
     class AccountToolkit(Toolkit):
         def __init__(self) -> None:
             super().__init__(name="calculator", tools=[async_account if async_body else account])
             self._requires_connect = True
-            function = next(iter({**self.functions, **self.async_functions}.values()))
-            function.tool_hooks = [before]
 
         def connect(self) -> None:
             pause("connect")
@@ -401,7 +428,7 @@ def test_native_dispatch_rejects_changed_publication(
     release = threading.Event()
     events: list[str] = []
 
-    build = _native_dispatch_builder(phase, async_body, paused, release, events)
+    build = _native_dispatch_builder(monkeypatch, phase, async_body, paused, release, events)
     monkeypatch.setattr(agents, "build_agent_toolkit", build)
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(
@@ -859,7 +886,6 @@ def test_token_storage_capacity_preserves_authorization_code(
     ("setting", "value"),
     [
         ("MINDROOM_MCP_GATEWAY_ENABLED", "false"),
-        ("MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT", "false"),
         ("MINDROOM_PUBLIC_URL", "https://example.org/unexpected-path"),
         ("MINDROOM_MCP_GATEWAY_ALLOWED_ORIGINS", "*"),
         ("MINDROOM_MCP_GATEWAY_ONBOARDING_RATE_LIMIT", "0"),
@@ -893,6 +919,37 @@ def test_disabled_or_invalid_gateway_does_not_start(gateway_app: FastAPI, settin
     with TestClient(gateway_app, base_url=ORIGIN) as client:
         assert _list(client).status_code == 404
         assert client.get("/.well-known/oauth-authorization-server/mcp/oauth").status_code == 404
+
+
+def test_chat_session_approves_clients_without_trusted_upstream_auth(gateway_app: FastAPI) -> None:
+    """Without trusted upstream auth, a Connections session from MindRoom Chat approves clients and nothing else does."""
+    snapshot = config_lifecycle.require_api_state(gateway_app).snapshot
+    snapshot.runtime_paths = replace(
+        snapshot.runtime_paths,
+        process_env={
+            name: value
+            for name, value in snapshot.runtime_paths.process_env.items()
+            if not name.startswith("MINDROOM_TRUSTED_UPSTREAM_")
+        },
+    )
+    with TestClient(gateway_app, base_url=ORIGIN, follow_redirects=False) as client:
+        _, consent_url = _authorize(client)
+        forged = {
+            "X-Trusted-User": "alice",
+            "X-Trusted-Email": "alice@example.org",
+            "Authorization": "Bearer owner-key",
+        }
+        assert client.get(consent_url, headers=forged).status_code == 401
+        assert client.get("/api/connections/mcp/clients", headers=forged).status_code == 401
+
+        client.cookies.set(
+            connections_session_cookie(ORIGIN),
+            issue_connections_session("@alice:example.org", now=time.time(), dashboard=False),
+        )
+        client_id, code = _code(client, {})
+        token = _exchange(client, client_id, code)
+        assert token.status_code == 200, token.text
+        assert _list(client, token.json()["access_token"]).status_code == 200
 
 
 @pytest.mark.parametrize("body", [b'{"client_name":', b'{"client_name":"\xff"}', b"[" * 1100])

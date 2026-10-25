@@ -73,6 +73,7 @@ Keep `models.default` configured, because room topic generation and automatic th
 | `egress_broker` | Agent Keys: services whose API keys and connected accounts are added to worker requests without the worker seeing them | [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/) |
 | `background_tool_jobs` | Experimental background execution of tool calls, off by default | [Background Jobs](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) |
 | `personal_rooms` | One private room per onboarded user | [Personal Rooms](https://docs.mindroom.chat/personal-rooms/#personal-rooms) |
+| `personal_agents` | Templates that give each onboarded user their own agent | [Personal Agents](https://docs.mindroom.chat/personal-agents/#personal-agents) |
 | `budgets` | Default monthly spending cap per user and the fallback model | [Budgets](https://docs.mindroom.chat/budgets/) |
 | `prompts` | Built-in prompt overrides | [Built-In Prompt Overrides](#built-in-prompt-overrides) |
 | `matrix_sync` | Matrix sync transport and limits | [Matrix Sync](https://docs.mindroom.chat/matrix/#matrix-sync) |
@@ -80,7 +81,7 @@ Keep `models.default` configured, because room topic generation and automatic th
 | `debug` | Provider request logging | [Debug Logging](https://docs.mindroom.chat/deployment/operational-log-events/#debug-logging) |
 | `mindroom_user` | Internal MindRoom user account | [Internal User](https://docs.mindroom.chat/matrix/#internal-user) |
 
-Optional tools that agents load on demand are configured as described in [Dynamic Tools](https://docs.mindroom.chat/tools/dynamic-tools/), and skills in [Skills](https://docs.mindroom.chat/skills/).
+Tools that stay out of the model's context until the agent searches for them are configured as described in [Dynamic Tools](https://docs.mindroom.chat/tools/dynamic-tools/), and skills in [Skills](https://docs.mindroom.chat/skills/).
 
 ## Splitting the Configuration Into Multiple Files
 
@@ -233,9 +234,10 @@ Provider keys from the environment or `.env` are also copied into the shared cre
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MINDROOM_API_KEY` | API key for dashboard/API requests; `mindroom config init` and first-run `mindroom run` add a generated key to `.env` when it has none; unset or empty means open access | _(none)_ |
-| `MINDROOM_PORT` | Port in the default OAuth callback URL when `MINDROOM_PUBLIC_URL` and `MINDROOM_BASE_URL` are unset, also read by deployment tooling; set the API server bind port with `mindroom run --api-port` instead | `8765` |
+| `MINDROOM_PORT` | Port in the default OAuth callback URL when `MINDROOM_PUBLIC_URL` and `MINDROOM_BASE_URL` are unset, and in the default [Connections token audience](https://docs.mindroom.chat/connections-portal/#token-binding) and the address MindRoom Chat finds when `MINDROOM_PUBLIC_URL` is unset, also read by deployment tooling; it does not set the API server's bind port, which is `mindroom run --api-port`, and when unset it follows that port | the `--api-port` port, `8765` by default |
+| `MINDROOM_DASHBOARD_URL` | Origin, HTTPS or HTTP on a local address, where administrators open the dashboard when another app owns `/` on `MINDROOM_PUBLIC_URL`; prerequisites and effects are in [Dashboard On Its Own Host](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#dashboard-on-its-own-host) | _(unset: the dashboard is at `/` on the public origin)_ |
 | `MINDROOM_DASHBOARD_ALLOWED_HOSTS` | Comma-separated extra host names that unauthenticated dashboard or `/v1` requests may address (see [Authorization](https://docs.mindroom.chat/authorization/#unauthenticated-dashboard-host-names)) | _(none)_ |
-| `MINDROOM_DASHBOARD_CORS_ALLOWED_ORIGINS` | Comma-separated origins allowed credentialed dashboard CORS responses; cookie and trusted-upstream mutations still require the app's own origin | `http://localhost:3003`, `http://localhost:5173`, `http://127.0.0.1:3003`, `http://127.0.0.1:5173`, or the hosted public origins when `MINDROOM_PUBLIC_URL` is set |
+| `MINDROOM_DASHBOARD_CORS_ALLOWED_ORIGINS` | Comma-separated origins allowed credentialed dashboard CORS responses; cookie and trusted-upstream mutations still require the app's own origin, or `MINDROOM_DASHBOARD_URL` on that host | `http://localhost:3003`, `http://localhost:5173`, `http://127.0.0.1:3003`, `http://127.0.0.1:5173`, or the hosted public origins when `MINDROOM_PUBLIC_URL` is set |
 | `MINDROOM_DASHBOARD_CORS_ALLOW_ALL_ORIGINS` | `true` allows every dashboard API origin while disabling credentialed CORS responses; without dashboard authentication, origins outside `MINDROOM_DASHBOARD_ALLOWED_HOSTS` are still refused | _(unset)_ |
 | `MINDROOM_ENABLE_API_DOCS` | `false` hides the generated API docs at `/docs`, `/redoc`, and `/openapi.json` | `true` (`false` on hosted platform instances) |
 | `OPENAI_COMPAT_API_KEYS` | Comma-separated API keys for `/v1/*` requests (see [OpenAI-Compatible API](https://docs.mindroom.chat/openai-api/)) | _(none; `/v1` is locked without this or the flag below)_ |

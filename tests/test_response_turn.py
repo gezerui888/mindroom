@@ -3,22 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import threading
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import Mock
 
 import pytest
-from agno.db.base import BaseDb
-from agno.models.response import ToolExecution
-from agno.run.agent import RunOutput
-from agno.run.base import RunStatus
-from agno.run.requirement import RunRequirement
-from agno.run.team import TeamRunOutput
-from agno.session.agent import AgentSession
-from agno.session.team import TeamSession
 
 from mindroom import response_turn as response_turn_module
 from mindroom.ai_runtime import EMPTY_RESPONSE_NOTICE
@@ -27,16 +18,17 @@ from mindroom.constants import (
     MATRIX_RESPONSE_EVENT_ID_METADATA_KEY,
     MATRIX_SEEN_EVENT_IDS_METADATA_KEY,
 )
+from mindroom.delegation.state import DELEGATION_STATE_KEY, DelegationChild, DelegationPendingTool, DelegationState
 from mindroom.helper_usage import get_helper_usage_owner
 from mindroom.history import storage as history_storage
 from mindroom.history.session_context import ScopeSessionContext
 from mindroom.history.types import HistoryScope
+from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
 from mindroom.participation import ParticipationGate
 from mindroom.response_turn import (
     AttemptResolved,
     BlockingTurnAdapter,
     CompletedAttempt,
-    DynamicContinuationRunState,
     EmptyRunDiscard,
     ExcludedAttempt,
     HandledAttempt,
@@ -45,19 +37,21 @@ from mindroom.response_turn import (
     StandaloneReplaySnapshot,
     StreamAttemptResolution,
     StreamingTurnAdapter,
+    TurnContinuationRunState,
     TurnPartialSnapshot,
     TurnRunState,
     TurnSinks,
     run_blocking_response_turn,
     stream_response_turn,
 )
-from mindroom.session_storage.agent_storage import create_state_storage, get_agent_session, get_team_session
+from mindroom.session_storage.agent_storage import create_state_storage
+from mindroom.session_storage.store import ConversationStore
+from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_system.events import ToolTraceEntry
 from tests.conftest import seed_session
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
-    from contextlib import AbstractContextManager
+    from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
     from pathlib import Path
 
 
@@ -142,16 +136,6 @@ def _trace(tool_name: str) -> ToolTraceEntry:
     return ToolTraceEntry(type="tool_call_completed", tool_name=tool_name)
 
 
-def _dynamic_tool_execution(tool_name: str = "sleep") -> ToolExecution:
-    return ToolExecution(
-        tool_call_id="call-load_tool",
-        tool_name="load_tool",
-        tool_args={"tool_name": tool_name},
-        result=json.dumps({"status": "loaded", "tool": "dynamic_tools", "tool_name": tool_name}),
-        stop_after_tool_call=True,
-    )
-
-
 def _model_switch_execution(when: str) -> ToolExecution:
     return ToolExecution(
         tool_call_id="call-switch-model",
@@ -166,7 +150,7 @@ def _model_switch_execution(when: str) -> ToolExecution:
                 "when": when,
             },
         ),
-        stop_after_tool_call=True,
+        stop_after_call=True,
     )
 
 
@@ -186,8 +170,8 @@ def _ctx(**overrides: object) -> ResponseTurnContext:
     return ResponseTurnContext(**values)
 
 
-def _continuation(prompt: str = "hello") -> DynamicContinuationRunState:
-    return DynamicContinuationRunState.initial(
+def _continuation(prompt: str = "hello") -> TurnContinuationRunState:
+    return TurnContinuationRunState.initial(
         prompt=prompt,
         model_prompt=None,
         current_timestamp_ms=None,
@@ -203,31 +187,39 @@ class _AdapterLog:
     """Call log shared by the fake adapter callbacks."""
 
     scope: Any = None
-    released: int = 0
-    closed: int = 0
     finalized: int = 0
     discards: list[EmptyRunDiscard] = field(default_factory=list)
     persisted: list[StandaloneReplaySnapshot] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _FixedAttempt:
+    """A running attempt whose partial output is fixed."""
+
     snapshot: TurnPartialSnapshot = field(default_factory=TurnPartialSnapshot)
 
+    def partial_snapshot(self) -> TurnPartialSnapshot:
+        return self.snapshot
 
-def _open_scope_factory(log: _AdapterLog) -> Callable[[], AbstractContextManager[ScopeSessionContext]]:
-    def _open() -> AbstractContextManager[ScopeSessionContext]:
+
+def _load_scope_factory(log: _AdapterLog) -> Callable[[], ScopeSessionContext]:
+    def _load() -> ScopeSessionContext:
         log.scope = ScopeSessionContext(
             scope=HistoryScope(kind="agent", scope_id="general"),
-            storage=Mock(spec=BaseDb),
+            storage=Mock(spec=ConversationStore),
             session=None,
+            session_id="session-1",
         )
-        return contextlib.nullcontext(log.scope)
+        return log.scope
 
-    return _open
+    return _load
 
 
 def _blocking_adapter(
     log: _AdapterLog,
-    run_attempt: Callable[[TurnRunState, DynamicContinuationRunState], Awaitable[Any]],
+    run_attempt: Callable[[TurnRunState, TurnContinuationRunState], Awaitable[Any]],
     *,
-    open_scope: Callable[[], AbstractContextManager[ScopeSessionContext | None]] | None = None,
+    load_scope: Callable[[], ScopeSessionContext | None] | None = None,
     with_standalone_replay: bool = True,
     unexpected_error_text: Callable[[Exception], str] | None = None,
 ) -> BlockingTurnAdapter:
@@ -238,11 +230,8 @@ def _blocking_adapter(
         _bump(log, "finalized")
 
     return BlockingTurnAdapter(
-        open_scope=open_scope or _open_scope_factory(log),
+        load_scope=load_scope or _load_scope_factory(log),
         run_attempt=run_attempt,
-        snapshot_partial=lambda: log.snapshot,
-        release_attempt_entity=lambda _scope: _bump(log, "released"),
-        close_runtime_dbs=lambda _scope: _bump(log, "closed"),
         discard_empty_run=lambda _scope, discard: log.discards.append(discard),
         finalize_attempt=_finalize,
         unexpected_error_text=unexpected_error_text,
@@ -264,7 +253,7 @@ async def test_blocking_paused_attempt_escapes_without_recording_terminal_interr
 
     async def paused_attempt(
         _run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> object:
         return response_turn_module.PausedAttempt(
             session_id="session-1",
@@ -283,7 +272,6 @@ async def test_blocking_paused_attempt_escapes_without_recording_terminal_interr
 
     assert raised.value.paused.tools == (tool,)
     assert recorder.outcome == "suspended"
-    assert log.closed == 1
 
 
 def test_paused_attempt_from_team_requirement_keeps_invoking_member_identity() -> None:
@@ -296,140 +284,119 @@ def test_paused_attempt_from_team_requirement_keeps_invoking_member_identity() -
     )
     requirement = RunRequirement(tool)
     requirement.member_agent_id = "member-id"
-    requirement.member_agent_name = "researcher"
+    requirement.member_display_name = "researcher"
     requirement.member_run_id = "member-run"
-    response = TeamRunOutput(
-        status=RunStatus.paused,
-        session_id="team-session",
+    response = TeamRunRecord(
         run_id="team-run",
+        session_id="team-session",
+        status=RunStatus.paused,
         tools=[],
         requirements=[requirement],
+        team_id=None,
     )
 
     paused = response_turn_module.paused_attempt_from_response(
         response,
-        fallback_session_id="fallback-session",
-        fallback_run_id="fallback-run",
         toolkit_owners={},
     )
 
     assert paused is not None
+    assert (paused.session_id, paused.run_id) == ("team-session", "team-run")
     assert paused.tools == (tool,)
     assert paused.requirements == (requirement,)
-    assert paused.requirements[0].member_agent_name == "researcher"
+    assert paused.requirements[0].member_display_name == "researcher"
 
 
-def test_paused_attempt_rejects_confirmation_entries_without_call_ids() -> None:
-    """A paused call without durable identity must fail closed instead of being silently skipped."""
-    invalid_tool = ToolExecution(tool_name="missing-id", requires_confirmation=True)
-    invalid_requirement = RunRequirement(invalid_tool)
-    valid_tool = ToolExecution(
-        tool_call_id="call-valid",
-        tool_name="dangerous",
-        requires_confirmation=True,
+def test_a_paused_run_without_a_session_fails_instead_of_losing_its_pause() -> None:
+    """The pause is resumed from the session its record names, so a record that names none cannot pause a reply."""
+    tool = ToolExecution(tool_call_id="call", tool_name="dangerous", requires_confirmation=True)
+    record = RunRecord(run_id="run-1", status=RunStatus.paused, tools=[tool], requirements=[RunRequirement(tool)])
+
+    with pytest.raises(RuntimeError, match="names no session"):
+        response_turn_module.paused_attempt_from_response(record, toolkit_owners={})
+
+
+@pytest.mark.parametrize(
+    ("recorded", "owners"),
+    [("files", {("worker", "write"): "files"}), (None, {})],
+)
+def test_a_paused_child_s_toolkit_owners_are_the_toolkits_its_sources_recorded(
+    recorded: str | None,
+    owners: dict[tuple[str, str], str],
+) -> None:
+    """A source that recorded no toolkit leaves its call unowned, so the owner map never holds a missing owner."""
+    tool = ToolExecution(tool_call_id="child-card", tool_name="write", tool_args={}, requires_confirmation=True)
+    child = DelegationChild(
+        delegation_id="delegation",
+        parent_tool_call_id="parent-call",
+        caller_agent_name="leader",
+        child_agent_name="worker",
+        task="write it",
+        session_id="child-session",
+        run_id="child-run",
+        model_name="default",
+        depth=1,
+        execution_identity={},
+    )
+    state = DelegationState(
+        pending_tools=[tool.to_dict()],
+        pending_tool_sources={"child-card": DelegationPendingTool(child, "child-call", toolkit_name=recorded)},
+        pending_requirements=[RunRequirement(tool).to_dict()],
+        pending_child_id="delegation",
+    )
+    response = RunRecord(
+        run_id="parent-run",
+        session_id="parent-session",
+        status=RunStatus.paused,
+        metadata={DELEGATION_STATE_KEY: state.to_dict()},
     )
 
-    with pytest.raises(RuntimeError, match="missing its exact tool-call ID"):
-        response_turn_module._paused_attempt(
-            tools=(invalid_tool, valid_tool),
-            requirements=(invalid_requirement,),
-            session_id="session-1",
-            run_id="run-1",
-            toolkit_owners={},
-        )
+    paused = response_turn_module.paused_attempt_from_response(
+        response,
+        toolkit_owners={},
+    )
+
+    assert paused is not None
+    assert (paused.session_id, paused.run_id) == ("parent-session", "parent-run")
+    assert paused.toolkit_owners == owners
+
+
+@pytest.mark.parametrize(
+    ("reason", "note"),
+    [("Alice declined it.", "Alice declined it."), (None, "Not approved by requester")],
+)
+def test_a_denial_is_recorded_with_the_reason_given_or_the_default_note(reason: str | None, note: str) -> None:
+    """The model is told the requester's reason, or that the call was not approved when there is none."""
+    requirement = RunRequirement(ToolExecution(tool_call_id="call", tool_name="dangerous", requires_confirmation=True))
+
+    [decided] = response_turn_module.apply_exact_approval_decisions(
+        [requirement],
+        decisions={"call": False},
+        denial_reasons={"call": reason},
+    )
+
+    assert decided.confirmation_note == note
+    assert decided.tool_execution.confirmation_note == note
 
 
 def test_paused_attempt_rejects_duplicate_requirement_call_ids() -> None:
     """One approval decision must never authorize two requirements sharing an ID."""
-    requirements = tuple(
-        RunRequirement(
-            ToolExecution(
-                tool_call_id="duplicate-call",
-                tool_name=tool_name,
-                requires_confirmation=True,
-            ),
-        )
+    requirements = [
+        RunRequirement(ToolExecution(tool_call_id="duplicate-call", tool_name=tool_name, requires_confirmation=True))
         for tool_name in ("first", "second")
+    ]
+
+    paused_record = RunRecord(
+        run_id="run-1",
+        session_id="session-1",
+        status=RunStatus.paused,
+        requirements=requirements,
     )
 
     with pytest.raises(RuntimeError, match="duplicate tool-call IDs"):
-        response_turn_module._paused_attempt(
-            tools=(),
-            requirements=requirements,
-            session_id="session-1",
-            run_id="run-1",
+        response_turn_module.paused_attempt_from_response(
+            paused_record,
             toolkit_owners={},
-        )
-
-
-def test_paused_attempt_rejects_mixed_unresolved_hitl_requirements() -> None:
-    """MindRoom must not show an approval card when the same run also needs unsupported user input."""
-    confirmation = RunRequirement(
-        ToolExecution(
-            tool_call_id="confirm-call",
-            tool_name="dangerous",
-            requires_confirmation=True,
-        ),
-    )
-    user_input = RunRequirement(
-        ToolExecution(
-            tool_call_id="input-call",
-            tool_name="needs_input",
-            requires_user_input=True,
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="unsupported non-confirmation"):
-        response_turn_module._paused_attempt(
-            tools=(),
-            requirements=(confirmation, user_input),
-            session_id="session-1",
-            run_id="run-1",
-            toolkit_owners={},
-        )
-
-
-def test_exact_approval_decisions_reject_mixed_unresolved_hitl_requirements() -> None:
-    """A persisted mixed pause must fail closed instead of executing a tool with missing input."""
-    confirmation = RunRequirement(
-        ToolExecution(
-            tool_call_id="confirm-call",
-            tool_name="dangerous",
-            requires_confirmation=True,
-        ),
-    )
-    user_input = RunRequirement(
-        ToolExecution(
-            tool_call_id="input-call",
-            tool_name="needs_input",
-            requires_user_input=True,
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="unsupported non-confirmation"):
-        response_turn_module.apply_exact_approval_decisions(
-            (confirmation, user_input),
-            decisions={"confirm-call": True},
-            denial_reasons={"confirm-call": None},
-        )
-
-
-def test_exact_approval_decisions_reject_one_call_with_confirmation_and_input() -> None:
-    """Confirmation must not execute a call that still needs a separate input answer."""
-    mixed = RunRequirement(
-        ToolExecution(
-            tool_call_id="mixed-call",
-            tool_name="dangerous_with_input",
-            requires_confirmation=True,
-            requires_user_input=True,
-        ),
-    )
-
-    with pytest.raises(RuntimeError, match="unsupported non-confirmation"):
-        response_turn_module.apply_exact_approval_decisions(
-            (mixed,),
-            decisions={"mixed-call": True},
-            denial_reasons={"mixed-call": None},
         )
 
 
@@ -453,7 +420,7 @@ async def test_streaming_paused_attempt_escapes_without_recording_terminal_inter
 
     async def paused_attempt(
         _run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(paused)
 
@@ -469,17 +436,16 @@ async def test_streaming_paused_attempt_escapes_without_recording_terminal_inter
 
     assert raised.value.paused.run_id == "run-stream"
     assert recorder.outcome == "suspended"
-    assert log.closed == 1
 
 
 def _streaming_adapter(
     log: _AdapterLog,
     run_attempt: Callable[
-        [TurnRunState, DynamicContinuationRunState],
+        [TurnRunState, TurnContinuationRunState],
         AsyncGenerator[str | AttemptResolved, None],
     ],
     *,
-    open_scope: Callable[[], AbstractContextManager[ScopeSessionContext | None]] | None = None,
+    load_scope: Callable[[], ScopeSessionContext | None] | None = None,
     with_standalone_replay: bool = True,
     unexpected_error_text: Callable[[Exception], str] | None = None,
 ) -> StreamingTurnAdapter[str]:
@@ -490,11 +456,8 @@ def _streaming_adapter(
         _bump(log, "finalized")
 
     return StreamingTurnAdapter[str](
-        open_scope=open_scope or _open_scope_factory(log),
+        load_scope=load_scope or _load_scope_factory(log),
         run_attempt=run_attempt,
-        snapshot_partial=lambda: log.snapshot,
-        release_attempt_entity=lambda _scope: _bump(log, "released"),
-        close_runtime_dbs=lambda _scope: _bump(log, "closed"),
         discard_empty_run=lambda _scope, discard: log.discards.append(discard),
         make_text_chunk=lambda text: f"notice:{text}",
         finalize_attempt=_finalize,
@@ -516,7 +479,7 @@ async def _collect(stream: AsyncIterator[str]) -> list[str]:
 async def test_helper_usage_owner_stays_inside_attempt_across_task_handoff(finish: str) -> None:
     """The caller's owner must follow each attempt pull and close without leaking at public yields."""
     log = _AdapterLog()
-    storage = Mock(spec=BaseDb)
+    storage = Mock(spec=ConversationStore)
     scope = ScopeSessionContext(
         scope=HistoryScope(kind="agent", scope_id="general"),
         storage=storage,
@@ -535,14 +498,14 @@ async def test_helper_usage_owner_stays_inside_attempt_across_task_handoff(finis
 
     async def blocking_attempt(
         _run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> CompletedAttempt:
         observe_owner("run")
         return CompletedAttempt(response_text="done", replayable_text="done", has_visible_content=True)
 
     async def streamed_attempt(
         _run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         try:
             observe_owner("first")
@@ -557,7 +520,7 @@ async def test_helper_usage_owner_stays_inside_attempt_across_task_handoff(finis
         assert (
             await run_blocking_response_turn(
                 _ctx(),
-                _blocking_adapter(log, blocking_attempt, open_scope=lambda: contextlib.nullcontext(scope)),
+                _blocking_adapter(log, blocking_attempt, load_scope=lambda: scope),
                 TurnSinks(),
                 continuation=_continuation(),
             )
@@ -567,7 +530,7 @@ async def test_helper_usage_owner_stays_inside_attempt_across_task_handoff(finis
     else:
         stream = stream_response_turn(
             _ctx(),
-            _streaming_adapter(log, streamed_attempt, open_scope=lambda: contextlib.nullcontext(scope)),
+            _streaming_adapter(log, streamed_attempt, load_scope=lambda: scope),
             TurnSinks(),
             continuation=_continuation(),
         )
@@ -588,61 +551,52 @@ async def test_helper_usage_owner_stays_inside_attempt_across_task_handoff(finis
         assert observed_phases == (["first", "close"] if finish == "close" else ["first", "second", "close"])
     assert get_helper_usage_owner() is None
     assert log.finalized == 1
-    assert log.closed == 1
 
 
 @pytest.mark.asyncio
-async def test_blocking_scope_storage_lifecycle_runs_off_event_loop() -> None:
-    """A slow synchronous session open or close must not stall every response."""
+async def test_blocking_scope_session_loads_off_event_loop() -> None:
+    """A slow synchronous session load must not stall every response."""
     log = _AdapterLog()
     event_loop_thread = threading.get_ident()
-    lifecycle_threads: dict[str, int] = {}
+    load_threads: list[int] = []
 
-    @contextlib.contextmanager
-    def _open_scope() -> Iterator[ScopeSessionContext | None]:
-        lifecycle_threads["enter"] = threading.get_ident()
-        try:
-            yield None
-        finally:
-            lifecycle_threads["exit"] = threading.get_ident()
+    def _load_scope() -> ScopeSessionContext | None:
+        load_threads.append(threading.get_ident())
+        return None
 
     async def _attempt(
         _run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> CompletedAttempt:
         return CompletedAttempt(response_text="done", replayable_text="done", has_visible_content=True)
 
     assert (
         await run_blocking_response_turn(
             _ctx(),
-            _blocking_adapter(log, _attempt, open_scope=_open_scope),
+            _blocking_adapter(log, _attempt, load_scope=_load_scope),
             TurnSinks(),
             continuation=_continuation(),
         )
         == "done"
     )
-    assert lifecycle_threads["enter"] != event_loop_thread
-    assert lifecycle_threads["exit"] != event_loop_thread
+    assert len(load_threads) == 1
+    assert load_threads[0] != event_loop_thread
 
 
 @pytest.mark.asyncio
-async def test_streaming_scope_storage_lifecycle_runs_off_event_loop() -> None:
-    """Streaming responses use the same non-blocking scope-storage boundary."""
+async def test_streaming_scope_session_loads_off_event_loop() -> None:
+    """Streaming responses load their scope session off the event loop too."""
     log = _AdapterLog()
     event_loop_thread = threading.get_ident()
-    lifecycle_threads: dict[str, int] = {}
+    load_threads: list[int] = []
 
-    @contextlib.contextmanager
-    def _open_scope() -> Iterator[ScopeSessionContext | None]:
-        lifecycle_threads["enter"] = threading.get_ident()
-        try:
-            yield None
-        finally:
-            lifecycle_threads["exit"] = threading.get_ident()
+    def _load_scope() -> ScopeSessionContext | None:
+        load_threads.append(threading.get_ident())
+        return None
 
     async def _attempt(
         _run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(CompletedAttempt(replayable_text="done", has_visible_content=True))
 
@@ -650,45 +604,42 @@ async def test_streaming_scope_storage_lifecycle_runs_off_event_loop() -> None:
         await _collect(
             stream_response_turn(
                 _ctx(),
-                _streaming_adapter(log, _attempt, open_scope=_open_scope),
+                _streaming_adapter(log, _attempt, load_scope=_load_scope),
                 TurnSinks(),
                 continuation=_continuation(),
             ),
         )
         == []
     )
-    assert lifecycle_threads["enter"] != event_loop_thread
-    assert lifecycle_threads["exit"] != event_loop_thread
+    assert len(load_threads) == 1
+    assert load_threads[0] != event_loop_thread
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_scope_open_closes_entered_context() -> None:
-    """Cancellation waits for an accepted scope open and then closes its storage."""
+async def test_cancel_during_scope_load_waits_for_the_load() -> None:
+    """Cancellation waits for an accepted scope load to finish and starts no attempt."""
     log = _AdapterLog()
     enter_started = threading.Event()
     allow_enter = threading.Event()
-    exited = threading.Event()
+    loaded = threading.Event()
 
-    @contextlib.contextmanager
-    def _open_scope() -> Iterator[ScopeSessionContext | None]:
+    def _load_scope() -> ScopeSessionContext | None:
         enter_started.set()
         if not allow_enter.wait(timeout=5):
-            pytest.fail("scope entry was never released")
-        try:
-            yield None
-        finally:
-            exited.set()
+            pytest.fail("scope load was never released")
+        loaded.set()
+        return None
 
     async def _unexpected_attempt(
         _run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> CompletedAttempt:
-        pytest.fail("a cancelled scope open must not start an attempt")
+        pytest.fail("a cancelled scope load must not start an attempt")
 
     turn_task = asyncio.create_task(
         run_blocking_response_turn(
             _ctx(),
-            _blocking_adapter(log, _unexpected_attempt, open_scope=_open_scope),
+            _blocking_adapter(log, _unexpected_attempt, load_scope=_load_scope),
             TurnSinks(),
             continuation=_continuation(),
         ),
@@ -699,24 +650,24 @@ async def test_cancel_during_scope_open_closes_entered_context() -> None:
     with pytest.raises(asyncio.CancelledError):
         await turn_task
 
-    assert exited.is_set()
+    assert loaded.is_set()
 
 
-def _history_run(run_id: str, *, team: bool, event_id: str, seen: list[str]) -> RunOutput | TeamRunOutput:
+def _history_run(run_id: str, *, team: bool, event_id: str, seen: list[str]) -> RunRecord | TeamRunRecord:
     metadata: dict[str, Any] = {
         MATRIX_EVENT_ID_METADATA_KEY: event_id,
         MATRIX_SEEN_EVENT_IDS_METADATA_KEY: seen,
         MATRIX_RESPONSE_EVENT_ID_METADATA_KEY: f"{event_id}-reply",
     }
     if team:
-        return TeamRunOutput(
+        return TeamRunRecord(
             run_id=run_id,
             team_id="crew",
             session_id="session-1",
             status=RunStatus.completed,
             metadata=metadata,
         )
-    return RunOutput(
+    return RunRecord(
         run_id=run_id,
         agent_id="crew",
         session_id="session-1",
@@ -740,7 +691,7 @@ async def test_turn_removes_history_derived_from_a_redacted_event_no_turn_owns(
     Redacting it, or the reply that read it, must remove that run and everything after it
     before the history is used again, while the history before it stays.
     """
-    storage = create_state_storage("crew", tmp_path, subdir="sessions", session_table="crew_sessions")
+    storage = create_state_storage("crew", tmp_path)
     runs = [
         _history_run("earlier", team=team, event_id="$earlier", seen=["$earlier"]),
         _history_run("newer", team=team, event_id="$newer", seen=["$older", "$newer"]),
@@ -748,13 +699,11 @@ async def test_turn_removes_history_derived_from_a_redacted_event_no_turn_owns(
     ]
     seed_session(
         storage,
-        TeamSession(session_id="session-1", team_id="crew", runs=runs)
-        if team
-        else AgentSession(session_id="session-1", agent_id="crew", runs=runs),
+        ConversationSession(session_id="session-1", kind="team" if team else "agent", owner_id="crew", runs=runs),
     )
 
-    def _stored_session() -> AgentSession | TeamSession | None:
-        return get_team_session(storage, "session-1") if team else get_agent_session(storage, "session-1")
+    def _stored_session() -> ConversationSession | None:
+        return storage.load_session("session-1", "team") if team else storage.load_session("session-1", "agent")
 
     lookups: list[tuple[str, ...]] = []
 
@@ -762,13 +711,12 @@ async def test_turn_removes_history_derived_from_a_redacted_event_no_turn_owns(
         lookups.append(event_ids)
         return dict.fromkeys(set(event_ids) & {redacted_event_id})
 
-    def _open_scope() -> AbstractContextManager[ScopeSessionContext]:
-        return contextlib.nullcontext(
-            ScopeSessionContext(
-                scope=HistoryScope(kind="team" if team else "agent", scope_id="crew"),
-                storage=storage,
-                session=_stored_session(),
-            ),
+    def _load_scope() -> ScopeSessionContext:
+        return ScopeSessionContext(
+            scope=HistoryScope(kind="team" if team else "agent", scope_id="crew"),
+            storage=storage,
+            session=_stored_session(),
+            session_id="session-1",
         )
 
     attempt_history: list[list[str | None]] = []
@@ -781,13 +729,13 @@ async def test_turn_removes_history_derived_from_a_redacted_event_no_turn_owns(
 
     async def _blocking_attempt(
         run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> CompletedAttempt:
         return _record_history(run)
 
     async def _streaming_attempt(
         run: TurnRunState,
-        _continuation_state: DynamicContinuationRunState,
+        _continuation_state: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(_record_history(run))
 
@@ -798,7 +746,7 @@ async def test_turn_removes_history_derived_from_a_redacted_event_no_turn_owns(
             await _collect(
                 stream_response_turn(
                     ctx,
-                    _streaming_adapter(log, _streaming_attempt, open_scope=_open_scope),
+                    _streaming_adapter(log, _streaming_attempt, load_scope=_load_scope),
                     TurnSinks(),
                     continuation=_continuation(),
                 ),
@@ -806,7 +754,7 @@ async def test_turn_removes_history_derived_from_a_redacted_event_no_turn_owns(
         else:
             await run_blocking_response_turn(
                 ctx,
-                _blocking_adapter(log, _blocking_attempt, open_scope=_open_scope),
+                _blocking_adapter(log, _blocking_attempt, load_scope=_load_scope),
                 TurnSinks(),
                 continuation=_continuation(),
             )
@@ -829,7 +777,7 @@ async def test_history_cleanup_repeats_until_a_pass_removes_nothing_new(monkeypa
     def read_history(*_args: object) -> set[str]:
         return next(histories)
 
-    def remove(*_args: object, event_id: str, legacy_source_event_id: str | None) -> bool:
+    def remove(*_args: object, event_id: str, legacy_source_event_id: str | None, **_kwargs: object) -> bool:
         assert legacy_source_event_id is None
         removed.append(event_id)
         return True
@@ -841,8 +789,9 @@ async def test_history_cleanup_repeats_until_a_pass_removes_nothing_new(monkeypa
     monkeypatch.setattr(history_storage, "_remove_redacted_event_from_history", remove)
     scope_context = ScopeSessionContext(
         scope=HistoryScope(kind="agent", scope_id="general"),
-        storage=Mock(spec=BaseDb),
-        session=AgentSession(session_id="session-1", agent_id="general"),
+        storage=Mock(spec=ConversationStore),
+        session=ConversationSession(session_id="session-1", kind="agent", owner_id="general"),
+        session_id="session-1",
     )
 
     await response_turn_module._remove_history_of_redacted_events(
@@ -861,7 +810,7 @@ def test_blocking_completion_records_and_updates_collector() -> None:
     collector: dict[str, Any] = {}
     trace = _trace("search")
 
-    async def _attempt(run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         run.run_metadata = {"room_id": "!room"}
         return CompletedAttempt(
             response_text="visible",
@@ -890,7 +839,6 @@ def test_blocking_completion_records_and_updates_collector() -> None:
         },
     ]
     assert log.finalized == 1
-    assert log.closed == 1
 
 
 @pytest.mark.parametrize(
@@ -930,7 +878,7 @@ def test_tool_only_agent_and_team_presentations_respect_quiet_delivery(
         result="sent",
     )
 
-    async def _attempt(run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         independent_alerts.append("$alert")
         run.run_metadata = {"tool_count": 1}
         return CompletedAttempt(
@@ -968,7 +916,7 @@ def test_blocking_completion_skips_collector_without_metadata_content() -> None:
     log = _AdapterLog()
     collector: dict[str, Any] = {}
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         return CompletedAttempt(response_text="done", replayable_text="done", has_visible_content=True)
 
     result = asyncio.run(
@@ -988,8 +936,8 @@ def test_blocking_errored_attempt_returns_user_text() -> None:
     """An errored attempt short-circuits to its user-facing text."""
     log = _AdapterLog()
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> ExcludedAttempt:
-        return ExcludedAttempt(RunStatus.error, "friendly error")
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> ExcludedAttempt:
+        return ExcludedAttempt("friendly error")
 
     result = asyncio.run(
         run_blocking_response_turn(
@@ -1009,8 +957,8 @@ def test_blocking_errored_attempt_preserves_seeded_recorder_metadata() -> None:
     seeded_metadata = {"matrix_source_event_ids": ["$source"], "matrix_seen_event_ids": ["$source"]}
     recorder = _FakeTurnRecorder(run_metadata=seeded_metadata)
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> ExcludedAttempt:
-        return ExcludedAttempt(RunStatus.error, "friendly error")
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> ExcludedAttempt:
+        return ExcludedAttempt("friendly error")
 
     result = asyncio.run(
         run_blocking_response_turn(
@@ -1035,50 +983,54 @@ def test_blocking_errored_attempt_preserves_seeded_recorder_metadata() -> None:
     }
 
 
-def test_blocking_cancelled_attempt_records_persists_and_raises() -> None:
-    """A cancelled attempt without recorder persists one standalone replay and raises."""
+def test_blocking_errored_attempt_persists_standalone_replay() -> None:
+    """An errored attempt without recorder persists one standalone replay and returns its text."""
     log = _AdapterLog()
 
-    async def _attempt(run: TurnRunState, _c: DynamicContinuationRunState) -> ExcludedAttempt:
+    async def _attempt(run: TurnRunState, _c: TurnContinuationRunState) -> ExcludedAttempt:
         run.run_metadata = {"room_id": "!room"}
         return ExcludedAttempt(
-            reason="user stop",
+            "friendly error",
             partial_text="partial",
             completed_tools=(_trace("search"),),
             interrupted_tools=(_trace("browse"),),
-            session_id="session-live",
             run_id="run-live",
         )
 
-    async def _run() -> None:
-        await run_blocking_response_turn(
+    result = asyncio.run(
+        run_blocking_response_turn(
             _ctx(),
             _blocking_adapter(log, _attempt),
             TurnSinks(),
             continuation=_continuation(),
-        )
+        ),
+    )
 
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(_run())
-
+    assert result == "friendly error"
     assert len(log.persisted) == 1
     snapshot = log.persisted[0]
-    assert snapshot.session_id == "session-live"
     assert snapshot.run_id == "run-live"
     assert snapshot.partial_text == "partial"
     assert snapshot.run_metadata == {"room_id": "!room"}
+    assert snapshot.original_status is RunStatus.error
     assert log.finalized == 1
-    assert log.closed == 1
 
 
-def test_blocking_cancelled_attempt_with_recorder_records_twice() -> None:
-    """An in-attempt cancellation records once inline and once from the outer handler."""
+def test_blocking_external_cancel_with_recorder_records_its_synced_state() -> None:
+    """An external cancel of a blocking turn records the recorder's synced partial state."""
     log = _AdapterLog()
     recorder = _FakeTurnRecorder()
 
-    async def _attempt(run: TurnRunState, _c: DynamicContinuationRunState) -> ExcludedAttempt:
+    async def _attempt(run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         run.run_metadata = {"room_id": "!room"}
-        return ExcludedAttempt(RunStatus.cancelled, reason="stop", partial_text="partial")
+        run.turn_state.sync_partial(
+            cast("Any", recorder),
+            run_metadata=run.run_metadata,
+            assistant_text="partial",
+            completed_tools=[_trace("search")],
+            interrupted_tools=[],
+        )
+        raise asyncio.CancelledError
 
     async def _run() -> None:
         await run_blocking_response_turn(
@@ -1091,19 +1043,22 @@ def test_blocking_cancelled_attempt_with_recorder_records_twice() -> None:
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(_run())
 
-    assert len(recorder.interrupted_calls) == 2
-    assert recorder.interrupted_calls[0]["assistant_text"] == "partial"
-    # The outer handler re-records from the recorder's canonical state.
-    assert recorder.interrupted_calls[1]["run_metadata"] == {"room_id": "!room"}
+    assert recorder.interrupted_calls == [
+        {
+            "run_metadata": {"room_id": "!room"},
+            "assistant_text": "partial",
+            "completed_tools": [_trace("search")],
+            "interrupted_tools": [],
+        },
+    ]
     assert log.persisted == []
 
 
 def test_blocking_external_cancel_builds_fallback_metadata() -> None:
     """An external cancel before prepare persists a replay with rebuilt run metadata."""
     log = _AdapterLog()
-    log.snapshot = TurnPartialSnapshot(attempt_run_id=None)
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         raise asyncio.CancelledError
 
     async def _run() -> None:
@@ -1129,17 +1084,20 @@ def test_blocking_external_cancel_builds_fallback_metadata() -> None:
 
 
 def test_blocking_external_cancel_skips_persist_after_inline_persist() -> None:
-    """The standalone replay is not persisted twice for one cancelled turn."""
+    """A cancel after an errored attempt persisted its replay does not persist a second one."""
     log = _AdapterLog()
 
-    async def _attempt(run: TurnRunState, _c: DynamicContinuationRunState) -> ExcludedAttempt:
+    async def _attempt(run: TurnRunState, _c: TurnContinuationRunState) -> ExcludedAttempt:
         run.run_metadata = {"room_id": "!room"}
-        return ExcludedAttempt(RunStatus.cancelled, reason="stop")
+        return ExcludedAttempt("friendly error")
+
+    async def _cancel_while_finalizing(_scope: ScopeSessionContext | None) -> None:
+        raise asyncio.CancelledError
 
     async def _run() -> None:
         await run_blocking_response_turn(
             _ctx(),
-            _blocking_adapter(log, _attempt),
+            replace(_blocking_adapter(log, _attempt), finalize_attempt=_cancel_while_finalizing),
             TurnSinks(),
             continuation=_continuation(),
         )
@@ -1151,21 +1109,24 @@ def test_blocking_external_cancel_skips_persist_after_inline_persist() -> None:
 
 
 def test_blocking_continuation_advances_and_resets_turn_state() -> None:
-    """A dynamic-tool attempt releases the entity and reruns with the continuation prompt."""
+    """A model-switch attempt is dropped, and the turn reruns with the continuation prompt."""
     log = _AdapterLog()
     recorder = _FakeTurnRecorder()
     prompts: list[str] = []
-    first_trace = _trace("load_tool")
+    live_at_start: list[object] = []
+    first_trace = _trace("switch_thread_model")
 
     async def _attempt(
-        _run: TurnRunState,
-        continuation: DynamicContinuationRunState,
+        run: TurnRunState,
+        continuation: TurnContinuationRunState,
     ) -> CompletedAttempt:
+        live_at_start.append(run.attempt)
+        run.attempt = _FixedAttempt()
         prompts.append(continuation.active_prompt)
         if len(prompts) == 1:
             return CompletedAttempt(
                 attempt_run_id="run-1",
-                tool_executions=(_dynamic_tool_execution(),),
+                tool_executions=(_model_switch_execution("next-turn"),),
                 completed_tools=(first_trace,),
             )
         return CompletedAttempt(
@@ -1187,8 +1148,8 @@ def test_blocking_continuation_advances_and_resets_turn_state() -> None:
     assert result == "final"
     assert len(prompts) == 2
     assert prompts[0] == "original ask"
-    assert "DYNAMIC TOOL CALL COMPLETED" in prompts[1]
-    assert log.released == 1
+    assert "MODEL SWITCH TOOL CALL COMPLETED" in prompts[1]
+    assert live_at_start == [None, None]
     assert log.finalized == 2
     # The continuation reset synced empty partial state carrying the prior tools.
     assert recorder.synced_calls[-1]["completed_tools"] == [first_trace]
@@ -1204,14 +1165,14 @@ def test_blocking_after_toolcall_switch_selects_new_continuation_model(hidden: b
 
     async def _attempt(
         _run: TurnRunState,
-        continuation: DynamicContinuationRunState,
+        continuation: TurnContinuationRunState,
     ) -> CompletedAttempt:
         active_models.append(continuation.active_model_name)
         if len(active_models) == 1:
             return CompletedAttempt(
                 attempt_run_id="run-1",
                 tool_executions=() if hidden else (_model_switch_execution("after-toolcall"),),
-                control_executions=(_model_switch_execution("after-toolcall"),) if hidden else (),
+                control_calls=(_model_switch_execution("after-toolcall").call,) if hidden else (),
             )
         return CompletedAttempt(response_text="final", replayable_text="final", has_visible_content=True)
 
@@ -1236,7 +1197,7 @@ def test_blocking_next_turn_switch_keeps_current_model_for_continuation(hidden: 
 
     async def _attempt(
         _run: TurnRunState,
-        continuation: DynamicContinuationRunState,
+        continuation: TurnContinuationRunState,
     ) -> CompletedAttempt:
         active_models.append(continuation.active_model_name)
         if len(active_models) == 1:
@@ -1244,7 +1205,7 @@ def test_blocking_next_turn_switch_keeps_current_model_for_continuation(hidden: 
                 attempt_run_id="run-1",
                 runtime_model_name="default",
                 tool_executions=() if hidden else (_model_switch_execution("next-turn"),),
-                control_executions=(_model_switch_execution("next-turn"),) if hidden else (),
+                control_calls=(_model_switch_execution("next-turn").call,) if hidden else (),
             )
         return CompletedAttempt(response_text="final", replayable_text="final", has_visible_content=True)
 
@@ -1265,10 +1226,10 @@ def test_blocking_continuation_limit_returns_limit_message() -> None:
     """Hitting the continuation limit surfaces the limit message when nothing is visible."""
     log = _AdapterLog()
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         return CompletedAttempt(
             attempt_run_id="run-1",
-            tool_executions=(_dynamic_tool_execution(),),
+            tool_executions=(_model_switch_execution("next-turn"),),
         )
 
     result = asyncio.run(
@@ -1284,14 +1245,17 @@ def test_blocking_continuation_limit_returns_limit_message() -> None:
 
 
 def test_blocking_empty_run_grants_one_retry_then_notice() -> None:
-    """The empty-run guard discards, retries once, then falls back to the notice."""
+    """The empty-run guard discards, drops the spent attempt, retries once, then falls back to the notice."""
     log = _AdapterLog()
     recorder = _FakeTurnRecorder()
     attempts = 0
+    live_at_start: list[object] = []
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         nonlocal attempts
         attempts += 1
+        live_at_start.append(run.attempt)
+        run.attempt = _FixedAttempt()
         return CompletedAttempt(is_empty=True, session_id="session-live", run_id=f"run-{attempts}")
 
     result = asyncio.run(
@@ -1307,7 +1271,7 @@ def test_blocking_empty_run_grants_one_retry_then_notice() -> None:
     assert attempts == 2
     # Both empty runs are discarded; the notice is delivery-only.
     assert [discard.run_id for discard in log.discards] == ["run-1", "run-2"]
-    assert log.released == 1
+    assert live_at_start == [None, None]
     assert recorder.completed_calls == [
         {"run_metadata": None, "assistant_text": "", "completed_tools": []},
     ]
@@ -1318,10 +1282,13 @@ def test_blocking_no_report_empty_run_completes_without_retry_or_notice() -> Non
     log = _AdapterLog()
     recorder = _FakeTurnRecorder()
     attempts = 0
+    runs: list[TurnRunState] = []
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         nonlocal attempts
         attempts += 1
+        runs.append(run)
+        run.attempt = _FixedAttempt()
         return CompletedAttempt(is_empty=True, session_id="session-live", run_id="run-empty")
 
     result = asyncio.run(
@@ -1336,25 +1303,25 @@ def test_blocking_no_report_empty_run_completes_without_retry_or_notice() -> Non
     assert result == ""
     assert attempts == 1
     assert log.discards == []
-    assert log.released == 0
+    assert runs[0].attempt is not None
     assert recorder.completed_calls == [
         {"run_metadata": None, "assistant_text": "", "completed_tools": []},
     ]
 
 
 def test_blocking_empty_retry_borrows_continuation_slot_within_shared_budget() -> None:
-    """One empty retry plus dynamic-tool continuations share the iteration budget."""
+    """One empty retry plus model-switch continuations share the iteration budget."""
     log = _AdapterLog()
     attempts = 0
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             return CompletedAttempt(is_empty=True, run_id="run-empty")
         return CompletedAttempt(
             attempt_run_id=f"run-{attempts}",
-            tool_executions=(_dynamic_tool_execution(),),
+            tool_executions=(_model_switch_execution("next-turn"),),
         )
 
     result = asyncio.run(
@@ -1386,7 +1353,7 @@ def test_blocking_discarded_empty_run_metadata_stays_out_of_collector() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> CompletedAttempt | ExcludedAttempt:
         nonlocal attempts
         attempts += 1
@@ -1396,7 +1363,7 @@ def test_blocking_discarded_empty_run_metadata_stays_out_of_collector() -> None:
                 run_id="run-empty",
                 metadata_content={"io.mindroom.ai_run": {"run_id": "run-empty", "status": "completed"}},
             )
-        return ExcludedAttempt(RunStatus.error, "friendly error")
+        return ExcludedAttempt("friendly error")
 
     result = asyncio.run(
         run_blocking_response_turn(
@@ -1418,13 +1385,13 @@ def test_blocking_superseded_continuation_metadata_stays_out_of_collector() -> N
     collector: dict[str, Any] = {}
     attempts = 0
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             return CompletedAttempt(
                 attempt_run_id="run-1",
-                tool_executions=(_dynamic_tool_execution(),),
+                tool_executions=(_model_switch_execution("next-turn"),),
                 metadata_content={"io.mindroom.ai_run": {"run_id": "run-1"}},
             )
         return CompletedAttempt(
@@ -1451,7 +1418,7 @@ def test_blocking_unexpected_error_reraises_without_shaper() -> None:
     """Unexpected exceptions propagate when no error shaper is configured."""
     log = _AdapterLog()
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         msg = "boom"
         raise RuntimeError(msg)
 
@@ -1465,14 +1432,13 @@ def test_blocking_unexpected_error_reraises_without_shaper() -> None:
 
     with pytest.raises(RuntimeError, match="boom"):
         asyncio.run(_run())
-    assert log.closed == 1
 
 
 def test_blocking_unexpected_error_uses_shaper_when_configured() -> None:
     """Unexpected exceptions become user-facing text through the configured shaper."""
     log = _AdapterLog()
 
-    async def _attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> CompletedAttempt:
+    async def _attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> CompletedAttempt:
         msg = "boom"
         raise RuntimeError(msg)
 
@@ -1495,7 +1461,7 @@ def test_streaming_turn_yields_chunks_and_filters_sentinel() -> None:
 
     async def _attempt(
         run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         run.run_metadata = {"room_id": "!room"}
         yield "hello "
@@ -1529,7 +1495,7 @@ def test_streaming_handled_attempt_records_and_publishes_its_metadata() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield "friendly error"
         yield AttemptResolved(HandledAttempt(metadata_content=error_metadata))
@@ -1552,98 +1518,23 @@ def test_streaming_handled_attempt_records_and_publishes_its_metadata() -> None:
     assert log.finalized == 1
 
 
-def test_streaming_cancelled_attempt_records_updates_collector_and_raises() -> None:
-    """A cancelled streaming attempt records, publishes metadata, persists, and raises."""
+def test_streaming_external_cancel_records_snapshot_partials() -> None:
+    """An external cancel records the running attempt's partial output."""
     log = _AdapterLog()
-    collector: dict[str, Any] = {}
+    recorder = _FakeTurnRecorder()
 
     async def _attempt(
         run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
-        run.run_metadata = {"room_id": "!room"}
-        yield "partial"
-        yield AttemptResolved(
-            ExcludedAttempt(
-                reason="stop",
-                partial_text="partial",
-                metadata_content={"io.mindroom.ai_run": {"status": "cancelled"}},
+        run.attempt = _FixedAttempt(
+            TurnPartialSnapshot(
+                assistant_text="live partial",
+                completed_tools=(_trace("search"),),
+                interrupted_tools=(_trace("browse"),),
+                attempt_run_id="run-live",
             ),
         )
-
-    collected: list[str] = []
-
-    async def _run() -> None:
-        async for chunk in stream_response_turn(
-            _ctx(),
-            _streaming_adapter(log, _attempt),
-            TurnSinks(run_metadata_collector=collector),
-            continuation=_continuation(),
-        ):
-            # A comprehension would lose the chunks yielded before the cancel.
-            collected.append(chunk)  # noqa: PERF401
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(_run())
-
-    assert collected == ["partial"]
-    assert collector == {"io.mindroom.ai_run": {"status": "cancelled"}}
-    assert len(log.persisted) == 1
-    assert log.finalized == 1
-    assert log.closed == 1
-
-
-def test_streaming_cancelled_attempt_with_recorder_records_twice() -> None:
-    """An in-attempt stream cancel records inline, then again from the live snapshot."""
-    log = _AdapterLog()
-    recorder = _FakeTurnRecorder()
-    log.snapshot = TurnPartialSnapshot(assistant_text="snapshot partial")
-
-    async def _attempt(
-        run: TurnRunState,
-        _c: DynamicContinuationRunState,
-    ) -> AsyncGenerator[str | AttemptResolved, None]:
-        run.run_metadata = {"room_id": "!room"}
-        yield "partial"
-        yield AttemptResolved(
-            ExcludedAttempt(RunStatus.cancelled, reason="stop", partial_text="attempt partial"),
-        )
-
-    async def _run() -> None:
-        async for _chunk in stream_response_turn(
-            _ctx(),
-            _streaming_adapter(log, _attempt),
-            TurnSinks(turn_recorder=cast("Any", recorder)),
-            continuation=_continuation(),
-        ):
-            pass
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(_run())
-
-    assert len(recorder.interrupted_calls) == 2
-    assert recorder.interrupted_calls[0]["assistant_text"] == "attempt partial"
-    # Unlike blocking, the streaming outer handler re-records from the live
-    # snapshot rather than the recorder's canonical state.
-    assert recorder.interrupted_calls[1]["assistant_text"] == "snapshot partial"
-    assert log.persisted == []
-
-
-def test_streaming_external_cancel_records_snapshot_partials() -> None:
-    """An external cancel records the adapter's live partial snapshot."""
-    log = _AdapterLog()
-    recorder = _FakeTurnRecorder()
-    log.snapshot = TurnPartialSnapshot(
-        assistant_text="live partial",
-        completed_tools=(_trace("search"),),
-        interrupted_tools=(_trace("browse"),),
-        attempt_run_id="run-live",
-    )
-
-    async def _attempt(
-        _run: TurnRunState,
-        _c: DynamicContinuationRunState,
-    ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield "chunk"
         raise asyncio.CancelledError
 
@@ -1670,14 +1561,14 @@ def test_streaming_external_cancel_records_snapshot_partials() -> None:
 
 
 def test_streaming_external_cancel_without_recorder_persists_snapshot() -> None:
-    """A recorder-less external cancel persists the standalone replay from the snapshot."""
+    """A recorder-less external cancel persists the standalone replay from the running attempt's partial output."""
     log = _AdapterLog()
-    log.snapshot = TurnPartialSnapshot(assistant_text="live partial", attempt_run_id="run-live")
 
     async def _attempt(
-        _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        run: TurnRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
+        run.attempt = _FixedAttempt(TurnPartialSnapshot(assistant_text="live partial", attempt_run_id="run-live"))
         yield "chunk"
         raise asyncio.CancelledError
 
@@ -1706,7 +1597,7 @@ def test_streaming_empty_run_retries_then_yields_notice_and_records() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         nonlocal attempts
         attempts += 1
@@ -1736,13 +1627,16 @@ def test_streaming_no_report_empty_run_completes_without_retry_or_notice() -> No
     log = _AdapterLog()
     recorder = _FakeTurnRecorder()
     attempts = 0
+    runs: list[TurnRunState] = []
 
     async def _attempt(
-        _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        run: TurnRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         nonlocal attempts
         attempts += 1
+        runs.append(run)
+        run.attempt = _FixedAttempt()
         yield AttemptResolved(CompletedAttempt(is_empty=True, run_id="run-empty"))
 
     chunks = asyncio.run(
@@ -1759,7 +1653,7 @@ def test_streaming_no_report_empty_run_completes_without_retry_or_notice() -> No
     assert chunks == []
     assert attempts == 1
     assert log.discards == []
-    assert log.released == 0
+    assert runs[0].attempt is not None
     assert recorder.completed_calls == [
         {"run_metadata": None, "assistant_text": "", "completed_tools": []},
     ]
@@ -1767,22 +1661,25 @@ def test_streaming_no_report_empty_run_completes_without_retry_or_notice() -> No
 
 @pytest.mark.parametrize("hidden", [False, True])
 def test_streaming_continuation_advances_then_finishes(hidden: bool) -> None:
-    """A streamed dynamic-tool attempt continues the turn and streams the second attempt."""
+    """A streamed model-switch attempt is dropped, and the turn continues and streams the second attempt."""
     log = _AdapterLog()
     prompts: list[str] = []
+    live_at_start: list[object] = []
 
     async def _attempt(
-        _run: TurnRunState,
-        continuation: DynamicContinuationRunState,
+        run: TurnRunState,
+        continuation: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
+        live_at_start.append(run.attempt)
+        run.attempt = _FixedAttempt()
         prompts.append(continuation.active_prompt)
         if len(prompts) == 1:
-            yield "loading tool"
+            yield "switching models"
             yield AttemptResolved(
                 CompletedAttempt(
                     attempt_run_id="run-1",
-                    tool_executions=() if hidden else (_dynamic_tool_execution(),),
-                    control_executions=(_dynamic_tool_execution(),) if hidden else (),
+                    tool_executions=() if hidden else (_model_switch_execution("next-turn"),),
+                    control_calls=(_model_switch_execution("next-turn").call,) if hidden else (),
                 ),
             )
             return
@@ -1800,11 +1697,65 @@ def test_streaming_continuation_advances_then_finishes(hidden: bool) -> None:
         ),
     )
 
-    assert chunks == ["loading tool", "final answer"]
+    assert chunks == ["switching models", "final answer"]
     assert len(prompts) == 2
-    assert "DYNAMIC TOOL CALL COMPLETED" in prompts[1]
-    assert log.released == 1
+    assert "MODEL SWITCH TOOL CALL COMPLETED" in prompts[1]
+    assert live_at_start == [None, None]
     assert log.finalized == 2
+
+
+def test_a_stop_before_the_next_attempt_starts_records_none_of_the_spent_attempt() -> None:
+    """A stop between a dropped attempt and the next one records no text or calls of the dropped attempt.
+
+    Its finished calls already carried over through the turn state, so keeping them here would count them twice.
+    """
+    log = _AdapterLog()
+    recorder = _FakeTurnRecorder()
+    switch = _trace("switch_thread_model")
+    attempts = 0
+
+    async def _attempt(
+        run: TurnRunState,
+        _c: TurnContinuationRunState,
+    ) -> AsyncGenerator[str | AttemptResolved, None]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 2:
+            raise asyncio.CancelledError
+        run.attempt = _FixedAttempt(
+            TurnPartialSnapshot(
+                assistant_text="stale partial",
+                completed_tools=(switch,),
+                interrupted_tools=(_trace("browse"),),
+                attempt_run_id="run-1",
+            ),
+        )
+        yield "stale partial"
+        yield AttemptResolved(
+            CompletedAttempt(
+                attempt_run_id="run-1",
+                tool_executions=(_model_switch_execution("next-turn"),),
+                completed_tools=(switch,),
+            ),
+        )
+
+    async def _run() -> None:
+        async for _chunk in stream_response_turn(
+            _ctx(),
+            _streaming_adapter(log, _attempt),
+            TurnSinks(turn_recorder=cast("Any", recorder)),
+            continuation=_continuation(),
+        ):
+            pass
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_run())
+
+    assert attempts == 2
+    [interrupted] = recorder.interrupted_calls
+    assert interrupted["assistant_text"] == ""
+    assert interrupted["completed_tools"] == [switch]
+    assert interrupted["interrupted_tools"] == []
 
 
 def test_streaming_continuation_limit_yields_limit_message() -> None:
@@ -1813,10 +1764,10 @@ def test_streaming_continuation_limit_yields_limit_message() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(
-            CompletedAttempt(attempt_run_id="run-1", tool_executions=(_dynamic_tool_execution(),)),
+            CompletedAttempt(attempt_run_id="run-1", tool_executions=(_model_switch_execution("next-turn"),)),
         )
 
     chunks = asyncio.run(
@@ -1836,25 +1787,25 @@ def test_streaming_continuation_limit_yields_limit_message() -> None:
 
 
 @pytest.mark.parametrize(("saved_count", "expected_attempts"), [(0, 4), (2, 2), (4, 0)])
-def test_resumed_schema_change_uses_remaining_budget(saved_count: int, expected_attempts: int) -> None:
-    """Restoring a schema boundary cannot reset the logical turn budget or leak stale text."""
+def test_resumed_continuation_uses_remaining_budget(saved_count: int, expected_attempts: int) -> None:
+    """Restoring a model-switch continuation cannot reset the logical turn budget or leak stale text."""
     log = _AdapterLog()
     prompts: list[str] = []
     completed: list[CompletedAttempt] = []
 
     async def attempt(
         _run: TurnRunState,
-        continuation: DynamicContinuationRunState,
+        continuation: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         prompts.append(continuation.active_prompt)
         yield AttemptResolved(
-            CompletedAttempt(attempt_run_id="fresh", tool_executions=(_dynamic_tool_execution(),)),
+            CompletedAttempt(attempt_run_id="fresh", tool_executions=(_model_switch_execution("next-turn"),)),
         )
 
     restored = CompletedAttempt(
         response_text="stale",
         attempt_run_id="saved",
-        tool_executions=(_dynamic_tool_execution(),),
+        tool_executions=(_model_switch_execution("next-turn"),),
     )
     chunks = asyncio.run(
         _collect(
@@ -1868,7 +1819,7 @@ def test_resumed_schema_change_uses_remaining_budget(saved_count: int, expected_
         ),
     )
     assert len(prompts) == expected_attempts
-    assert all("DYNAMIC TOOL CALL COMPLETED" in prompt for prompt in prompts)
+    assert all("MODEL SWITCH TOOL CALL COMPLETED" in prompt for prompt in prompts)
     assert len(chunks) == 1
     assert "did not produce a final answer" in chunks[0]
     assert "stale" not in chunks[0]
@@ -1877,14 +1828,14 @@ def test_resumed_schema_change_uses_remaining_budget(saved_count: int, expected_
     assert completed[0].metadata_content is None
 
 
-def test_resumed_schema_change_preserves_count_on_next_pause() -> None:
-    """A second approval must save the consumed fresh schema step."""
+def test_resumed_continuation_preserves_count_on_next_pause() -> None:
+    """A second approval must save the consumed fresh continuation attempt."""
     log = _AdapterLog()
     completed: list[CompletedAttempt] = []
 
     async def attempt(
         _run: TurnRunState,
-        _continuation: DynamicContinuationRunState,
+        _continuation: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(
             response_turn_module.PausedAttempt(session_id="session", run_id="fresh", tools=(), toolkit_owners={}),
@@ -1899,7 +1850,7 @@ def test_resumed_schema_change_preserves_count_on_next_pause() -> None:
                     TurnSinks(on_completed=completed.append),
                     continuation=_continuation(),
                     resumed_attempt=response_turn_module.ResumedAttempt(
-                        CompletedAttempt(tool_executions=(_dynamic_tool_execution(),)),
+                        CompletedAttempt(tool_executions=(_model_switch_execution("next-turn"),)),
                         continuation_count=2,
                     ),
                 ),
@@ -1910,25 +1861,25 @@ def test_resumed_schema_change_preserves_count_on_next_pause() -> None:
 
 
 @pytest.mark.parametrize("streaming", [False, True])
-def test_fresh_schema_change_saves_count_before_first_approval(streaming: bool) -> None:
-    """The budget starts with the first schema change, before any approval checkpoint."""
+def test_fresh_continuation_saves_count_before_first_approval(streaming: bool) -> None:
+    """The budget starts with the first continuation, before any approval checkpoint."""
     log = _AdapterLog()
     calls = 0
     completed: list[CompletedAttempt] = []
 
     async def attempt(
         _run: TurnRunState,
-        _continuation: DynamicContinuationRunState,
+        _continuation: TurnContinuationRunState,
     ) -> CompletedAttempt | response_turn_module.PausedAttempt:
         nonlocal calls
         calls += 1
         if calls == 1:
-            return CompletedAttempt(tool_executions=(_dynamic_tool_execution(),))
+            return CompletedAttempt(tool_executions=(_model_switch_execution("next-turn"),))
         return response_turn_module.PausedAttempt(session_id="session", run_id="fresh", tools=(), toolkit_owners={})
 
     async def streamed_attempt(
         run: TurnRunState,
-        continuation: DynamicContinuationRunState,
+        continuation: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(await attempt(run, continuation))
 
@@ -1959,15 +1910,15 @@ def test_fresh_schema_change_saves_count_before_first_approval(streaming: bool) 
 
 @pytest.mark.parametrize(
     "resolution",
-    [HandledAttempt(), ExcludedAttempt(original_status=RunStatus.error), SkippedAttempt(reason="quiet")],
+    [HandledAttempt(), SkippedAttempt(reason="quiet")],
 )
 def test_noncompletion_does_not_publish_completed_attempt(resolution: StreamAttemptResolution) -> None:
-    """Handled errors, excluded runs and quiet turns cannot report typed success."""
+    """Handled errors and quiet turns cannot report typed success."""
     completed: list[CompletedAttempt] = []
 
     async def attempt(
         _run: TurnRunState,
-        _continuation: DynamicContinuationRunState,
+        _continuation: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(resolution)
 
@@ -1990,7 +1941,7 @@ def test_streaming_finalize_runs_when_attempt_raises() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield "chunk"
         msg = "stream blew up"
@@ -2008,7 +1959,6 @@ def test_streaming_finalize_runs_when_attempt_raises() -> None:
     with pytest.raises(RuntimeError, match="stream blew up"):
         asyncio.run(_run())
     assert log.finalized == 1
-    assert log.closed == 1
 
 
 def test_streaming_unexpected_error_yields_shaped_notice_chunk() -> None:
@@ -2017,7 +1967,7 @@ def test_streaming_unexpected_error_yields_shaped_notice_chunk() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield "chunk"
         msg = "boom"
@@ -2043,7 +1993,7 @@ def test_streaming_completed_response_text_is_emitted_after_settle() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(
             CompletedAttempt(response_text="final doc", replayable_text="final doc", has_visible_content=True),
@@ -2075,7 +2025,7 @@ def test_streaming_empty_terminal_text_is_not_leaked_before_retry() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         nonlocal attempts
         attempts += 1
@@ -2104,13 +2054,13 @@ def test_streaming_empty_terminal_text_is_not_leaked_before_retry() -> None:
 
 
 def test_streaming_continuation_does_not_emit_first_attempt_terminal_text() -> None:
-    """A dynamic-tool attempt's terminal text is superseded by the rerun's."""
+    """A model-switch attempt's terminal text is superseded by the rerun's."""
     log = _AdapterLog()
     attempts = 0
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         nonlocal attempts
         attempts += 1
@@ -2119,7 +2069,7 @@ def test_streaming_continuation_does_not_emit_first_attempt_terminal_text() -> N
                 CompletedAttempt(
                     response_text="stale first-attempt text",
                     attempt_run_id="run-1",
-                    tool_executions=(_dynamic_tool_execution(),),
+                    tool_executions=(_model_switch_execution("next-turn"),),
                 ),
             )
             return
@@ -2149,7 +2099,7 @@ def test_streaming_attempt_without_sentinel_raises() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield "chunk"
 
@@ -2166,7 +2116,6 @@ def test_streaming_attempt_without_sentinel_raises() -> None:
         asyncio.run(_run())
     assert recorder.completed_calls == []
     assert log.finalized == 1
-    assert log.closed == 1
 
 
 def test_streaming_aclose_runs_cleanup_without_recording() -> None:
@@ -2177,7 +2126,7 @@ def test_streaming_aclose_runs_cleanup_without_recording() -> None:
 
     async def _attempt(
         _run: TurnRunState,
-        _c: DynamicContinuationRunState,
+        _c: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         nonlocal attempt_closed
         try:
@@ -2186,7 +2135,6 @@ def test_streaming_aclose_runs_cleanup_without_recording() -> None:
             yield AttemptResolved(CompletedAttempt(replayable_text="full", has_visible_content=True))
         finally:
             assert log.finalized == 0
-            assert log.closed == 0
             attempt_closed = True
 
     async def _run() -> None:
@@ -2202,7 +2150,6 @@ def test_streaming_aclose_runs_cleanup_without_recording() -> None:
 
     asyncio.run(_run())
 
-    assert log.closed == 1
     assert log.finalized == 1
     assert recorder.completed_calls == []
     assert recorder.interrupted_calls == []
@@ -2229,14 +2176,14 @@ def test_declined_participation_discards_empty_run_without_retry(streaming: bool
     gate = ParticipationGate()
     gate.decline("Already answered.")
 
-    async def attempt(_run: TurnRunState, _c: DynamicContinuationRunState) -> SkippedAttempt:
+    async def attempt(_run: TurnRunState, _c: TurnContinuationRunState) -> SkippedAttempt:
         nonlocal attempts
         attempts += 1
         return SkippedAttempt(reason="Already answered.", session_id="session-live", run_id="run-quiet")
 
     async def streamed_attempt(
         run: TurnRunState,
-        continuation: DynamicContinuationRunState,
+        continuation: TurnContinuationRunState,
     ) -> AsyncIterator[AttemptResolved]:
         yield AttemptResolved(await attempt(run, continuation))
 
@@ -2279,16 +2226,16 @@ async def test_outer_turn_failure_is_quiet_until_participation_approves(streamin
     elif gate is not None and gate_state == "silent":
         gate.decline("already_answered")
 
-    def broken_scope() -> AbstractContextManager[ScopeSessionContext | None]:
+    def broken_scope() -> ScopeSessionContext | None:
         message = "Scope unavailable"
         raise RuntimeError(message)
 
-    async def attempt(_run: TurnRunState, _continuation: DynamicContinuationRunState) -> CompletedAttempt:
-        pytest.fail("Scope must open before an attempt")
+    async def attempt(_run: TurnRunState, _continuation: TurnContinuationRunState) -> CompletedAttempt:
+        pytest.fail("Scope must load before an attempt")
 
     async def streamed_attempt(
         run: TurnRunState,
-        continuation: DynamicContinuationRunState,
+        continuation: TurnContinuationRunState,
     ) -> AsyncGenerator[str | AttemptResolved, None]:
         yield AttemptResolved(await attempt(run, continuation))
 
@@ -2301,7 +2248,7 @@ async def test_outer_turn_failure_is_quiet_until_participation_approves(streamin
                     _streaming_adapter(
                         log,
                         streamed_attempt,
-                        open_scope=broken_scope,
+                        load_scope=broken_scope,
                         unexpected_error_text=lambda _: "Visible error",
                     ),
                     TurnSinks(turn_recorder=cast("Any", recorder)),
@@ -2315,7 +2262,7 @@ async def test_outer_turn_failure_is_quiet_until_participation_approves(streamin
             _blocking_adapter(
                 log,
                 attempt,
-                open_scope=broken_scope,
+                load_scope=broken_scope,
                 unexpected_error_text=lambda _: "Visible error",
             ),
             TurnSinks(turn_recorder=cast("Any", recorder)),

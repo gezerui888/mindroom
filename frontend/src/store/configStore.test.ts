@@ -364,8 +364,6 @@ describe("configStore", () => {
       expect(state.agents).toHaveLength(1);
       expect(state.agents[0].id).toBe("test");
       expect(state.agents[0].display_name).toBe("Test Agent");
-      expect(state.agents[0].learning).toBe(true);
-      expect(state.agents[0].learning_mode).toBe("always");
       expect(state.agentPoliciesByAgent).toEqual({
         test: makeAgentPolicy("test"),
       });
@@ -552,196 +550,210 @@ describe("configStore", () => {
       expect(state.config?.defaults?.tools).toEqual(["gmail", "file"]);
     });
 
-    it("should apply global learning defaults when agent settings are omitted", async () => {
-      const mockConfig = {
-        agents: {
-          test: {
-            display_name: "Test Agent",
-            role: "Test role",
-            tools: [],
-            skills: [],
-            instructions: [],
-            rooms: [],
-          },
-        },
-        defaults: {
-          learning: false,
-          learning_mode: "agentic",
-        },
-        models: {
-          default: {
-            provider: "ollama",
-            id: "test-model",
-          },
-        },
+    describe("agents and teams that omit defaulted fields", () => {
+      const authoredAgent = { display_name: "Test Agent" };
+      const authoredTeam = {
+        display_name: "Ops Team",
+        role: "Coordinates operations",
+        agents: ["test"],
       };
 
-      (global.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: async () => mockConfig,
-      });
-      (global.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          agent_policies: { test: makeAgentPolicy("test") },
-        }),
-      });
-
-      const { loadConfig } = useConfigStore.getState();
-      await loadConfig();
-
-      const state = useConfigStore.getState();
-      expect(state.agents[0].learning).toBe(false);
-      expect(state.agents[0].learning_mode).toBe("agentic");
-    });
-
-    it("normalizes teams without authored rooms when loading configuration", async () => {
-      const mockConfig = {
-        agents: {
-          test: {
-            display_name: "Test Agent",
-            role: "Test role",
-            tools: [],
-            skills: [],
-            instructions: [],
-            rooms: [],
-          },
-        },
-        teams: {
-          ops: {
-            display_name: "Ops Team",
-            role: "Coordinates operations",
-            agents: ["test"],
-            mode: "coordinate",
-          },
-        },
-        models: {
-          default: {
-            provider: "ollama",
-            id: "test-model",
-          },
-        },
-        defaults: {
-          markdown: true,
-        },
-        router: {
-          model: "default",
-        },
-        memory: {
-          embedder: {
-            provider: "openai",
-            config: {
-              model: "text-embedding-3-small",
+      async function loadAuthored({
+        agent = authoredAgent as object,
+        team = authoredTeam as object,
+        defaults = { markdown: true } as object,
+      } = {}) {
+        (global.fetch as any).mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            agents: { test: agent },
+            teams: { ops: team },
+            models: { default: { provider: "ollama", id: "test-model" } },
+            defaults,
+            router: { model: "default" },
+            memory: {
+              embedder: {
+                provider: "openai",
+                config: { model: "text-embedding-3-small" },
+              },
             },
+          }),
+        });
+        (global.fetch as any).mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({
+            agent_policies: { test: makeAgentPolicy("test") },
+          }),
+        });
+        await useConfigStore.getState().loadConfig();
+      }
+
+      async function savedPayload() {
+        (global.fetch as any).mockResolvedValueOnce({
+          ok: true,
+          json: async () => ({ success: true }),
+        });
+        await useConfigStore.getState().saveConfig();
+        const saveCalls = (global.fetch as any).mock.calls.filter(
+          ([url]: [string]) => url === "/api/config/save",
+        );
+        return JSON.parse(saveCalls[saveCalls.length - 1][1].body);
+      }
+
+      it("fills them in on load", async () => {
+        await loadAuthored();
+
+        const state = useConfigStore.getState();
+        expect(state.syncStatus).toBe("synced");
+        expect(state.agents).toEqual([
+          {
+            id: "test",
+            display_name: "Test Agent",
+            tools: [],
+            skills: [],
+            instructions: [],
+            rooms: [],
+            knowledge_bases: [],
+            delegate_to: [],
+            context_files: [],
           },
-        },
-      };
-
-      (global.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: async () => mockConfig,
-      });
-      (global.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          agent_policies: { test: makeAgentPolicy("test") },
-        }),
+        ]);
+        expect(state.teams).toEqual([
+          { id: "ops", ...authoredTeam, rooms: [], mode: "coordinate" },
+        ]);
+        expect(state.rooms).toEqual([]);
       });
 
-      await useConfigStore.getState().loadConfig();
+      it("saves only the edited fields of agents and teams", async () => {
+        await loadAuthored();
 
-      const state = useConfigStore.getState();
-      expect(state.syncStatus).toBe("synced");
-      expect(state.teams).toEqual([
-        {
-          id: "ops",
-          display_name: "Ops Team",
-          role: "Coordinates operations",
-          agents: ["test"],
+        useConfigStore.getState().updateAgent("test", {
+          role: "Edited role",
+          instructions: ["Be brief"],
+        });
+        useConfigStore.getState().updateTeam("ops", { mode: "collaborate" });
+
+        const payload = await savedPayload();
+        expect(payload.agents.test).toEqual({
+          ...authoredAgent,
+          role: "Edited role",
+          instructions: ["Be brief"],
+        });
+        expect(payload.teams.ops).toEqual({
+          ...authoredTeam,
+          mode: "collaborate",
+        });
+      });
+
+      it("saves untouched agents as authored", async () => {
+        await loadAuthored();
+
+        useConfigStore
+          .getState()
+          .updateConfigValue(["router"], { model: "default" });
+
+        expect((await savedPayload()).agents.test).toEqual(authoredAgent);
+      });
+
+      it("keeps authored values, including empty ones", async () => {
+        const agent = {
+          ...authoredAgent,
+          tools: [],
+          skills: [],
+          instructions: [],
           rooms: [],
-          mode: "coordinate",
-        },
-      ]);
-    });
+          knowledge_bases: [],
+          delegate_to: [],
+          context_files: [],
+        };
+        const team = { ...authoredTeam, rooms: [], mode: "coordinate" };
+        await loadAuthored({ agent, team });
 
-    it("should preserve explicit learning=false from configuration", async () => {
-      const mockConfig = {
-        agents: {
-          test: {
-            display_name: "Test Agent",
-            role: "Test role",
-            tools: [],
-            skills: [],
-            instructions: [],
-            rooms: [],
-            learning: false,
-          },
-        },
-        models: {
-          default: {
-            provider: "ollama",
-            id: "test-model",
-          },
-        },
-      };
+        useConfigStore.getState().updateAgent("test", { role: "Edited role" });
+        useConfigStore.getState().updateTeam("ops", { role: "Edited role" });
 
-      (global.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: async () => mockConfig,
-      });
-      (global.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          agent_policies: { test: makeAgentPolicy("test") },
-        }),
+        const payload = await savedPayload();
+        expect(payload.agents.test).toEqual({ ...agent, role: "Edited role" });
+        expect(payload.teams.ops).toEqual({ ...team, role: "Edited role" });
       });
 
-      const { loadConfig } = useConfigStore.getState();
-      await loadConfig();
-
-      const state = useConfigStore.getState();
-      expect(state.agents[0].learning).toBe(false);
-      expect(state.agents[0].learning_mode).toBe("always");
-    });
-
-    it("should preserve explicit learning_mode from configuration", async () => {
-      const mockConfig = {
-        agents: {
-          test: {
-            display_name: "Test Agent",
-            role: "Test role",
-            tools: [],
-            skills: [],
-            instructions: [],
-            rooms: [],
-            learning: true,
-            learning_mode: "agentic",
+      it.each([
+        {
+          edits: "an instruction added and removed again",
+          edit: () => {
+            useConfigStore
+              .getState()
+              .updateAgent("test", { instructions: [""] });
+            useConfigStore.getState().updateAgent("test", { instructions: [] });
           },
+          agent: { instructions: [] },
         },
-        models: {
-          default: {
-            provider: "ollama",
-            id: "test-model",
+        {
+          edits: "the team mode switched back to coordinate",
+          edit: () => {
+            useConfigStore
+              .getState()
+              .updateTeam("ops", { mode: "collaborate" });
+            useConfigStore.getState().updateTeam("ops", { mode: "coordinate" });
           },
+          team: { mode: "coordinate" },
         },
-      };
+      ])("keeps a field after $edits", async ({ edit, agent, team }) => {
+        await loadAuthored();
 
-      (global.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: async () => mockConfig,
-      });
-      (global.fetch as any).mockResolvedValueOnce({
-        ok: true,
-        json: async () => ({
-          agent_policies: { test: makeAgentPolicy("test") },
-        }),
+        edit();
+
+        const payload = await savedPayload();
+        expect(payload.agents.test).toEqual({ ...authoredAgent, ...agent });
+        expect(payload.teams.ops).toEqual({ ...authoredTeam, ...team });
       });
 
-      const { loadConfig } = useConfigStore.getState();
-      await loadConfig();
+      it("keeps untouched fields omitted after a reload during edits", async () => {
+        await loadAuthored();
+        useConfigStore.getState().updateAgent("test", { role: "Edited role" });
 
-      const state = useConfigStore.getState();
-      expect(state.agents[0].learning_mode).toBe("agentic");
+        await loadAuthored({ defaults: { markdown: false } });
+
+        expect((await savedPayload()).agents.test).toEqual({
+          ...authoredAgent,
+          role: "Edited role",
+        });
+      });
+
+      it("keeps untouched fields omitted after an edit during a save", async () => {
+        await loadAuthored();
+        useConfigStore.getState().updateAgent("test", { role: "First edit" });
+        const response = deferred<Response>();
+        vi.mocked(fetch).mockReturnValueOnce(response.promise);
+        const firstSave = useConfigStore.getState().saveConfig();
+        useConfigStore.getState().updateAgent("test", { role: "Second edit" });
+        response.resolve(
+          new Response(JSON.stringify({ success: true }), { status: 200 }),
+        );
+        expect(await firstSave).toEqual({ status: "stale" });
+
+        expect((await savedPayload()).agents.test).toEqual({
+          ...authoredAgent,
+          role: "Second edit",
+        });
+      });
+
+      it("treats an authored null like an omitted field", async () => {
+        await loadAuthored({
+          agent: { ...authoredAgent, instructions: null, rooms: null },
+        });
+        expect(useConfigStore.getState().agents[0]).toMatchObject({
+          instructions: [],
+          rooms: [],
+        });
+
+        useConfigStore.getState().updateAgent("test", { role: "Edited role" });
+
+        expect((await savedPayload()).agents.test).toEqual({
+          ...authoredAgent,
+          role: "Edited role",
+        });
+      });
     });
 
     it("should preserve private agent configuration from the backend", async () => {
@@ -1279,8 +1291,6 @@ describe("configStore", () => {
             skills: [],
             instructions: [],
             rooms: [],
-            learning: true,
-            learning_mode: "always",
           },
         ],
       });
@@ -1689,8 +1699,6 @@ describe("configStore", () => {
             skills: [],
             instructions: [],
             rooms: ["lobby"],
-            learning: true,
-            learning_mode: "always",
           },
         ],
         agentPoliciesByAgent: {
@@ -1747,8 +1755,6 @@ describe("configStore", () => {
           knowledge_bases: [],
           delegate_to: [],
           context_files: [],
-          learning: true,
-          learning_mode: "always",
         },
       ]);
       expect(state.agentPoliciesByAgent).toEqual({});
@@ -3066,8 +3072,6 @@ describe("configStore", () => {
                 knowledge_bases: [],
                 delegate_to: [],
                 context_files: [],
-                learning: true,
-                learning_mode: "always",
               },
             },
           }),
@@ -3759,47 +3763,8 @@ describe("configStore", () => {
       expect(state.agents).toHaveLength(3);
       const newAgent = state.agents[2];
       expect(newAgent.display_name).toBe("New Agent");
-      expect(newAgent.learning).toBe(true);
-      expect(newAgent.learning_mode).toBe("always");
       expect(state.selectedAgentId).toBe(newAgent.id);
       expect(state.isDirty).toBe(true);
-    });
-
-    it("should create new agent with learning values from global defaults", () => {
-      const newAgentData = {
-        display_name: "New Agent",
-        role: "New role",
-        tools: [],
-        skills: [],
-        instructions: [],
-        rooms: [],
-      };
-      useConfigStore.setState({
-        config: {
-          memory: {
-            embedder: {
-              provider: "openai",
-              config: { model: "text-embedding-3-small" },
-            },
-          },
-          models: {},
-          agents: {},
-          defaults: {
-            markdown: true,
-            learning: false,
-            learning_mode: "agentic",
-          },
-          router: { model: "default" },
-        },
-      });
-
-      const { createAgent } = useConfigStore.getState();
-      createAgent(newAgentData);
-
-      const state = useConfigStore.getState();
-      const newAgent = state.agents[state.agents.length - 1];
-      expect(newAgent?.learning).toBe(false);
-      expect(newAgent?.learning_mode).toBe("agentic");
     });
 
     it("refreshes agent policies when creating a standard shared agent", async () => {

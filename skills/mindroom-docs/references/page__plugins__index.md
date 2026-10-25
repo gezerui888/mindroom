@@ -277,6 +277,10 @@ def greeter_tools() -> type[Toolkit]:
     return GreeterTools
 ```
 
+A `str` parameter receives the model's string unchanged, and a `Literal[...]` parameter each of its choices, so a choice may be named `none` or `true`.
+A parameter with a default, such as `title: str | None = None`, receives a model's `"none"` or `"null"`, in any case, as `None` unless that exact string is one of its choices.
+Other parameters receive a model's `"none"`, `"null"`, `"true"`, or `"false"` string, in any case, as `None` or a boolean.
+
 Assign the tool to agents like any built-in tool:
 
 ```yaml
@@ -452,6 +456,44 @@ Inside a Matrix-connected agent run, `mindroom.tool_system.runtime_context.get_t
 It carries `room_id`, `thread_id`, `resolved_thread_id`, `requester_id`, `agent_name`, the Matrix client, the active config, and runtime paths.
 `thread_id` is the thread the inbound message named, while `resolved_thread_id` is the conversation thread after plain replies are resolved to their thread.
 
+### Calling a configured model
+
+A tool that runs its own model calls, such as a research loop, builds a provider for a model named in `config.yaml` and sends it one prompt at a time:
+
+```python
+from pydantic import BaseModel
+
+from mindroom.agent_loop.helper import complete_prompt
+from mindroom.providers.registry import build_model_provider
+from mindroom.tool_system.runtime_context import (
+    build_execution_identity_from_runtime_context,
+    get_tool_runtime_context,
+)
+
+
+class Finding(BaseModel):
+    claim: str
+    source_url: str
+
+
+async def find(question: str) -> Finding | str:
+    context = get_tool_runtime_context()
+    if context is None:
+        return "This tool runs only inside an agent's Matrix conversation."
+    provider = build_model_provider(
+        context.config,
+        context.runtime_paths,
+        "default",
+        execution_identity=build_execution_identity_from_runtime_context(context),
+    )
+    result = await complete_prompt(provider, question, instructions=["Cite one source."], schema=Finding)
+    return result.content
+```
+
+The provider uses the model entry's credentials, base URL, and request settings.
+With `schema`, `result.content` is an instance of that model, or the raw text when the answer does not parse; without it, `result.content` is the answer text.
+Each call is one request with no tools and no conversation history.
+
 ### Dispatch-time worker targets
 
 A tool that builds other registered tools while handling a call, for example a sub-toolkit from `get_tool_by_name`, should use the same worker target as agent toolkit construction so scoped credentials and OAuth MCP sessions resolve identically:
@@ -463,7 +505,7 @@ context = get_tool_runtime_context()
 worker_target = context.resolve_worker_target()
 ```
 
-`resolve_worker_target()` raises `ValueError` in team and router dispatches, which have no single agent scope; catch it if the tool can run inside a team.
+A plugin tool always runs as an agent, inside a team as the member that called it, so `resolve_worker_target()` returns that agent's target.
 
 ## OAuth providers
 

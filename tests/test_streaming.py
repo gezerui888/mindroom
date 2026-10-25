@@ -17,8 +17,6 @@ from typing import TYPE_CHECKING, Any, Literal
 from unittest.mock import MagicMock, patch
 
 import pytest
-from agno.models.response import ToolExecution
-from agno.run.agent import RunCompletedEvent, RunContentEvent, ToolCallCompletedEvent, ToolCallStartedEvent
 
 from mindroom import interactive
 from mindroom import reply_lifecycle as rl
@@ -35,6 +33,8 @@ from mindroom.constants import (
     STREAM_STATUS_PENDING,
     STREAM_STATUS_STREAMING,
 )
+from mindroom.llm.events import RunFinished, TextDelta, ToolCompleted, ToolStarted
+from mindroom.llm.runs import RunRecord, ToolExecution
 from mindroom.matrix import message_builder
 from mindroom.matrix.client import DeliveredMatrixEvent
 from mindroom.message_target import MessageTarget
@@ -190,14 +190,14 @@ async def test_lifecycle_suspension_captures_last_committed_presentation(config:
     gateway = _FakeGateway()
 
     async def suspended_stream() -> AsyncIterator[object]:
-        yield RunContentEvent(content="I checked the input.")
+        yield TextDelta("I checked the input.")
         await gateway.wait_for_ops(1)
-        yield ToolCallStartedEvent(
-            tool=ToolExecution(
+        yield ToolStarted(
+            call=ToolExecution(
                 tool_call_id="call-1",
                 tool_name="inspect",
                 tool_args={"path": "report.txt"},
-            ),
+            ).call,
         )
         await gateway.wait_for_ops(2)
         raise suspension
@@ -259,15 +259,25 @@ async def test_placeholder_progressive_edits_and_final_tool_trace(config: Config
     gateway = _FakeGateway()
 
     async def scripted_stream() -> AsyncIterator[object]:
-        yield RunContentEvent(content="")
+        yield TextDelta("")
         await gateway.wait_for_ops(1)
         yield "Hello"
         await gateway.wait_for_ops(2)
-        yield ToolCallStartedEvent(tool=ToolExecution(tool_name="search_web", tool_args={"q": "mindroom"}))
+        yield ToolStarted(
+            call=ToolExecution(
+                tool_call_id="call-search_web",
+                tool_name="search_web",
+                tool_args={"q": "mindroom"},
+            ).call,
+        )
         await gateway.wait_for_ops(3)
-        yield ToolCallCompletedEvent(
-            tool=ToolExecution(tool_name="search_web", tool_args={"q": "mindroom"}, result="ok"),
-            content="ok",
+        yield ToolCompleted(
+            call=ToolExecution(
+                tool_call_id="call-search_web",
+                tool_name="search_web",
+                tool_args={"q": "mindroom"},
+                result="ok",
+            ).call,
         )
         await gateway.wait_for_ops(4)
         yield " Done."
@@ -575,7 +585,7 @@ async def test_stream_rerenders_changed_markdown(config: Config, change: str) ->
         target=MessageTarget.resolve("!test:localhost", None, "$original_123", room_mode=True),
         config=config,
         runtime_paths=runtime_paths_for(config),
-        accumulated_text="Hello @helper",
+        accumulated_text="Hello @helper ",
     )
     initial = await streaming._prepare_delivery_async(is_final=False, allow_empty_progress=False, stream_status=None)
     assert initial is not None
@@ -846,6 +856,41 @@ def test_only_a_final_edit_warns_about_an_unfinished_interactive_block(config: C
         streaming_mod._prepare_delivery_from_snapshot(final)
     mock_warning.assert_called_once()
     assert mock_warning.call_args.args == ("Interactive block not parsed",)
+
+
+@pytest.mark.parametrize(
+    ("streamed", "stream_status", "shown_user_id"),
+    [
+        # Still arriving: the cut ID would pill a different user, @grace:matrix.
+        ("Next item, @grace:matrix.", None, None),
+        ("Next item, @grace:matrix.localhost", STREAM_STATUS_COMPLETED, "@grace:matrix.localhost"),
+        ("Next item, @grace:matrix.localhost ", None, "@grace:matrix.localhost"),
+    ],
+)
+def test_streaming_edits_hide_a_mention_still_arriving(
+    config: Config,
+    streamed: str,
+    stream_status: str | None,
+    shown_user_id: str | None,
+) -> None:
+    """An edit leaves out a trailing mention until it is complete, so it never pills a prefix of the ID."""
+    streaming = StreamingResponse(
+        target=MessageTarget.resolve("!test:localhost", "$thread", "$reply"),
+        config=config,
+        runtime_paths=runtime_paths_for(config),
+    )
+    streaming.accumulated_text = streamed
+    snapshot = streaming._delivery_snapshot(is_final=False, allow_empty_progress=False, stream_status=stream_status)
+    assert snapshot is not None
+
+    content = streaming_mod._prepare_delivery_from_snapshot(snapshot).content
+
+    assert "Next item," in content["body"]
+    assert content.get("m.mentions", {}).get("user_ids", []) == ([shown_user_id] if shown_user_id else [])
+    if shown_user_id is None:
+        assert "matrix.to/#/@grace" not in content["formatted_body"]
+    else:
+        assert f'href="https://matrix.to/#/{shown_user_id}"' in content["formatted_body"]
 
 
 _PICK_BLOCK_JSON = '{"question": "Pick one", "options": [{"emoji": "✅", "label": "Yes", "value": "yes"}]}'
@@ -1220,10 +1265,10 @@ async def test_a_resumed_stream_continues_below_the_stopped_text(config: Config)
     gateway = _FakeGateway()
 
     async def continuation() -> AsyncIterator[object]:
-        yield RunContentEvent(content="The second half.")
-        yield ToolCallStartedEvent(tool=ToolExecution(tool_call_id="call-2", tool_name="search_web", tool_args={}))
-        yield ToolCallCompletedEvent(
-            tool=ToolExecution(tool_call_id="call-2", tool_name="search_web", tool_args={}, result="ok"),
+        yield TextDelta("The second half.")
+        yield ToolStarted(call=ToolExecution(tool_call_id="call-2", tool_name="search_web", tool_args={}).call)
+        yield ToolCompleted(
+            call=ToolExecution(tool_call_id="call-2", tool_name="search_web", tool_args={}, result="ok").call,
         )
 
     with patch("mindroom.streaming.edit_message_result", new=gateway.edit):
@@ -1267,7 +1312,7 @@ async def test_stopping_a_resumed_stream_keeps_the_stopped_text(config: Config) 
     gateway = _FakeGateway()
 
     async def stopped_continuation() -> AsyncIterator[object]:
-        yield RunContentEvent(content="The second")
+        yield TextDelta("The second")
         await gateway.wait_for_ops(1)
         raise asyncio.CancelledError(USER_STOP_CANCEL_MSG)
 
@@ -1299,7 +1344,7 @@ async def test_a_failed_first_resumed_edit_keeps_the_stopped_text(config: Config
         return await gateway.edit(*args, **kwargs)  # type: ignore[arg-type]
 
     async def failing_continuation() -> AsyncIterator[object]:
-        yield RunContentEvent(content="The second")
+        yield TextDelta("The second")
         message = "Provider failed"
         raise RuntimeError(message)
 
@@ -1401,7 +1446,7 @@ async def test_a_resumed_final_event_only_answer_lands_below_the_stopped_text(co
     gateway = _FakeGateway()
 
     async def final_only() -> AsyncIterator[object]:
-        yield RunCompletedEvent(content="The second half.")
+        yield RunFinished(RunRecord(run_id="run-final", content="The second half."))
 
     with patch("mindroom.streaming.edit_message_result", new=gateway.edit):
         outcome = await _run_resumed_stream(config, final_only())

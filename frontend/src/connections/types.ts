@@ -2,8 +2,12 @@ export interface ConnectionService {
   provider: string;
   is_shared: boolean;
   can_manage: boolean;
-  /** Whether the account is connected, as the viewer's status would show it, read without refreshing the token. */
-  connected: boolean;
+  /**
+   * Whether the account is connected, as the viewer's status would show it,
+   * read without refreshing the token. Filled in from the agent's state; absent
+   * until it loads.
+   */
+  connected?: boolean;
   display_name: string;
   description: string;
   icon: string | null;
@@ -25,9 +29,19 @@ export interface AgentConnections {
   tools: ConnectionTool[];
   /**
    * The agent's egress services: an array, empty when it has none, for an agent
-   * the viewer may use egress credentials with. Absent or `null` for any other.
+   * the viewer may use egress credentials with, and `null` for any other.
+   * Filled in from the agent's state; absent until it loads.
    */
   egress_services?: EgressCredentialService[] | null;
+  /** Set by the page when the agent's state could not load and none loaded before, so nothing is known yet. */
+  state_unavailable?: boolean;
+}
+
+/** What one agent's connections are, from `GET /api/connections/agents/{agent}/state`. */
+export interface AgentState {
+  /** Whether each of the agent's services is connected, by provider. */
+  connected: Record<string, boolean>;
+  egress_services: EgressCredentialService[] | null;
 }
 
 export interface ConnectionTool {
@@ -46,13 +60,15 @@ export interface ConnectionList {
 /** Who the Connections pages are open for, from `GET /api/connections/me`. */
 export interface ConnectionsIdentity {
   matrix_user_id: string;
+  /** The Matrix display name, or the localpart when the profile has none. */
+  display_name: string;
   email: string | null;
   /** The administrator dashboard is open to this user too. */
   is_administrator: boolean;
   /** The egress broker is on, so the Agent Keys page exists. */
   egress_enabled: boolean;
-  /** The Agents page is served; the Agent Keys page can be served without it. */
-  portal_enabled: boolean;
+  /** Where administrators open the dashboard, on this origin or its own host. */
+  dashboard_url: string;
 }
 
 export interface ConnectionStatus {
@@ -61,6 +77,8 @@ export interface ConnectionStatus {
   can_connect: boolean;
   reset_required: boolean;
   account_label: string | null;
+  /** A shared service account serves this provider, so no personal account can be connected. */
+  service_account: boolean;
 }
 
 /** The account a service can use instead of an API key. */
@@ -80,6 +98,11 @@ export interface EgressOAuthStatus {
   unavailable_reason: "shared_sandbox" | null;
   /** The service allows personal accounts in this shared sandbox anyway, so every user of the agent can act with one. */
   shared_worker_opt_in: boolean;
+  /**
+   * Agent Keys may use this connection for the service. Until someone allows
+   * it, a connected account serves only its tools.
+   */
+  reuse_enabled: boolean;
 }
 
 /** Who defined a service: the administrator in config.yaml or the caller's own scope. */

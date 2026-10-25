@@ -19,14 +19,18 @@ import {
 import egressPresets from "@/test/fixtures/egressPresets.json";
 import {
   credentialService,
+  expectNoAction,
   oauthStatus,
-  pressInDialog,
   presetsReady,
+  pressInDialog,
+  rowAction,
 } from "@/test/egressServiceTestKit";
 import { EgressBroker } from "./EgressBroker";
 
 const NOT_RUNNING =
   "Egress broker is not running. Set MINDROOM_EGRESS_BROKER_PORT and MINDROOM_EGRESS_BROKER_URL.";
+const NO_AGENT_USES_KEYS =
+  "No agent uses these keys. An agent uses them once it has shell or python and the egress_credentials tool.";
 
 let storeState: {
   agents: unknown[];
@@ -173,7 +177,7 @@ function requests(pathname: string, method = "GET") {
 // without a scope start from it when they are shown first; the loads come after it.
 const listings = () => requests("/api/egress-broker/services").slice(1);
 
-const row = (name: string) => screen.getByRole("listitem", { name });
+const row = (name: string) => screen.getByRole("row", { name });
 const selectTarget = (value: string) =>
   fireEvent.change(screen.getByLabelText("Keys for"), {
     target: { value },
@@ -341,7 +345,7 @@ describe("egress broker panel", () => {
 
     const note = screen.getByText(/Services you add here are offered/);
     expect(note.textContent).toBe(
-      "Services you add here are offered to every agent and user. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page.",
+      "Services you add here are offered to every user and to every agent with the egress_credentials tool. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page.",
     );
     expect(
       within(note).getByRole("link", { name: "Agent Keys page" }),
@@ -354,14 +358,14 @@ describe("egress broker panel", () => {
     ).toBeTruthy();
   });
 
-  it("says that per-user keys need trusted upstream auth where their page is not served", async () => {
+  it("says nobody can sign in to the Agent Keys page while Chat sign-in and trusted upstream JWT are both off", async () => {
     keyAgents = { ...keyAgents, personal_page_served: false };
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
     const note = screen.getByText(/Services you add here are offered/);
     expect(note.textContent).toBe(
-      "Services you add here are offered to every agent and user. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page, which needs trusted upstream auth and is not served here. Give such agents a shared worker scope to set their keys here.",
+      "Services you add here are offered to every user and to every agent with the egress_credentials tool. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page, which nobody can sign in to while sign-in from MindRoom Chat is off and trusted upstream JWT auth is not set. Give such agents a shared worker scope to set their keys here.",
     );
     expect(within(note).queryByRole("link")).toBeNull();
   });
@@ -396,9 +400,7 @@ describe("egress broker panel", () => {
       ),
     ).toBeInTheDocument();
     expect(
-      within(row("openai")).getByRole("button", {
-        name: "Replace key for openai",
-      }),
+      await rowAction("Replace key for openai", row("openai")),
     ).toBeInTheDocument();
     expect(
       requests("/api/egress-broker/services").map((url) => url.search),
@@ -469,7 +471,7 @@ describe("egress broker key target", () => {
     expect(screen.getByLabelText("Keys for")).toBeEnabled();
     expect(screen.getByLabelText("Keys for")).toHaveValue("team");
     expect(listings()[0].searchParams.get("agent_name")).toBe("team");
-    expect(screen.queryByText("No agent uses these keys.")).toBeNull();
+    expect(screen.queryByText(NO_AGENT_USES_KEYS)).toBeNull();
     expect(
       screen.getByRole("button", { name: "Set key for GitHub" }),
     ).toBeVisible();
@@ -533,9 +535,7 @@ describe("egress broker key target", () => {
       };
       const { unmount } = render(<EgressBroker />);
       await screen.findByText("GitHub");
-      expect(screen.queryByText("No agent uses these keys.") !== null).toBe(
-        unused,
-      );
+      expect(screen.queryByText(NO_AGENT_USES_KEYS) !== null).toBe(unused);
       unmount();
     }
   });
@@ -551,17 +551,17 @@ describe("egress broker key target", () => {
     await screen.findByText("GitHub");
 
     expect(screen.getByLabelText("Keys for")).toBeDisabled();
-    expect(screen.getByText("No agent uses these keys.")).toBeVisible();
+    expect(screen.getByText(NO_AGENT_USES_KEYS)).toBeVisible();
     for (const name of [
       "Set key for GitHub",
       "Replace key for openai",
       "Remove key for openai",
     ])
-      expect(screen.queryByRole("button", { name })).toBeNull();
+      await expectNoAction(name);
     // What changes the service, not its keys, stays.
-    expect(
-      screen.getByRole("button", { name: "Edit service for GitHub" }),
-    ).toBeEnabled();
+    expect(await rowAction("Edit service for GitHub")).not.toHaveAttribute(
+      "aria-disabled",
+    );
   });
 
   it("hides the connect and disconnect actions of an account too", async () => {
@@ -594,12 +594,10 @@ describe("egress broker key target", () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    expect(screen.getByText("No agent uses these keys.")).toBeVisible();
-    expect(screen.queryByRole("button", { name: /Disconnect/ })).toBeNull();
+    expect(screen.getByText(NO_AGENT_USES_KEYS)).toBeVisible();
+    await expectNoAction(/Disconnect/);
     expect(screen.queryByRole("button", { name: /Connect GitLab/ })).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: /Use an API key instead/ }),
-    ).toBeNull();
+    await expectNoAction(/Use an API key instead/);
   });
 
   it("keeps the key actions while an agent uses the keys", async () => {
@@ -607,7 +605,7 @@ describe("egress broker key target", () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    expect(screen.queryByText("No agent uses these keys.")).toBeNull();
+    expect(screen.queryByText(NO_AGENT_USES_KEYS)).toBeNull();
     expect(
       screen.getByRole("button", { name: "Set key for GitHub" }),
     ).toBeVisible();
@@ -627,16 +625,14 @@ describe("egress broker key target", () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    expect(screen.queryByText("No agent uses these keys.")).toBeNull();
+    expect(screen.queryByText(NO_AGENT_USES_KEYS)).toBeNull();
     expect(
       screen.getByText(
         "Only agents whose keys each user sets use the broker, so no keys are set here.",
       ),
     ).toBeVisible();
     expect(screen.getByLabelText("Keys for")).toBeDisabled();
-    expect(
-      screen.queryByRole("button", { name: "Set key for GitHub" }),
-    ).toBeNull();
+    await expectNoAction("Set key for GitHub");
   });
 
   it("loads the services of the selected target", async () => {
@@ -779,9 +775,7 @@ describe("egress broker key target", () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Remove key for openai" }),
-    );
+    fireEvent.click(await rowAction("Remove key for openai"));
     expect(
       within(screen.getByRole("dialog")).getByText(
         "This deletes the global key, which every agent without a worker scope shares. Those agents lose access to this service until a key is set again.",
@@ -796,9 +790,7 @@ describe("egress broker key target", () => {
     sharedCoder();
     cleanup();
     render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Remove key for openai" }),
-    );
+    fireEvent.click(await rowAction("Remove key for openai"));
     expect(
       within(screen.getByRole("dialog")).getByText(
         "This deletes the shared key. Everyone who relies on it loses access to this service until a key is set again.",
@@ -811,9 +803,7 @@ describe("egress broker key target", () => {
     render(<EgressBroker />);
     await screen.findByText("GitHub");
 
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Remove key for openai" }),
-    );
+    fireEvent.click(await rowAction("Remove key for openai"));
     fireEvent.click(
       within(screen.getByRole("dialog")).getByRole("button", {
         name: "Remove",
@@ -884,7 +874,9 @@ describe("egress broker connected accounts", () => {
     await screen.findByText("GitHub");
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "Connect GitHub for GitHub" }),
+      await screen.findByRole("button", {
+        name: "Connect GitHub for Agent Keys for GitHub",
+      }),
     );
     // Everyone who uses the shared agent acts as the account, so the admin is asked first.
     const question = await screen.findByRole("dialog", {
@@ -919,11 +911,55 @@ describe("egress broker connected accounts", () => {
       }),
     );
     expect(
-      await screen.findByText(
-        "Connected as octocat · shared with everyone using Agent coder",
-      ),
+      await screen.findByText("Shared with everyone using Agent coder"),
     ).toBeInTheDocument();
+    expect(screen.getByText("octocat")).toBeInTheDocument();
     expect(listings()).toHaveLength(2);
+  });
+
+  it("lets the selected agent's commands use its connected account after confirming", async () => {
+    services = [
+      {
+        ...github,
+        oauth: {
+          ...githubAccount,
+          connected: true,
+          account_label: "team-bot",
+          reuse_enabled: false,
+        },
+      },
+      openai,
+    ];
+    sharedCoder();
+    render(<EgressBroker />);
+    expect(
+      await screen.findByText("Connected for tools only"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Use account for GitHub" }),
+    );
+    const question = await screen.findByRole("dialog", {
+      name: "Use your GitHub account for Agent Keys?",
+    });
+    expect(question).toHaveTextContent(
+      "Commands this agent runs (shell, python) will act as team-bot with its full access, without the approval prompts GitHub tools ask for. Everyone using Agent coder gets this.",
+    );
+    fireEvent.click(
+      within(question).getByRole("button", { name: "Use account" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        requests("/api/egress-broker/services/github/oauth-reuse", "PUT"),
+      ).toHaveLength(1),
+    );
+    const [allow] = requests(
+      "/api/egress-broker/services/github/oauth-reuse",
+      "PUT",
+    );
+    expect(allow.searchParams.get("agent_name")).toBe("coder");
+    await waitFor(() => expect(listings()).toHaveLength(2));
   });
 
   it("reads the selected agent's services again when the popup closes without answering", async () => {
@@ -931,7 +967,9 @@ describe("egress broker connected accounts", () => {
     sharedCoder();
     render(<EgressBroker />);
     fireEvent.click(
-      await screen.findByRole("button", { name: "Connect GitHub for GitHub" }),
+      await screen.findByRole("button", {
+        name: "Connect GitHub for Agent Keys for GitHub",
+      }),
     );
     const question = await screen.findByRole("dialog", {
       name: "Connect a shared account?",
@@ -947,11 +985,12 @@ describe("egress broker connected accounts", () => {
 
     expect(
       await screen.findByText(
-        "Connected as octocat · shared with everyone using Agent coder",
+        "Shared with everyone using Agent coder",
         {},
         { timeout: 2000 },
       ),
     ).toBeInTheDocument();
+    expect(screen.getByText("octocat")).toBeInTheDocument();
     expect(screen.queryByText("Authorization was cancelled.")).toBeNull();
     // The first load, the check after the popup closed, and the reload.
     const loads = listings();
@@ -970,19 +1009,18 @@ describe("egress broker connected accounts", () => {
     render(<EgressBroker />);
     expect(
       await screen.findByText(
-        "Connected as octocat · shared with everyone using the agents without a scope",
+        "Shared with everyone using the agents without a scope",
       ),
     ).toBeInTheDocument();
+    expect(screen.getByText("octocat")).toBeInTheDocument();
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Disconnect for GitHub" }),
-    );
+    fireEvent.click(await rowAction("Disconnect for GitHub"));
     const dialog = await screen.findByRole("dialog", {
       name: "Disconnect GitHub?",
     });
     expect(
       within(dialog).getByText(
-        "This removes the saved GitHub connection for the agents without a scope. These services stop working until an account is connected again: GitHub.",
+        "This removes the saved GitHub connection for the agents without a scope. These services stop working until an account is connected again: GitHub. GitHub tools lose it too. To keep it for them, choose Stop using GitHub account instead.",
       ),
     ).toBeVisible();
     fireEvent.click(within(dialog).getByRole("button", { name: "Disconnect" }));
@@ -1123,7 +1161,7 @@ describe("egress broker request log", () => {
     expect(
       await screen.findByText("No requests logged yet."),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByRole("table", { name: "Request log" })).toBeNull();
   });
 
   it("filters the log by user, agent, host and service on refresh", async () => {
@@ -1198,7 +1236,7 @@ describe("egress broker request log", () => {
     render(<EgressBroker />);
 
     expect(await screen.findByText(NOT_RUNNING)).toBeInTheDocument();
-    expect(screen.queryByRole("table")).toBeNull();
+    expect(screen.queryByRole("table", { name: "Request log" })).toBeNull();
     // Services stay manageable while the broker is down.
     expect(screen.getByText("GitHub")).toBeInTheDocument();
   });
@@ -1384,9 +1422,7 @@ describe("egress broker service editor", () => {
     saveConfig.mockResolvedValue({ status: "error", message, diagnostics: [] });
   const openEdit = async (name: string) => {
     render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: `Edit service for ${name}` }),
-    );
+    fireEvent.click(await rowAction(`Edit service for ${name}`));
     await presetsReady();
   };
 
@@ -1499,9 +1535,7 @@ describe("egress broker service editor", () => {
     expect(within(limit).getByText("Limit only")).toBeVisible();
     const githubRow = screen.getByLabelText("GitHub");
     expect(within(githubRow).getByText("Limited to acme/app")).toBeVisible();
-    expect(
-      screen.queryByRole("button", { name: /Change limit|Remove limit/ }),
-    ).toBeNull();
+    await expectNoAction(/Change limit|Remove limit/);
   });
 
   it("edits a preset service without expanding it", async () => {
@@ -1751,9 +1785,7 @@ describe("egress broker service editor", () => {
   it("repeats the warning when deleting, and saves nothing until confirmed", async () => {
     storeState = { ...storeState, isDirty: true, dirtyRoots: ["models"] };
     render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Delete service for GitHub" }),
-    );
+    fireEvent.click(await rowAction("Delete service for GitHub"));
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent(
       "This also saves your other unsaved settings changes.",
@@ -1763,9 +1795,7 @@ describe("egress broker service editor", () => {
 
   it("deletes a service from the config after confirmation", async () => {
     render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Delete service for GitHub" }),
-    );
+    fireEvent.click(await rowAction("Delete service for GitHub"));
     const dialog = await screen.findByRole("dialog");
     expect(dialog).toHaveTextContent(
       "removes the service from the configuration",
@@ -1786,9 +1816,7 @@ describe("egress broker service editor", () => {
   it("shows why a delete failed and restores the service in the draft", async () => {
     failSave();
     render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Delete service for GitHub" }),
-    );
+    fireEvent.click(await rowAction("Delete service for GitHub"));
     await pressInDialog("Delete");
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Failed to save configuration (Error 500)",
@@ -1812,23 +1840,26 @@ describe("egress broker service editor", () => {
     fireEvent.click(screen.getByLabelText("Refuse other paths on these hosts"));
     save();
 
-    await waitFor(() =>
-      expect(
-        screen.getByRole("button", { name: "Edit service for OpenAI" }),
-      ).toBeDisabled(),
+    await waitFor(async () =>
+      expect(await rowAction("Edit service for OpenAI")).toHaveAttribute(
+        "aria-disabled",
+        "true",
+      ),
     );
-    expect(
-      screen.getByRole("button", { name: "Delete service for OpenAI" }),
-    ).toBeDisabled();
-    expect(
-      screen.getByRole("button", { name: "Delete service for GitHub" }),
-    ).toBeDisabled();
+    expect(await rowAction("Delete service for OpenAI")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(await rowAction("Delete service for GitHub")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
 
     finish({ status: "saved" });
     await waitFor(() => expect(screen.queryByRole("form")).toBeNull());
-    expect(
-      screen.getByRole("button", { name: "Edit service for OpenAI" }),
-    ).toBeEnabled();
+    expect(await rowAction("Edit service for OpenAI")).not.toHaveAttribute(
+      "aria-disabled",
+    );
     expect(saveConfig).toHaveBeenCalledTimes(1);
   });
 
@@ -1837,9 +1868,7 @@ describe("egress broker service editor", () => {
     openMoreOptions();
     fill("Description", "typed but not saved");
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Edit service for OpenAI" }),
-    );
+    fireEvent.click(await rowAction("Edit service for OpenAI"));
     expect(screen.getByRole("alert")).toHaveTextContent(
       "You have unsaved changes in the open editor.",
     );
@@ -1852,9 +1881,7 @@ describe("egress broker service editor", () => {
       "typed but not saved",
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Edit service for OpenAI" }),
-    );
+    fireEvent.click(await rowAction("Edit service for OpenAI"));
     fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
     expect(
       await screen.findByRole("form", { name: "Edit openai" }),
@@ -1864,9 +1891,7 @@ describe("egress broker service editor", () => {
 
   it("opens another service straight away when nothing was changed", async () => {
     await openEdit("GitHub");
-    fireEvent.click(
-      screen.getByRole("button", { name: "Edit service for OpenAI" }),
-    );
+    fireEvent.click(await rowAction("Edit service for OpenAI"));
     expect(
       await screen.findByRole("form", { name: "Edit openai" }),
     ).toBeInTheDocument();
@@ -1874,25 +1899,24 @@ describe("egress broker service editor", () => {
 
   it("keeps Edit off for the service whose editor is open", async () => {
     await openEdit("GitHub");
-    expect(
-      screen.getByRole("button", { name: "Edit service for GitHub" }),
-    ).toBeDisabled();
-    expect(
-      screen.getByRole("button", { name: "Edit service for OpenAI" }),
-    ).toBeEnabled();
+    expect(await rowAction("Edit service for GitHub")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+    expect(await rowAction("Edit service for OpenAI")).not.toHaveAttribute(
+      "aria-disabled",
+    );
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(
-      screen.getByRole("button", { name: "Edit service for GitHub" }),
-    ).toBeEnabled();
+    expect(await rowAction("Edit service for GitHub")).not.toHaveAttribute(
+      "aria-disabled",
+    );
   });
 
   it("drops the question about another service when the editor is cancelled", async () => {
     await openEdit("GitHub");
     openMoreOptions();
     fill("Description", "typed but not saved");
-    fireEvent.click(
-      screen.getByRole("button", { name: "Edit service for OpenAI" }),
-    );
+    fireEvent.click(await rowAction("Edit service for OpenAI"));
     expect(
       screen.getByText(/unsaved changes in the open editor/),
     ).toBeInTheDocument();
@@ -1939,9 +1963,7 @@ describe("egress broker service editor", () => {
     await screen.findByLabelText("Mine");
 
     expect(within(row("Mine")).getByText("User service")).toBeInTheDocument();
-    expect(
-      within(row("Mine")).queryByRole("button", { name: /Edit|Delete/ }),
-    ).toBeNull();
+    await expectNoAction(/Edit|Delete/, row("Mine"));
     expect(within(row("GitHub")).queryByText("User service")).toBeNull();
     // The key can still be set on it.
     expect(
@@ -1952,9 +1974,7 @@ describe("egress broker service editor", () => {
   it("cannot edit a service the loaded config does not have", async () => {
     services = [configRow("included", "Included")];
     render(<EgressBroker />);
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Edit service for Included" }),
-    );
+    fireEvent.click(await rowAction("Edit service for Included"));
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "not in the loaded configuration",
     );

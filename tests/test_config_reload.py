@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 from contextlib import suppress
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -47,13 +48,14 @@ from mindroom.orchestration.plugin_watch import (
 )
 from mindroom.orchestration.runtime import log_startup_phase_finished, log_startup_phase_started
 from mindroom.orchestrator import _MultiAgentOrchestrator, _watch_skills_task
+from mindroom.personal_agents import _append_personal_agent_roster_entry
 from mindroom.response_admission import ResponseAdmissionGate, ResponseAdmissionRefusedError
 from mindroom.response_runner import ResponseRequest
 from mindroom.response_sources import ResponseSources
 from mindroom.runtime_shutdown import SYNC_RESTART_SHUTDOWN
 from mindroom.startup_errors import PermanentStartupError
 from mindroom.tool_system.plugins import PluginReloadResult
-from mindroom.tool_system.skills import _get_plugin_skill_roots, set_plugin_skill_roots
+from mindroom.tool_system.skills import get_plugin_skill_roots, set_plugin_skill_roots
 from tests.bot_helpers import make_test_agent_bot
 from tests.conftest import (
     TEST_PASSWORD,
@@ -65,6 +67,8 @@ from tests.conftest import (
     test_runtime_paths,
     unwrap_extracted_collaborator,
 )
+from tests.test_personal_agents_config import BASE as PERSONAL_AGENTS_BASE
+from tests.test_personal_agents_config import _entry as personal_agent_entry
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -1012,7 +1016,7 @@ async def test_reload_plugins_now_deactivates_broken_plugin_after_failure(tmp_pa
     orchestrator.config = config
     orchestrator.running = True
 
-    original_plugin_roots = _get_plugin_skill_roots()
+    original_plugin_roots = get_plugin_skill_roots()
     original_plugin_cache = plugin_module._PLUGIN_CACHE.copy()
     original_module_cache = plugin_module._MODULE_IMPORT_CACHE.copy()
     original_modules = set(sys.modules)
@@ -1094,7 +1098,7 @@ async def test_reload_plugins_now_deactivates_all_plugins_when_degraded_reload_s
     orchestrator.config = config
     orchestrator.running = True
 
-    original_plugin_roots = _get_plugin_skill_roots()
+    original_plugin_roots = get_plugin_skill_roots()
     original_plugin_cache = plugin_module._PLUGIN_CACHE.copy()
     original_module_cache = plugin_module._MODULE_IMPORT_CACHE.copy()
     original_modules = set(sys.modules)
@@ -1105,7 +1109,7 @@ async def test_reload_plugins_now_deactivates_all_plugins_when_degraded_reload_s
             "first",
             "second",
         ]
-        assert _get_plugin_skill_roots() == [first_root / "skills"]
+        assert get_plugin_skill_roots() == [first_root / "skills"]
 
         second_manifest_path.write_text(
             '{"name": "first", "hooks_module": "hooks.py", "skills": []}',
@@ -1116,7 +1120,7 @@ async def test_reload_plugins_now_deactivates_all_plugins_when_degraded_reload_s
             await orchestrator.reload_plugins_now(source="test")
 
         assert orchestrator.hook_registry.hooks_for(EVENT_MESSAGE_RECEIVED) == ()
-        assert _get_plugin_skill_roots() == []
+        assert get_plugin_skill_roots() == []
     finally:
         plugin_module._PLUGIN_CACHE.clear()
         plugin_module._PLUGIN_CACHE.update(original_plugin_cache)
@@ -1163,6 +1167,34 @@ async def test_update_config_keeps_current_config_when_new_entity_account_prepar
 
     assert orchestrator.config is current_config
     prepare.assert_awaited_once_with(new_config, {"writer"})
+
+
+@pytest.mark.asyncio
+async def test_update_config_starts_agent_added_only_by_personal_agent_roster(tmp_path: Path) -> None:
+    """A roster entry changes no authored byte, but its generated agent still needs the reload."""
+    paths = test_runtime_paths(tmp_path)
+    current_config = Config.validate_with_runtime(deepcopy(PERSONAL_AGENTS_BASE), paths)
+    _append_personal_agent_roster_entry(paths, personal_agent_entry())
+    new_config = Config.validate_with_runtime(deepcopy(PERSONAL_AGENTS_BASE), paths)
+    assert current_config.authored_model_dump() == new_config.authored_model_dump()
+    orchestrator = _MultiAgentOrchestrator(paths)
+    orchestrator.config = current_config
+    orchestrator.agent_bots = {ROUTER_AGENT_NAME: MagicMock()}
+    orchestrator.running = True
+
+    with (
+        patch("mindroom.orchestration.config_lifecycle.load_config", return_value=new_config),
+        patch.object(
+            orchestrator,
+            "_prepare_entity_accounts",
+            new=AsyncMock(side_effect=PermanentStartupError("stop")),
+        ) as prepare,
+        pytest.raises(PermanentStartupError, match="stop"),
+    ):
+        await orchestrator.config_reload._update_config()
+
+    assert orchestrator.config is current_config
+    prepare.assert_awaited_once_with(new_config, {"mind_alice_smith"})
 
 
 @pytest.mark.asyncio
@@ -1322,6 +1354,77 @@ async def test_prepare_entity_accounts_retries_transient_create_agent_user_failu
 
 
 @pytest.mark.asyncio
+async def test_ready_personal_agent_nudges_router_reconciliation(tmp_path: Path) -> None:
+    """A generated agent's first sync lets the router onboard its owner at once instead of after a retry delay."""
+    paths = test_runtime_paths(tmp_path)
+    _append_personal_agent_roster_entry(paths, personal_agent_entry())
+    data = deepcopy(PERSONAL_AGENTS_BASE) | {"agents": {"general": {"display_name": "General"}}}
+    orchestrator = _MultiAgentOrchestrator(paths)
+    orchestrator.config = Config.validate_with_runtime(data, paths)
+    router = MagicMock(spec=AgentBot)
+    orchestrator.agent_bots = {ROUTER_AGENT_NAME: router}
+
+    await orchestrator.handle_bot_ready(MagicMock(spec=AgentBot, agent_name="general"))
+    router.personal_room_target_ready.assert_not_called()
+    await orchestrator.handle_bot_ready(MagicMock(spec=AgentBot, agent_name="mind_alice_smith"))
+    router.personal_room_target_ready.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_prepare_entity_accounts_requests_personal_agent_username(tmp_path: Path) -> None:
+    """A generated agent's stored Matrix username is requested, so a wiped matrix_state recreates the same ID."""
+    paths = test_runtime_paths(tmp_path)
+    _append_personal_agent_roster_entry(paths, personal_agent_entry(matrix_username="alice.mind"))
+    config = Config.validate_with_runtime(deepcopy(PERSONAL_AGENTS_BASE), paths)
+    orchestrator = _MultiAgentOrchestrator(paths)
+    requested: dict[str, str | None] = {}
+
+    async def record_user(
+        _homeserver: str,
+        entity_name: str,
+        display_name: str,
+        *,
+        runtime_paths: object,
+        username: str | None = None,
+    ) -> AgentMatrixUser:
+        del runtime_paths
+        requested[entity_name] = username
+        actual_username = username or f"actual_{entity_name}"
+        state = MatrixState.load(runtime_paths=paths)
+        state.add_account(f"agent_{entity_name}", actual_username, TEST_PASSWORD, domain="localhost")
+        state.save(runtime_paths=paths)
+        return AgentMatrixUser(
+            agent_name=entity_name,
+            user_id=f"@{actual_username}:localhost",
+            display_name=display_name,
+            password=TEST_PASSWORD,
+        )
+
+    with patch("mindroom.orchestrator.create_agent_user", new=record_user):
+        await orchestrator._prepare_entity_accounts(config, [ROUTER_AGENT_NAME, "mind_alice_smith"])
+
+    assert requested == {ROUTER_AGENT_NAME: None, "mind_alice_smith": "alice.mind"}
+
+
+def test_preflight_account_provisioning_checks_personal_agent_username(tmp_path: Path) -> None:
+    """The localpart collision check uses a generated agent's stored Matrix username."""
+    paths = test_runtime_paths(tmp_path)
+    _append_personal_agent_roster_entry(paths, personal_agent_entry(matrix_username="alice.mind"))
+    config = Config.validate_with_runtime(deepcopy(PERSONAL_AGENTS_BASE), paths)
+    state = MatrixState.load(runtime_paths=paths)
+    state.add_account("agent_other", "alice.mind", TEST_PASSWORD, domain="localhost")
+    state.save(runtime_paths=paths)
+    orchestrator = _MultiAgentOrchestrator(paths)
+
+    with pytest.raises(PermanentStartupError, match=r"'alice\.mind'"):
+        orchestrator._preflight_account_provisioning(
+            config,
+            entity_names=["mind_alice_smith"],
+            include_internal_user=False,
+        )
+
+
+@pytest.mark.asyncio
 async def test_prepare_entity_accounts_rejects_duplicate_persisted_matrix_ids(tmp_path: Path) -> None:
     """Account preparation should fail permanently when persisted entity IDs are ambiguous."""
     config = _runtime_bound_config(
@@ -1425,7 +1528,7 @@ async def test_update_config_cancels_tasks_for_removed_plugins(
 ) -> None:
     """Config-driven plugin removal should tear down the old live plugin runtime."""
     hooks_path = _write_plugin_removal_test_files(tmp_path)
-    original_plugin_roots = _get_plugin_skill_roots()
+    original_plugin_roots = get_plugin_skill_roots()
     original_plugin_cache = plugin_module._PLUGIN_CACHE.copy()
     original_module_cache = plugin_module._MODULE_IMPORT_CACHE.copy()
     original_modules = set(sys.modules)
@@ -1599,7 +1702,7 @@ async def test_update_config_serializes_live_plugin_reload_against_staged_plugin
         authorization_changed=False,
     )
 
-    original_plugin_roots = _get_plugin_skill_roots()
+    original_plugin_roots = get_plugin_skill_roots()
     original_plugin_cache = plugin_module._PLUGIN_CACHE.copy()
     original_module_cache = plugin_module._MODULE_IMPORT_CACHE.copy()
     original_modules = set(sys.modules)

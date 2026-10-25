@@ -76,7 +76,7 @@ import {
   SiX,
   SiZoom,
 } from "react-icons/si";
-import { TbBrain } from "react-icons/tb";
+import { TbBrandTeams, TbBrain, TbBrandOnedrive } from "react-icons/tb";
 import { WiDaySunny } from "react-icons/wi";
 import { AwsRedshift } from "./awsIcons";
 import {
@@ -114,10 +114,12 @@ import {
   Database,
   Network,
   Brain,
+  ListTodo,
+  NotebookPen,
+  CalendarDays,
   Calendar,
   FolderOpen,
   Cpu,
-  ListTodo,
   Search,
   Home,
 } from "lucide-react";
@@ -197,7 +199,9 @@ export const iconMap: Record<
   SiReddit,
   SiX,
   SiZoom,
+  TbBrandTeams,
   TbBrain,
+  TbBrandOnedrive,
   WiDaySunny,
   AwsRedshift,
   PanelsTopLeft,
@@ -234,10 +238,12 @@ export const iconMap: Record<
   Database,
   Network,
   Brain,
+  ListTodo,
+  NotebookPen,
+  CalendarDays,
   Calendar,
   FolderOpen,
   Cpu,
-  ListTodo,
   Search,
   Home,
 };

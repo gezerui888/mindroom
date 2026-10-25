@@ -7,8 +7,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
-from agno.db.base import SessionType
-from agno.session.team import TeamSession
 
 from mindroom.ai_run_metadata import build_ai_run_metadata_content
 from mindroom.config.agent import AgentConfig
@@ -17,7 +15,7 @@ from mindroom.config.models import DefaultsConfig, ModelConfig
 from mindroom.constants import AI_RUN_METADATA_KEY
 from mindroom.history.policy import classify_compaction_decision
 from mindroom.history.session_context import create_scope_session_storage
-from mindroom.history.storage import read_scope_state, set_force_compaction_state
+from mindroom.history.storage import _with_scope_state, read_scope_state
 from mindroom.history.types import (
     CompactionOutcome,
     HistoryScope,
@@ -26,6 +24,10 @@ from mindroom.history.types import (
     ResolvedHistoryExecutionPlan,
     ResolvedReplayPlan,
 )
+from mindroom.llm.messages import Message, model_provenance
+from mindroom.llm.runs import RunRecord, RunStatus
+from mindroom.llm.usage import MessageMetrics, RunMetrics, TokenCounts
+from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.conftest import bind_runtime_paths, seed_session, test_runtime_paths
 
@@ -214,9 +216,11 @@ def test_ai_run_metadata_separates_compaction_and_prepared_context_tokens(tmp_pa
             add_history_to_context=True,
         ),
         prepared_context_tokens=20_000,
+        native_history=None,
     )
 
     metadata = build_ai_run_metadata_content(
+        prices={},
         config=config,
         model_name="default",
         run_id="run-1",
@@ -224,7 +228,7 @@ def test_ai_run_metadata_separates_compaction_and_prepared_context_tokens(tmp_pa
         status="completed",
         model="test-model",
         model_provider="openai",
-        metrics={"input_tokens": 123, "output_tokens": 45, "total_tokens": 168},
+        metrics=RunMetrics(tokens=TokenCounts(input_tokens=123, output_tokens=45, total_tokens=168)),
         prepared_history=prepared_history,
     )
 
@@ -246,64 +250,39 @@ def test_ai_run_metadata_separates_compaction_and_prepared_context_tokens(tmp_pa
     }
 
 
-def test_ai_run_metadata_fallback_usage_only_backfills_missing_fields(tmp_path: Path) -> None:
-    """Fallback request metrics should not replace provider-reported final usage."""
-    config, _runtime_paths = _make_prepare_config(tmp_path)
+def test_ai_run_metadata_bounds_context_cache_split_to_displayed_context(tmp_path: Path) -> None:
+    """Context cache counters should not exceed the context size exposed to clients.
+
+    An OpenAI-compatible server can report more cached tokens than prompt tokens.
+    """
+    runtime_paths = test_runtime_paths(tmp_path)
+    config = bind_runtime_paths(
+        Config(
+            agents={"test_agent": AgentConfig(display_name="Test Agent")},
+            defaults=DefaultsConfig(tools=[]),
+            models={"default": ModelConfig(provider="openai", id="test-model", context_window=200_000)},
+        ),
+        runtime_paths,
+    )
+    counts = TokenCounts(input_tokens=153_294, cache_read_tokens=281_264, cache_write_tokens=500)
+    answer = Message(
+        role="assistant",
+        content="ok",
+        metrics=MessageMetrics(tokens=counts),
+        provider_data=model_provenance("test-model", "OpenAI Chat"),
+    )
 
     metadata = build_ai_run_metadata_content(
+        prices={},
         config=config,
         model_name="default",
         run_id="run-1",
         session_id="session-1",
         status="completed",
         model="test-model",
-        model_provider="openai",
-        metrics={"input_tokens": 100, "output_tokens": 25, "total_tokens": 125},
-        metrics_fallback={
-            "input_tokens": 900,
-            "output_tokens": 90,
-            "total_tokens": 990,
-            "time_to_first_token": "0.12",
-        },
-    )
-
-    usage = metadata[AI_RUN_METADATA_KEY]["usage"]
-    assert usage["input_tokens"] == 100
-    assert usage["output_tokens"] == 25
-    assert usage["total_tokens"] == 125
-    assert usage["time_to_first_token"] == format(0.12, ".12g")
-
-
-def test_ai_run_metadata_bounds_context_cache_split_to_displayed_context(tmp_path: Path) -> None:
-    """Context cache counters should not exceed the context size exposed to clients."""
-    runtime_paths = test_runtime_paths(tmp_path)
-    config = bind_runtime_paths(
-        Config(
-            agents={"test_agent": AgentConfig(display_name="Test Agent")},
-            defaults=DefaultsConfig(tools=[]),
-            models={
-                "default": ModelConfig(
-                    provider="vertexai_claude",
-                    id="claude-opus-5",
-                    context_window=200_000,
-                ),
-            },
-        ),
-        runtime_paths,
-    )
-
-    metadata = build_ai_run_metadata_content(
-        config=config,
-        model_name="default",
-        run_id="run-1",
-        session_id="session-1",
-        status="completed",
-        model="claude-opus-5",
-        model_provider="VertexAI",
-        metrics={"input_tokens": 153_294, "cache_read_tokens": 281_264},
-        context_input_tokens=153_294,
-        context_cache_read_tokens=281_264,
-        context_cache_write_tokens=500,
+        model_provider="OpenAI",
+        metrics=RunMetrics(tokens=counts),
+        context_run=RunRecord(run_id="run-1", agent_id="test_agent", status=RunStatus.completed, messages=[answer]),
     )
 
     context = metadata[AI_RUN_METADATA_KEY]["context"]
@@ -342,37 +321,31 @@ def test_team_scope_storage_is_shared_across_requesters(tmp_path: Path) -> None:
     )
 
     first_storage = create_scope_session_storage(
-        agent_name="general",
         scope=scope,
         config=config,
         runtime_paths=runtime_paths,
         execution_identity=first_identity,
     )
     second_storage = create_scope_session_storage(
-        agent_name="general",
         scope=scope,
         config=config,
         runtime_paths=runtime_paths,
         execution_identity=second_identity,
     )
-    try:
-        session = TeamSession(
-            session_id="session-1",
-            team_id="super_team",
-            metadata={"source": "alice"},
-            created_at=1,
-            updated_at=1,
-        )
-        set_force_compaction_state(session, scope, HistoryScopeState(), force=True)
-        seed_session(first_storage, session)
+    session = ConversationSession(
+        session_id="session-1",
+        kind="team",
+        owner_id="super_team",
+        metadata={"source": "alice"},
+        created_at=1,
+    )
+    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    seed_session(first_storage, session)
 
-        persisted = second_storage.get_session("session-1", SessionType.TEAM)
+    persisted = second_storage.load_session("session-1", "team")
 
-        assert first_storage.db_file == second_storage.db_file
-        assert isinstance(persisted, TeamSession)
-        assert persisted.metadata["source"] == "alice"
-        state = read_scope_state(persisted, scope)
-        assert state.force_compact_before_next_run is True
-    finally:
-        first_storage.close()
-        second_storage.close()
+    assert first_storage.path == second_storage.path
+    assert persisted is not None
+    assert persisted.metadata["source"] == "alice"
+    state = read_scope_state(persisted, scope)
+    assert state.force_compact_before_next_run is True

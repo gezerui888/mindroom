@@ -12,9 +12,6 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from uuid import uuid4
 
-from agno.db.base import SessionType
-from agno.run.base import RunStatus
-
 from mindroom import reply_lifecycle as rl
 from mindroom.agent_cli.cli_approval_waits import CliApprovalWaits
 from mindroom.agent_modes import resolve_agent_mode
@@ -24,7 +21,7 @@ from mindroom.ai import ResponseTurnContext, ai_response, build_matrix_run_metad
 from mindroom.ai_run_metadata import ai_run_extra_content_from_metadata
 from mindroom.ai_runtime import bind_mid_turn_conversation_context
 from mindroom.approval.execution import AgentApprovalExecution
-from mindroom.approval.receipt import approval_receipt_context, build_approval_receipt
+from mindroom.approval.receipt_readers import approval_receipt_context
 from mindroom.approval.response import (
     ApprovalResponseCoordinator,
     continuation_target,
@@ -63,12 +60,13 @@ from mindroom.event_journal import (
 )
 from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.history.interrupted_replay import persist_interrupted_replay_snapshot, render_stopped_attempt
-from mindroom.history.storage import has_queued_force_compaction
+from mindroom.history.storage import has_queued_force_compaction, new_scope_session
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.hooks import EnrichmentItem, MessageEnvelope, render_enrichment_block
 from mindroom.interactive import InteractiveMetadata
 from mindroom.judgment.cold_cache import idle_seconds_before_turn, select_cold_cache_model
 from mindroom.judgment.conversation import conversation_context_before_sources
+from mindroom.llm.runs import RunStatus
 from mindroom.matrix.client_visible_messages import (
     ResolvedVisibleMessage,
     replace_visible_message,
@@ -131,7 +129,6 @@ from mindroom.runtime_shutdown import (
     RuntimeShutdownIntent,
 )
 from mindroom.scheduling.scheduled_run_records import record_silent_schedule_started_if_needed
-from mindroom.session_storage.agno_compat_session_persistence import drain_cancelled_team_save
 from mindroom.skill_learning.capture import SkillReviewCapture
 from mindroom.streaming import (
     PROGRESS_PLACEHOLDER,
@@ -142,16 +139,11 @@ from mindroom.streaming import (
     UnfinishedStreamedReply,
     clean_partial_reply_text,
 )
-from mindroom.teams import (
-    TeamMode,
-    TeamTurnModelSelection,
-    continue_paused_team_run,
-    resolve_team_turn_models,
-    select_model_for_team,
-    strip_team_display,
-    team_response,
-    team_response_stream,
-)
+from mindroom.teams.envelope import team_response, team_response_stream
+from mindroom.teams.members import TeamTurnModelSelection, resolve_team_turn_models, select_model_for_team
+from mindroom.teams.presentation import strip_team_display
+from mindroom.teams.resume import continue_paused_team_run
+from mindroom.teams.spec import TeamMode
 from mindroom.thread_models import set_thread_model_override
 from mindroom.thread_summary import thread_summary_message_count_hint
 from mindroom.timing import DispatchPipelineTiming, timed
@@ -193,6 +185,7 @@ from .response_lifecycle import (
     ResponseLifecycleCoordinator,
     ResponseLifecycleDeps,
     ResponseLifecycleReservation,
+    SessionStartedWatch,
 )
 
 
@@ -211,8 +204,6 @@ if TYPE_CHECKING:
 
     import nio
     import structlog
-    from agno.db.base import BaseDb
-    from agno.run.requirement import RunRequirement
 
     from mindroom.bot_runtime_view import BotRuntimeView
     from mindroom.config.main import Config, ResolvedRuntimeModel
@@ -226,6 +217,7 @@ if TYPE_CHECKING:
     from mindroom.judgment.state import JudgmentMessage
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.knowledge.utils import KnowledgeAccessSupport
+    from mindroom.llm.runs import RunRequirement
     from mindroom.matrix.identity import MatrixID
     from mindroom.message_target import MessageTarget
     from mindroom.mid_turn import MidTurnGate
@@ -478,15 +470,10 @@ def _reply_authorization_entity_names(
     return tuple(dict.fromkeys((owner_entity_name, *team_member_names)))
 
 
-def _agent_has_matrix_messaging_tool(config: Config, agent_name: str, session_id: str | None) -> bool:
+def _agent_has_matrix_messaging_tool(config: Config, agent_name: str) -> bool:
     """Return whether one agent can issue Matrix message actions."""
     try:
-        surface = visible_tool_surface(
-            agent_name=agent_name,
-            config=config,
-            session_id=session_id,
-            enable_dynamic_tools_manager=False,
-        )
+        surface = visible_tool_surface(agent_name=agent_name, config=config)
     except ValueError:
         return False
     return "matrix_message" in {entry.name for entry in surface.runtime_tool_configs}
@@ -893,6 +880,18 @@ def _paused_answer() -> PausedAnswer:
     return PausedAnswer(text=segment.text, tool_trace=deepcopy(segment.tool_trace), team_state=segment.team_state)
 
 
+def _continuation_execution_identity(continuation: ApprovalContinuation) -> ToolExecutionIdentity:
+    """Return the execution identity an approval continuation recorded when its run paused."""
+    identity = parse_tool_execution_identity_payload(
+        continuation.execution_identity,
+        error_prefix="Approval continuation execution_identity",
+    )
+    if identity is None:
+        msg = f"Approval continuation {continuation.approval_id!r} has no execution identity"
+        raise RuntimeError(msg)
+    return identity
+
+
 def _paused_presentation(handle: SpanHandle, paused: PausedAttempt, *, waiting_text: str | None) -> Presentation:
     """Return what a span's reply shows while it waits for approval."""
     return handle.presentation(
@@ -1087,6 +1086,9 @@ def _requested_by_a_person(origin: TurnOrigin) -> bool:
     )
 
 
+# TODO(simplify): ResponseRunner mixes the agent and team turn drivers, approval pause, resume, and recovery,
+# inbox ownership with its shutdown recovery proofs, and the locked span lifecycle. Split approval handling and
+# the team driver into focused modules, as teams/ was. Contributors only; no behavior change (#3075).
 @dataclass
 class ResponseRunner:
     """Run one response lifecycle while keeping bot seams patchable."""
@@ -1555,6 +1557,13 @@ class ResponseRunner:
         """Return tool-call visibility for this agent."""
         return show_tool_calls_for_agent(self.deps.runtime.config, self.deps.agent_name)
 
+    def _thread_summary_message_count_hint(self, request: ResponseRequest) -> int:
+        """Return a lower bound on the thread's size after this reply, counted from the request's visible history."""
+        return thread_summary_message_count_hint(
+            request.thread_history,
+            trusted_sender_ids=current_internal_sender_ids(self.deps.runtime.config, self.deps.runtime_paths),
+        )
+
     async def _failed_approval_handoff(
         self,
         approval_id: str,
@@ -1591,7 +1600,7 @@ class ResponseRunner:
         team_member_names: tuple[str, ...] = (),
         team_mode: str | None = None,
     ) -> FinalDeliveryOutcome:
-        """Persist a paused Agno run, expose its cards, and leave the response lock."""
+        """Persist a paused run, expose its cards, and leave the response lock."""
         requester_id = request.user_id or execution_identity.requester_id
         if requester_id is None:
             msg = "Approval continuation requires the original requester identity"
@@ -1627,6 +1636,8 @@ class ResponseRunner:
                 runtime_paths=self.deps.runtime_paths,
                 requester_id=requester_id,
                 toolkit_owners=paused.toolkit_owners,
+                room_id=target.room_id,
+                thread_id=target.resolved_thread_id,
             )
             approval_pending = plan.waiting_text is not None
             visible_tool_trace = tuple(paused.tool_trace) if show_tool_calls else ()
@@ -1692,13 +1703,7 @@ class ResponseRunner:
                     )
                     for message in request.thread_history
                 ),
-                thread_summary_message_count_hint=thread_summary_message_count_hint(
-                    request.thread_history,
-                    trusted_sender_ids=current_internal_sender_ids(
-                        self.deps.runtime.config,
-                        self.deps.runtime_paths,
-                    ),
-                ),
+                thread_summary_message_count_hint=self._thread_summary_message_count_hint(request),
                 runtime_generation=(self.deps.approval_runtime_generation if continuation_state == "waiting" else None),
             )
             # Later messages of the conversation wait while the approval is pending, as behind a running reply.
@@ -2214,7 +2219,6 @@ class ResponseRunner:
             progress=progress,
             response_function=continue_response,
             user_id=claimed.requester_id,
-            run_id=claimed.run_id,
             build_post_response_outcome=lambda final: self._approval_post_response_outcome(
                 post_effect_continuation,
                 target=target,
@@ -2287,7 +2291,7 @@ class ResponseRunner:
         *,
         target: MessageTarget,
     ) -> str | None:
-        """Recover frozen FINAL debt without invoking Agno a second time."""
+        """Recover frozen FINAL debt without resuming the run a second time."""
         owns_final, event_id = await self._recover_frozen_approval_final(claimed, target=target)
         if owns_final:
             return event_id
@@ -2448,15 +2452,9 @@ class ResponseRunner:
         final: FinalDeliveryOutcome,
     ) -> ResponseOutcome:
         """Build normal post-response facts for one resumed native run."""
-        execution_identity = parse_tool_execution_identity_payload(
-            continuation.execution_identity,
-            error_prefix="Approval continuation execution_identity",
-        )
         return ResponseOutcome(
             response_run_id=final.response_run_id or continuation.run_id,
             session_id=continuation.session_id,
-            session_type=SessionType.TEAM if continuation.entity_kind == "team" else SessionType.AGENT,
-            execution_identity=execution_identity,
             run_succeeded=final.terminal_status == "completed",
             response_target=target,
             thread_summary_room_id=continuation.room_id if target.resolved_thread_id is not None else None,
@@ -2537,12 +2535,7 @@ class ResponseRunner:
             agent_name = list(continuation.team_member_names)
         else:
             return None
-        execution_identity = parse_tool_execution_identity_payload(
-            continuation.execution_identity,
-            error_prefix="Approval continuation execution_identity",
-        )
-        if execution_identity is None:
-            return None
+        execution_identity = _continuation_execution_identity(continuation)
         return self._memory_persistence(
             agent_name=agent_name,
             session_id=continuation.session_id,
@@ -2602,12 +2595,7 @@ class ResponseRunner:
         continuation: ApprovalContinuation,
     ) -> Callable[[str, str], Awaitable[None]] | None:
         """Return the normal run-to-Matrix event linkage for a resumed response."""
-        execution_identity = parse_tool_execution_identity_payload(
-            continuation.execution_identity,
-            error_prefix="Approval continuation execution_identity",
-        )
-        if execution_identity is None:
-            return None
+        execution_identity = _continuation_execution_identity(continuation)
         history_scope = continuation.history_scope
         if history_scope is None:
             if continuation.entity_kind == "team":
@@ -2615,11 +2603,8 @@ class ResponseRunner:
             history_scope = self.deps.state_writer.history_scope()
         return self._build_persist_response_event_id_effect(
             session_id=continuation.session_id,
-            session_type=self.deps.state_writer.session_type_for_scope(history_scope),
-            create_storage=lambda: self.deps.state_writer.create_storage(
-                execution_identity,
-                scope=history_scope,
-            ),
+            scope=history_scope,
+            execution_identity=execution_identity,
         )
 
     async def _continue_entity_call(
@@ -2632,13 +2617,7 @@ class ResponseRunner:
         progress: ProgressPublisher | None,
         cli_approval_handler: Callable[[PausedAttempt], Awaitable[tuple[RunRequirement, ...]]] | None = None,
     ) -> CompletedApprovalRun | PausedAttempt:
-        execution_identity = parse_tool_execution_identity_payload(
-            continuation.execution_identity,
-            error_prefix="Approval continuation execution_identity",
-        )
-        if execution_identity is None:
-            msg = f"Approval continuation {continuation.approval_id!r} has no execution identity"
-            raise RuntimeError(msg)
+        execution_identity = _continuation_execution_identity(continuation)
         tool_dispatch = self.deps.tool_runtime.build_dispatch_context(
             target,
             user_id=continuation.requester_id,
@@ -2662,7 +2641,7 @@ class ResponseRunner:
         decisions = {call.tool_call_id: call.decision is ContinuationDecision.APPROVED for call in continuation.calls}
         denial_reasons = {call.tool_call_id: call.reason for call in continuation.calls}
         paused_answer = _paused_answer()
-        with approval_receipt_context(build_approval_receipt(continuation.calls)):
+        with approval_receipt_context((*continuation.earlier_calls, *continuation.calls), run_id=continuation.run_id):
             if continuation.entity_kind == "team":
 
                 async def continue_team() -> CompletedApprovalRun | PausedAttempt:
@@ -2720,7 +2699,6 @@ class ResponseRunner:
                         request,
                         response_run_id=continuation.run_id,
                     ),
-                    run_id_callback=self._note_run_id,
                     progress=progress,
                 )
         return response_text
@@ -2844,41 +2822,6 @@ class ResponseRunner:
         self._note_final_delivery_timing(request, delivery)
         return delivery
 
-    def _persist_interrupted_turn(
-        self,
-        *,
-        recorder: TurnRecorder,
-        session_scope: HistoryScope,
-        session_id: str,
-        execution_identity: ToolExecutionIdentity | None,
-        run_id: str | None,
-        is_team: bool,
-        response_event_id: str | None = None,
-    ) -> None:
-        """Persist one interrupted recorder snapshot exactly once."""
-        if not recorder.claim_interrupted_persistence():
-            return
-        if response_event_id:
-            recorder.set_response_event_id(response_event_id)
-        storage = self.deps.state_writer.create_storage(execution_identity, scope=session_scope)
-        try:
-            persist_interrupted_replay_snapshot(
-                storage=storage,
-                session=None,
-                session_id=session_id,
-                scope_id=session_scope.scope_id,
-                run_id=recorder.run_id or run_id or str(uuid4()),
-                snapshot=recorder.interrupted_snapshot(),
-                is_team=is_team,
-            )
-        finally:
-            storage.close()
-
-    def _ensure_recorder_interrupted(self, recorder: TurnRecorder) -> None:
-        """Mark one recorder interrupted unless lower layers already captured richer state."""
-        if recorder.outcome == "pending":
-            recorder.mark_interrupted()
-
     def _persist_interrupted_recorder(
         self,
         *,
@@ -2890,16 +2833,21 @@ class ResponseRunner:
         is_team: bool,
         response_event_id: str | None = None,
     ) -> None:
-        """Persist one interrupted recorder snapshot after marking it interrupted."""
-        self._ensure_recorder_interrupted(recorder)
-        self._persist_interrupted_turn(
-            recorder=recorder,
-            session_scope=session_scope,
-            session_id=session_id,
-            execution_identity=execution_identity,
-            run_id=run_id,
-            is_team=is_team,
-            response_event_id=response_event_id,
+        """Persist one recorder's interrupted snapshot once, first marking a still-pending recorder interrupted."""
+        if recorder.outcome == "pending":
+            recorder.mark_interrupted()
+        if not recorder.claim_interrupted_persistence():
+            return
+        if response_event_id:
+            recorder.set_response_event_id(response_event_id)
+        # TODO(simplify): `is_team` travels beside `session_scope`; agent paths pass False with `history_scope()`,
+        # a team scope on a team bot. Derive the row kind from `session_scope.kind` and drop the `is_team` parameters.
+        # Stored data would notice: a team bot's agent-path turn would store its interrupted row as a team run (#3075).
+        persist_interrupted_replay_snapshot(
+            storage=self.deps.state_writer.create_storage(execution_identity, scope=session_scope),
+            session=new_scope_session(session_id=session_id, scope_id=session_scope.scope_id, is_team=is_team),
+            run_id=recorder.run_id or run_id or str(uuid4()),
+            snapshot=recorder.interrupted_snapshot(),
         )
 
     async def _persist_interrupted_recorder_off_loop(
@@ -3534,10 +3482,19 @@ class ResponseRunner:
         await self.deps.approval_store.settle(event.event_id)
 
     async def _follow_up_due(self, request: ResponseRequest) -> bool:
-        """Decide under the conversation lock whether a follow-up still has jobs to report, which a reply may have collected."""
-        assert request.follow_up_key is not None
+        """Decide under the conversation lock whether a follow-up still has jobs to report.
+
+        A reply may have collected them, and the reply to a message of their requester that already waits here reports
+        them in its start note, so the follow-up gives way to that message.
+        """
+        key = request.follow_up_key
+        assert key is not None
+        waiting = self._lifecycle_coordinator.has_waiting_messages_from(
+            request.response_envelope.target,
+            key.requester_id,
+        )
         runtime = get_background_runtime(self.deps.runtime_paths)
-        if runtime is not None and follow_up_jobs(await runtime.ended_jobs(request.follow_up_key)):
+        if not waiting and runtime is not None and follow_up_jobs(await runtime.ended_jobs(key)):
             return True
         # A follow-up whose own reply a restart cut short answers again, though that reply collected the jobs.
         reply = await self.deps.replies.store.replies.for_sources((request.response_envelope.source_event_id,))
@@ -3683,20 +3640,44 @@ class ResponseRunner:
             response_envelope=response_envelope,
         )
 
+    async def _setup_session_watch(
+        self,
+        lifecycle: ResponseLifecycle,
+        *,
+        request: ResponseRequest,
+        tool_dispatch: ToolDispatchContext,
+        session_id: str,
+        scope: HistoryScope,
+        resolved_target: MessageTarget,
+    ) -> SessionStartedWatch:
+        """Pre-compute session:started eligibility for a response whose session lives in one history scope."""
+        return await lifecycle.setup_session_watch(
+            tool_context=runtime_context_from_dispatch_context(tool_dispatch),
+            session_id=session_id,
+            scope=scope,
+            room_id=request.room_id,
+            thread_id=resolved_target.resolved_thread_id,
+            create_storage=partial(
+                self.deps.state_writer.create_storage,
+                tool_dispatch.execution_identity,
+                scope=scope,
+            ),
+        )
+
     def _build_persist_response_event_id_effect(
         self,
         *,
         session_id: str,
-        session_type: SessionType,
-        create_storage: Callable[[], BaseDb],
+        scope: HistoryScope,
+        execution_identity: ToolExecutionIdentity | None,
     ) -> Callable[[str, str], Awaitable[None]]:
         """Build the response-event persistence callback for one session-backed response."""
 
         async def persist_response_event_id(run_id: str, response_event_id: str) -> None:
             await self.deps.state_writer.apersist_response_event_id_in_session_run(
-                create_storage=create_storage,
+                execution_identity=execution_identity,
+                scope=scope,
                 session_id=session_id,
-                session_type=session_type,
                 run_id=run_id,
                 response_event_id=response_event_id,
             )
@@ -3749,7 +3730,6 @@ class ResponseRunner:
         scope: HistoryScope,
         execution_identity: ToolExecutionIdentity | None,
     ) -> bool:
-        storage = None
         try:
             storage = self.deps.state_writer.create_storage(execution_identity, scope=scope)
             return has_queued_force_compaction(storage, session_id, scope)
@@ -3761,17 +3741,6 @@ class ResponseRunner:
                 exception_type=error.__class__.__name__,
             )
             return False
-        finally:
-            if storage is not None:
-                try:
-                    storage.close()
-                except Exception as error:
-                    self.deps.logger.warning(
-                        "forced_compaction_placeholder_storage_close_failed",
-                        session_id=session_id,
-                        scope=scope.key,
-                        exception_type=error.__class__.__name__,
-                    )
 
     async def _refresh_model_history_after_lock(
         self,
@@ -3905,7 +3874,6 @@ class ResponseRunner:
             matrix_message_available=_agent_has_matrix_messaging_tool(
                 self.deps.runtime.config,
                 self.deps.agent_name,
-                runtime.session_id,
             ),
             runtime=self.deps.runtime,
         )
@@ -4284,7 +4252,6 @@ class ResponseRunner:
         progress: _DeliveryProgress,
         response_function: Callable[[str | None], Coroutine[Any, Any, None]],
         user_id: str | None,
-        run_id: str,
         build_post_response_outcome: Callable[[FinalDeliveryOutcome], ResponseOutcome],
         post_response_deps: PostResponseEffectsDeps | Callable[[], PostResponseEffectsDeps],
         streaming_delivery_error_handler: Callable[
@@ -4306,7 +4273,6 @@ class ResponseRunner:
                 response_function=response_function,
                 existing_event_id=_existing_event_id(request),
                 user_id=user_id,
-                run_id=run_id,
                 on_cancelled=progress.note_task_cancelled,
                 show_stop_button=not _is_silent_schedule_response(request),
             )
@@ -4571,9 +4537,7 @@ class ResponseRunner:
             requester_user_id=retry_execution_identity.requester_id,
         )
         registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
-        agent_names = [
-            registry.current_entity_name_for_user_id(mid.full_id) or mid.username for mid in team_request.team_agents
-        ]
+        agent_names = [registry.entity_name_or_username(mid) for mid in team_request.team_agents]
         request = replace(request, participating_agent_names=tuple(agent_names))
         if not request.prompt.strip():
             return await self._finalize_empty_prompt_locked(
@@ -4658,7 +4622,6 @@ class ResponseRunner:
                 progress=progress,
                 response_function=deliver_resolution_reason,
                 user_id=request.user_id,
-                run_id=str(uuid4()),
                 build_post_response_outcome=lambda _final_outcome: ResponseOutcome(),
                 post_response_deps=lambda: self._post_response_deps(request),
             )
@@ -4689,8 +4652,7 @@ class ResponseRunner:
         matrix_target_item = _matrix_message_target_item(
             resolved_target,
             matrix_message_available=any(
-                _agent_has_matrix_messaging_tool(self.deps.runtime.config, name, resolved_target.session_id)
-                for name in agent_names
+                _agent_has_matrix_messaging_tool(self.deps.runtime.config, name) for name in agent_names
             ),
             runtime=self.deps.runtime,
         )
@@ -4732,19 +4694,13 @@ class ResponseRunner:
             [agent_name for agent_name in agent_names if agent_name != ROUTER_AGENT_NAME],
             allow_direct_private_agents=allow_direct_private_agents,
         )
-        session_type = self.deps.state_writer.session_type_for_scope(session_scope)
-
-        def team_storage_factory() -> BaseDb:
-            return self.deps.state_writer.create_storage(execution_identity, scope=session_scope)
-
-        session_started_watch = lifecycle.setup_session_watch(
-            tool_context=runtime_context_from_dispatch_context(tool_dispatch),
+        session_started_watch = await self._setup_session_watch(
+            lifecycle,
+            request=request,
+            tool_dispatch=tool_dispatch,
             session_id=session_id,
-            session_type=session_type,
             scope=session_scope,
-            room_id=request.room_id,
-            thread_id=resolved_target.resolved_thread_id,
-            create_storage=team_storage_factory,
+            resolved_target=resolved_target,
         )
         orchestrator = self.deps.runtime.orchestrator
         if orchestrator is None:
@@ -4796,8 +4752,6 @@ class ResponseRunner:
             return {**fallback, **team_run_metadata_content} or None
 
         async def persist_failed_team_turn() -> None:
-            if current_task_is_process_shutdown():
-                return
             await self._persist_failed_turn(
                 team_turn_recorder,
                 is_team=True,
@@ -4809,8 +4763,6 @@ class ResponseRunner:
             )
 
         async def persist_interrupted_team_turn() -> None:
-            # Agno saves the stopped team run in the background; this turn's record must land after it.
-            await drain_cancelled_team_save(team_turn_recorder.run_id or response_run_id)
             await self._persist_interrupted_recorder_off_loop(
                 recorder=team_turn_recorder,
                 session_scope=session_scope,
@@ -4823,8 +4775,8 @@ class ResponseRunner:
 
         persist_response_event_id = self._build_persist_response_event_id_effect(
             session_id=session_id,
-            session_type=session_type,
-            create_storage=team_storage_factory,
+            scope=session_scope,
+            execution_identity=execution_identity,
         )
         # A configured team keeps the conversations it answers in its members' shared memory.
         queue_memory_persistence = (
@@ -4851,13 +4803,6 @@ class ResponseRunner:
                 request=delivery_request,
             )
 
-            def _note_attempt_run_id(current_run_id: str) -> None:
-                self._note_run_id(current_run_id)
-                team_turn_recorder.set_run_id(current_run_id)
-
-            def _note_visible_response_event_id(response_event_id: str) -> None:
-                team_turn_recorder.set_response_event_id(response_event_id)
-
             if use_streaming and (_existing_event_id(delivery_request) is None or _shows_placeholder(delivery_request)):
                 async with _response_typing_indicator(
                     self._client(),
@@ -4867,18 +4812,18 @@ class ResponseRunner:
 
                     def build_response_stream() -> AsyncIterator[StreamInputChunk]:
                         return team_response_stream(
-                            agent_ids=list(team_request.team_agents),
+                            agent_names=agent_names,
+                            mode=mode,
                             message=prepared_prompt,
                             orchestrator=orchestrator,
                             execution_identity=tool_dispatch.execution_identity,
                             ctx=team_turn_ctx,
-                            mode=mode,
                             thread_history=model_thread_history,
                             model_name=model_name,
                             member_model_names=member_model_names,
                             media=resolved_request.media,
                             show_tool_calls=show_tool_calls,
-                            run_id_callback=_note_attempt_run_id,
+                            run_id_callback=team_turn_recorder.set_run_id,
                             user_id=requester_user_id,
                             current_timestamp_ms=request.current_timestamp_ms,
                             current_prompt_is_structured=request.current_prompt_is_structured,
@@ -4890,7 +4835,6 @@ class ResponseRunner:
                             else None,
                             reason_prefix=team_request.reason_prefix,
                             pipeline_timing=request.pipeline_timing,
-                            attempt_model_runtime=self.deps.tool_runtime,
                             turn_recorder=team_turn_recorder,
                         )
 
@@ -4921,7 +4865,7 @@ class ResponseRunner:
                                 ),
                                 streaming_cls=ReplacementStreamingResponse,
                                 pipeline_timing=request.pipeline_timing,
-                                visible_event_id_callback=_note_visible_response_event_id,
+                                visible_event_id_callback=team_turn_recorder.set_response_event_id,
                                 visible_progress_callback=self._lifecycle_coordinator.visible_progress_callback(
                                     delivery_target,
                                 ),
@@ -4973,7 +4917,7 @@ class ResponseRunner:
                                     member_model_names=member_model_names,
                                     media=resolved_request.media,
                                     show_tool_calls=show_tool_calls,
-                                    run_id_callback=_note_attempt_run_id,
+                                    run_id_callback=team_turn_recorder.set_run_id,
                                     user_id=requester_user_id,
                                     current_timestamp_ms=request.current_timestamp_ms,
                                     current_prompt_is_structured=request.current_prompt_is_structured,
@@ -4985,7 +4929,6 @@ class ResponseRunner:
                                     else None,
                                     reason_prefix=team_request.reason_prefix,
                                     pipeline_timing=request.pipeline_timing,
-                                    attempt_model_runtime=self.deps.tool_runtime,
                                     turn_recorder=team_turn_recorder,
                                 )
 
@@ -5081,19 +5024,11 @@ class ResponseRunner:
             return ResponseOutcome(
                 response_run_id=team_turn_recorder.run_id or response_run_id,
                 session_id=session_id,
-                session_type=SessionType.TEAM,
-                execution_identity=tool_dispatch.execution_identity,
                 run_succeeded=team_turn_recorder.outcome == "completed",
                 response_target=resolved_target,
                 thread_summary_room_id=(request.room_id if resolved_target.resolved_thread_id is not None else None),
                 thread_summary_thread_id=resolved_target.resolved_thread_id,
-                thread_summary_message_count_hint=thread_summary_message_count_hint(
-                    request.thread_history,
-                    trusted_sender_ids=current_internal_sender_ids(
-                        self.deps.runtime.config,
-                        self.deps.runtime_paths,
-                    ),
-                ),
+                thread_summary_message_count_hint=self._thread_summary_message_count_hint(request),
                 thread_summary_entity_name=self.deps.agent_name,
             )
 
@@ -5105,7 +5040,6 @@ class ResponseRunner:
             progress=progress,
             response_function=generate_team_response,
             user_id=requester_user_id,
-            run_id=response_run_id,
             build_post_response_outcome=build_team_post_response_outcome,
             post_response_deps=lambda: self._post_response_deps(
                 request,
@@ -5134,7 +5068,6 @@ class ResponseRunner:
         response_function: Callable[[str | None], Coroutine[Any, Any, None]],
         existing_event_id: str | None = None,
         user_id: str | None = None,
-        run_id: str | None = None,
         on_cancelled: Callable[[str], None] | None = None,
         show_stop_button: bool = True,
     ) -> None:
@@ -5152,36 +5085,24 @@ class ResponseRunner:
                 existing_event_id=existing_event_id,
                 user_id=user_id,
                 on_cancelled=on_cancelled,
-                span=self._span_attempt(run_id),
+                span=self._span_attempt(),
             ),
         )
 
-    def _span_attempt(self, run_id: str | None) -> SpanAttempt:
+    def _span_attempt(self) -> SpanAttempt:
         """Return the current reply span's ownership of an attempt: its Stop and its Stop button."""
         handle = current_span()
         assert handle is not None, "every response attempt runs in a reply span"
-        spans = handle.runtime.spans
-
-        def register(task: asyncio.Task[None]) -> None:
-            spans.register(handle.span_id, task)
-            spans.update_run_id(handle.span_id, run_id)
 
         async def reply_event() -> str | None:
             await handle.reply_shown.wait()
             return handle.reply.event_id
 
         return SpanAttempt(
-            register=register,
+            register=partial(handle.runtime.spans.register, handle.span_id),
             add_stop_button=lambda message_id: self.deps.delivery_gateway.add_reply_stop_button(handle, message_id),
             reply_event=reply_event,
         )
-
-    @staticmethod
-    def _note_run_id(run_id: str | None) -> None:
-        """Tell the span registry which Agno run the current span's attempt is on, so a Stop cancels it too."""
-        handle = current_span()
-        assert handle is not None, "every response attempt runs in a reply span"
-        handle.runtime.spans.update_run_id(handle.span_id, run_id)
 
     @timed("prepare_response_runtime")
     async def prepare_response_runtime(
@@ -5249,8 +5170,7 @@ class ResponseRunner:
         tool_trace: list[ToolTraceEntry] = []
         run_metadata_content: dict[str, Any] = {}
 
-        def note_attempt_run_id(current_run_id: str) -> None:
-            self._note_run_id(current_run_id)
+        def note_attempt_run_id(current_run_id: str, _model_name: str) -> None:
             turn_recorder.set_run_id(current_run_id)
             attempt_run_id_collector.append(current_run_id)
 
@@ -5286,7 +5206,7 @@ class ResponseRunner:
                 current_timestamp_ms=request.current_timestamp_ms,
                 current_prompt_is_structured=request.current_prompt_is_structured,
                 knowledge=knowledge_resolution.knowledge,
-                run_id_callback=note_attempt_run_id,
+                on_attempt_start=note_attempt_run_id,
                 media=runtime.media_inputs,
                 show_tool_calls=show_tool_calls,
                 collect_streamed_response=show_tool_calls,
@@ -5298,7 +5218,6 @@ class ResponseRunner:
                 turn_recorder=turn_recorder,
                 pipeline_timing=pipeline_timing,
                 supports_native_tool_approval=True,
-                attempt_model_runtime=self.deps.tool_runtime,
             )
 
         try:
@@ -5353,8 +5272,7 @@ class ResponseRunner:
             request=request,
         )
 
-        def note_attempt_run_id(current_run_id: str) -> None:
-            self._note_run_id(current_run_id)
+        def note_attempt_run_id(current_run_id: str, _model_name: str) -> None:
             turn_recorder.set_run_id(current_run_id)
             attempt_run_id_collector.append(current_run_id)
 
@@ -5393,7 +5311,7 @@ class ResponseRunner:
                 current_timestamp_ms=request.current_timestamp_ms,
                 current_prompt_is_structured=request.current_prompt_is_structured,
                 knowledge=knowledge_resolution.knowledge,
-                run_id_callback=note_attempt_run_id,
+                on_attempt_start=note_attempt_run_id,
                 media=runtime.media_inputs,
                 show_tool_calls=runtime.show_tool_calls,
                 run_metadata_collector=run_metadata_content,
@@ -5403,7 +5321,6 @@ class ResponseRunner:
                 turn_recorder=turn_recorder,
                 pipeline_timing=pipeline_timing,
                 supports_native_tool_approval=True,
-                attempt_model_runtime=self.deps.tool_runtime,
             )
 
             async with _response_typing_indicator(
@@ -5471,7 +5388,7 @@ class ResponseRunner:
             )
             raise
 
-    async def _process_and_respond(  # noqa: C901, PLR0912, PLR0915
+    async def _process_and_respond(  # noqa: C901, PLR0912
         self,
         request: ResponseRequest,
         *,
@@ -5495,19 +5412,13 @@ class ResponseRunner:
             request=request,
         )
         session_scope = self.deps.state_writer.history_scope()
-        session_type = self.deps.state_writer.session_type_for_scope(session_scope)
-
-        def history_storage_factory() -> BaseDb:
-            return self.deps.state_writer.create_storage(runtime.tool_dispatch.execution_identity, scope=session_scope)
-
-        session_started_watch = lifecycle.setup_session_watch(
-            tool_context=runtime_context_from_dispatch_context(runtime.tool_dispatch),
+        session_started_watch = await self._setup_session_watch(
+            lifecycle,
+            request=request,
+            tool_dispatch=runtime.tool_dispatch,
             session_id=runtime.session_id,
-            session_type=session_type,
             scope=session_scope,
-            room_id=request.room_id,
-            thread_id=runtime.resolved_target.resolved_thread_id,
-            create_storage=history_storage_factory,
+            resolved_target=runtime.resolved_target,
         )
         # The caller's list survives raising exit paths (cancellation, stream
         # re-raises), unlike the returned outcome.
@@ -5633,19 +5544,13 @@ class ResponseRunner:
             request=request,
         )
         session_scope = self.deps.state_writer.history_scope()
-        session_type = self.deps.state_writer.session_type_for_scope(session_scope)
-
-        def history_storage_factory() -> BaseDb:
-            return self.deps.state_writer.create_storage(runtime.tool_dispatch.execution_identity, scope=session_scope)
-
-        session_started_watch = lifecycle.setup_session_watch(
-            tool_context=runtime_context_from_dispatch_context(runtime.tool_dispatch),
+        session_started_watch = await self._setup_session_watch(
+            lifecycle,
+            request=request,
+            tool_dispatch=runtime.tool_dispatch,
             session_id=runtime.session_id,
-            session_type=session_type,
             scope=session_scope,
-            room_id=request.room_id,
-            thread_id=runtime.resolved_target.resolved_thread_id,
-            create_storage=history_storage_factory,
+            resolved_target=runtime.resolved_target,
         )
         # The streaming path keeps these caller-owned (unlike the non-streaming
         # path's returned _NonStreamingGeneration): the metadata dict must stay
@@ -6045,8 +5950,8 @@ class ResponseRunner:
 
         persist_response_event_id = self._build_persist_response_event_id_effect(
             session_id=session_id,
-            session_type=self.deps.state_writer.session_type_for_scope(history_scope),
-            create_storage=lambda: self.deps.state_writer.create_storage(execution_identity),
+            scope=history_scope,
+            execution_identity=execution_identity,
         )
 
         async def generate(_message_id: str | None) -> None:
@@ -6090,8 +5995,6 @@ class ResponseRunner:
                 # returned generation outcome never materialized.
                 response_run_id=attempt_run_ids[-1] if attempt_run_ids else response_run_id,
                 session_id=session_id,
-                session_type=self.deps.state_writer.session_type_for_scope(self.deps.state_writer.history_scope()),
-                execution_identity=execution_identity,
                 run_succeeded=(
                     generation.run_succeeded
                     if generation is not None
@@ -6100,13 +6003,7 @@ class ResponseRunner:
                 response_target=resolved_target,
                 thread_summary_room_id=(request.room_id if resolved_target.resolved_thread_id is not None else None),
                 thread_summary_thread_id=resolved_target.resolved_thread_id,
-                thread_summary_message_count_hint=thread_summary_message_count_hint(
-                    request.thread_history,
-                    trusted_sender_ids=current_internal_sender_ids(
-                        self.deps.runtime.config,
-                        self.deps.runtime_paths,
-                    ),
-                ),
+                thread_summary_message_count_hint=self._thread_summary_message_count_hint(request),
                 thread_summary_entity_name=self.deps.agent_name,
             )
 
@@ -6124,7 +6021,6 @@ class ResponseRunner:
                 progress=progress,
                 response_function=generate,
                 user_id=request.user_id,
-                run_id=response_run_id,
                 build_post_response_outcome=build_post_response_outcome,
                 post_response_deps=lambda: self._post_response_deps(
                     request,

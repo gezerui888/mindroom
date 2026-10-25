@@ -25,9 +25,9 @@ __all__ = [
     "DREAMING_PROMPT_TEMPLATE",
     "DREAMING_VERIFY_TEMPLATE",
     "DYNAMIC_TOOLING_INSTRUCTION_TEMPLATE",
-    "DYNAMIC_TOOLS_TOOLKIT_INSTRUCTIONS",
     "EXPLORATION_PROMPT_TEMPLATE",
     "FILE_MEMORY_ENTRYPOINT_HEADER_TEMPLATE",
+    "FILE_MEMORY_ENTRYPOINT_KEPT_COPY_NOTICE",
     "FILE_MEMORY_ENTRYPOINT_TRUNCATION_TEMPLATE",
     "HIDDEN_TOOL_CALLS_PROMPT",
     "INLINE_MEDIA_FALLBACK_PROMPT",
@@ -152,7 +152,7 @@ Step-by-step instructions...
 
 Do not write to the bundled, plugin, or user skill directories (for example `~/.mindroom/skills`); they may be read-only, and workspace skills take precedence over them anyway.
 A workspace skill you create or edit becomes available on your next run, without any config change.
-Workspace skill scripts cannot be executed through get_skill_script; run them with your shell tools if you have them.
+get_skill_script only reads skill scripts; run a script with your shell tools if you have them.
 """
 
 HIDDEN_TOOL_CALLS_PROMPT = """Your tool calls are not visible to the user in the chat. They only see your text responses.
@@ -184,15 +184,13 @@ CONTEXT_TRUNCATION_MARKER_TEMPLATE = (
 )
 CONTEXT_CHUNK_OMITTED_MARKER_TEMPLATE = "[Truncated - {omitted_chars} chars omitted. Read {title} for the rest.]"
 
-DYNAMIC_TOOLING_INSTRUCTION_TEMPLATE = """## Dynamic Tools
-Deferred tools are available by exact name and can be loaded for this session.
+DYNAMIC_TOOLING_INSTRUCTION_TEMPLATE = """## Deferred Tools
+These toolkits are available, but the definitions of their functions are not included:
 <available-deferred-tools>
 {tool_catalog}
 </available-deferred-tools>
-Use load_tool(tool_name) to load one by exact name.
-Use tool_search(query) for keyword lookup across deferred tools.
-A loaded tool becomes callable once it appears in your available tools; do not call it in the same parallel tool-call batch as load_tool.
-In team conversations, each member manages its own dynamic tool state."""
+Use tool_search(query) to get the definitions of matching functions, or tool_search() with no query to list the deferred functions, then call one with call_tool(name, arguments), passing its arguments as a JSON object.
+Search before concluding that a capability is unavailable."""
 
 NATIVE_TOOL_SEARCH_INSTRUCTION_TEMPLATE = """## Deferred Tool Discovery
 Deferred capability domains available through native tool search: {tool_domains}.
@@ -291,23 +289,29 @@ FILE_MEMORY_ENTRYPOINT_HEADER_TEMPLATE = (
     "automatically every turn. Do not re-read it to recall what it says; open it to edit it, "
     "or when a marker says lines were omitted."
 )
+FILE_MEMORY_ENTRYPOINT_KEPT_COPY_NOTICE = (
+    "This conversation keeps the copy it last loaded, so entries added from other conversations since then "
+    "may be missing; open the file to look for them."
+)
 FILE_MEMORY_ENTRYPOINT_TRUNCATION_TEMPLATE = (
-    "[Memory entrypoint truncated - showing the first {included_lines} of {total_lines} lines "
+    "[Memory entrypoint truncated - showing {included_lines} of {total_lines} lines "
     "(capped by memory.file.max_entrypoint_lines={max_entrypoint_lines} "
     "and memory.file.max_entrypoint_tokens={max_entrypoint_tokens}). "
     "Read `{memory_path}` directly for the omitted lines.]"
 )
-PROMPT_CURATION_PROMPT_TEMPLATE = """🧹 Prompt maintenance: the files loaded into every one of your prompts total {measured_tokens} tokens, over the {trigger_tokens}-token limit.
+PROMPT_CURATION_PROMPT_TEMPLATE = """🧹 Prompt maintenance: the files loaded into every one of your prompts total {measured_tokens} tokens (limit {trigger_tokens}), and MEMORY.md has {memory_lines} lines and {entrypoint_tokens} tokens (preload limits {max_entrypoint_lines} lines and {max_entrypoint_tokens} tokens; over either, some of its lines never reach your prompt).
 Files: {file_sizes}.
 
 1. Commit these files to git in your workspace first (run `git init` if it is not a repository yet), so this change can be undone.
 2. Bring them to at most {upper_tokens} tokens in total, but not below {floor_tokens}; no single file may shrink by more than {max_file_shrink_percent}%.
-3. When the same fact appears in more than one file, keep it once, in the file that owns it: identity and voice in SOUL.md and IDENTITY.md, workflow rules in AGENTS.md, facts about the person in USER.md, and everything else in MEMORY.md.
-4. Move detail, history, and finished items verbatim into topic files under memory/, such as memory/projects.md, and leave a one-line pointer where it helps; those files are searched on demand.
-5. Never invent facts or change their meaning, names, dates, or numbers.
+   If MEMORY.md is over either preload limit, take lines out of it first, as far as these bounds allow.
+3. When a later entry corrects or supersedes an earlier one, rewrite the earlier entry to the corrected fact and delete the separate correction, so only the corrected fact remains.
+4. When the same fact appears in more than one file, keep it once, in the file that owns it: identity and voice in SOUL.md and IDENTITY.md, workflow rules in AGENTS.md, facts about the person in USER.md, and everything else in MEMORY.md.
+5. Move detail, history, and finished items verbatim into topic files under memory/, such as memory/projects.md, and leave a one-line pointer where it helps; those files are searched on demand.
+6. Never invent facts or change their meaning, names, dates, or numbers, except to apply a correction as in step 3.
 
-Delete only true duplicates; move everything else.
-When you finish, MindRoom measures the files again and asks you to re-check if a file shrank too much, the total fell below {floor_tokens} tokens or did not shrink, or detail was deleted instead of moved.
+Delete only true duplicates and folded corrections; move everything else.
+When you finish, MindRoom measures the files again and asks you to re-check if a file shrank too much, the total fell below {floor_tokens} tokens or did not shrink, MEMORY.md kept all its lines while over {max_entrypoint_lines}, or detail was deleted instead of moved.
 Reply with one line saying what you changed."""
 PROMPT_CURATION_RECHECK_TEMPLATE = """⚠️ Prompt maintenance needs a re-check: {findings}.
 Compare your change with the commit you made before it, fix what is listed, and reply with one line saying what you fixed."""
@@ -670,12 +674,6 @@ Avoid childish, sticker-like, or overly decorative designs.
 Make each room instantly recognizable at small sizes."""
 
 CODEX_DEFAULT_INSTRUCTIONS = "You are a helpful assistant."
-DYNAMIC_TOOLS_TOOLKIT_INSTRUCTIONS = (
-    "Manage deferred tools for this session. "
-    "Use list_tools() or tool_search() when unsure. "
-    "A tool loaded with load_tool() becomes callable once it appears in your available tools, and "
-    "unload_tool() removes one. Do not call a newly loaded tool in the same parallel tool-call batch as load_tool()."
-)
 DELEGATE_TOOLKIT_INSTRUCTIONS_TEMPLATE = """You can run the following configured agents as fresh subagents:
 {agent_descriptions}
 
@@ -742,6 +740,10 @@ PROMPT_TEMPLATE_FIELDS = MappingProxyType(
             {
                 "measured_tokens",
                 "trigger_tokens",
+                "memory_lines",
+                "entrypoint_tokens",
+                "max_entrypoint_lines",
+                "max_entrypoint_tokens",
                 "file_sizes",
                 "upper_tokens",
                 "floor_tokens",

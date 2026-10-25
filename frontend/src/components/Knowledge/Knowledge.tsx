@@ -1035,7 +1035,7 @@ export function Knowledge() {
                             "rounded-md border p-3 text-left transition-colors",
                             isActive
                               ? "border-primary bg-primary/5"
-                              : "border-border hover:border-primary/40 hover:bg-muted/40",
+                              : "border-border hover:bg-secondary",
                           )}
                           aria-pressed={isActive}
                         >
@@ -1331,6 +1331,7 @@ export function Knowledge() {
                       onClick={() =>
                         updateSettings({
                           git: defaultGitSettings(settings.git),
+                          poll_interval_seconds: undefined,
                         })
                       }
                       disabled={savingSettings}
@@ -1382,6 +1383,7 @@ export function Knowledge() {
                               ? ""
                               : settings.path,
                           watch: false,
+                          poll_interval_seconds: undefined,
                         })
                       }
                       disabled={savingSettings}

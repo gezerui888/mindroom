@@ -18,8 +18,9 @@ from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.knowledge.availability import KnowledgeAvailability
 from mindroom.knowledge.file_memory_knowledge import resolve_file_memory_knowledge
+from mindroom.knowledge.read_protocol import SearchHit
 from mindroom.knowledge.utils import KnowledgeBaseAccessResolution
-from mindroom.memory import MemoryPromptParts
+from mindroom.memory import ConversationRef, MemoryPromptParts
 from mindroom.memory import add_agent_memory as public_add_agent_memory
 from mindroom.memory import build_memory_prompt_parts as public_build_memory_prompt_parts
 from mindroom.memory import delete_agent_memory as public_delete_agent_memory
@@ -29,6 +30,7 @@ from mindroom.memory import search_agent_memories as public_search_agent_memorie
 from mindroom.memory import store_conversation_memory as public_store_conversation_memory
 from mindroom.memory import update_agent_memory as public_update_agent_memory
 from mindroom.memory._shared import MemoryNotFoundError
+from mindroom.prompts import PROMPT_DEFAULTS
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.timing import timing_scope
 from mindroom.tool_system.worker_routing import (
@@ -290,16 +292,10 @@ async def test_semantic_memory_search_uses_ready_published_index_without_refresh
     runtime_paths = runtime_paths_for(config)
 
     class FakeKnowledge:
-        async def asearch(self, *, query: str, max_results: int) -> list[object]:
+        async def asearch(self, query: str, limit: int) -> list[SearchHit]:
             assert query == "semantic memory"
-            assert max_results == 5
-            return [
-                SimpleNamespace(
-                    content="Published semantic memory.",
-                    meta_data={"source_path": "memory/2026-06-02.md"},
-                    reranking_score=0.8,
-                ),
-            ]
+            assert limit == 5
+            return [SearchHit(content="Published semantic memory.", meta_data={"source_path": "memory/2026-06-02.md"})]
 
     access_base_ids: list[str] = []
 
@@ -348,16 +344,10 @@ async def test_semantic_memory_search_uses_ready_published_index_without_refresh
 
 
 class _FakeSemanticTimingKnowledge:
-    async def asearch(self, *, query: str, max_results: int) -> list[object]:
+    async def asearch(self, query: str, limit: int) -> list[SearchHit]:
         assert query == "semantic memory"
-        assert max_results == 5
-        return [
-            SimpleNamespace(
-                content="Published semantic memory.",
-                meta_data={"source_path": "memory/2026-06-02.md"},
-                reranking_score=0.8,
-            ),
-        ]
+        assert limit == 5
+        return [SearchHit(content="Published semantic memory.", meta_data={"source_path": "memory/2026-06-02.md"})]
 
 
 @pytest.mark.asyncio
@@ -1556,6 +1546,59 @@ async def test_file_backend_prompt_respects_max_entrypoint_lines(storage_path: P
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cap", ["lines", "tokens"])
+async def test_file_backend_capped_entrypoint_withholds_the_oldest_entries(
+    storage_path: Path,
+    config: Config,
+    cap: str,
+) -> None:
+    """add_memory appends, so a capped preload keeps the curated head and the newest entries, not the oldest."""
+    config.memory.backend = "file"
+    config.memory.file.path = str(storage_path / "memory-files")
+    if cap == "lines":
+        config.memory.file.max_entrypoint_lines = 3
+    else:
+        config.memory.file.max_entrypoint_tokens = 15
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "MEMORY.md").write_text(
+        "# Memory\nCurated fact.\n- [id=m1] Oldest entry.\n- [id=m2] Middle entry.\n- [id=m3] Newest entry.\n",
+        encoding="utf-8",
+    )
+
+    prompt_parts = await build_memory_prompt_parts("What should I remember?", "general", storage_path, config)
+
+    assert "# Memory\nCurated fact.\n- [id=m3] Newest entry." in prompt_parts.session_preamble
+    assert "Oldest entry." not in prompt_parts.session_preamble
+    assert "Middle entry." not in prompt_parts.session_preamble
+    assert "[Memory entrypoint truncated - showing 3 of 5 lines" in prompt_parts.session_preamble
+
+
+@pytest.mark.asyncio
+async def test_file_backend_oversized_oldest_entry_does_not_withhold_newer_entries(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    """An oldest entry too long for the token cap is withheld alone, not with every newer entry."""
+    config.memory.backend = "file"
+    config.memory.file.path = str(storage_path / "memory-files")
+    config.memory.file.max_entrypoint_tokens = 15
+
+    workspace = agent_workspace_root_path(storage_path, "general")
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "MEMORY.md").write_text(
+        f"# Memory\nCurated fact.\n- [id=m1] {'Long oldest entry. ' * 5}\n- [id=m2] Newest entry.\n",
+        encoding="utf-8",
+    )
+
+    prompt_parts = await build_memory_prompt_parts("What should I remember?", "general", storage_path, config)
+
+    assert "# Memory\nCurated fact.\n- [id=m2] Newest entry." in prompt_parts.session_preamble
+    assert "Long oldest entry." not in prompt_parts.session_preamble
+
+
+@pytest.mark.asyncio
 async def test_file_backend_entrypoint_preamble_announces_automatic_preload(
     storage_path: Path,
     config: Config,
@@ -1582,6 +1625,52 @@ async def test_file_backend_entrypoint_preamble_announces_automatic_preload(
 
 
 @pytest.mark.asyncio
+async def test_file_backend_conversation_keeps_its_entrypoint_after_a_memory_is_added(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    """An entry added mid-conversation leaves its inlined MEMORY.md unchanged; a deleted line reloads it.
+
+    Only a kept copy tells the agent that newer entries may be missing, and an edited header loads again.
+    """
+    config.memory.backend = "file"
+    config.memory.file.path = str(storage_path / "memory-files")
+    workspace = agent_workspace_root_path(storage_path, "general")
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "MEMORY.md").write_text("# Memory\nCurated fact.\n", encoding="utf-8")
+
+    async def preamble(conversation: ConversationRef | None) -> str:
+        prompt_parts = await public_build_memory_prompt_parts(
+            "What should I remember?",
+            "general",
+            storage_path,
+            config,
+            runtime_paths_for(config),
+            get_tool_execution_identity(),
+            conversation=conversation,
+        )
+        return prompt_parts.session_preamble
+
+    first = await preamble(ConversationRef("thread", (None, None)))
+    await add_agent_memory("Added fact.", "general", storage_path, config)
+
+    assert await preamble(ConversationRef("thread", (None, None))) == first
+    assert "Added fact." not in first
+    assert "Added fact." in await preamble(ConversationRef("other-thread", (None, None)))
+    assert PROMPT_DEFAULTS["FILE_MEMORY_ENTRYPOINT_KEPT_COPY_NOTICE"] in first
+    fresh = await preamble(None)
+    assert "Added fact." in fresh
+    assert PROMPT_DEFAULTS["FILE_MEMORY_ENTRYPOINT_KEPT_COPY_NOTICE"] not in fresh
+
+    (workspace / "MEMORY.md").write_text("# Memory\n", encoding="utf-8")
+    assert "Curated fact." not in await preamble(ConversationRef("thread", (None, None)))
+
+    # A prompt override applies through hot reload, so an edited header loads again.
+    config.prompts["FILE_MEMORY_ENTRYPOINT_HEADER_TEMPLATE"] = "Edited header for `{memory_path}`."
+    assert (await preamble(ConversationRef("thread", (None, None)))).startswith("Edited header")
+
+
+@pytest.mark.asyncio
 async def test_file_backend_entrypoint_preamble_reports_truncated_lines(
     storage_path: Path,
     config: Config,
@@ -1603,7 +1692,7 @@ async def test_file_backend_entrypoint_preamble_reports_truncated_lines(
         config,
     )
 
-    assert "[Memory entrypoint truncated - showing the first 2 of 4 lines" in prompt_parts.session_preamble
+    assert "[Memory entrypoint truncated - showing 2 of 4 lines" in prompt_parts.session_preamble
     assert "memory.file.max_entrypoint_lines=2" in prompt_parts.session_preamble
     assert str(memory_path) in prompt_parts.session_preamble
 
@@ -1630,7 +1719,7 @@ async def test_file_backend_entrypoint_reports_truncation_when_preloaded_head_is
         config,
     )
 
-    assert "[Memory entrypoint truncated - showing the first 2 of 5 lines" in prompt_parts.session_preamble
+    assert "[Memory entrypoint truncated - showing 2 of 5 lines" in prompt_parts.session_preamble
     assert str(memory_path) in prompt_parts.session_preamble
 
 
@@ -1654,7 +1743,7 @@ async def test_file_backend_entrypoint_token_cap_keeps_whole_lines(
 
     assert lines[1] in prompt_parts.session_preamble
     assert lines[2] not in prompt_parts.session_preamble
-    assert "[Memory entrypoint truncated - showing the first 2 of 10 lines" in prompt_parts.session_preamble
+    assert "[Memory entrypoint truncated - showing 2 of 10 lines" in prompt_parts.session_preamble
     assert "memory.file.max_entrypoint_tokens=250" in prompt_parts.session_preamble
     assert str(memory_path) in prompt_parts.session_preamble
 
@@ -1677,7 +1766,7 @@ async def test_file_backend_entrypoint_token_cap_counts_newlines_across_many_sho
     prompt_parts = await build_memory_prompt_parts("What should I remember?", "general", storage_path, config)
 
     # 114 lines join to 797 characters (199 tokens); 115 would be 804 (201 tokens).
-    assert "[Memory entrypoint truncated - showing the first 114 of 200 lines" in prompt_parts.session_preamble
+    assert "[Memory entrypoint truncated - showing 114 of 200 lines" in prompt_parts.session_preamble
 
 
 @pytest.mark.asyncio
@@ -1697,7 +1786,7 @@ async def test_file_backend_entrypoint_token_cap_reports_an_oversized_first_line
     prompt_parts = await build_memory_prompt_parts("What should I remember?", "general", storage_path, config)
 
     assert "y" * 400 not in prompt_parts.session_preamble
-    assert "[Memory entrypoint truncated - showing the first 0 of 2 lines" in prompt_parts.session_preamble
+    assert "[Memory entrypoint truncated - showing 0 of 2 lines" in prompt_parts.session_preamble
 
 
 @pytest.mark.asyncio

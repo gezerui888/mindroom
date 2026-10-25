@@ -1701,6 +1701,9 @@ def test_unknown_checkpoint_schema_version_is_ignored(tmp_path: Path) -> None:
     _candidate_checkpoint_path(storage_path).write_text('{"schema_version": 9999}', encoding="utf-8")
     assert load_candidate_checkpoint(storage_path) is None
 
+    _candidate_checkpoint_path(storage_path).write_text('{"schema_version": [2]}', encoding="utf-8")
+    assert load_candidate_checkpoint(storage_path) is None
+
     _candidate_checkpoint_path(storage_path).write_text("not json", encoding="utf-8")
     assert load_candidate_checkpoint(storage_path) is None
 

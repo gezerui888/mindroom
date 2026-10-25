@@ -223,7 +223,7 @@ def _parse_failed(raw_failed: object) -> dict[str, CandidateFailure]:
 
 
 def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None:
-    if payload.get("schema_version") not in {_CANDIDATE_CHECKPOINT_SCHEMA_VERSION, _KEPT_CHECKPOINT_SCHEMA_VERSION}:
+    if payload.get("schema_version") not in (_CANDIDATE_CHECKPOINT_SCHEMA_VERSION, _KEPT_CHECKPOINT_SCHEMA_VERSION):
         return None
     collection = payload.get("collection")
     status = payload.get("status")

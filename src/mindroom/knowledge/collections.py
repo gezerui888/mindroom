@@ -226,27 +226,35 @@ def _delete_source_paths(chroma_collection: Collection, relative_paths: Sequence
         chroma_collection.delete(where={SOURCE_PATH_KEY: {"$in": batch}})
 
 
+def row_count(collection: KnowledgeCollection) -> int:
+    """Return how many rows one collection holds."""
+    return collection.collection().count()
+
+
 def replay_source_paths(
     space: CollectionSpace,
     *,
     source: KnowledgeCollection,
     target: str,
     relative_paths: Sequence[str],
-) -> None:
-    """Make ``target`` hold exactly ``source``'s rows for each path, copied verbatim.
+) -> int:
+    """Make ``target`` hold exactly ``source``'s rows for each path, copied verbatim; return the rows it deleted.
 
     ``target`` must be a collection readers can no longer select. A reader
     holds the lifetime lock shared from selecting a collection until it closes
     it, so taking the lock exclusively once waits out every reader that chose
     ``target`` before it stopped being selectable, and none sees the rewrite.
     Each read is bounded by one path and a page of rows, because Chroma binds
-    one SQL variable per returned row.
+    one SQL variable per returned row. Chroma's vector index keeps every
+    deleted row as a dead entry it never reuses, which the count reports.
     """
     with collection_lifetime_lock(space.storage_path, exclusive=True):
         pass
     source_rows = source.collection()
     target_rows = source.client.get_collection(name=target)
+    rows_before = target_rows.count()
     _delete_source_paths(target_rows, relative_paths)
+    deleted = rows_before - target_rows.count()
     for relative_path in relative_paths:
         offset = 0
         while True:
@@ -268,6 +276,7 @@ def replay_source_paths(
             if len(ids) < _REPLAY_PAGE_ROWS:
                 break
             offset += len(ids)
+    return deleted
 
 
 def _source_content_hash(source_metadata: Mapping[str, Any]) -> str:

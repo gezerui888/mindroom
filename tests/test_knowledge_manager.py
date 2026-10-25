@@ -9437,6 +9437,16 @@ async def test_git_pull_that_changes_one_file_only_reindexes_that_file(
         "rewritten body 2",
     ]
 
+    (remote_work / "doc3.md").write_text("rewritten body 3", encoding="utf-8")
+    await _git(remote_work, "commit", "-am", "change another file")
+    await _git(remote_work, "push", str(remote_bare), "main")
+    with capture_logs() as logs:
+        third = await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
+
+    assert third.indexed_count == 1
+    [delta] = [log for log in logs if log["event"] == "Used knowledge Git delta for candidate reconciliation"]
+    assert delta["scanned_count"] == 1, "resuming the kept collection rescanned the whole checkout"
+
 
 @pytest.mark.asyncio
 async def test_linked_worktree_checkout_is_refused_and_not_listed(tmp_path: Path) -> None:

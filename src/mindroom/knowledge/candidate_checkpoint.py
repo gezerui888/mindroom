@@ -98,8 +98,8 @@ class CandidateCheckpoint:
     #: The collection whose publication retired this one and brought it level
     #: with itself; None for a candidate a refresh is building.
     retired_by: str | None = None
-    #: Files replayed into a retired collection since a refresh last copied the
-    #: published index whole, bounding the replaced vectors its index retains.
+    #: Rows replays deleted from the retired collections since a refresh last
+    #: copied the published index whole; their vector index keeps each.
     churn: int = 0
     #: Journal entries replayed when this checkpoint was loaded. Not persisted:
     #: it exists so a resumed run inherits the compaction bound instead of

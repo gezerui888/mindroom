@@ -198,6 +198,10 @@ class _FakeCollection:
             )
             _FakeVectorDb.store[self._name] = records
 
+    def count(self) -> int:
+        with _FakeVectorDb.lock:
+            return len(_FakeVectorDb.store.get(self._name, []))
+
     def delete(self, *, where: dict[str, object]) -> None:
         validate_where_operands(where)
         key, condition = next(iter(where.items()))
@@ -3653,41 +3657,66 @@ async def test_a_refresh_after_the_first_copy_writes_only_the_rows_that_changed(
     kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
     assert kept is not None
     assert kept.collection == published
-    assert kept.churn == 5, "each refresh's replayed files must count toward the next whole copy"
+    assert kept.churn == 4, "each replay's deleted rows must count toward the next whole copy"
 
 
 @pytest.mark.asyncio
-async def test_replays_adding_up_to_the_corpus_make_the_next_refreshes_copy_both_collections_afresh(
+async def test_replays_that_delete_as_many_rows_as_the_index_holds_make_both_collections_copied_afresh(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     embedder: _RecordingEmbedder,
 ) -> None:
-    """Replaced vectors stay in a collection's vector index, so churn must eventually cost a whole copy again."""
+    """Deleted rows stay in a collection's vector index, so churn must eventually cost a whole copy again.
+
+    Churn counts rows, not files: one large file rewritten every refresh
+    leaves as many dead entries as its chunks.
+    """
     docs_path = tmp_path / "docs"
-    names = _write_corpus(docs_path, 4)
-    config = _config(tmp_path, docs_path)
+    names = _write_corpus(docs_path, 3)
+    large = docs_path / "large.md"
+    large.write_text(_overlapping_body(300), encoding="utf-8")
+    config = _config(tmp_path, docs_path, chunk_size=500)
     runtime_paths = runtime_paths_for(config)
     storage = _storage_path(config, runtime_paths)
-    worn, published = await _publish_twice(config, docs_path, names)
-    kept = load_candidate_checkpoint(storage)
-    assert kept is not None
-    save_candidate_checkpoint(storage, replace(kept, churn=len(kept.completed)))
-    (docs_path / names[1]).write_text("second change", encoding="utf-8")
+    await _manager(config).reindex_all()
+    first = _published_state(config, runtime_paths)
+    assert first is not None
+    assert first.collection is not None
+    large_rows = sum(record.metadata["source_path"] == "large.md" for record in _FakeVectorDb.store[first.collection])
+    assert large_rows > len(names), "the large file must outweigh the others for this to prove anything"
+
+    # Replay pages smaller than the large file, so bringing it level takes several queries.
+    monkeypatch.setattr(knowledge_collections, "_REPLAY_PAGE_ROWS", 2)
+    for version in (1, 2):
+        large.write_text(_overlapping_body(300).replace("token0000", f"tokenv{version:03d}"), encoding="utf-8")
+        assert (await _manager(config).reindex_all()).published
+        kept = load_candidate_checkpoint(storage)
+        assert kept is not None
+        assert kept.churn == version * large_rows
+        state = _published_state(config, runtime_paths)
+        assert state is not None
+        assert state.collection is not None
+        assert _rows(kept.collection) == _rows(state.collection), "a page of the large file was not replayed"
+    worn = kept.collection
+    published = _published_state(config, runtime_paths)
+    assert published is not None
+    large.write_text(_overlapping_body(300).replace("token0000", "tokenv003"), encoding="utf-8")
     _FakeVectorDb.writes = []
-    embedder.embedded_texts.clear()
 
     assert (await _manager(config).reindex_all()).published
 
-    assert embedder.embedded_texts == ["second change"]
-    assert sum(_FakeVectorDb.writes) == 4, "the worn collection was resumed instead of copied afresh"
+    assert sum(_FakeVectorDb.writes) == len(names) + large_rows, "the worn collection was resumed, not copied afresh"
     state = _published_state(config, runtime_paths)
     assert state is not None
     assert state.collection == worn
-    assert published not in _FakeVectorDb.store, "the published collection shares the churn, so it must not be kept"
+    assert published.collection not in _FakeVectorDb.store, "it shares the churn, so it must not be kept"
     assert load_candidate_checkpoint(storage) is None
 
-    (docs_path / names[2]).write_text("third change", encoding="utf-8")
+    (docs_path / names[0]).write_text("small change", encoding="utf-8")
+    embedder.embedded_texts.clear()
     assert (await _manager(config).reindex_all()).published
 
+    assert embedder.embedded_texts == ["small change"]
     fresh = load_candidate_checkpoint(storage)
     assert fresh is not None
     assert fresh.collection == worn
@@ -3789,6 +3818,42 @@ async def test_a_crash_while_updating_the_retired_collection_keeps_the_new_index
 
 
 @pytest.mark.asyncio
+async def test_a_failure_after_the_kept_checkpoint_lands_still_spares_the_collection_it_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: _RecordingEmbedder,
+) -> None:
+    """Deleting a collection a landed checkpoint names would cost re-embedding the whole corpus."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    await _manager(config).reindex_all()
+    original_save = knowledge_manager_module.save_candidate_checkpoint
+
+    def _save_then_fail(base_storage_path: Path, checkpoint: CandidateCheckpoint) -> CandidateCheckpoint:
+        saved = original_save(base_storage_path, checkpoint)
+        if checkpoint.retired_by is not None:
+            message = "the superseded journal could not be removed"
+            raise OSError(message)
+        return saved
+
+    (docs_path / names[0]).write_text("first change", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        patch.setattr(knowledge_manager_module, "save_candidate_checkpoint", _save_then_fail)
+        assert (await _manager(config).reindex_all()).published
+    kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
+    assert kept is not None
+    assert kept.collection in _FakeVectorDb.store
+    (docs_path / names[1]).write_text("second change", encoding="utf-8")
+    embedder.embedded_texts.clear()
+
+    assert (await _manager(config).reindex_all()).published
+
+    assert embedder.embedded_texts == ["second change"], "the named collection was deleted, so every file was embedded"
+
+
+@pytest.mark.asyncio
 async def test_changed_chunking_rebuilds_every_vector_instead_of_resuming_the_kept_collection(
     tmp_path: Path,
     embedder: _RecordingEmbedder,
@@ -3845,6 +3910,43 @@ async def test_an_interrupted_forced_rebuild_never_brings_back_the_vectors_it_re
     assert state.collection == forced.collection
     assert distrusted not in _FakeVectorDb.store, "the replaced vectors were kept for the next refresh"
     assert load_candidate_checkpoint(_storage_path(config, runtime_paths)) is None
+
+
+@pytest.mark.asyncio
+async def test_a_kept_collection_holding_an_unpublished_change_is_not_kept_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the kept collection records a change the published index lacks, it no longer mirrors it.
+
+    Treating it as a copy anyway would keep the published collection with the
+    kept one's claims but its own older rows, so a later publication would
+    serve stale text under a current claim.
+    """
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    await _publish_twice(config, docs_path, names)
+
+    async def _crash_before_publishing(*_args: object, **_kwargs: object) -> None:
+        raise _Crash
+
+    (docs_path / names[1]).write_text("second change", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        patch.setattr(KnowledgeManager, "_publish_candidate", _crash_before_publishing)
+        with pytest.raises(_Crash):
+            await _manager(config).reindex_all()
+
+    assert (await _manager(config).reindex_all()).published
+    (docs_path / names[2]).write_text("third change", encoding="utf-8")
+    assert (await _manager(config).reindex_all()).published
+
+    state = _published_state(config, runtime_paths)
+    assert state is not None
+    assert state.collection is not None
+    texts = sorted(text for _identifier, _path, text in _rows(state.collection))
+    assert texts == ["first change", "second change", "third change"], "stale text survived under a current claim"
 
 
 @pytest.mark.asyncio

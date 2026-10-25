@@ -54,6 +54,7 @@ from mindroom.knowledge.collections import (
     KnowledgeChunk,
     candidate_collection_name,
     cleanup_superseded_collections,
+    copy_collection,
     delete_collection,
     delete_source_path_vectors,
     open_collection,
@@ -218,8 +219,9 @@ class _CandidateRun:
     journal_appends: int = 0
     resumed: bool = False
     published: bool = False
-    #: The published collection this candidate began as a row-for-row copy of,
-    #: apart from ``diverged``, for publication to keep; None to delete it.
+    #: The published collection whose rows this candidate's equal outside
+    #: ``diverged``, which publication brings level and keeps; None when no
+    #: such collection is known, and publication deletes it instead.
     copy_of: str | None = None
     #: Paths whose rows may differ from ``copy_of``'s: left out of the copy,
     #: dropped, or written since.
@@ -233,9 +235,6 @@ class _OpenedCandidate:
     checkpoint: CandidateCheckpoint
     collection: KnowledgeCollection
     reused: dict[str, FileSignature] = field(default_factory=dict)
-    #: Published paths the copy left out, when every published row names its
-    #: path; None when publication must not keep the published collection.
-    uncopied: frozenset[str] | None = None
     resumed: bool = False
 
 
@@ -1360,11 +1359,13 @@ class KnowledgeManager:
         account for. That copy-specific state is recoverable rather than
         prevented: it leaves ``completed`` empty with a non-empty collection,
         which ``_candidate_holds_unclaimed_rows`` detects on the next open.
+        The same write records which collection the copy matches and where
+        it does not, so an interrupted refresh can still keep that collection.
         """
         checkpoint = await asyncio.to_thread(
             save_candidate_checkpoint,
             self._base_storage_path,
-            replace(checkpoint, completed={}, failed={}, retired_by=None),
+            replace(checkpoint, completed={}, failed={}, copy_of=None, diverged=frozenset(), churn=0),
         )
         collection = open_collection(self._collections, checkpoint.collection)
         await asyncio.to_thread(reset_collection, collection)
@@ -1374,21 +1375,21 @@ class KnowledgeManager:
             candidate=collection,
             published_collection=published_collection,
         )
-        if reused:
-            checkpoint = await _shielded_write(
-                asyncio.to_thread(
-                    save_candidate_checkpoint,
-                    self._base_storage_path,
-                    replace(checkpoint, completed=reused),
+        checkpoint = await _shielded_write(
+            asyncio.to_thread(
+                save_candidate_checkpoint,
+                self._base_storage_path,
+                replace(
+                    checkpoint,
+                    completed=reused,
+                    copy_of=None if uncopied is None else published_collection,
+                    diverged=uncopied or frozenset(),
                 ),
-            )
-        return _OpenedCandidate(checkpoint=checkpoint, collection=collection, reused=reused, uncopied=uncopied)
+            ),
+        )
+        return _OpenedCandidate(checkpoint=checkpoint, collection=collection, reused=reused)
 
-    async def _resume_candidate_collection(
-        self,
-        checkpoint: CandidateCheckpoint,
-        persisted_state: PublishedIndexState | None,
-    ) -> _OpenedCandidate:
+    async def _resume_candidate_collection(self, checkpoint: CandidateCheckpoint) -> _OpenedCandidate:
         """Continue a candidate whose recorded work is still backed by its collection."""
         if not await asyncio.to_thread(
             chroma_collection_exists,
@@ -1404,28 +1405,44 @@ class KnowledgeManager:
             # have damaged the published one, and a full rebuild is the safe repair.
             return await self._rebuild_candidate_collection(checkpoint, published_collection=None)
         collection = open_collection(self._collections, checkpoint.collection)
-        # A candidate mirroring the published index is the collection the last
-        # publication retired and brought level with it.
-        mirrors = checkpoint.mirrors(persisted_state)
-        if mirrors and checkpoint.churn > await asyncio.to_thread(row_count, collection):
-            # Each replay leaves the rows it deleted in the vector index as dead
-            # entries. Once they outnumber the live rows, copy afresh and keep
-            # nothing, because the published collection absorbed the same
-            # changes; the next refresh copies again and keeps this fresh copy.
-            logger.info(
-                "Copying the published knowledge index afresh to shed replaced vectors",
-                base_id=self.base_id,
-                collection=checkpoint.collection,
-                churn=checkpoint.churn,
-            )
-            opened = await self._rebuild_candidate_collection(checkpoint, published_collection=checkpoint.retired_by)
-            return replace(opened, uncopied=None)
+        if checkpoint.churn > await asyncio.to_thread(row_count, collection):
+            collection.close()
+            checkpoint = await self._shed_dead_entries(checkpoint)
+            collection = open_collection(self._collections, checkpoint.collection)
         return _OpenedCandidate(
             checkpoint=checkpoint,
             collection=collection,
-            uncopied=checkpoint.diverged if mirrors else None,
             resumed=True,
         )
+
+    async def _shed_dead_entries(self, checkpoint: CandidateCheckpoint) -> CandidateCheckpoint:
+        """Move a candidate whose dead vector-index entries outnumber its rows into a fresh collection.
+
+        Chroma never reuses the slot of a deleted row, so the live rows are
+        copied verbatim into a new collection, which then carries the same
+        claims and records. The checkpoint names it only once the copy lands,
+        so an interruption leaves an unnamed copy for cleanup to reclaim and
+        the old collection in place.
+        """
+        logger.info(
+            "Copying a knowledge candidate into a fresh collection to shed replaced vectors",
+            base_id=self.base_id,
+            collection=checkpoint.collection,
+            churn=checkpoint.churn,
+        )
+        fresh = candidate_collection_name(self._collections)
+        await _shielded_write(
+            asyncio.to_thread(copy_collection, self._collections, source=checkpoint.collection, target=fresh),
+        )
+        compacted = await _shielded_write(
+            asyncio.to_thread(
+                save_candidate_checkpoint,
+                self._base_storage_path,
+                replace(checkpoint, collection=fresh, churn=0),
+            ),
+        )
+        await delete_collection(self._collections, checkpoint.collection)
+        return compacted
 
     async def _open_candidate_run(self, *, force_reindex: bool = False) -> _CandidateRun:
         """Resolve the durable candidate to continue, or start one clean candidate."""
@@ -1512,9 +1529,10 @@ class KnowledgeManager:
                 else None
             )
         else:
-            opened = await self._resume_candidate_collection(checkpoint, persisted_state)
+            opened = await self._resume_candidate_collection(checkpoint)
             baseline_revision = checkpoint.target_revision
         checkpoint = opened.checkpoint
+        copy_of = checkpoint.copy_of if checkpoint.mirrors(persisted_state) else None
 
         run = _CandidateRun(
             checkpoint=checkpoint,
@@ -1528,8 +1546,8 @@ class KnowledgeManager:
             verified=set(opened.reused),
             journal_appends=checkpoint.replayed_journal_entries,
             resumed=opened.resumed,
-            copy_of=None if opened.uncopied is None else published_collection,
-            diverged=set(opened.uncopied or ()),
+            copy_of=copy_of,
+            diverged=set(checkpoint.diverged) if copy_of else set(),
         )
         # Reconcile candidates abandoned by earlier crashed refreshes now, so
         # storage stays bounded even when a build never reaches publication.
@@ -1574,8 +1592,8 @@ class KnowledgeManager:
         can reach that state: the checkpoint and its collection would otherwise
         sit on disk indefinitely.
         Retiring it discards partial forced-rebuild progress, so a later forced
-        rebuild starts from zero. A candidate mirroring the published index is
-        kept: it is the retired collection waiting for the next change.
+        rebuild starts from zero. A candidate that copies the published index
+        is kept, so the next change resumes it instead of copying again.
         """
         checkpoint = await asyncio.to_thread(load_candidate_checkpoint, self._base_storage_path)
         if checkpoint is None or checkpoint.mirrors(published_state):
@@ -1621,7 +1639,8 @@ class KnowledgeManager:
         if not relative_paths:
             return
         await self._record_diverged(run, relative_paths)
-        await asyncio.to_thread(delete_source_path_vectors, run.collection, relative_paths)
+        deleted = await asyncio.to_thread(delete_source_path_vectors, run.collection, relative_paths)
+        run.checkpoint = replace(run.checkpoint, churn=run.checkpoint.churn + deleted)
         for relative_path in relative_paths:
             run.completed.pop(relative_path, None)
             run.failed.pop(relative_path, None)
@@ -1637,9 +1656,9 @@ class KnowledgeManager:
         """Journal paths whose rows the run is about to change, when it copies the published collection.
 
         The entry lands before the rows change, so an interrupted refresh
-        leaves a kept collection that still records exactly where it can
-        differ from the published one, and the next refresh can still bring
-        the published one level and keep it.
+        leaves a candidate that still records exactly where it can differ
+        from the published collection, and the refresh that publishes it can
+        still bring that collection level and keep it.
         """
         if run.copy_of is None:
             return
@@ -1797,6 +1816,7 @@ class KnowledgeManager:
                 # completed files: status subtracts completed from this to
                 # report how much work is still outstanding.
                 total_files=run.total_files,
+                copy_of=run.copy_of,
                 diverged=frozenset(run.diverged),
             ),
         )
@@ -1995,7 +2015,8 @@ class KnowledgeManager:
             if unclaimed:
                 # A crash between a file's rows and its claim leaves rows no
                 # claim describes; publication must neither serve nor replay them.
-                await asyncio.to_thread(delete_source_path_vectors, run.collection, unclaimed)
+                deleted = await asyncio.to_thread(delete_source_path_vectors, run.collection, unclaimed)
+                run.checkpoint = replace(run.checkpoint, churn=run.checkpoint.churn + deleted)
             await self._publish_candidate(run, candidate_source_signature)
             return
 
@@ -2063,8 +2084,9 @@ class KnowledgeManager:
                         target_revision=run.baseline_revision,
                         total_files=len(run.completed),
                         completed=dict(run.completed),
-                        retired_by=run.collection.name,
-                        churn=run.checkpoint.churn + deleted,
+                        copy_of=run.collection.name,
+                        churn=run.checkpoint.copy_churn + deleted,
+                        copy_churn=run.checkpoint.churn,
                     ),
                 ),
             )

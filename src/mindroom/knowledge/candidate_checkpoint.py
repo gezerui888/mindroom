@@ -40,11 +40,16 @@ if TYPE_CHECKING:
 
 #: Bumped whenever the persisted candidate layout changes incompatibly. An
 #: unknown version is treated as "no resumable candidate" rather than an error.
-_CANDIDATE_CHECKPOINT_SCHEMA_VERSION = 2
-#: Written instead while ``retired_by`` is set. Releases that cannot honor the
-#: record refuse it and leave the kept collection to cleanup, rather than
-#: changing that collection while the record still claims it matches.
-_KEPT_CHECKPOINT_SCHEMA_VERSION = 3
+#: Layout 3 records which published collection a candidate copies and where it
+#: diverged; releases that cannot honor that refuse it and copy afresh, rather
+#: than changing the collection while the record still claims a match.
+_CANDIDATE_CHECKPOINT_SCHEMA_VERSION = 3
+# LEGACY_COMPAT: Candidate checkpoints in layout 2, without a copy record.
+# Legacy format: Snapshots with schema_version 2, which carry no copy_of, diverged, churn or copy_churn keys.
+# Last legacy release: the last release before mindroom-ai/mindroom#3166 (v2026.10.534 when it was written); replacement: the release containing #3166 writes layout 3.
+# Handling: Load them as ordinary candidates with no copy record, nothing diverged and no churn, so a resumed one publishes without keeping the published collection and the next refresh copies it as before.
+# Coverage: tests/test_knowledge_resumable_refresh.py::test_a_layout_2_checkpoint_resumes_as_an_ordinary_candidate.
+_LAYOUT_2_SCHEMA_VERSION = 2
 
 _CANDIDATE_CHECKPOINT_FILENAME = "candidate_index.json"
 _CANDIDATE_JOURNAL_FILENAME = "candidate_index.jsonl"
@@ -98,15 +103,18 @@ class CandidateCheckpoint:
     failed: Mapping[str, CandidateFailure] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
-    #: The collection whose publication retired this one and brought it level
-    #: with itself; None for a candidate a refresh is building.
-    retired_by: str | None = None
-    #: Paths whose rows may differ from ``retired_by``'s, each recorded before
-    #: a refresh changes its rows.
+    #: The published collection whose rows this candidate's equal outside
+    #: ``diverged``: the one it was copied from, or the one whose publication
+    #: retired it and brought it level. None when no such collection is known.
+    copy_of: str | None = None
+    #: Paths whose rows may differ from ``copy_of``'s, each recorded before a
+    #: refresh changes its rows.
     diverged: frozenset[str] = frozenset()
-    #: Rows replays deleted from the retired collections since a refresh last
-    #: copied the published index whole; their vector index keeps each.
+    #: Rows deleted from this candidate's collection since it was created.
+    #: Chroma's vector index keeps each as a dead entry it never reuses.
     churn: int = 0
+    #: The same count for the collection ``copy_of`` names.
+    copy_churn: int = 0
     #: Journal entries replayed when this checkpoint was loaded. Not persisted:
     #: it exists so a resumed run inherits the compaction bound instead of
     #: restarting the count and letting the journal grow without limit across
@@ -119,17 +127,17 @@ class CandidateCheckpoint:
         return len(self.completed)
 
     def mirrors(self, state: PublishedIndexState | None) -> bool:
-        """Return whether this is the retired collection, equal to the index ``state`` publishes outside ``diverged``.
+        """Return whether this candidate equals the index ``state`` publishes outside ``diverged``.
 
-        Publication keeps the collection it retires as the next candidate once
-        that collection holds the new index's rows again, and records which
-        collection it matches. A refresh records every path in ``diverged``
-        before it drops or writes that path's rows, so the record proves where
-        the two can differ. Claims could not: a forced rebuild produces the
-        same claims over vectors the operator stopped trusting, and a write
-        that crashes before its claim leaves rows no claim describes.
+        A candidate copied from the published collection, or the collection a
+        publication retired and brought level, records which collection it
+        matches. A refresh records every path in ``diverged`` before it drops
+        or writes that path's rows, so the record proves where the two can
+        differ. Claims could not: a forced rebuild produces the same claims
+        over vectors the operator stopped trusting, and a write that crashes
+        before its claim leaves rows no claim describes.
         """
-        return state is not None and self.retired_by is not None and state.collection == self.retired_by
+        return state is not None and self.copy_of is not None and state.collection == self.copy_of
 
 
 def _candidate_checkpoint_path(base_storage_path: Path) -> Path:
@@ -166,9 +174,7 @@ def _parse_failure(value: object) -> CandidateFailure | None:
 
 def _snapshot_payload(checkpoint: CandidateCheckpoint) -> dict[str, object]:
     return {
-        "schema_version": (
-            _CANDIDATE_CHECKPOINT_SCHEMA_VERSION if checkpoint.retired_by is None else _KEPT_CHECKPOINT_SCHEMA_VERSION
-        ),
+        "schema_version": _CANDIDATE_CHECKPOINT_SCHEMA_VERSION,
         "collection": checkpoint.collection,
         "status": checkpoint.status,
         "settings": checkpoint.settings.to_metadata(),
@@ -187,9 +193,10 @@ def _snapshot_payload(checkpoint: CandidateCheckpoint) -> dict[str, object]:
         },
         "created_at": checkpoint.created_at,
         "updated_at": checkpoint.updated_at,
-        "retired_by": checkpoint.retired_by,
+        "copy_of": checkpoint.copy_of,
         "diverged": sorted(checkpoint.diverged),
         "churn": checkpoint.churn,
+        "copy_churn": checkpoint.copy_churn,
     }
 
 
@@ -227,7 +234,7 @@ def _parse_failed(raw_failed: object) -> dict[str, CandidateFailure]:
 
 
 def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None:
-    if payload.get("schema_version") not in (_CANDIDATE_CHECKPOINT_SCHEMA_VERSION, _KEPT_CHECKPOINT_SCHEMA_VERSION):
+    if payload.get("schema_version") not in (_CANDIDATE_CHECKPOINT_SCHEMA_VERSION, _LAYOUT_2_SCHEMA_VERSION):
         return None
     collection = payload.get("collection")
     status = payload.get("status")
@@ -243,9 +250,8 @@ def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None
     total_files = payload.get("total_files")
     created_at = payload.get("created_at")
     updated_at = payload.get("updated_at")
-    retired_by = payload.get("retired_by")
+    copy_of = payload.get("copy_of")
     raw_diverged = payload.get("diverged")
-    churn = payload.get("churn")
     return CandidateCheckpoint(
         collection=collection,
         settings=settings,
@@ -256,12 +262,17 @@ def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None
         failed=failed,
         created_at=created_at if isinstance(created_at, str) else "",
         updated_at=updated_at if isinstance(updated_at, str) else "",
-        retired_by=retired_by if isinstance(retired_by, str) and retired_by else None,
+        copy_of=copy_of if isinstance(copy_of, str) and copy_of else None,
         diverged=frozenset(
             path for path in (raw_diverged if isinstance(raw_diverged, list) else ()) if isinstance(path, str)
         ),
-        churn=churn if isinstance(churn, int) and not isinstance(churn, bool) and churn > 0 else 0,
+        churn=_count(payload.get("churn")),
+        copy_churn=_count(payload.get("copy_churn")),
     )
+
+
+def _count(value: object) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
 def _journal_entries(journal_path: Path) -> list[Mapping[str, object]]:

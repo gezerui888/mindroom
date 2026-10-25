@@ -95,6 +95,7 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
     from mindroom.embeddings.base import Embedder
     from mindroom.knowledge.indexing_config import IndexingSettings
+    from mindroom.knowledge.readers import Reader
 
 
 # --------------------------------------------------------------------------
@@ -3661,85 +3662,11 @@ async def test_a_refresh_after_the_first_copy_writes_only_the_rows_that_changed(
     kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
     assert kept is not None
     assert kept.collection == published
-    assert kept.churn == 4, "each replay's deleted rows must count toward the next whole copy"
+    assert (kept.churn, kept.copy_churn) == (3, 4), "every deleted row must count toward the next whole copy"
 
 
-@pytest.mark.asyncio
-async def test_replays_that_delete_as_many_rows_as_the_index_holds_make_both_collections_copied_afresh(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    embedder: _RecordingEmbedder,
-) -> None:
-    """Deleted rows stay in a collection's vector index, so churn must eventually cost a whole copy again.
-
-    Churn counts rows, not files: one large file rewritten every refresh
-    leaves as many dead entries as its chunks.
-    """
-    docs_path = tmp_path / "docs"
-    names = _write_corpus(docs_path, 3)
-    large = docs_path / "large.md"
-    large.write_text(_overlapping_body(300), encoding="utf-8")
-    config = _config(tmp_path, docs_path, chunk_size=500)
-    runtime_paths = runtime_paths_for(config)
-    storage = _storage_path(config, runtime_paths)
-    await _manager(config).reindex_all()
-    first = _published_state(config, runtime_paths)
-    assert first is not None
-    assert first.collection is not None
-    large_rows = sum(record.metadata["source_path"] == "large.md" for record in _FakeVectorDb.store[first.collection])
-    assert large_rows > len(names), "the large file must outweigh the others for this to prove anything"
-
-    # Replay pages smaller than the large file, so bringing it level takes several queries.
-    monkeypatch.setattr(knowledge_collections, "_REPLAY_PAGE_ROWS", 2)
-    for version in (1, 2):
-        large.write_text(_overlapping_body(300).replace("token0000", f"tokenv{version:03d}"), encoding="utf-8")
-        assert (await _manager(config).reindex_all()).published
-        kept = load_candidate_checkpoint(storage)
-        assert kept is not None
-        assert kept.churn == version * large_rows
-        state = _published_state(config, runtime_paths)
-        assert state is not None
-        assert state.collection is not None
-        assert _rows(kept.collection) == _rows(state.collection), "a page of the large file was not replayed"
-    worn = kept.collection
-    published = _published_state(config, runtime_paths)
-    assert published is not None
-    assert kept.churn > len(_FakeVectorDb.store[worn]), "this refresh must find more dead entries than live rows"
-    large.write_text(_overlapping_body(300).replace("token0000", "tokenv003"), encoding="utf-8")
-    _FakeVectorDb.writes = []
-
-    assert (await _manager(config).reindex_all()).published
-
-    assert sum(_FakeVectorDb.writes) == len(names) + large_rows, "the worn collection was resumed, not copied afresh"
-    state = _published_state(config, runtime_paths)
-    assert state is not None
-    assert state.collection == worn
-    assert published.collection not in _FakeVectorDb.store, "it shares the churn, so it must not be kept"
-    assert load_candidate_checkpoint(storage) is None
-
-    (docs_path / names[0]).write_text("small change", encoding="utf-8")
-    embedder.embedded_texts.clear()
-    assert (await _manager(config).reindex_all()).published
-
-    assert embedder.embedded_texts == ["small change"]
-    fresh = load_candidate_checkpoint(storage)
-    assert fresh is not None
-    assert fresh.collection == worn
-    assert fresh.churn == 1
-
-
-@pytest.mark.asyncio
-async def test_failed_refreshes_between_changes_keep_dead_index_entries_bounded(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    embedder: _RecordingEmbedder,
-) -> None:
-    """A failed refresh must not reset the count of rows its kept collection's vector index still holds dead."""
-    docs_path = tmp_path / "docs"
-    names = _write_corpus(docs_path, 4)
-    large = docs_path / "large.md"
-    large.write_text(_overlapping_body(300), encoding="utf-8")
-    config = _config(tmp_path, docs_path, chunk_size=500)
+def _count_dead_rows(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count, per collection, the rows deleted since it was created: the dead entries its vector index keeps."""
     dead: dict[str, int] = {}
     original_delete = _FakeCollection.delete
     original_create = _FakeClient.create_collection
@@ -3755,6 +3682,79 @@ async def test_failed_refreshes_between_changes_keep_dead_index_entries_bounded(
 
     monkeypatch.setattr(_FakeCollection, "delete", _counting_delete)
     monkeypatch.setattr(_FakeClient, "create_collection", _fresh_create)
+    return dead
+
+
+def _assert_dead_rows_bounded(dead: dict[str, int], slack: int, when: str) -> None:
+    for name, records in _FakeVectorDb.store.items():
+        assert dead.get(name, 0) <= len(records) + slack, (
+            f"{name} holds {dead.get(name, 0)} dead entries over {len(records)} live rows {when}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_large_file_rewritten_every_refresh_keeps_both_collections_dead_entries_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: _RecordingEmbedder,
+) -> None:
+    """Deleted rows stay in a collection's vector index, so churn must eventually cost a whole copy again.
+
+    Churn counts rows, not files: one large file rewritten every refresh
+    leaves as many dead entries as its chunks, in both collections.
+    """
+    docs_path = tmp_path / "docs"
+    _write_corpus(docs_path, 12)
+    large = docs_path / "large.md"
+    large.write_text(_overlapping_body(300), encoding="utf-8")
+    config = _config(tmp_path, docs_path, chunk_size=500)
+    runtime_paths = runtime_paths_for(config)
+    dead = _count_dead_rows(monkeypatch)
+    # Replay pages smaller than the large file, so bringing it level takes several queries.
+    monkeypatch.setattr(knowledge_collections, "_REPLAY_PAGE_ROWS", 2)
+    await _manager(config).reindex_all()
+    first = _published_state(config, runtime_paths)
+    assert first is not None
+    assert first.collection is not None
+    large_rows = sum(record.metadata["source_path"] == "large.md" for record in _FakeVectorDb.store[first.collection])
+    assert large_rows > 3, "the large file must be several chunks for this to prove anything"
+
+    shed = 0
+    for version in range(1, 13):
+        large.write_text(_overlapping_body(300).replace("token0000", f"tokenv{version:03d}"), encoding="utf-8")
+        embedder.embedded_texts.clear()
+        with capture_logs() as logs:
+            assert (await _manager(config).reindex_all()).published
+        shed += sum(log["event"].startswith("Copying a knowledge candidate into a fresh collection") for log in logs)
+        assert not [text for text in embedder.embedded_texts if text.startswith("content")], (
+            "copying a candidate afresh lost rows it then had to embed again"
+        )
+        _assert_dead_rows_bounded(dead, 2 * large_rows, f"after {version} rewrites")
+        state = _published_state(config, runtime_paths)
+        kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
+        assert state is not None
+        assert state.collection is not None
+        assert kept is not None
+        assert _rows(kept.collection) == _rows(state.collection), "a page of the large file was not replayed"
+
+    # Each refresh leaves the large file's chunks dead in both collections, so each is copied afresh about
+    # every other time it is resumed: never would leave the bound to luck, every time would waste copies.
+    assert 2 <= shed <= 6, f"candidates were copied afresh {shed} times in 12 refreshes"
+
+
+@pytest.mark.asyncio
+async def test_failed_refreshes_between_changes_keep_dead_index_entries_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    embedder: _RecordingEmbedder,
+) -> None:
+    """A failed refresh must not reset the count of rows its kept collection's vector index still holds dead."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 4)
+    large = docs_path / "large.md"
+    large.write_text(_overlapping_body(300), encoding="utf-8")
+    config = _config(tmp_path, docs_path, chunk_size=500)
+    dead = _count_dead_rows(monkeypatch)
     await _manager(config).reindex_all()
     first = _published_state(config, runtime_paths_for(config))
     assert first is not None
@@ -3770,10 +3770,92 @@ async def test_failed_refreshes_between_changes_keep_dead_index_entries_bounded(
         (docs_path / names[version % len(names)]).write_text(f"small change {version}", encoding="utf-8")
         assert (await _manager(config).reindex_all()).published
 
-        for name, records in _FakeVectorDb.store.items():
-            assert dead.get(name, 0) <= len(records) + 2 * large_rows, (
-                f"{name} holds {dead.get(name, 0)} dead entries over {len(records)} live rows after {version} cycles"
-            )
+        _assert_dead_rows_bounded(dead, 2 * large_rows, f"after {version} cycles")
+
+
+@pytest.mark.asyncio
+async def test_refreshes_that_keep_failing_while_a_file_changes_keep_dead_index_entries_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A candidate that never publishes still rewrites changed files, and each rewrite leaves dead entries."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 4)
+    large = docs_path / "large.md"
+    large.write_text(_overlapping_body(300), encoding="utf-8")
+    config = _config(tmp_path, docs_path, chunk_size=500)
+    dead = _count_dead_rows(monkeypatch)
+    await _manager(config).reindex_all()
+    (docs_path / names[0]).write_text("first change", encoding="utf-8")
+    assert (await _manager(config).reindex_all()).published
+    published = _published_state(config, runtime_paths_for(config))
+    assert published is not None
+    assert published.collection is not None
+    large_rows = sum(
+        record.metadata["source_path"] == "large.md" for record in _FakeVectorDb.store[published.collection]
+    )
+    original_read = KnowledgeManager._read_documents
+
+    def _fail_one_file(self: KnowledgeManager, reader: Reader, snapshot: Path, relative_path: str) -> list[Document]:
+        if relative_path == names[1]:
+            message = "this file cannot be parsed"
+            raise ValueError(message)
+        return original_read(self, reader, snapshot, relative_path)
+
+    monkeypatch.setattr(KnowledgeManager, "_read_documents", _fail_one_file)
+    (docs_path / names[1]).write_text("unparseable", encoding="utf-8")
+    for version in range(1, 13):
+        large.write_text(_overlapping_body(300).replace("token0000", f"tokenv{version:03d}"), encoding="utf-8")
+        assert not (await _manager(config).reindex_all()).published
+        _assert_dead_rows_bounded(dead, 2 * large_rows, f"after {version} failed refreshes")
+
+    monkeypatch.setattr(KnowledgeManager, "_read_documents", original_read)
+    assert (await _manager(config).reindex_all()).published
+    _assert_dead_rows_bounded(dead, 2 * large_rows, "after the recovery")
+
+
+@pytest.mark.asyncio
+async def test_rows_a_crash_wrote_into_a_fresh_copy_before_their_claim_are_never_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first copy of the published index records where it diverges too, so its unclaimed rows are dropped."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    await _manager(config).reindex_all()
+    original_write = knowledge_manager_module.write_source_rows
+
+    def _crash_after_writing(
+        collection: KnowledgeCollection,
+        *,
+        relative_path: str,
+        signature: FileSignature,
+        rows: Sequence[tuple[KnowledgeChunk, Sequence[float]]],
+    ) -> None:
+        original_write(collection, relative_path=relative_path, signature=signature, rows=rows)
+        raise _Crash
+
+    (docs_path / "added.md").write_text("added body", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        patch.setattr(knowledge_manager_module, "write_source_rows", _crash_after_writing)
+        with pytest.raises(_Crash):
+            await _manager(config).reindex_all()
+    (docs_path / "added.md").unlink()
+    (docs_path / names[1]).write_text("second change", encoding="utf-8")
+
+    assert (await _manager(config).reindex_all()).published
+
+    state = _published_state(config, runtime_paths)
+    assert state is not None
+    assert state.collection is not None
+    assert "added.md" not in {path for _identifier, path, _text in _rows(state.collection)}, (
+        "rows of a file that left the corpus were published"
+    )
+    assert load_candidate_checkpoint(_storage_path(config, runtime_paths)) is not None, (
+        "an interrupted first copy still keeps the collection it copied"
+    )
 
 
 @pytest.mark.asyncio
@@ -3891,11 +3973,13 @@ async def test_a_failure_after_the_kept_checkpoint_lands_still_spares_the_collec
     config = _config(tmp_path, docs_path)
     runtime_paths = runtime_paths_for(config)
     await _manager(config).reindex_all()
+    cold = _published_state(config, runtime_paths)
+    assert cold is not None
     original_save = knowledge_manager_module.save_candidate_checkpoint
 
     def _save_then_fail(base_storage_path: Path, checkpoint: CandidateCheckpoint) -> CandidateCheckpoint:
         saved = original_save(base_storage_path, checkpoint)
-        if checkpoint.retired_by is not None:
+        if checkpoint.collection == cold.collection and checkpoint.copy_of is not None:
             message = "the superseded journal could not be removed"
             raise OSError(message)
         return saved
@@ -3926,11 +4010,13 @@ async def test_cancellation_waits_for_the_kept_checkpoint_to_land(
     config = _config(tmp_path, docs_path)
     runtime_paths = runtime_paths_for(config)
     await _manager(config).reindex_all()
+    cold = _published_state(config, runtime_paths)
+    assert cold is not None
     original_save = knowledge_manager_module.save_candidate_checkpoint
     saving, release = Event(), Event()
 
     def _slow_save(base_storage_path: Path, checkpoint: CandidateCheckpoint) -> CandidateCheckpoint:
-        if checkpoint.retired_by is not None:
+        if checkpoint.collection == cold.collection and checkpoint.copy_of is not None:
             saving.set()
             assert release.wait(10)
         return original_save(base_storage_path, checkpoint)
@@ -3949,7 +4035,8 @@ async def test_cancellation_waits_for_the_kept_checkpoint_to_land(
         await refresh
     kept = load_candidate_checkpoint(_storage_path(config, runtime_paths))
     assert kept is not None
-    assert kept.retired_by is not None
+    assert kept.collection == cold.collection
+    assert kept.copy_of is not None
 
 
 @pytest.mark.asyncio
@@ -4237,25 +4324,26 @@ async def test_rebuilding_a_lost_kept_collection_stops_it_passing_as_level(
     assert not rebuilt.mirrors(_published_state(config, runtime_paths)), "an emptied collection still passed as level"
 
 
-def test_only_a_kept_checkpoint_is_written_in_a_version_older_releases_refuse(tmp_path: Path) -> None:
-    """A release that ignores ``retired_by`` would change the kept collection while the record still stands."""
+def test_a_layout_2_checkpoint_resumes_as_an_ordinary_candidate(tmp_path: Path) -> None:
+    """Checkpoints written before the copy record load with none, so nothing is trusted as a copy."""
     settings = _manager(_config(tmp_path, tmp_path / "docs"))._indexing_settings
     claims = {"doc0000.md": (1, 1, "digest")}
-
     save_candidate_checkpoint(
         tmp_path,
-        CandidateCheckpoint(collection="kept", settings=settings, completed=claims, retired_by="live"),
+        CandidateCheckpoint(collection="kept", settings=settings, completed=claims, copy_of="live"),
     )
-    kept_version = json.loads(_candidate_checkpoint_path(tmp_path).read_text(encoding="utf-8"))["schema_version"]
-    kept = load_candidate_checkpoint(tmp_path)
-    save_candidate_checkpoint(tmp_path, CandidateCheckpoint(collection="building", settings=settings, completed=claims))
-    building_version = json.loads(_candidate_checkpoint_path(tmp_path).read_text(encoding="utf-8"))["schema_version"]
+    payload = json.loads(_candidate_checkpoint_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 3, "releases that cannot honor the copy record must refuse the checkpoint"
+    layout_2 = {
+        key: value for key, value in payload.items() if key not in {"copy_of", "diverged", "churn", "copy_churn"}
+    }
+    write_json_atomic(_candidate_checkpoint_path(tmp_path), {**layout_2, "schema_version": 2})
 
-    assert kept_version == 3
-    assert kept is not None
-    assert kept.retired_by == "live"
-    assert building_version == 2, "candidates that are not kept must stay readable by older releases"
-    assert load_candidate_checkpoint(tmp_path) is not None
+    loaded = load_candidate_checkpoint(tmp_path)
+
+    assert loaded is not None
+    assert loaded.completed == claims
+    assert (loaded.copy_of, loaded.diverged, loaded.churn, loaded.copy_churn) == (None, frozenset(), 0, 0)
 
 
 @pytest.mark.asyncio

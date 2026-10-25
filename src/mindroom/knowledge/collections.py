@@ -208,27 +208,57 @@ def paths_with_vectors(collection: KnowledgeCollection, relative_paths: Sequence
     return _collection_paths_with_vectors(collection.collection(), relative_paths)
 
 
-def delete_source_path_vectors(collection: KnowledgeCollection, relative_paths: Sequence[str]) -> None:
-    """Delete vectors for many source paths in one vector-store round trip.
+def delete_source_path_vectors(collection: KnowledgeCollection, relative_paths: Sequence[str]) -> int:
+    """Delete vectors for many source paths in one vector-store round trip, returning how many rows went.
 
     Unlike the ``$in`` the verification query issues, this one needs no
     ceiling protection: a delete does not bind one SQL variable per matched
     row, so the batch size alone bounds it. Measured on ChromaDB 1.5.8,
     deleting 51,200 rows across 128 paths in one call succeeds, where the
     equivalent read fails with ``too many SQL variables``.
+
+    Chroma's vector index keeps every deleted row as a dead entry it never
+    reuses, which the count lets callers bound.
     """
-    _delete_source_paths(collection.collection(), relative_paths)
+    return _delete_source_paths(collection.collection(), relative_paths)
 
 
-def _delete_source_paths(chroma_collection: Collection, relative_paths: Sequence[str]) -> None:
+def _delete_source_paths(chroma_collection: Collection, relative_paths: Sequence[str]) -> int:
+    rows_before = chroma_collection.count()
     for start in range(0, len(relative_paths), _VECTOR_DELETE_BATCH):
         batch = list(relative_paths[start : start + _VECTOR_DELETE_BATCH])
         chroma_collection.delete(where={SOURCE_PATH_KEY: {"$in": batch}})
+    return rows_before - chroma_collection.count()
 
 
 def row_count(collection: KnowledgeCollection) -> int:
     """Return how many rows one collection holds."""
     return collection.collection().count()
+
+
+def copy_collection(space: CollectionSpace, *, source: str, target: str) -> None:
+    """Create ``target`` holding every row of ``source``, copied verbatim one page of rows at a time."""
+    with closing(open_collection(space, source)) as handle:
+        source_rows = handle.collection()
+        target_rows = handle.client.create_collection(name=target, metadata=_COLLECTION_METADATA)
+        offset = 0
+        while True:
+            page = source_rows.get(
+                limit=_REPLAY_PAGE_ROWS,
+                offset=offset,
+                include=["embeddings", "documents", "metadatas"],
+            )
+            ids = page["ids"]
+            if ids:
+                target_rows.add(
+                    ids=ids,
+                    embeddings=cast("Embeddings", page["embeddings"]),
+                    documents=cast("list[str]", page["documents"]),
+                    metadatas=cast("list[Metadata]", page["metadatas"]),
+                )
+            if len(ids) < _REPLAY_PAGE_ROWS:
+                return
+            offset += len(ids)
 
 
 def replay_source_paths(
@@ -245,16 +275,13 @@ def replay_source_paths(
     it, so taking the lock exclusively once waits out every reader that chose
     ``target`` before it stopped being selectable, and none sees the rewrite.
     Each read is bounded by one path and a page of rows, because Chroma binds
-    one SQL variable per returned row. Chroma's vector index keeps every
-    deleted row as a dead entry it never reuses, which the count reports.
+    one SQL variable per returned row.
     """
     with collection_lifetime_lock(space.storage_path, exclusive=True):
         pass
     source_rows = source.collection()
     target_rows = source.client.get_collection(name=target)
-    rows_before = target_rows.count()
-    _delete_source_paths(target_rows, relative_paths)
-    deleted = rows_before - target_rows.count()
+    deleted = _delete_source_paths(target_rows, relative_paths)
     for relative_path in relative_paths:
         offset = 0
         while True:

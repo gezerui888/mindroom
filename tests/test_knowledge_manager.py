@@ -57,7 +57,7 @@ from mindroom.embeddings import embedder_health
 from mindroom.embeddings.batching import RefreshEmbedder
 from mindroom.git_invocation import hardened_git_command, hardened_git_env
 from mindroom.knowledge.availability import KnowledgeAvailability
-from mindroom.knowledge.candidate_checkpoint import load_candidate_checkpoint
+from mindroom.knowledge.candidate_checkpoint import load_candidate_checkpoint, save_candidate_checkpoint
 from mindroom.knowledge.collections import _collection_has_source_path, candidate_collection_name, open_collection
 from mindroom.knowledge.file_listing import (
     git_checkout_present,
@@ -9370,27 +9370,36 @@ async def test_git_refresh_marks_duplicate_source_sibling_stale(
     ]
 
 
-@pytest.mark.asyncio
-async def test_git_pull_that_changes_one_file_only_reindexes_that_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A one-file commit must cost one file's indexing, not the whole checkout's."""
+async def _git(cwd: Path, *args: str) -> None:
+    await asyncio.to_thread(
+        subprocess.run,
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+async def _commit_and_push(remote_work: Path, remote_bare: Path, message: str, **bodies: str) -> None:
+    for name, body in bodies.items():
+        (remote_work / f"{name}.md").write_text(body, encoding="utf-8")
+    await _git(remote_work, "commit", "-am", message)
+    await _git(remote_work, "push", str(remote_bare), "main")
+
+
+async def _published_bodies(config: Config, runtime_paths: RuntimePaths) -> list[str]:
+    lookup = get_published_index("docs", config=config, runtime_paths=runtime_paths)
+    assert lookup.index is not None
+    return sorted(document.content for document in await lookup.index.reader.asearch("body", limit=10))
+
+
+async def _git_backed_docs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path, Config]:
+    """Return a five-file remote, its bare clone, and a config whose base tracks it."""
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     remote_work = tmp_path / "remote-work"
     remote_work.mkdir()
-
-    async def _git(cwd: Path, *args: str) -> None:
-        await asyncio.to_thread(
-            subprocess.run,
-            ["git", *args],
-            cwd=cwd,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-
     await _git(remote_work, "init", "-b", "main")
     await _git(remote_work, "config", "user.email", "tests@example.com")
     await _git(remote_work, "config", "user.name", "MindRoom Tests")
@@ -9406,30 +9415,32 @@ async def test_git_pull_that_changes_one_file_only_reindexes_that_file(
         capture_output=True,
         text=True,
     )
-
-    docs_path = tmp_path / "checkout"
     config = _config(
         tmp_path,
-        bases={"docs": docs_path},
+        bases={"docs": tmp_path / "checkout"},
         agent_bases=["docs"],
         git_configs={"docs": KnowledgeGitConfig(repo_url=str(remote_bare), branch="main")},
     )
+    return remote_work, remote_bare, config
+
+
+@pytest.mark.asyncio
+async def test_git_pull_that_changes_one_file_only_reindexes_that_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-file commit must cost one file's indexing, not the whole checkout's."""
+    remote_work, remote_bare, config = await _git_backed_docs(tmp_path, monkeypatch)
     runtime_paths = runtime_paths_for(config)
     first = await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
     assert first.indexed_count == 5
 
-    (remote_work / "doc2.md").write_text("rewritten body 2", encoding="utf-8")
-    await _git(remote_work, "commit", "-am", "change one file")
-    await _git(remote_work, "push", str(remote_bare), "main")
-
+    await _commit_and_push(remote_work, remote_bare, "change one file", doc2="rewritten body 2")
     second = await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
 
     assert second.index_published is True
     assert second.indexed_count == 1, "the whole checkout was reindexed for a one-file commit"
-    lookup = get_published_index("docs", config=config, runtime_paths=runtime_paths)
-    assert lookup.index is not None
-    contents = sorted(document.content for document in await lookup.index.reader.asearch("body", limit=10))
-    assert contents == [
+    assert await _published_bodies(config, runtime_paths) == [
         "original body 0",
         "original body 1",
         "original body 3",
@@ -9437,15 +9448,62 @@ async def test_git_pull_that_changes_one_file_only_reindexes_that_file(
         "rewritten body 2",
     ]
 
-    (remote_work / "doc3.md").write_text("rewritten body 3", encoding="utf-8")
-    await _git(remote_work, "commit", "-am", "change another file")
-    await _git(remote_work, "push", str(remote_bare), "main")
+    await _commit_and_push(remote_work, remote_bare, "change another file", doc3="rewritten body 3")
     with capture_logs() as logs:
         third = await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
 
     assert third.indexed_count == 1
     [delta] = [log for log in logs if log["event"] == "Used knowledge Git delta for candidate reconciliation"]
     assert delta["scanned_count"] == 1, "resuming the kept collection rescanned the whole checkout"
+
+
+@pytest.mark.asyncio
+async def test_shedding_dead_entries_after_a_failed_refresh_keeps_the_git_delta_that_refresh_recorded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed refresh moves the kept collection's revision, so its claims must move with it.
+
+    Copying the published index instead would pair the older claims with the
+    newer revision, and the files that commit changed would keep old vectors.
+    """
+    remote_work, remote_bare, config = await _git_backed_docs(tmp_path, monkeypatch)
+    runtime_paths = runtime_paths_for(config)
+    await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
+    await _commit_and_push(remote_work, remote_bare, "change one file", doc2="rewritten body 2")
+    await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
+
+    class _AuthFailingEmbedder(_FakeEmbedder):
+        def embed(self, texts: Sequence[str], *, purpose: str) -> list[list[float]]:
+            del texts, purpose
+            raise _embedder_auth_error()
+
+    await _commit_and_push(
+        remote_work,
+        remote_bare,
+        "change two files",
+        doc0="rewritten body 0",
+        doc4="rewritten body 4",
+    )
+    with monkeypatch.context() as patch:
+        patch.setattr("mindroom.knowledge.manager.create_configured_embedder", lambda *_a, **_k: _AuthFailingEmbedder())
+        assert (
+            await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
+        ).index_published is False
+    storage = _base_storage_path(config, runtime_paths)
+    worn = load_candidate_checkpoint(storage)
+    assert worn is not None
+    save_candidate_checkpoint(storage, replace(worn, churn=10_000))
+
+    assert (await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)).index_published is True
+
+    assert await _published_bodies(config, runtime_paths) == [
+        "original body 1",
+        "original body 3",
+        "rewritten body 0",
+        "rewritten body 2",
+        "rewritten body 4",
+    ], "files the failed commit changed kept their old vectors"
 
 
 @pytest.mark.asyncio

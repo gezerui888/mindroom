@@ -20,6 +20,11 @@ from mindroom.agent_rename.steps import RenameUndoError
 from mindroom.cli import agents as cli_agents
 from mindroom.cli.config import activate_cli_runtime
 from mindroom.cli.main import app
+from mindroom.config.personal_agents import (
+    PersonalAgentRosterEntry,
+    personal_agent_roster_path,
+    read_personal_agent_roster,
+)
 from mindroom.constants import matrix_state_file, tracking_dir
 from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME, scoped_credentials_dir_part
 from mindroom.event_journal import EventJournalStore, EventKind, encode_thread_id
@@ -745,6 +750,37 @@ def test_from_naming_someone_else_is_refused(
         assert "is not @mindroom_nova:x, the ID MindRoom generates for nova" in result.output
     assert tree_snapshot(tmp_path) == before
     assert server.requests == []
+
+
+def test_from_with_a_personal_agents_localpart_needs_no_journal_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A personal agent's ID comes from the localpart its roster entry keeps, so that ID is accepted as generated."""
+    runtime_paths = _install(tmp_path, monkeypatch)
+    _adopt_by_hand(runtime_paths)
+    storage = runtime_paths.storage_root
+    generated = "@nova_alice:x"
+    entry = PersonalAgentRosterEntry(
+        template="buddy",
+        user_id="@alice:x",
+        username="alice",
+        agent_name=AGENT,
+        matrix_username="nova_alice",
+        user_display_name="Alice",
+        source_room_id="!source:x",
+    )
+    roster = personal_agent_roster_path(runtime_paths)
+    roster.parent.mkdir(parents=True, exist_ok=True)
+    roster.write_text(json.dumps({"entries": [entry.model_dump(mode="json")]}), encoding="utf-8")
+    _oauth_store(_oauth_path(storage, generated), _key("user_agent", generated))
+
+    result = _invoke(runtime_paths, "--from", generated, "--apply", "--yes", "--skip-login-check")
+
+    assert result.exit_code == 0, result.output
+    assert not _oauth_path(storage, generated).exists()
+    assert _stored_worker_key(_oauth_path(storage, NEW)) == _key("user_agent", NEW)
+    assert read_personal_agent_roster(runtime_paths) == [entry.model_copy(update={"matrix_username": "new"})]
 
 
 @pytest.mark.parametrize(("namespace", "generated"), [("", "@mindroom_nova:x"), ("ab12", "@mindroom_nova_ab12:x")])

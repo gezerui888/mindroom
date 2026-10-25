@@ -20516,6 +20516,7 @@ If MindRoom started after your edit, add `--discard-new-principal` for the state
 While `matrix_state.yaml` still names the old ID, `--from` may only repeat that ID.
 Otherwise it must also be a former Matrix ID of this agent, because the command moves whatever is stored under it: a person's ID would hand their OAuth credentials and journal mentions to the agent.
 The command accepts it when the event journal has rows for `<name>@<old ID>`, or when it is the ID MindRoom generates for the agent on that server, `@mindroom_<name>:<server>`, or `@mindroom_<name>_<namespace>:<server>` when `MINDROOM_NAMESPACE` is set.
+For a personal agent whose roster entry in `tracking/personal_agents.json` keeps a `matrix_username`, the generated ID uses that localpart instead.
 Anything else is refused before anything changes, dry run included, with `--from <old ID> must be a former Matrix ID of agent <name>`.
 
 Once a `--from` run has moved the journal, the journal no longer has rows for the old ID.
@@ -20538,6 +20539,7 @@ Otherwise move the remaining OAuth stores and workers by hand, as listed in [Wha
 | `workers/` | Each worker whose key names the old ID as requester moves to the directory of its new key. Its `metadata/worker.json` and OAuth stores are rewritten. Its `venv/` is moved into the backup, because the scripts in it name the old path; MindRoom builds a new one on the worker's next use, and packages installed into the old one must be installed again. Docker control records and config projections of the old key are removed. |
 | `private_instances/` and `tracking/private_instances/` | Private scopes owned by the old ID move to the scope of the new ID, and their owner record is rewritten. When [`MINDROOM_SESSION_STORAGE_PATH`](https://docs.mindroom.chat/configuration/#environment-variables) is set, their session databases below it move the same way. Links to a moved scope are moved into the backup, because they would no longer lead anywhere. |
 | `tracking/agents/*/personal_rooms/*.json` | The old ID is replaced in every record. A record owned by the old ID moves to the file name of the new ID. |
+| `tracking/personal_agents.json` | For a personal agent, its roster entry's `matrix_username` is set to the new localpart, so MindRoom registers the new ID again if `matrix_state.yaml` is ever lost. |
 | `matrix_message_sends/` in the control state directory | Send intents of the old ID are removed from these files, because MindRoom refuses to replay an intent as another sender. Intents of other senders, including the new ID, stay. The directory is `control_state/` under the storage directory unless [`MINDROOM_CONTROL_STATE_PATH`](https://docs.mindroom.chat/configuration/#environment-variables) points elsewhere. |
 | `config.yaml` and the YAML files it includes | Every string value equal to the old ID, such as entries in user lists, `bot_accounts`, or `authorization.aliases`, becomes the new ID. A matching value inside a literal or folded block scalar makes the command refuse with `edit it by hand`. |
 

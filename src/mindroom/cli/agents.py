@@ -314,10 +314,12 @@ def _require_former_user_id(runtime_paths: RuntimePaths, *, agent: str, from_use
 
     ``--from`` moves whatever is stored under that ID, so a wrong one, such as a person's, would hand their
     OAuth credentials and journal mentions to the agent. Accepted are an ID the journal keys the agent's rows by,
-    and the ID MindRoom generates for the agent on the new ID's server, which lets a killed run resume.
+    and the ID MindRoom generates for the agent on the new ID's server, which lets a killed run resume. A personal
+    agent's ID is generated from the localpart its roster entry keeps, when it keeps one.
     """
     from mindroom.agent_rename.journal import other_principal_user_ids  # noqa: PLC0415
     from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
+    from mindroom.config.personal_agents import read_personal_agent_roster  # noqa: PLC0415
     from mindroom.event_journal.opening import event_journal_sqlite_path  # noqa: PLC0415
     from mindroom.matrix.identity import MatrixID  # noqa: PLC0415
     from mindroom.matrix_identifiers import agent_username_localpart  # noqa: PLC0415
@@ -325,8 +327,12 @@ def _require_former_user_id(runtime_paths: RuntimePaths, *, agent: str, from_use
     database = event_journal_sqlite_path(runtime_paths.storage_root)
     if from_user_id in other_principal_user_ids(database, agent=agent, user_id=new_user_id):
         return
+    roster_localpart = next(
+        (entry.matrix_username for entry in read_personal_agent_roster(runtime_paths) if entry.agent_name == agent),
+        None,
+    )
     generated = MatrixID.from_username(
-        agent_username_localpart(agent, runtime_paths),
+        roster_localpart or agent_username_localpart(agent, runtime_paths),
         MatrixID.parse(new_user_id).domain,
     ).full_id
     if from_user_id == generated:

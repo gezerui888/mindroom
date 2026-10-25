@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, cast
 from mindroom import yaml_io
 from mindroom.agent_rename.matching import replace_user_id
 from mindroom.agent_rename.steps import DropPath, FileRewrite, FinalAction, MovePath, RenameRefusedError, SqliteEdit
+from mindroom.config.personal_agents import personal_agent_roster_path
 from mindroom.constants import matrix_state_file, primary_records_dir, resolve_session_state_root
 from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME, scoped_credentials_dir_part
 from mindroom.desktop.native_config import native_config_path
@@ -118,7 +119,8 @@ def account_file_steps(
     """Return the steps that move ``agent``'s files from ``old_user_id`` to ``new_user_id``, and report lines.
 
     Covers the requester's OAuth directory, workers and private-instance scopes whose keys name the old requester,
-    personal-room records, and Matrix send intents of the old sender; ``matrix_state_steps`` covers the account.
+    personal-room records, Matrix send intents of the old sender, and the localpart a personal agent's roster entry
+    keeps; ``matrix_state_steps`` covers the account.
     ``config`` is only used when a Docker worker is retired after apply.
     Refuses when a destination already exists.
     MindRoom creates new-ID state when it runs after the server rename; with ``discard_new_identity_state``
@@ -133,6 +135,7 @@ def account_file_steps(
         *_private_instance_steps(runtime_paths, rename),
         *_personal_room_steps(runtime_paths, agent, rename),
         *_message_send_intent_steps(runtime_paths, rename),
+        *_personal_agent_roster_steps(runtime_paths, agent, rename),
     ]
     return steps, [*worker_reports, *_reports(runtime_paths, old_user_id)]
 
@@ -545,6 +548,39 @@ def _personal_room_steps(runtime_paths: RuntimePaths, agent: str, rename: _Accou
             ),
         )
     return steps
+
+
+def _personal_agent_roster_steps(runtime_paths: RuntimePaths, agent: str, rename: _AccountRename) -> list[Step]:
+    """Set the localpart that ``agent``'s personal-agent roster entry keeps to the new ID's.
+
+    A personal agent's entry in ``tracking/personal_agents.json`` names the localpart its account was registered
+    under, ``None`` for the generated ``mindroom_<agent>``. MindRoom requests that localpart when it registers the
+    account again, such as after ``matrix_state.yaml`` was lost, and counts the ID it gives among its own accounts.
+    An agent that is not in the roster, or whose entry already names the new localpart, needs no step.
+    """
+    path = personal_agent_roster_path(runtime_paths)
+    entries = _field(_read_json(path), "entries")
+    localpart = MatrixID.parse(rename.new_user_id).username
+    own = [entry for entry in entries if _field(entry, "agent_name") == agent] if isinstance(entries, list) else []
+    if all(_field(entry, "matrix_username") == localpart for entry in own):
+        return []
+    return [
+        FileRewrite(
+            path,
+            partial(_rewrite_roster_localpart, agent=agent, localpart=localpart),
+            f"Set the Matrix username of personal agent {agent} in {path} to {localpart}",
+        ),
+    ]
+
+
+def _rewrite_roster_localpart(content: bytes, *, agent: str, localpart: str) -> bytes:
+    roster = json.loads(content)
+    roster["entries"] = [
+        {**entry, "matrix_username": localpart} if entry["agent_name"] == agent else entry
+        for entry in roster["entries"]
+    ]
+    # Written like personal_agents.py's _write_personal_agent_roster.
+    return json.dumps(roster).encode()
 
 
 def _without_sender(content: bytes, *, sender_id: str) -> bytes:

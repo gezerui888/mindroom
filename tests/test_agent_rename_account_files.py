@@ -17,6 +17,7 @@ from mindroom.agent_rename import account_files
 from mindroom.agent_rename.account_files import _rewrite_worker_key, account_file_steps, matrix_state_steps
 from mindroom.agent_rename.steps import (
     DropPath,
+    FileRewrite,
     FinalAction,
     MovePath,
     RenamePlan,
@@ -24,6 +25,11 @@ from mindroom.agent_rename.steps import (
     apply_plan,
 )
 from mindroom.config.main import Config
+from mindroom.config.personal_agents import (
+    PersonalAgentRosterEntry,
+    personal_agent_roster_path,
+    read_personal_agent_roster,
+)
 from mindroom.constants import matrix_state_file, primary_records_dir, resolve_session_state_root
 from mindroom.credentials.manager import (
     PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME,
@@ -641,6 +647,44 @@ def test_personal_room_and_intent_files(tmp_path: Path) -> None:
         "version": 1,
         "sends": {"k": {**intent, "sender_id": "@router:x"}},
     }
+
+
+def _roster_entry(agent_name: str, user_id: str, matrix_username: str | None) -> PersonalAgentRosterEntry:
+    return PersonalAgentRosterEntry(
+        template="buddy",
+        user_id=user_id,
+        username=user_id.removeprefix("@").partition(":")[0],
+        agent_name=agent_name,
+        matrix_username=matrix_username,
+        user_display_name=user_id,
+        source_room_id="!source:x",
+    )
+
+
+@pytest.mark.parametrize("matrix_username", [None, "old"])
+def test_personal_agent_roster_takes_the_new_localpart(tmp_path: Path, matrix_username: str | None) -> None:
+    """A personal agent's roster entry keeps the new localpart, so a lost matrix_state.yaml registers the new ID.
+
+    Entries of other agents stay, and once the entry names the new localpart a rerun plans nothing for it.
+    """
+    runtime_paths = _install(tmp_path)
+    own = _roster_entry(AGENT, "@alice:x", matrix_username)
+    other = _roster_entry("orion", "@bob:x", "old")
+    roster = personal_agent_roster_path(runtime_paths)
+    _write_json(roster, {"entries": [own.model_dump(mode="json"), other.model_dump(mode="json")]})
+
+    _apply(runtime_paths)
+
+    assert read_personal_agent_roster(runtime_paths) == [own.model_copy(update={"matrix_username": "new"}), other]
+    steps, _reports = account_file_steps(
+        runtime_paths,
+        agent=AGENT,
+        old_user_id=OLD,
+        new_user_id=NEW,
+        config=Config(),
+        discard_new_identity_state=False,
+    )
+    assert not any(isinstance(step, FileRewrite) and step.path == roster for step in steps)
 
 
 def test_send_intents_of_the_new_id_stay(tmp_path: Path) -> None:

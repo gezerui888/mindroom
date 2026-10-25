@@ -38,7 +38,6 @@ from mindroom.knowledge.candidate_checkpoint import (
     CandidateFailure,
     FileSignature,
     append_candidate_journal,
-    corpus_signature,
     delete_candidate_checkpoint,
     file_signature_from_fields,
     load_candidate_checkpoint,
@@ -510,6 +509,21 @@ def _reusable_row_signature(
     if signature is None:
         return None
     return source_path, signature
+
+
+def _source_signature_from_file_signatures(file_signatures: Mapping[str, FileSignature]) -> str:
+    """Return the same corpus signature from already-indexed relative path signatures."""
+    digest = hashlib.sha256()
+    for relative_path, (source_mtime_ns, source_size, source_digest) in sorted(file_signatures.items()):
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(source_mtime_ns).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(source_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(source_digest.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 @dataclass
@@ -1512,9 +1526,6 @@ class KnowledgeManager:
             # Rows this process just copied need no vector-existence probe: the
             # copy already reported which paths actually received them.
             verified=set(opened.reused),
-            # Until reconciliation measures the corpus, a compaction on the way
-            # out must keep what the checkpoint already targets.
-            total_files=checkpoint.total_files,
             journal_appends=checkpoint.replayed_journal_entries,
             resumed=opened.resumed,
             copy_of=None if opened.uncopied is None else published_collection,
@@ -1609,6 +1620,7 @@ class KnowledgeManager:
         """Remove candidate vectors and checkpoint entries for gone or stale paths."""
         if not relative_paths:
             return
+        await self._end_mirror(run)
         run.diverged.update(relative_paths)
         await asyncio.to_thread(delete_source_path_vectors, run.collection, relative_paths)
         for relative_path in relative_paths:
@@ -1621,6 +1633,13 @@ class KnowledgeManager:
             removed=tuple(relative_paths),
         )
         run.journal_appends += len(relative_paths)
+
+    async def _end_mirror(self, run: _CandidateRun) -> None:
+        """Durably stop a kept collection passing as level with the published index, before it changes."""
+        if run.checkpoint.retired_by is None:
+            return
+        run.checkpoint = replace(run.checkpoint, retired_by=None)
+        await self._compact_candidate_checkpoint(run, force=True)
 
     async def _restamp_candidate_paths(
         self,
@@ -1905,6 +1924,7 @@ class KnowledgeManager:
                 await self._compact_candidate_checkpoint(run, force=True)
 
             if plan.pending:
+                await self._end_mirror(run)
                 run.diverged.update(map(self._relative_path, plan.pending))
 
                 async def _record_file(file_path: Path, active_run: _CandidateRun = run) -> None:
@@ -1946,7 +1966,7 @@ class KnowledgeManager:
                 )
                 return
 
-            candidate_source_signature = corpus_signature(candidate_signatures)
+            candidate_source_signature = _source_signature_from_file_signatures(candidate_signatures)
             if not await self._candidate_matches_source(
                 round_revision,
                 candidate_signatures,

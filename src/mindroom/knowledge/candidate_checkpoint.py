@@ -24,7 +24,6 @@ its recorded identity and settings fingerprint match the current runtime.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -116,38 +115,14 @@ class CandidateCheckpoint:
         """Return whether this is the retired collection, still level with the index ``state`` publishes.
 
         Publication keeps the collection it retires as the next candidate once
-        that collection holds the new index's rows again. Such a candidate is
-        neither unfinished work nor an orphan: it lets the next refresh write
-        only what changed instead of copying every published row. Matching
-        claims alone would not prove it, because a forced rebuild produces the
-        same claims over vectors the operator stopped trusting. A refresh that
-        resumes it and records any change to its claims or its corpus ends the
-        match.
+        that collection holds the new index's rows again, and records which
+        collection it matches. A refresh clears that record durably before it
+        drops or writes any file's rows, so the record alone proves the match.
+        Claims could not: a forced rebuild produces the same claims over
+        vectors the operator stopped trusting, and a write that crashes before
+        its claim leaves rows no claim describes.
         """
-        return (
-            state is not None
-            and state.status == "complete"
-            and self.retired_by is not None
-            and state.collection == self.retired_by
-            and state.settings == self.settings
-            and self.total_files == len(self.completed)
-            and state.source_signature == corpus_signature(self.completed)
-        )
-
-
-def corpus_signature(file_signatures: Mapping[str, FileSignature]) -> str:
-    """Return the corpus signature a publication records for these per-file signatures."""
-    digest = hashlib.sha256()
-    for relative_path, (source_mtime_ns, source_size, source_digest) in sorted(file_signatures.items()):
-        digest.update(relative_path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(source_mtime_ns).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(source_size).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(source_digest.encode("ascii"))
-        digest.update(b"\0")
-    return digest.hexdigest()
+        return state is not None and self.retired_by is not None and state.collection == self.retired_by
 
 
 def _candidate_checkpoint_path(base_storage_path: Path) -> Path:

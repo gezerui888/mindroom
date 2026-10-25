@@ -4059,6 +4059,99 @@ async def test_a_kept_collection_interrupted_while_indexing_a_new_file_is_not_ke
 
 
 @pytest.mark.asyncio
+async def test_a_kept_collection_that_dropped_a_removed_file_before_a_crash_is_not_kept_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping a removed file makes the kept collection differ from the published one, which a later publish keeps.
+
+    Treated as level, the published collection would be kept with the removed
+    file's rows, and a later refresh would publish them again.
+    """
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    await _publish_twice(config, docs_path, names)
+
+    async def _crash_before_publishing(*_args: object, **_kwargs: object) -> None:
+        raise _Crash
+
+    (docs_path / names[2]).unlink()
+    with monkeypatch.context() as patch:
+        patch.setattr(KnowledgeManager, "_publish_candidate", _crash_before_publishing)
+        with pytest.raises(_Crash):
+            await _manager(config).reindex_all()
+
+    for change in range(2):
+        (docs_path / names[1]).write_text(f"change {change}", encoding="utf-8")
+        assert (await _manager(config).reindex_all()).published
+
+    assert not [
+        name
+        for name, records in _FakeVectorDb.store.items()
+        if any(record.metadata["source_path"] == names[2] for record in records)
+    ], "the removed file's rows survived in a kept collection"
+
+
+@pytest.mark.asyncio
+async def test_a_second_interruption_never_revives_a_kept_collection_holding_unclaimed_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once a refresh starts changing the kept collection, nothing it later records may make it pass as level again.
+
+    Removing the file a crash left unclaimed rows for restores the original
+    claims and corpus size, so only a record cleared before the write tells
+    the next refresh that the collection diverged.
+    """
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    storage = _storage_path(config, runtime_paths_for(config))
+    original_write = knowledge_manager_module.write_source_rows
+    recorded_while_writing: list[str | None] = []
+
+    def _crash_after_writing(
+        collection: KnowledgeCollection,
+        *,
+        relative_path: str,
+        signature: FileSignature,
+        rows: Sequence[tuple[KnowledgeChunk, Sequence[float]]],
+    ) -> None:
+        # A killed process runs no cleanup, so the record must already be gone from disk here.
+        checkpoint = load_candidate_checkpoint(storage)
+        recorded_while_writing.append(None if checkpoint is None else checkpoint.retired_by)
+        original_write(collection, relative_path=relative_path, signature=signature, rows=rows)
+        raise _Crash
+
+    async def _crash_before_publishing(*_args: object, **_kwargs: object) -> None:
+        raise _Crash
+
+    await _publish_twice(config, docs_path, names)
+    (docs_path / "added.md").write_text("added body", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        patch.setattr(knowledge_manager_module, "write_source_rows", _crash_after_writing)
+        with pytest.raises(_Crash):
+            await _manager(config).reindex_all()
+    assert recorded_while_writing == [None], "the kept collection still passed as level while it was written"
+    (docs_path / "added.md").unlink()
+    with monkeypatch.context() as patch:
+        patch.setattr(KnowledgeManager, "_publish_candidate", _crash_before_publishing)
+        with pytest.raises(_Crash):
+            await _manager(config).reindex_all()
+
+    for change, name in enumerate(names[1:]):
+        (docs_path / name).write_text(f"change {change}", encoding="utf-8")
+        assert (await _manager(config).reindex_all()).published
+
+    assert not [
+        name
+        for name, records in _FakeVectorDb.store.items()
+        if any(record.metadata["source_path"] == "added.md" for record in records)
+    ], "rows of a file that left the corpus kept alternating between the collections"
+
+
+@pytest.mark.asyncio
 async def test_a_published_row_naming_no_source_keeps_the_retired_collection_from_being_kept(
     tmp_path: Path,
 ) -> None:

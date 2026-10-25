@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
     from chromadb.api.client import Client
     from chromadb.api.models.Collection import Collection
-    from chromadb.api.types import Embeddings, Metadata
+    from chromadb.api.types import Embeddings, Metadata, Where
 
     from mindroom.knowledge.candidate_checkpoint import FileSignature
 
@@ -208,19 +208,29 @@ def paths_with_vectors(collection: KnowledgeCollection, relative_paths: Sequence
     return _collection_paths_with_vectors(collection.collection(), relative_paths)
 
 
-def delete_source_path_vectors(collection: KnowledgeCollection, relative_paths: Sequence[str]) -> int:
-    """Delete vectors for many source paths in one vector-store round trip, returning how many rows went.
+def delete_source_path_vectors(collection: KnowledgeCollection, relative_paths: Sequence[str]) -> None:
+    """Delete vectors for many source paths in one vector-store round trip.
 
     Unlike the ``$in`` the verification query issues, this one needs no
     ceiling protection: a delete does not bind one SQL variable per matched
     row, so the batch size alone bounds it. Measured on ChromaDB 1.5.8,
     deleting 51,200 rows across 128 paths in one call succeeds, where the
     equivalent read fails with ``too many SQL variables``.
-
-    Chroma's vector index keeps every deleted row as a dead entry it never
-    reuses, which the count lets callers bound.
     """
-    return _delete_source_paths(collection.collection(), relative_paths)
+    _delete_source_paths(collection.collection(), relative_paths)
+
+
+def count_source_path_rows(collection: KnowledgeCollection, relative_paths: Sequence[str]) -> int:
+    """Return how many rows the given source paths hold, reading ids only, one page of rows at a time."""
+    chroma_collection = collection.collection()
+    rows = 0
+    for start in range(0, len(relative_paths), _VECTOR_DELETE_BATCH):
+        where: dict[str, Any] = {SOURCE_PATH_KEY: {"$in": list(relative_paths[start : start + _VECTOR_DELETE_BATCH])}}
+        offset = 0
+        while page := chroma_collection.get(where=where, limit=_REPLAY_PAGE_ROWS, offset=offset, include=[])["ids"]:
+            rows += len(page)
+            offset += len(page)
+    return rows
 
 
 def _delete_source_paths(chroma_collection: Collection, relative_paths: Sequence[str]) -> int:
@@ -236,29 +246,44 @@ def row_count(collection: KnowledgeCollection) -> int:
     return collection.collection().count()
 
 
+def successor_collection_name(space: CollectionSpace, collection_name: str) -> str:
+    """Return the one name a copy of ``collection_name`` takes, so a retried copy replaces an interrupted one."""
+    return f"{space.default_collection}_candidate_{hashlib.sha256(collection_name.encode()).hexdigest()[:16]}"
+
+
 def copy_collection(space: CollectionSpace, *, source: str, target: str) -> None:
-    """Create ``target`` holding every row of ``source``, copied verbatim one page of rows at a time."""
+    """Create ``target`` holding every row of ``source``, copied verbatim one page of rows at a time.
+
+    A ``target`` left by an interrupted copy is dropped first rather than added to.
+    """
     with closing(open_collection(space, source)) as handle:
         source_rows = handle.collection()
-        target_rows = handle.client.create_collection(name=target, metadata=_COLLECTION_METADATA)
-        offset = 0
-        while True:
-            page = source_rows.get(
-                limit=_REPLAY_PAGE_ROWS,
-                offset=offset,
-                include=["embeddings", "documents", "metadatas"],
+        _delete_if_present(handle.client, target)
+        _copy_rows(source_rows, handle.client.create_collection(name=target, metadata=_COLLECTION_METADATA))
+
+
+def _copy_rows(source_rows: Collection, target_rows: Collection, where: Where | None = None) -> None:
+    """Add every row of ``source_rows`` matching ``where`` to ``target_rows`` verbatim, one page at a time."""
+    offset = 0
+    while True:
+        page = source_rows.get(
+            where=where,
+            limit=_REPLAY_PAGE_ROWS,
+            offset=offset,
+            include=["embeddings", "documents", "metadatas"],
+        )
+        ids = page["ids"]
+        if ids:
+            # Chroma types these optional because a caller may leave them out; this one asked for them.
+            target_rows.add(
+                ids=ids,
+                embeddings=cast("Embeddings", page["embeddings"]),
+                documents=cast("list[str]", page["documents"]),
+                metadatas=cast("list[Metadata]", page["metadatas"]),
             )
-            ids = page["ids"]
-            if ids:
-                target_rows.add(
-                    ids=ids,
-                    embeddings=cast("Embeddings", page["embeddings"]),
-                    documents=cast("list[str]", page["documents"]),
-                    metadatas=cast("list[Metadata]", page["metadatas"]),
-                )
-            if len(ids) < _REPLAY_PAGE_ROWS:
-                return
-            offset += len(ids)
+        if len(ids) < _REPLAY_PAGE_ROWS:
+            return
+        offset += len(ids)
 
 
 def replay_source_paths(
@@ -283,26 +308,7 @@ def replay_source_paths(
     target_rows = source.client.get_collection(name=target)
     deleted = _delete_source_paths(target_rows, relative_paths)
     for relative_path in relative_paths:
-        offset = 0
-        while True:
-            page = source_rows.get(
-                where={SOURCE_PATH_KEY: relative_path},
-                limit=_REPLAY_PAGE_ROWS,
-                offset=offset,
-                include=["embeddings", "documents", "metadatas"],
-            )
-            ids = page["ids"]
-            if ids:
-                # Chroma types these optional because a caller may leave them out; this one asked for them.
-                target_rows.add(
-                    ids=ids,
-                    embeddings=cast("Embeddings", page["embeddings"]),
-                    documents=cast("list[str]", page["documents"]),
-                    metadatas=cast("list[Metadata]", page["metadatas"]),
-                )
-            if len(ids) < _REPLAY_PAGE_ROWS:
-                break
-            offset += len(ids)
+        _copy_rows(source_rows, target_rows, {SOURCE_PATH_KEY: relative_path})
     return deleted
 
 

@@ -338,14 +338,17 @@ def load_candidate_checkpoint(base_storage_path: Path) -> CandidateCheckpoint | 
     completed = dict(checkpoint.completed)
     failed = dict(checkpoint.failed)
     diverged = set(checkpoint.diverged)
+    churn = checkpoint.churn
     entries = _journal_entries(_candidate_journal_path(base_storage_path))
     for entry in entries:
+        churn += _count(entry.get("churn"))
         _apply_journal_entry(entry, completed, failed, diverged)
     return replace(
         checkpoint,
         completed=completed,
         failed=failed,
         diverged=frozenset(diverged),
+        churn=churn,
         replayed_journal_entries=len(entries),
     )
 
@@ -374,6 +377,7 @@ def append_candidate_journal(
     failed: Iterable[tuple[str, CandidateFailure]] = (),
     removed: Iterable[str] = (),
     diverged: Iterable[str] = (),
+    churn: int = 0,
 ) -> None:
     """Append per-file candidate updates without rewriting the snapshot."""
     lines: list[str] = []
@@ -395,6 +399,8 @@ def append_candidate_journal(
         )
     lines.extend(json.dumps({"path": relative_path, "removed": True}, sort_keys=True) for relative_path in removed)
     lines.extend(json.dumps({"path": relative_path, "diverged": True}, sort_keys=True) for relative_path in diverged)
+    if churn:
+        lines.append(json.dumps({"churn": churn}))
     if not lines:
         return
     base_storage_path.mkdir(parents=True, exist_ok=True)

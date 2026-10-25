@@ -147,7 +147,7 @@ class _FakeCollection:
             records = [record for record in records if metadata_matches(record.metadata, key, condition)]
         selected = records[offset:] if limit is None else records[offset : offset + limit]
         with _FakeVectorDb.lock:
-            _FakeVectorDb.queries.append((len(selected), where))
+            _FakeVectorDb.queries.append((len(selected), where, tuple(include)))
             _FakeVectorDb.enforce_row_ceiling(len(selected))
         return chroma_get_result(
             ids=[record.identifier for record in selected],
@@ -254,7 +254,7 @@ class _FakeVectorDb:
     lock: ClassVar[Lock] = Lock()
     #: Rows returned by each ``get``, with its filter, so tests can prove a copy
     #: query was paged and that a verification probe was or was not issued.
-    queries: ClassVar[list[tuple[int, dict[str, object] | None]]] = []
+    queries: ClassVar[list[tuple[int, dict[str, object] | None, tuple[str, ...]]]] = []
     #: Copy writes accepted before the store starts refusing them.
     max_writes: ClassVar[int] = 1_000_000
     #: Rows handed to each accepted or refused ``add``.
@@ -3231,11 +3231,15 @@ def _stored_paths(collection: str) -> list[str]:
 
 
 def _vector_existence_probe_count() -> int:
-    """Return how many ``$in`` source-path existence probes the store was asked."""
+    """Return how many ``$in`` source-path existence probes the store was asked.
+
+    A probe reads each matched row's metadata to learn its path; counting the
+    rows a delete is about to remove reads ids only and is not a probe.
+    """
     probes = 0
-    for _rows, where in _FakeVectorDb.queries:
+    for _rows, where, include in _FakeVectorDb.queries:
         condition = where.get("source_path") if isinstance(where, dict) else None
-        if isinstance(condition, dict) and "$in" in condition:
+        if isinstance(condition, dict) and "$in" in condition and "metadatas" in include:
             probes += 1
     return probes
 
@@ -3464,7 +3468,7 @@ async def test_published_vector_copy_is_paged_so_no_query_exceeds_the_store_ceil
 
     assert (await _manager(config).reindex_all()).indexed_count == 1
 
-    assert max(rows for rows, _where in _FakeVectorDb.queries) <= 4
+    assert max(rows for rows, _where, _include in _FakeVectorDb.queries) <= 4
     assert _vector_existence_probe_count() == 0, "copied paths were sent back through the vector-existence probe"
 
 
@@ -3812,6 +3816,132 @@ async def test_refreshes_that_keep_failing_while_a_file_changes_keep_dead_index_
     monkeypatch.setattr(KnowledgeManager, "_read_documents", original_read)
     assert (await _manager(config).reindex_all()).published
     _assert_dead_rows_bounded(dead, 2 * large_rows, "after the recovery")
+
+
+@pytest.mark.asyncio
+async def test_refreshes_killed_after_writing_a_changing_file_keep_dead_index_entries_bounded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A killed refresh runs no cleanup, so the dead-entry count must already be on disk.
+
+    Each kill lands after the large file's new rows but before their claim, so
+    the next refresh replaces those unclaimed rows too, and they must count.
+    """
+    docs_path = tmp_path / "docs"
+    _write_corpus(docs_path, 4)
+    large = docs_path / "large.md"
+    large.write_text(_overlapping_body(300), encoding="utf-8")
+    config = _config(tmp_path, docs_path, chunk_size=500)
+    dead = _count_dead_rows(monkeypatch)
+    await _manager(config).reindex_all()
+    (docs_path / "doc0000.md").write_text("first change", encoding="utf-8")
+    assert (await _manager(config).reindex_all()).published
+    published = _published_state(config, runtime_paths_for(config))
+    assert published is not None
+    assert published.collection is not None
+    large_rows = sum(
+        record.metadata["source_path"] == "large.md" for record in _FakeVectorDb.store[published.collection]
+    )
+    original_write = knowledge_manager_module.write_source_rows
+
+    def _killed_after_writing(
+        collection: KnowledgeCollection,
+        *,
+        relative_path: str,
+        signature: FileSignature,
+        rows: Sequence[tuple[KnowledgeChunk, Sequence[float]]],
+    ) -> None:
+        original_write(collection, relative_path=relative_path, signature=signature, rows=rows)
+        if relative_path == "large.md":
+            raise _Crash
+
+    async def _no_cleanup(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(knowledge_manager_module, "write_source_rows", _killed_after_writing)
+    monkeypatch.setattr(KnowledgeManager, "_finalize_candidate_checkpoint", _no_cleanup)
+    for version in range(1, 13):
+        large.write_text(_overlapping_body(300).replace("token0000", f"tokenv{version:03d}"), encoding="utf-8")
+        with pytest.raises(_Crash):
+            await _manager(config).reindex_all()
+        _assert_dead_rows_bounded(dead, 2 * large_rows, f"after {version} killed refreshes")
+
+
+@pytest.mark.asyncio
+async def test_an_interrupted_fresh_copy_is_replaced_rather_than_left_beside_its_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copies that land but are never named must not pile up, each the size of the corpus."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    storage = _storage_path(config, runtime_paths)
+    await _publish_twice(config, docs_path, names)
+    kept = load_candidate_checkpoint(storage)
+    assert kept is not None
+    save_candidate_checkpoint(storage, replace(kept, churn=10_000))
+    original_copy = knowledge_manager_module.copy_collection
+
+    def _copy_then_crash(*args: object, **kwargs: object) -> None:
+        original_copy(*args, **kwargs)
+        raise _Crash
+
+    with monkeypatch.context() as patch:
+        patch.setattr(knowledge_manager_module, "copy_collection", _copy_then_crash)
+        for _attempt in range(3):
+            with pytest.raises(_Crash):
+                await _manager(config).reindex_all()
+
+    assert len(_FakeVectorDb.store) == 3, f"interrupted copies piled up: {sorted(_FakeVectorDb.store)}"
+    (docs_path / names[1]).write_text("second change", encoding="utf-8")
+    assert (await _manager(config).reindex_all()).published
+    state = _published_state(config, runtime_paths)
+    assert state is not None
+    assert state.collection is not None
+    rows = _rows(state.collection)
+    assert len({identifier for identifier, _path, _text in rows}) == len(rows), "a retried copy duplicated rows"
+    assert sorted(path for _identifier, path, _text in rows) == sorted(names)
+
+
+@pytest.mark.asyncio
+async def test_a_store_that_cannot_hold_the_fresh_copy_still_refreshes_and_keeps_no_partial_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Copying a worn candidate afresh only bounds storage, so its failure must not stop refreshes or fill the disk."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    storage = _storage_path(config, runtime_paths)
+    await _publish_twice(config, docs_path, names)
+    original_create = _FakeClient.create_collection
+
+    def _disk_full_after_creating(
+        self: _FakeClient,
+        name: str,
+        metadata: dict[str, object] | None = None,
+    ) -> _FakeCollection:
+        created = original_create(self, name, metadata)
+        if name == knowledge_collections.successor_collection_name(_manager(config)._collections, worn):
+            message = "database or disk is full"
+            raise RuntimeError(message)
+        return created
+
+    monkeypatch.setattr(_FakeClient, "create_collection", _disk_full_after_creating)
+    for change in range(3):
+        kept = load_candidate_checkpoint(storage)
+        assert kept is not None
+        worn = kept.collection
+        save_candidate_checkpoint(storage, replace(kept, churn=10_000))
+        (docs_path / names[1]).write_text(f"change {change}", encoding="utf-8")
+
+        assert (await _manager(config).reindex_all()).published, "a failed copy stopped the refresh"
+
+        assert len(_FakeVectorDb.store) == 2, f"a partial copy was left behind: {sorted(_FakeVectorDb.store)}"
 
 
 @pytest.mark.asyncio

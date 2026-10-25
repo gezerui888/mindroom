@@ -55,6 +55,7 @@ from mindroom.knowledge.collections import (
     candidate_collection_name,
     cleanup_superseded_collections,
     copy_collection,
+    count_source_path_rows,
     delete_collection,
     delete_source_path_vectors,
     open_collection,
@@ -62,6 +63,7 @@ from mindroom.knowledge.collections import (
     replay_source_paths,
     reset_collection,
     row_count,
+    successor_collection_name,
     write_source_rows,
 )
 from mindroom.knowledge.file_listing import (
@@ -1362,6 +1364,7 @@ class KnowledgeManager:
         The same write records which collection the copy matches and where
         it does not, so an interrupted refresh can still keep that collection.
         """
+        # ``copy_churn`` stays: rebuilding the candidate leaves the published collection as it was.
         checkpoint = await asyncio.to_thread(
             save_candidate_checkpoint,
             self._base_storage_path,
@@ -1430,10 +1433,23 @@ class KnowledgeManager:
             collection=checkpoint.collection,
             churn=checkpoint.churn,
         )
-        fresh = candidate_collection_name(self._collections)
-        await _shielded_write(
-            asyncio.to_thread(copy_collection, self._collections, source=checkpoint.collection, target=fresh),
-        )
+        fresh = successor_collection_name(self._collections, checkpoint.collection)
+        try:
+            await _shielded_write(
+                asyncio.to_thread(copy_collection, self._collections, source=checkpoint.collection, target=fresh),
+            )
+        except Exception:
+            # Shedding only bounds storage, so a store that cannot hold the copy
+            # must not stop the refresh. The candidate carries on as it is, and
+            # the cleanup after it reclaims the partial copy, which a retry
+            # would replace anyway because it takes the same name.
+            logger.warning(
+                "Failed to copy a knowledge candidate into a fresh collection; continuing with it as it is",
+                base_id=self.base_id,
+                collection=checkpoint.collection,
+                exc_info=True,
+            )
+            return checkpoint
         compacted = await _shielded_write(
             asyncio.to_thread(
                 save_candidate_checkpoint,
@@ -1639,8 +1655,7 @@ class KnowledgeManager:
         if not relative_paths:
             return
         await self._record_diverged(run, relative_paths)
-        deleted = await asyncio.to_thread(delete_source_path_vectors, run.collection, relative_paths)
-        run.checkpoint = replace(run.checkpoint, churn=run.checkpoint.churn + deleted)
+        await self._delete_candidate_rows(run, relative_paths)
         for relative_path in relative_paths:
             run.completed.pop(relative_path, None)
             run.failed.pop(relative_path, None)
@@ -1651,6 +1666,29 @@ class KnowledgeManager:
             removed=tuple(relative_paths),
         )
         run.journal_appends += len(relative_paths)
+
+    async def _delete_candidate_rows(self, run: _CandidateRun, relative_paths: Sequence[str]) -> None:
+        """Delete the candidate's rows for these paths, journaling how many before they go.
+
+        Every deleted row stays in the vector index as a dead entry, and the
+        count is what eventually sheds them, so it is recorded first: a process
+        killed before the delete overcounts, never undercounts.
+        """
+        rows = await asyncio.to_thread(count_source_path_rows, run.collection, relative_paths)
+        if rows:
+            await asyncio.to_thread(append_candidate_journal, self._base_storage_path, churn=rows)
+            run.journal_appends += 1
+            run.checkpoint = replace(run.checkpoint, churn=run.checkpoint.churn + rows)
+            await asyncio.to_thread(delete_source_path_vectors, run.collection, relative_paths)
+
+    async def _clear_pending_rows(self, run: _CandidateRun, relative_paths: Sequence[str]) -> None:
+        """Record the paths about to be written and, in a copying run, delete rows a crash left for them.
+
+        Those rows would otherwise be replaced inside the write, where nothing counts them.
+        """
+        await self._record_diverged(run, relative_paths)
+        if run.copy_of is not None:
+            await self._delete_candidate_rows(run, relative_paths)
 
     async def _record_diverged(self, run: _CandidateRun, relative_paths: Sequence[str]) -> None:
         """Journal paths whose rows the run is about to change, when it copies the published collection.
@@ -1954,7 +1992,7 @@ class KnowledgeManager:
                 await self._compact_candidate_checkpoint(run, force=True)
 
             if plan.pending:
-                await self._record_diverged(run, [self._relative_path(file_path) for file_path in plan.pending])
+                await self._clear_pending_rows(run, [self._relative_path(file_path) for file_path in plan.pending])
 
                 async def _record_file(file_path: Path, active_run: _CandidateRun = run) -> None:
                     await self._persist_candidate_batch(active_run, (file_path,))
@@ -2011,12 +2049,9 @@ class KnowledgeManager:
                 )
                 continue
 
-            unclaimed = sorted(run.diverged - run.completed.keys())
-            if unclaimed:
-                # A crash between a file's rows and its claim leaves rows no
-                # claim describes; publication must neither serve nor replay them.
-                deleted = await asyncio.to_thread(delete_source_path_vectors, run.collection, unclaimed)
-                run.checkpoint = replace(run.checkpoint, churn=run.checkpoint.churn + deleted)
+            # A crash between a file's rows and its claim leaves rows no claim
+            # describes; publication must neither serve nor replay them.
+            await self._delete_candidate_rows(run, sorted(run.diverged - run.completed.keys()))
             await self._publish_candidate(run, candidate_source_signature)
             return
 

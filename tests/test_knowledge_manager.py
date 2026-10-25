@@ -4221,7 +4221,9 @@ async def test_refresh_generations_keep_latest_index_without_protecting_old_hand
         doc.write_text(f"generation {generation}", encoding="utf-8")
         await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
 
-    assert first_collection not in _VectorDb.collections
+    assert "generation one" not in {row["content"] for rows in _VectorDb.collections.values() for row in rows}, (
+        f"refresh kept the first generation of {first_collection} for an old handle"
+    )
     latest = get_published_index("docs", config=config, runtime_paths=runtime_paths)
     assert latest.index is not None
     assert [document.content for document in await latest.index.reader.asearch("generation", limit=5)] == [
@@ -4297,8 +4299,8 @@ async def test_publish_invalidates_cached_indexes_for_same_physical_binding(tmp_
 
 
 @pytest.mark.asyncio
-async def test_successful_refreshes_keep_only_published_index(tmp_path: Path) -> None:
-    """Repeated publishes keep the published index and clean older generations best effort."""
+async def test_successful_refreshes_keep_only_published_index_and_next_candidate(tmp_path: Path) -> None:
+    """Repeated publishes keep the published index and the retired one kept as the next candidate, and no others."""
     docs_path = tmp_path / "docs"
     docs_path.mkdir()
     doc = docs_path / "doc.md"
@@ -4313,8 +4315,9 @@ async def test_successful_refreshes_keep_only_published_index(tmp_path: Path) ->
     key = resolve_published_index_key("docs", config=config, runtime_paths=runtime_paths)
     state = load_published_index_state(published_index_metadata_path(key))
     assert state is not None
-    assert state.collection in _VectorDb.collections
-    assert len(_VectorDb.collections) == 1
+    checkpoint = load_candidate_checkpoint(_base_storage_path(config, runtime_paths))
+    assert checkpoint is not None
+    assert set(_VectorDb.collections) == {state.collection, checkpoint.collection}
     lookup = get_published_index("docs", config=config, runtime_paths=runtime_paths)
     assert lookup.index is not None
     assert [document.content for document in await lookup.index.reader.asearch("generation", limit=5)] == [

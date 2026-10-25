@@ -1091,7 +1091,7 @@ async def _publish_unchanged_index(
     # This path returns before any candidate is opened, so it is the only place
     # that can retire candidate state left by an interrupted forced rebuild.
     try:
-        await manager.discard_superseded_candidate(published_collection=updated_state.collection)
+        await manager.discard_superseded_candidate(updated_state)
     except Exception:
         logger.warning(
             "Failed to retire candidate after unchanged knowledge index publish",

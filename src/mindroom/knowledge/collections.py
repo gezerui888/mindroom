@@ -17,7 +17,7 @@ import sqlite3
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from chromadb.errors import InternalError, NotFoundError
 
@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
     from chromadb.api.client import Client
     from chromadb.api.models.Collection import Collection
-    from chromadb.api.types import Metadata
+    from chromadb.api.types import Embeddings, Metadata
 
     from mindroom.knowledge.candidate_checkpoint import FileSignature
 
@@ -55,6 +55,8 @@ VECTOR_VERIFY_BATCH = 128
 #: the verify batch: a delete binds no variable per matched row, so this bounds
 #: only how much work one call does.
 _VECTOR_DELETE_BATCH = 128
+#: Rows one replay query returns, which also bounds the vector data it holds at once.
+_REPLAY_PAGE_ROWS = 500
 #: The distance every knowledge collection is created with; collections written before MindRoom owned this store
 #: carry the same setting, so they stay readable as they are.
 _COLLECTION_METADATA: Final = {"hnsw:space": "cosine"}
@@ -215,10 +217,57 @@ def delete_source_path_vectors(collection: KnowledgeCollection, relative_paths: 
     deleting 51,200 rows across 128 paths in one call succeeds, where the
     equivalent read fails with ``too many SQL variables``.
     """
-    chroma_collection = collection.collection()
+    _delete_source_paths(collection.collection(), relative_paths)
+
+
+def _delete_source_paths(chroma_collection: Collection, relative_paths: Sequence[str]) -> None:
     for start in range(0, len(relative_paths), _VECTOR_DELETE_BATCH):
         batch = list(relative_paths[start : start + _VECTOR_DELETE_BATCH])
         chroma_collection.delete(where={SOURCE_PATH_KEY: {"$in": batch}})
+
+
+def replay_source_paths(
+    space: CollectionSpace,
+    *,
+    source: KnowledgeCollection,
+    target: str,
+    relative_paths: Sequence[str],
+) -> None:
+    """Make ``target`` hold exactly ``source``'s rows for each path, copied verbatim.
+
+    ``target`` must be a collection readers can no longer select. A reader
+    holds the lifetime lock shared from selecting a collection until it closes
+    it, so taking the lock exclusively once waits out every reader that chose
+    ``target`` before it stopped being selectable, and none sees the rewrite.
+    Each read is bounded by one path and a page of rows, because Chroma binds
+    one SQL variable per returned row.
+    """
+    with collection_lifetime_lock(space.storage_path, exclusive=True):
+        pass
+    source_rows = source.collection()
+    target_rows = source.client.get_collection(name=target)
+    _delete_source_paths(target_rows, relative_paths)
+    for relative_path in relative_paths:
+        offset = 0
+        while True:
+            page = source_rows.get(
+                where={SOURCE_PATH_KEY: relative_path},
+                limit=_REPLAY_PAGE_ROWS,
+                offset=offset,
+                include=["embeddings", "documents", "metadatas"],
+            )
+            ids = page["ids"]
+            if ids:
+                # Chroma types these optional because a caller may leave them out; this one asked for them.
+                target_rows.add(
+                    ids=ids,
+                    embeddings=cast("Embeddings", page["embeddings"]),
+                    documents=cast("list[str]", page["documents"]),
+                    metadatas=cast("list[Metadata]", page["metadatas"]),
+                )
+            if len(ids) < _REPLAY_PAGE_ROWS:
+                break
+            offset += len(ids)
 
 
 def _source_content_hash(source_metadata: Mapping[str, Any]) -> str:

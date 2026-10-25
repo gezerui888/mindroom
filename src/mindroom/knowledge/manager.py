@@ -38,6 +38,7 @@ from mindroom.knowledge.candidate_checkpoint import (
     CandidateFailure,
     FileSignature,
     append_candidate_journal,
+    corpus_signature,
     delete_candidate_checkpoint,
     file_signature_from_fields,
     load_candidate_checkpoint,
@@ -58,6 +59,7 @@ from mindroom.knowledge.collections import (
     delete_source_path_vectors,
     open_collection,
     paths_with_vectors,
+    replay_source_paths,
     reset_collection,
     write_source_rows,
 )
@@ -216,6 +218,12 @@ class _CandidateRun:
     journal_appends: int = 0
     resumed: bool = False
     published: bool = False
+    #: The published collection this candidate began as a row-for-row copy of,
+    #: apart from ``diverged``; None when its start is not known to match one.
+    copy_of: str | None = None
+    #: Paths whose rows may differ from ``copy_of``'s: left out of the copy,
+    #: dropped, or written since.
+    diverged: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -225,6 +233,9 @@ class _OpenedCandidate:
     checkpoint: CandidateCheckpoint
     collection: KnowledgeCollection
     reused: dict[str, FileSignature] = field(default_factory=dict)
+    #: Published paths the copy left out, when every published row names its
+    #: path; None when the candidate is not a copy of the published collection.
+    uncopied: frozenset[str] | None = None
     resumed: bool = False
 
 
@@ -498,21 +509,6 @@ def _reusable_row_signature(
     if signature is None:
         return None
     return source_path, signature
-
-
-def _source_signature_from_file_signatures(file_signatures: Mapping[str, FileSignature]) -> str:
-    """Return the same corpus signature from already-indexed relative path signatures."""
-    digest = hashlib.sha256()
-    for relative_path, (source_mtime_ns, source_size, source_digest) in sorted(file_signatures.items()):
-        digest.update(relative_path.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(source_mtime_ns).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(str(source_size).encode("ascii"))
-        digest.update(b"\0")
-        digest.update(source_digest.encode("ascii"))
-        digest.update(b"\0")
-    return digest.hexdigest()
 
 
 @dataclass
@@ -1137,7 +1133,7 @@ class KnowledgeManager:
         published_collection: str,
         candidate: KnowledgeCollection,
         managed_paths: frozenset[str],
-    ) -> dict[str, FileSignature]:
+    ) -> tuple[dict[str, FileSignature], frozenset[str] | None]:
         """Copy stored chunks for currently-managed paths into the candidate.
 
         Every published chunk carries the signature of the file it came from,
@@ -1152,11 +1148,14 @@ class KnowledgeManager:
         an unpaged read on its own; only bounding the returned rows escapes.
 
         Returns the signature published for each path that actually received
-        rows, so a path the published index cannot serve is never claimed.
+        rows, so a path the published index cannot serve is never claimed, and
+        the paths whose published rows were left out, or None when a row names
+        no path, since the candidate then cannot be matched back to the copy.
         """
         published = candidate.client.get_collection(name=published_collection)
         candidate_rows = candidate.collection()
         reused: dict[str, FileSignature] = {}
+        uncopied: set[str] | None = set()
         offset = 0
         while True:
             page = published.get(
@@ -1166,7 +1165,7 @@ class KnowledgeManager:
             )
             ids = page["ids"]
             if not ids:
-                return reused
+                return reused, None if uncopied is None else frozenset(uncopied)
             offset += len(ids)
             # Chroma types every one of these optional because the caller may
             # not have asked for it; this one did, in the ``include`` above.
@@ -1179,6 +1178,11 @@ class KnowledgeManager:
             for index, metadata in enumerate(metadatas):
                 entry = _reusable_row_signature(metadata, managed_paths)
                 if entry is None:
+                    source_path = metadata.get(SOURCE_PATH_KEY)
+                    if not isinstance(source_path, str):
+                        uncopied = None
+                    elif uncopied is not None:
+                        uncopied.add(source_path)
                     continue
                 relative_path, signature = entry
                 reused[relative_path] = signature
@@ -1221,7 +1225,7 @@ class KnowledgeManager:
         *,
         candidate: KnowledgeCollection,
         published_collection: str,
-    ) -> dict[str, FileSignature]:
+    ) -> tuple[dict[str, FileSignature], frozenset[str] | None]:
         """Start a fresh candidate from the published index instead of from zero.
 
         Publication retires the candidate checkpoint, so without this the next
@@ -1236,7 +1240,7 @@ class KnowledgeManager:
             self._relative_path(file_path) for file_path in await asyncio.to_thread(self.list_files)
         )
         try:
-            reused = await _shielded_write(
+            reused, uncopied = await _shielded_write(
                 asyncio.to_thread(
                     self._copy_published_vectors,
                     published_collection=published_collection,
@@ -1255,7 +1259,7 @@ class KnowledgeManager:
                 exc_info=True,
             )
             await asyncio.to_thread(reset_collection, candidate)
-            return {}
+            return {}, None
         logger.info(
             "Reused published knowledge vectors in a new candidate",
             base_id=self.base_id,
@@ -1263,7 +1267,7 @@ class KnowledgeManager:
             reused_files=len(reused),
             managed_files=len(managed_paths),
         )
-        return reused
+        return reused, uncopied
 
     def _candidate_holds_unclaimed_rows(self, checkpoint: CandidateCheckpoint) -> bool:
         """Return whether an interrupted bulk copy is visible from candidate shape.
@@ -1351,7 +1355,7 @@ class KnowledgeManager:
         await asyncio.to_thread(reset_collection, collection)
         if published_collection is None:
             return _OpenedCandidate(checkpoint=checkpoint, collection=collection)
-        reused = await self._seed_candidate_from_published(
+        reused, uncopied = await self._seed_candidate_from_published(
             candidate=collection,
             published_collection=published_collection,
         )
@@ -1363,9 +1367,13 @@ class KnowledgeManager:
                     replace(checkpoint, completed=reused),
                 ),
             )
-        return _OpenedCandidate(checkpoint=checkpoint, collection=collection, reused=reused)
+        return _OpenedCandidate(checkpoint=checkpoint, collection=collection, reused=reused, uncopied=uncopied)
 
-    async def _resume_candidate_collection(self, checkpoint: CandidateCheckpoint) -> _OpenedCandidate:
+    async def _resume_candidate_collection(
+        self,
+        checkpoint: CandidateCheckpoint,
+        persisted_state: PublishedIndexState | None,
+    ) -> _OpenedCandidate:
         """Continue a candidate whose recorded work is still backed by its collection."""
         if not await asyncio.to_thread(
             chroma_collection_exists,
@@ -1383,6 +1391,9 @@ class KnowledgeManager:
         return _OpenedCandidate(
             checkpoint=checkpoint,
             collection=open_collection(self._collections, checkpoint.collection),
+            # A candidate mirroring the published index is the collection the
+            # last publication retired and brought level with it.
+            uncopied=frozenset() if checkpoint.mirrors(persisted_state) else None,
             resumed=True,
         )
 
@@ -1471,7 +1482,7 @@ class KnowledgeManager:
                 else None
             )
         else:
-            opened = await self._resume_candidate_collection(checkpoint)
+            opened = await self._resume_candidate_collection(checkpoint, persisted_state)
             baseline_revision = checkpoint.target_revision
         checkpoint = opened.checkpoint
 
@@ -1487,6 +1498,8 @@ class KnowledgeManager:
             verified=set(opened.reused),
             journal_appends=checkpoint.replayed_journal_entries,
             resumed=opened.resumed,
+            copy_of=None if opened.uncopied is None else published_collection,
+            diverged=set(opened.uncopied or ()),
         )
         # Reconcile candidates abandoned by earlier crashed refreshes now, so
         # storage stays bounded even when a build never reaches publication.
@@ -1522,7 +1535,7 @@ class KnowledgeManager:
         state = load_published_index_state(self._indexing_settings_path)
         return state, state is not None or not self._indexing_settings_path.exists()
 
-    async def discard_superseded_candidate(self, *, published_collection: str | None) -> None:
+    async def discard_superseded_candidate(self, published_state: PublishedIndexState) -> None:
         """Drop candidate state that publishing an unchanged index made obsolete.
 
         A forced rebuild interrupted part-way leaves a candidate behind. If the
@@ -1531,12 +1544,13 @@ class KnowledgeManager:
         can reach that state: the checkpoint and its collection would otherwise
         sit on disk indefinitely.
         Retiring it discards partial forced-rebuild progress, so a later forced
-        rebuild starts from zero.
+        rebuild starts from zero. A candidate mirroring the published index is
+        kept: it is the retired collection waiting for the next change.
         """
         checkpoint = await asyncio.to_thread(load_candidate_checkpoint, self._base_storage_path)
-        if checkpoint is None:
+        if checkpoint is None or checkpoint.mirrors(published_state):
             return
-        if checkpoint.collection != published_collection and not await delete_collection(
+        if checkpoint.collection != published_state.collection and not await delete_collection(
             self._collections,
             checkpoint.collection,
         ):
@@ -1576,6 +1590,7 @@ class KnowledgeManager:
         """Remove candidate vectors and checkpoint entries for gone or stale paths."""
         if not relative_paths:
             return
+        run.diverged.update(relative_paths)
         await asyncio.to_thread(delete_source_path_vectors, run.collection, relative_paths)
         for relative_path in relative_paths:
             run.completed.pop(relative_path, None)
@@ -1871,6 +1886,7 @@ class KnowledgeManager:
                 await self._compact_candidate_checkpoint(run, force=True)
 
             if plan.pending:
+                run.diverged.update(map(self._relative_path, plan.pending))
 
                 async def _record_file(file_path: Path, active_run: _CandidateRun = run) -> None:
                     await self._persist_candidate_batch(active_run, (file_path,))
@@ -1911,7 +1927,7 @@ class KnowledgeManager:
                 )
                 return
 
-            candidate_source_signature = _source_signature_from_file_signatures(candidate_signatures)
+            candidate_source_signature = corpus_signature(candidate_signatures)
             if not await self._candidate_matches_source(
                 round_revision,
                 candidate_signatures,
@@ -1951,9 +1967,62 @@ class KnowledgeManager:
             # never be rewritten as if the build were still in progress.
             run.published = publish_state.index_published
         await asyncio.to_thread(delete_candidate_checkpoint, self._base_storage_path)
+        kept = await self._keep_retired_collection(run)
         await asyncio.to_thread(
             cleanup_superseded_collections,
             self._collections,
             client=run.collection.client,
-            preserved=frozenset({run.collection.name}),
+            preserved=frozenset({run.collection.name, *([kept] if kept else [])}),
         )
+
+    async def _keep_retired_collection(self, run: _CandidateRun) -> str | None:
+        """Bring the collection this publication retired level with it, as the next refresh's candidate.
+
+        The candidate began as a row-for-row copy of that collection, so
+        replaying the paths it diverged on makes the two identical. The next
+        refresh resumes it and writes only what changed since, where a fresh
+        candidate would copy every published row first.
+
+        The checkpoint naming it is written only after the replay lands, so an
+        interruption leaves a collection nothing names, which the next refresh
+        reclaims before copying the published index as before.
+        """
+        if run.copy_of is None:
+            return None
+        try:
+            await _shielded_write(
+                asyncio.to_thread(
+                    replay_source_paths,
+                    self._collections,
+                    source=run.collection,
+                    target=run.copy_of,
+                    relative_paths=sorted(run.diverged),
+                ),
+            )
+            await asyncio.to_thread(
+                save_candidate_checkpoint,
+                self._base_storage_path,
+                CandidateCheckpoint(
+                    collection=run.copy_of,
+                    settings=self._indexing_settings,
+                    target_revision=run.baseline_revision,
+                    total_files=len(run.completed),
+                    completed=dict(run.completed),
+                    retired_by=run.collection.name,
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to keep the retired knowledge collection for the next refresh",
+                base_id=self.base_id,
+                collection=run.copy_of,
+                exc_info=True,
+            )
+            return None
+        logger.info(
+            "Kept the retired knowledge collection as the next candidate",
+            base_id=self.base_id,
+            collection=run.copy_of,
+            replayed_files=len(run.diverged),
+        )
+        return run.copy_of

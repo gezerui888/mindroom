@@ -75,9 +75,12 @@ def _indexed_count_for_state(
     return state.indexed_count or 0
 
 
-def _candidate_status_for_key(key: registry.PublishedIndexKey) -> KnowledgeCandidateStatus | None:
+def _candidate_status_for_key(
+    key: registry.PublishedIndexKey,
+    state: registry.PublishedIndexState | None,
+) -> KnowledgeCandidateStatus | None:
     checkpoint = load_candidate_checkpoint(registry.published_index_storage_path(key))
-    if checkpoint is None or checkpoint.settings != key.indexing_settings:
+    if checkpoint is None or checkpoint.settings != key.indexing_settings or checkpoint.mirrors(state):
         return None
     return KnowledgeCandidateStatus(
         collection=checkpoint.collection,
@@ -111,7 +114,7 @@ def get_knowledge_index_status(
     metadata_exists = metadata_path.exists()
     state = registry.load_published_index_state(metadata_path)
     return KnowledgeIndexStatus(
-        candidate=_candidate_status_for_key(key),
+        candidate=_candidate_status_for_key(key, state),
         indexed_count=_indexed_count_for_state(key, state),
         refresh_state=registry.published_index_refresh_state(state, metadata_exists=metadata_exists),
         availability=registry.published_index_availability_for_state(

@@ -24,6 +24,7 @@ its recorded identity and settings fingerprint match the current runtime.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -35,6 +36,8 @@ from mindroom.knowledge.indexing_config import IndexingSettings
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
     from pathlib import Path
+
+    from mindroom.knowledge.index_metadata import PublishedIndexState
 
 #: Bumped whenever the persisted candidate layout changes incompatibly. An
 #: unknown version is treated as "no resumable candidate" rather than an error.
@@ -92,6 +95,9 @@ class CandidateCheckpoint:
     failed: Mapping[str, CandidateFailure] = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
+    #: The collection whose publication retired this one and brought it level
+    #: with itself; None for a candidate a refresh is building.
+    retired_by: str | None = None
     #: Journal entries replayed when this checkpoint was loaded. Not persisted:
     #: it exists so a resumed run inherits the compaction bound instead of
     #: restarting the count and letting the journal grow without limit across
@@ -102,6 +108,43 @@ class CandidateCheckpoint:
     def completed_count(self) -> int:
         """Return how many source files the candidate has recorded as indexed."""
         return len(self.completed)
+
+    def mirrors(self, state: PublishedIndexState | None) -> bool:
+        """Return whether this is the retired collection, still level with the index ``state`` publishes.
+
+        Publication keeps the collection it retires as the next candidate once
+        that collection holds the new index's rows again. Such a candidate is
+        neither unfinished work nor an orphan: it lets the next refresh write
+        only what changed instead of copying every published row. Matching
+        claims alone would not prove it, because a forced rebuild produces the
+        same claims over vectors the operator stopped trusting. A refresh that
+        resumes it and records any change to its claims or its corpus ends the
+        match.
+        """
+        return (
+            state is not None
+            and state.status == "complete"
+            and self.retired_by is not None
+            and state.collection == self.retired_by
+            and state.settings == self.settings
+            and self.total_files == len(self.completed)
+            and state.source_signature == corpus_signature(self.completed)
+        )
+
+
+def corpus_signature(file_signatures: Mapping[str, FileSignature]) -> str:
+    """Return the corpus signature a publication records for these per-file signatures."""
+    digest = hashlib.sha256()
+    for relative_path, (source_mtime_ns, source_size, source_digest) in sorted(file_signatures.items()):
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(source_mtime_ns).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(source_size).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(source_digest.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _candidate_checkpoint_path(base_storage_path: Path) -> Path:
@@ -157,6 +200,7 @@ def _snapshot_payload(checkpoint: CandidateCheckpoint) -> dict[str, object]:
         },
         "created_at": checkpoint.created_at,
         "updated_at": checkpoint.updated_at,
+        "retired_by": checkpoint.retired_by,
     }
 
 
@@ -210,6 +254,7 @@ def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None
     total_files = payload.get("total_files")
     created_at = payload.get("created_at")
     updated_at = payload.get("updated_at")
+    retired_by = payload.get("retired_by")
     return CandidateCheckpoint(
         collection=collection,
         settings=settings,
@@ -220,6 +265,7 @@ def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None
         failed=failed,
         created_at=created_at if isinstance(created_at, str) else "",
         updated_at=updated_at if isinstance(updated_at, str) else "",
+        retired_by=retired_by if isinstance(retired_by, str) and retired_by else None,
     )
 
 

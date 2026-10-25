@@ -6167,6 +6167,7 @@ depends_on = [
     "mindroom.knowledge.index_metadata",
     "mindroom.knowledge.indexing_config",
     "mindroom.runtime_resolution",
+    "mindroom.tool_system.dependencies",
     "mindroom.tool_system.worker_routing",
 ]
 
@@ -6267,6 +6268,7 @@ depends_on = [
     "mindroom.knowledge.refresh_locks",
     "mindroom.knowledge.registry",
     "mindroom.runtime_resolution",
+    "mindroom.tool_system.dependencies",
     "mindroom.tool_system.worker_routing",
 ]
 

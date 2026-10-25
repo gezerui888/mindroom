@@ -24,6 +24,7 @@ from mindroom.agent_rename.steps import (
     RenameRefusedError,
     apply_plan,
 )
+from mindroom.attachments.storage import load_attachment, register_local_attachment
 from mindroom.config.main import Config
 from mindroom.config.personal_agents import (
     PersonalAgentRosterEntry,
@@ -36,6 +37,8 @@ from mindroom.credentials.manager import (
     get_runtime_credentials_manager,
     scoped_credentials_dir_part,
 )
+from mindroom.custom_tools.todo_state import locked_update_json, read_json, todos_path
+from mindroom.custom_tools.todo_state import state_root as todo_state_root
 from mindroom.desktop.native_config import native_config_path
 from mindroom.matrix.client_session import olm_store_dir
 from mindroom.matrix.personal_room_store import (
@@ -721,6 +724,88 @@ def test_send_intents_of_the_new_id_stay(tmp_path: Path) -> None:
     assert json.loads(path.read_text()) == {**store, "sends": {"b": new_pending}}
     (backup,) = (runtime_paths.storage_root / "agent-rename-backups").iterdir()
     assert [json.loads(saved.read_text()) for saved in backup.glob("*/mixed.json")] == [store]
+
+
+def _todo_item(item_id: str, *, requester_id: str, title: str = "Draft the summary") -> dict[str, object]:
+    """Return a todo item the way the todo tool records one."""
+    return {
+        "id": item_id,
+        "title": title,
+        "status": "open",
+        "priority": "medium",
+        "depends_on": [],
+        "assigned_agent": "orion",
+        "requester_id": requester_id,
+        "created_at": "2026-10-19T21:00:00+00:00",
+        "updated_at": "2026-10-19T21:00:00+00:00",
+        "completed_at": None,
+    }
+
+
+def _write_todos(runtime_paths: RuntimePaths, thread_id: str, items: list[dict[str, object]]) -> Path:
+    path = todos_path(todo_state_root(runtime_paths), "!room:x", thread_id)
+    locked_update_json(path, lambda data: data.update(room_id="!room:x", thread_id=thread_id, items=items))
+    return path
+
+
+def test_todo_items_requested_by_the_old_id_take_the_new_id(tmp_path: Path) -> None:
+    """A todo poke acts for its item's requester, so items that recorded the old ID as requester take the new one.
+
+    Only whole field values change: a title that mentions the old ID keeps it, a lookalike ID of another user stays,
+    and a todo file that never names the old ID gets no step. The rewritten file keeps a backup.
+    """
+    runtime_paths = _install(tmp_path)
+    requested = _todo_item("a1", requester_id=OLD, title=f"Ask {OLD} for the numbers")
+    others = [_todo_item("b2", requester_id="@alice:x"), _todo_item("c3", requester_id="@old:x.example.org")]
+    path = _write_todos(runtime_paths, "$thread", [requested, *others])
+    original = json.loads(path.read_text())
+    untouched_path = _write_todos(runtime_paths, "$other", [_todo_item("d4", requester_id="@alice:x")])
+    untouched = untouched_path.read_bytes()
+
+    steps, _reports = _steps(runtime_paths)
+    assert [step.path for step in steps if isinstance(step, FileRewrite) and step.path.name == "todos.json"] == [path]
+    _apply(runtime_paths)
+
+    assert read_json(path)["items"] == [{**requested, "requester_id": NEW}, *others]
+    assert untouched_path.read_bytes() == untouched
+    (backup,) = (runtime_paths.storage_root / "agent-rename-backups").iterdir()
+    assert [json.loads(saved.read_text()) for saved in backup.glob("*/todos.json")] == [original]
+
+
+def test_attachment_records_sent_by_the_old_id_take_the_new_id(tmp_path: Path) -> None:
+    """An attachment record's ``sender`` names who sent it in the attachment context, so the old ID becomes the new.
+
+    Only whole field values change: a file name that mentions the old ID keeps it, and records of other senders,
+    a lookalike ID included, stay byte for byte.
+    """
+    runtime_paths = _install(tmp_path)
+    storage = runtime_paths.storage_root
+    source = tmp_path / "notes.txt"
+    source.write_text("notes", encoding="utf-8")
+    for attachment_id, sender in (("att_old", OLD), ("att_other", "@alice:x"), ("att_lookalike", "@old:x.example.org")):
+        record = register_local_attachment(
+            storage,
+            source,
+            kind="file",
+            attachment_id=attachment_id,
+            filename=f"notes for {OLD}.txt",
+            room_id="!room:x",
+            sender=sender,
+        )
+        assert record is not None
+    records = storage / "attachments"
+    untouched = {name: (records / f"{name}.json").read_bytes() for name in ("att_other", "att_lookalike")}
+    before = load_attachment(storage, "att_old")
+    assert before is not None
+
+    steps, _reports = _steps(runtime_paths)
+    assert [step.path for step in steps if isinstance(step, FileRewrite) and step.path.parent == records] == [
+        records / "att_old.json",
+    ]
+    _apply(runtime_paths)
+
+    assert load_attachment(storage, "att_old") == replace(before, sender=NEW)
+    assert {name: (records / f"{name}.json").read_bytes() for name in untouched} == untouched
 
 
 def test_reports_encryption_keys_and_desktop_pin(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ Several stores are named or keyed after the Matrix ID: ``matrix_state.yaml`` hol
 primary-runtime OAuth stores sit in a directory hashed from the requester's ID, worker and private-instance
 directories are named after worker keys that embed the requester, and some JSON records hold the ID itself.
 After the rename MindRoom looks for all of them under the new ID, so each moves there and its contents follow.
+Todo items and attachment records only hold the ID as a field value, so those values follow without a move.
 Building the steps only reads; every refusal happens here, before anything is written.
 """
 
@@ -29,6 +30,7 @@ from mindroom.agent_rename.workers import (
 from mindroom.config.personal_agents import personal_agent_roster_path
 from mindroom.constants import matrix_state_file, primary_records_dir, resolve_session_state_root
 from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME, scoped_credentials_dir_part
+from mindroom.custom_tools.todo_state import state_root as todo_state_root
 from mindroom.desktop.native_config import native_config_path
 from mindroom.matrix.client_session import olm_store_dir, olm_store_exists
 from mindroom.matrix.identity import MatrixID, managed_account_key
@@ -107,6 +109,14 @@ class _AccountRename:
             return {key: self.strings(item) for key, item in value.items()}
         return value
 
+    def fields(self, record: dict[str, object]) -> dict[str, object]:
+        """Return ``record`` with every member whose whole value is the old ID set to the new ID; text stays."""
+        return {key: self.new_user_id if value == self.old_user_id else value for key, value in record.items()}
+
+    def names_old_id_in_a_field(self, record: object) -> bool:
+        """Whether ``record`` is a JSON object with a member whose whole value is the old ID."""
+        return isinstance(record, dict) and self.old_user_id in cast("dict[str, object]", record).values()
+
 
 def account_file_steps(
     runtime_paths: RuntimePaths,
@@ -120,8 +130,9 @@ def account_file_steps(
     """Return the steps that move ``agent``'s files from ``old_user_id`` to ``new_user_id``, and report lines.
 
     Covers the requester's OAuth directory, workers and private-instance scopes whose keys name the old requester,
-    personal-room records, Matrix send intents of the old sender, and the localpart a personal agent's roster entry
-    keeps; ``matrix_state_steps`` covers the account.
+    personal-room records, Matrix send intents of the old sender, the localpart a personal agent's roster entry
+    keeps, and todo items and attachment records with a field holding the old ID; ``matrix_state_steps`` covers
+    the account.
     ``config`` is only used when a Docker worker is retired after apply.
     Refuses when a destination already exists.
     MindRoom creates new-ID state when it runs after the server rename; with ``discard_new_identity_state``
@@ -145,6 +156,8 @@ def account_file_steps(
             *_personal_room_steps(runtime_paths, agent, rename),
             *_message_send_intent_steps(runtime_paths, rename),
             *_personal_agent_roster_steps(runtime_paths, agent, rename),
+            *_todo_steps(runtime_paths, rename),
+            *_attachment_steps(runtime_paths, rename),
         ]
     except DestinationExistsError as exc:
         msg = f"{exc} --discard-new-principal drops new-ID state that holds no credentials."
@@ -448,6 +461,58 @@ def _message_send_intent_steps(runtime_paths: RuntimePaths, rename: _AccountRena
                 ),
             )
     return steps
+
+
+def _rewrite_todo_items(content: bytes, *, rename: _AccountRename) -> bytes:
+    state = json.loads(content)
+    state["items"] = [rename.fields(item) if isinstance(item, dict) else item for item in state["items"]]
+    # Written like custom_tools/todo_state.py's locked_update_json.
+    return (json.dumps(state, indent=2, sort_keys=True) + "\n").encode()
+
+
+def _todo_steps(runtime_paths: RuntimePaths, rename: _AccountRename) -> list[Step]:
+    """Set every todo item field whose whole value is the old ID to the new ID.
+
+    An item records who asked for it in ``requester_id``, which is the old ID when this agent filed work for another.
+    A todo poke acts only for a human requester or one of MindRoom's own accounts, and after the rename the old ID is
+    neither, so the item would never be poked. Titles that mention the old ID are text and stay.
+    """
+    steps: list[Step] = []
+    for path in sorted((todo_state_root(runtime_paths) / "threads").glob("*/todos.json")):
+        items = _field(_read_json(path), "items")
+        if isinstance(items, list) and any(rename.names_old_id_in_a_field(item) for item in items):
+            steps.append(
+                FileRewrite(
+                    path,
+                    partial(_rewrite_todo_items, rename=rename),
+                    f"Set the todo item fields that hold {rename.old_user_id} in {path} to {rename.new_user_id}",
+                ),
+            )
+    return steps
+
+
+def _rewrite_attachment_record(content: bytes, *, rename: _AccountRename) -> bytes:
+    # Written like attachments/storage.py's _persist_attachment_record.
+    return json.dumps(rename.fields(json.loads(content)), sort_keys=True).encode()
+
+
+def _attachment_steps(runtime_paths: RuntimePaths, rename: _AccountRename) -> list[Step]:
+    """Set every attachment record field whose whole value is the old ID to the new ID.
+
+    ``sender`` is the only field holding a user ID; it names who sent the attachment.
+    File names that mention the old ID are text and stay.
+    """
+    # attachments/storage.py keeps one record per attachment in this directory.
+    records = runtime_paths.storage_root / "attachments"
+    return [
+        FileRewrite(
+            path,
+            partial(_rewrite_attachment_record, rename=rename),
+            f"Set the fields that hold {rename.old_user_id} in the attachment record {path} to {rename.new_user_id}",
+        )
+        for path in sorted(records.glob("*.json"))
+        if rename.names_old_id_in_a_field(_read_json(path))
+    ]
 
 
 def _reports(runtime_paths: RuntimePaths, old_user_id: str) -> list[str]:

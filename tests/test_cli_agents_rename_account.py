@@ -17,6 +17,7 @@ from mindroom.agent_rename import account_files
 from mindroom.agent_rename import steps as steps_module
 from mindroom.agent_rename.guard import stopped_runtime
 from mindroom.agent_rename.steps import RenameUndoError
+from mindroom.attachments.storage import load_attachment, register_local_attachment
 from mindroom.cli import agents as cli_agents
 from mindroom.cli.config import activate_cli_runtime
 from mindroom.cli.main import app
@@ -27,6 +28,8 @@ from mindroom.config.personal_agents import (
 )
 from mindroom.constants import matrix_state_file, tracking_dir
 from mindroom.credentials.manager import PRIMARY_RUNTIME_SCOPED_CREDENTIALS_DIRNAME, scoped_credentials_dir_part
+from mindroom.custom_tools.todo_state import locked_update_json, read_json, todos_path
+from mindroom.custom_tools.todo_state import state_root as todo_state_root
 from mindroom.event_journal import EventJournalStore, EventKind, encode_thread_id
 from mindroom.event_journal.opening import event_journal_sqlite_path
 from mindroom.file_locks import release_file_lock, try_exclusive_file_lock
@@ -305,6 +308,40 @@ def test_apply_adopts_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, s
     assert backup_dir.name.endswith("-rename-account")
     assert (backup_dir / "manifest.json").is_file()
     assert str(backup_dir) in result.output
+    assert f"Leftover scan: nothing in {storage} names {OLD} any more." in result.output
+
+
+def test_todo_requesters_and_attachment_senders_follow_the_account(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A todo item another agent filed for nova and an attachment nova sent take the new ID, and nothing is left over.
+
+    Both rewrites are listed in the dry-run plan.
+    """
+    runtime_paths = _install(tmp_path, monkeypatch)
+    storage = runtime_paths.storage_root
+    item = {"id": "a1", "title": "Draft the summary", "assigned_agent": "orion", "requester_id": OLD}
+    todos = todos_path(todo_state_root(runtime_paths), "!room:x", "$thread")
+    locked_update_json(todos, lambda data: data.update(room_id="!room:x", thread_id="$thread", items=[item]))
+    source = tmp_path / "chart.png"
+    source.write_bytes(b"png")
+    register_local_attachment(storage, source, kind="image", attachment_id="att_chart", room_id="!room:x", sender=OLD)
+    record = storage / "attachments" / "att_chart.json"
+
+    dry_run = _invoke(runtime_paths)
+
+    assert dry_run.exit_code == 0, dry_run.output
+    assert f"Set the todo item fields that hold {OLD} in {todos} to {NEW}" in dry_run.output
+    assert f"Set the fields that hold {OLD} in the attachment record {record} to {NEW}" in dry_run.output
+
+    result = _invoke(runtime_paths, "--apply", "--yes", "--skip-login-check")
+
+    assert result.exit_code == 0, result.output
+    assert read_json(todos)["items"] == [{**item, "requester_id": NEW}]
+    attachment = load_attachment(storage, "att_chart")
+    assert attachment is not None
+    assert attachment.sender == NEW
     assert f"Leftover scan: nothing in {storage} names {OLD} any more." in result.output
 
 

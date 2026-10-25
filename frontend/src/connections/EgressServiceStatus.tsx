@@ -1,13 +1,14 @@
-import { Badge } from "@/components/ui/badge";
 import { personalAccountRefusal, personalSandboxRefusal } from "./accountCopy";
 import {
   type RowAgent,
   type ServiceEditing,
+  sharesAccount,
   statusLabel,
 } from "./egressRowText";
+import { StatusLabel } from "./ToolRow";
 import type { EgressCredentialService } from "./types";
 
-/** The row's status badge and the notes about the account it uses, in the order they are shown. */
+/** The row's status and the notes about the account it uses, in the order they are shown. */
 export function ServiceStatus({
   service,
   agent,
@@ -15,21 +16,35 @@ export function ServiceStatus({
 }: {
   service: EgressCredentialService;
   agent: RowAgent;
-  serviceEditing?: ServiceEditing;
+  serviceEditing: ServiceEditing;
 }) {
   const oauth = service.oauth;
-  const sourceLabel = serviceEditing?.labels?.[service.source];
+  const sourceLabel = serviceEditing.labels?.[service.source];
   // Once a key is saved there is nothing left to ask for, so the hint goes.
   const refusalShown =
     oauth?.unavailable_reason === "shared_sandbox" && !service.key_configured;
   return (
     <>
-      <Badge
-        variant={service.configured ? "secondary" : "outline"}
-        className="max-w-full font-normal"
+      <StatusLabel
+        tone={
+          oauth?.reset_required && !service.configured
+            ? "attention"
+            : service.configured
+              ? "set"
+              : "unset"
+        }
       >
-        {statusLabel(service, agent)}
-      </Badge>
+        {statusLabel(service)}
+      </StatusLabel>
+      {/* Also beside an account only its tools use: the one Agent Keys would use once allowed. */}
+      {service.active_source !== "key" && oauth?.account_label && (
+        <span className="text-xs wrap-anywhere">{oauth.account_label}</span>
+      )}
+      {service.active_source === "oauth" && sharesAccount(agent, oauth) && (
+        <span className="text-xs text-muted-foreground">
+          Shared with everyone using {agent.displayName}
+        </span>
+      )}
       {service.active_source === "key" && oauth?.connected && (
         <span className="text-xs text-muted-foreground">
           Your connected {oauth.display_name} account is kept for other
@@ -37,9 +52,7 @@ export function ServiceStatus({
         </span>
       )}
       {sourceLabel && (
-        <Badge variant="outline" className="font-normal">
-          {sourceLabel}
-        </Badge>
+        <span className="text-xs text-muted-foreground">{sourceLabel}</span>
       )}
       {/* A service account serves the provider's tools, but the broker never injects it. */}
       {oauth?.service_account && service.active_source !== "key" && (
@@ -47,7 +60,9 @@ export function ServiceStatus({
           Agent Keys cannot use the shared service account, so{" "}
           {service.active_source === "oauth"
             ? "this uses the account connected earlier."
-            : "this service needs a key."}
+            : oauth.connected
+              ? "this service needs a key or the account connected earlier."
+              : "this service needs a key."}
         </span>
       )}
       {refusalShown && (

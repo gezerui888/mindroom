@@ -45,6 +45,7 @@ Generated from `docs/` via `.github/scripts/generate_skill_references.py`.
 | Matrix | Matrix Integration | `matrix.md` | `matrix/index.md` | `page__matrix__index.md` |
 | Matrix | Rooms & Spaces | `rooms.md` | `rooms/index.md` | `page__rooms__index.md` |
 | Matrix | Personal Rooms | `personal-rooms.md` | `personal-rooms/index.md` | `page__personal-rooms__index.md` |
+| Matrix | Personal Agents | `personal-agents.md` | `personal-agents/index.md` | `page__personal-agents__index.md` |
 | Matrix | Bridges | `deployment/bridges/index.md` | `deployment/bridges/index.md` | `page__deployment__bridges__index.md` |
 | Matrix | Telegram Bridge | `deployment/bridges/telegram.md` | `deployment/bridges/telegram/index.md` | `page__deployment__bridges__telegram__index.md` |
 | Tools | Enable & Configure Tools | `tools/index.md` | `tools/index.md` | `page__tools__index.md` |
@@ -67,6 +68,7 @@ Generated from `docs/` via `.github/scripts/generate_skill_references.py`.
 | Tools > Tool Catalog | Messaging & Social | `tools/messaging-and-social.md` | `tools/messaging-and-social/index.md` | `page__tools__messaging-and-social__index.md` |
 | Tools > Tool Catalog | Project Management | `tools/project-management.md` | `tools/project-management/index.md` | `page__tools__project-management__index.md` |
 | Tools > Tool Catalog | Atlassian Cloud | `tools/atlassian.md` | `tools/atlassian/index.md` | `page__tools__atlassian__index.md` |
+| Tools > Tool Catalog | Microsoft 365 | `tools/microsoft-365.md` | `tools/microsoft-365/index.md` | `page__tools__microsoft-365__index.md` |
 | Tools > Tool Catalog | Calendar & Tasks | `tools/calendar-and-scheduling.md` | `tools/calendar-and-scheduling/index.md` | `page__tools__calendar-and-scheduling__index.md` |
 | Tools > Tool Catalog | Mem0 & Zep | `tools/memory-and-storage.md` | `tools/memory-and-storage/index.md` | `page__tools__memory-and-storage__index.md` |
 | Tools > Tool Catalog | Agent Orchestration | `tools/agent-orchestration.md` | `tools/agent-orchestration/index.md` | `page__tools__agent-orchestration__index.md` |
@@ -75,6 +77,7 @@ Generated from `docs/` via `.github/scripts/generate_skill_references.py`.
 | Security & Access | Access Control | `authorization.md` | `authorization/index.md` | `page__authorization__index.md` |
 | Security & Access | Tool Approval | `tool-approval.md` | `tool-approval/index.md` | `page__tool-approval__index.md` |
 | Security & Access | Credentials & OAuth | `oauth-framework.md` | `oauth-framework/index.md` | `page__oauth-framework__index.md` |
+| Security & Access | Connections Portal | `connections-portal.md` | `connections-portal/index.md` | `page__connections-portal__index.md` |
 | Security & Access | Connect Google Accounts | `deployment/google-services-user-oauth.md` | `deployment/google-services-user-oauth/index.md` | `page__deployment__google-services-user-oauth__index.md` |
 | Security & Access | Google OAuth Apps & Scopes | `deployment/google-services-oauth.md` | `deployment/google-services-oauth/index.md` | `page__deployment__google-services-oauth__index.md` |
 | Security & Access | Security Model | `architecture/security-posture.md` | `architecture/security-posture/index.md` | `page__architecture__security-posture__index.md` |

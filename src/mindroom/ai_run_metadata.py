@@ -2,156 +2,98 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from agno.metrics import RunMetrics
-from agno.run.base import RunStatus
-
+from mindroom.budgets.pricing import format_cost_usd, run_cost_usd
 from mindroom.constants import AI_RUN_METADATA_KEY
-from mindroom.model_usage import context_input_tokens_from_counts
+from mindroom.llm.messages import is_own_model_message
+from mindroom.llm.runs import RunStatus
+from mindroom.model_usage import ContextTokens, message_context_tokens, uncached_input_tokens_from_counts
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
+    from mindroom.budgets.pricing import PricedModel
     from mindroom.config.main import Config
     from mindroom.config.models import ModelConfig
     from mindroom.history.types import PreparedHistoryState
+    from mindroom.llm.runs import AnyRunRecord
+    from mindroom.llm.usage import RunMetrics, TokenCounts
 
 _AI_RUN_METADATA_VERSION = 1
+# The ``usage`` object lists the counters first, in this order; a counter it omits follows them. It equals the stored
+# order (``llm/usage.py``) today but is its own tuple: the published event and the stored row are separate contracts.
+_PUBLISHED_COUNTERS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "audio_input_tokens",
+    "audio_output_tokens",
+    "audio_total_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
 
 
-def empty_request_metric_totals() -> dict[str, int]:
-    """Return zeroed cumulative model-request counters for one streamed run."""
-    return {
-        "input_tokens": 0,
-        "output_tokens": 0,
-        "total_tokens": 0,
-        "reasoning_tokens": 0,
-        "cache_read_tokens": 0,
-        "cache_write_tokens": 0,
-    }
+@dataclass(frozen=True, slots=True)
+class _ReplyUsage:
+    """The ``usage`` object of a reply's ``io.mindroom.ai_run`` metadata, kept apart from how runs store usage.
 
-
-def accumulate_model_request_metrics(
-    totals: dict[str, int],
-    observed_fields: set[str],
-    *,
-    input_tokens: int | None,
-    output_tokens: int | None,
-    total_tokens: int | None,
-    reasoning_tokens: int | None,
-    cache_read_tokens: int | None,
-    cache_write_tokens: int | None,
-    time_to_first_token: float | None,
-    first_token_latency: float | None,
-) -> float | None:
-    """Accumulate observed integer counters and retain the first numeric latency.
-
-    The caller owns counter initialization; missing counters are left untouched.
+    Zero counters and unset values are left out, and fractions are published as decimal strings, because Matrix
+    event JSON forbids floats.
     """
-    for field_name, value in (
-        ("input_tokens", input_tokens),
-        ("output_tokens", output_tokens),
-        ("total_tokens", total_tokens),
-        ("reasoning_tokens", reasoning_tokens),
-        ("cache_read_tokens", cache_read_tokens),
-        ("cache_write_tokens", cache_write_tokens),
-    ):
-        if isinstance(value, int):
-            observed_fields.add(field_name)
-            totals[field_name] = totals.get(field_name, 0) + value
-    if first_token_latency is None and isinstance(time_to_first_token, (int, float)):
-        return float(time_to_first_token)
-    return first_token_latency
+
+    tokens: TokenCounts
+    cost: float | None
+    time_to_first_token: float | None
+    duration: float | None
+    uncached_input_tokens: int | None
+
+    @classmethod
+    def of(cls, metrics: RunMetrics, *, uncached_input_tokens: int | None) -> _ReplyUsage:
+        """Return the usage a run's metrics publish."""
+        return cls(metrics.tokens, metrics.cost, metrics.time_to_first_token, metrics.duration, uncached_input_tokens)
+
+    def to_wire(self) -> dict[str, Any]:
+        """Return the published object, empty when nothing was reported; the uncached input is published as given."""
+        values = {
+            **self.tokens.to_dict(first=_PUBLISHED_COUNTERS),
+            "cost": self.cost,
+            "time_to_first_token": self.time_to_first_token,
+            "duration": self.duration,
+        }
+        wire: dict[str, Any] = {
+            key: format(value, ".12g") if isinstance(value, float) else value
+            for key, value in values.items()
+            if isinstance(value, (float, str)) or (isinstance(value, int) and value != 0)
+        }
+        if wire and self.uncached_input_tokens is not None:
+            wire["uncached_input_tokens"] = self.uncached_input_tokens
+        return wire
 
 
-def _serialize_metrics(metrics: RunMetrics | dict[str, Any] | None) -> dict[str, Any] | None:
-    def _sanitize_metrics_payload(payload: dict[str, Any]) -> dict[str, Any] | None:
-        sanitized: dict[str, Any] = {}
-        for key, value in payload.items():
-            if isinstance(value, (str, int)) or value is None or isinstance(value, bool):
-                sanitized[key] = value
-            elif isinstance(value, float):
-                sanitized[key] = format(value, ".12g")
-        return sanitized or None
-
-    if metrics is None:
-        return None
-    if isinstance(metrics, RunMetrics):
-        metrics_dict = metrics.to_dict()
-        if not isinstance(metrics_dict, dict):
-            return None
-        return _sanitize_metrics_payload(metrics_dict)
-    if isinstance(metrics, dict):
-        return _sanitize_metrics_payload(metrics)
-    return None
-
-
-def build_model_request_metrics_fallback(
-    totals: dict[str, int],
-    first_token_latency: float | None,
-    observed_fields: set[str] | None = None,
-) -> dict[str, Any] | None:
-    """Build aggregate usage metadata from streamed request events."""
-    if observed_fields is None:
-        payload: dict[str, Any] = {key: value for key, value in totals.items() if value > 0}
-    else:
-        payload: dict[str, Any] = {key: totals[key] for key in observed_fields if key in totals}
-    total_tokens = payload.get("total_tokens")
-    if isinstance(total_tokens, int) and total_tokens <= 0:
-        payload.pop("total_tokens")
-    if "total_tokens" not in payload:
-        input_tokens = payload.get("input_tokens")
-        output_tokens = payload.get("output_tokens")
-        if isinstance(input_tokens, int) and isinstance(output_tokens, int):
-            payload["total_tokens"] = input_tokens + output_tokens
-    if first_token_latency is not None:
-        payload["time_to_first_token"] = format(first_token_latency, ".12g")
-    return payload or None
-
-
-def _build_context_payload(
-    *,
-    context_input_tokens: int | None,
-    cache_read_tokens: int | None,
-    cache_write_tokens: int | None,
-    model_config: ModelConfig | None,
-) -> dict[str, Any] | None:
-    if context_input_tokens is None or model_config is None or model_config.context_window is None:
+def _build_context_payload(context: ContextTokens | None, model_config: ModelConfig | None) -> dict[str, Any] | None:
+    if context is None or model_config is None or model_config.context_window is None:
         return None
     context_window = model_config.context_window
     if context_window <= 0:
         return None
     payload = {
-        "input_tokens": context_input_tokens,
+        "input_tokens": context.tokens,
         "window_tokens": context_window,
     }
-    bounded_cache_read_tokens: int | None = None
-    if cache_read_tokens is not None and cache_read_tokens > 0:
-        bounded_cache_read_tokens = min(cache_read_tokens, context_input_tokens)
-        if bounded_cache_read_tokens > 0:
-            payload["cache_read_input_tokens"] = bounded_cache_read_tokens
-    uncached_input_tokens: int | None = None
-    if cache_read_tokens is not None or cache_write_tokens is not None:
-        # Cache writes were not read from cache, so they remain in the non-cache-read bucket.
-        uncached_input_tokens = context_input_tokens - (bounded_cache_read_tokens or 0)
-        if uncached_input_tokens >= 0:
-            payload["uncached_input_tokens"] = uncached_input_tokens
-    if (
-        cache_write_tokens is not None
-        and cache_write_tokens > 0
-        and uncached_input_tokens is not None
-        and cache_write_tokens <= uncached_input_tokens
-    ):
+    if context.cache_read_input_tokens > 0:
+        payload["cache_read_input_tokens"] = context.cache_read_input_tokens
+    # The split into cache reads and the rest is shown only when the provider reported a cache counter.
+    if context.cache_read_tokens is None and context.cache_write_tokens is None:
+        return payload
+    payload["uncached_input_tokens"] = context.uncached_input_tokens
+    cache_write_tokens = context.cache_write_tokens
+    if cache_write_tokens is not None and 0 < cache_write_tokens <= context.uncached_input_tokens:
         payload["cache_write_input_tokens"] = cache_write_tokens
     return payload
-
-
-def _int_usage_value(usage_payload: dict[str, Any] | None, key: str) -> int | None:
-    if usage_payload is None:
-        return None
-    value = usage_payload.get(key)
-    return value if isinstance(value, int) else None
 
 
 def _build_compaction_metadata_payload(prepared_history: PreparedHistoryState | None) -> dict[str, Any] | None:
@@ -207,31 +149,68 @@ def ai_run_extra_content_from_metadata(run_metadata: Mapping[str, Any] | None) -
     return {AI_RUN_METADATA_KEY: dict(ai_run_metadata)}
 
 
-def _context_provider_key(provider: str | None) -> str:
-    key = (provider or "").strip().lower().replace("-", "_")
-    return {"vertexai_claude": "vertexai", "bedrock_claude": "awsbedrock"}.get(key, key)
-
-
-def _native_context_counts(
-    metrics: RunMetrics | None,
-    model_id: str | None,
+def _reply_context_tokens(
+    run: AnyRunRecord | None,
+    prepared_history: PreparedHistoryState | None,
+    *,
     provider: str | None,
-) -> tuple[int | None, int | None, int | None] | None:
-    """Read final-iteration context separately from accumulated billing."""
-    if isinstance(metrics, RunMetrics):
-        for detail in (metrics.details or {}).get("model", []):
-            if detail.id == model_id and _context_provider_key(detail.provider) == _context_provider_key(provider):
-                usage = (detail.provider_metrics or {}).get("context_usage")
-                if isinstance(usage, dict):
-                    return (
-                        _int_usage_value(usage, "input_tokens"),
-                        _int_usage_value(usage, "cache_read_tokens"),
-                        _int_usage_value(usage, "cache_write_tokens"),
-                    )
-    return None
+    configured_provider: str | None,
+    model_id: str | None,
+) -> ContextTokens | None:
+    """Return the context the run's last own model request reported, else the pre-flight estimate of its history.
+
+    The estimate stands in when the run holds no request its model answered, and when the last one reported no usage
+    of its own: on a route that reports none, or for a retried request whose usage sums its attempts.
+    """
+    newest_first = reversed(run.messages) if run is not None else ()
+    last = next((message for message in newest_first if is_own_model_message(message)), None)
+    if last is not None:
+        reported = message_context_tokens(
+            last,
+            provider=provider,
+            configured_provider=configured_provider,
+            model_id=model_id,
+        )
+        if reported is not None:
+            return reported
+    estimate = prepared_history.prepared_context_tokens if prepared_history is not None else None
+    return None if estimate is None else ContextTokens(estimate)
 
 
-def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
+def _uncached_input_tokens(
+    metrics: RunMetrics,
+    *,
+    provider: str | None,
+    configured_provider: str | None,
+    model_id: str | None,
+) -> int | None:
+    """Split new input from cache reads per model, since providers count cache tokens differently."""
+    entries = [entry for entries in (metrics.details or {}).values() for entry in entries]
+    if entries:
+        return sum(
+            uncached_input_tokens_from_counts(
+                input_tokens=entry.tokens.input_tokens,
+                cache_read_tokens=entry.tokens.cache_read_tokens,
+                cache_write_tokens=entry.tokens.cache_write_tokens,
+                provider=entry.provider,
+                configured_provider=None,
+                model_id=entry.id,
+            )
+            or 0
+            for entry in entries
+        )
+    # A zero counter counts as unreported, as the published usage leaves it out.
+    return uncached_input_tokens_from_counts(
+        input_tokens=metrics.tokens.input_tokens or None,
+        cache_read_tokens=metrics.tokens.cache_read_tokens or None,
+        cache_write_tokens=metrics.tokens.cache_write_tokens or None,
+        provider=provider,
+        configured_provider=configured_provider,
+        model_id=model_id,
+    )
+
+
+def build_ai_run_metadata_content(  # noqa: C901, PLR0912
     *,
     config: Config,
     model_name: str,
@@ -240,13 +219,9 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     status: RunStatus | str | None,
     model: str | None,
     model_provider: str | None,
-    metrics: RunMetrics | dict[str, Any] | None = None,
-    metrics_fallback: dict[str, Any] | None = None,
-    context_metrics: RunMetrics | None = None,
-    context_raw_input_tokens: int | None = None,
-    context_input_tokens: int | None = None,
-    context_cache_read_tokens: int | None = None,
-    context_cache_write_tokens: int | None = None,
+    prices: Mapping[tuple[str, str], PricedModel],
+    metrics: RunMetrics | None = None,
+    context_run: AnyRunRecord | None = None,
     tool_count: int | None = None,
     prepared_history: PreparedHistoryState | None = None,
 ) -> dict[str, Any]:
@@ -256,63 +231,14 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     It must not be re-resolved here: the per-thread override store can change
     mid-run (for example via `switch_thread_model`), and this metadata must
     describe the model that actually produced the response.
-    `context_metrics` belongs to that model run before team-member billing is aggregated.
+    `context_run` is the run whose last own model request's context the reply reports: the reply's run, or a team's
+    leader run, whose members' requests each held a context of their own.
+    `prices` maps recorded (provider, model ID) identities to prices for the reply's cost.
     """
     model_config = config.models.get(model_name)
     model_id = model or (model_config.id if model_config is not None else None)
     provider = model_provider or (model_config.provider if model_config is not None else None)
-
-    usage_payload = _serialize_metrics(metrics)
-    if metrics_fallback:
-        fallback_usage_payload = dict(metrics_fallback)
-        if usage_payload is None:
-            usage_payload = fallback_usage_payload
-        else:
-            for key, value in fallback_usage_payload.items():
-                usage_payload.setdefault(key, value)
-
-    usage_input_tokens = usage_payload.get("input_tokens") if usage_payload else None
-    if not isinstance(usage_input_tokens, int):
-        usage_input_tokens = None
-    # Native compaction adds a billed sampling iteration. Its cost is included
-    # above, while the final iteration alone describes the active context.
-    if native_counts := _native_context_counts(context_metrics, model_id, provider):
-        context_raw_input_tokens, context_cache_read_tokens, context_cache_write_tokens = native_counts
-    explicit_context_scope = any(
-        value is not None
-        for value in (
-            context_raw_input_tokens,
-            context_cache_read_tokens,
-            context_cache_write_tokens,
-        )
-    )
-    # Provider usage counters are authoritative for context occupancy; the
-    # pre-flight `context_input_tokens` estimate is only a fallback when the
-    # provider reported nothing (for example a request that failed early).
-    resolved_context_input_tokens = context_input_tokens_from_counts(
-        input_tokens=context_raw_input_tokens if explicit_context_scope else usage_input_tokens,
-        cache_read_tokens=(
-            context_cache_read_tokens
-            if explicit_context_scope
-            else _int_usage_value(usage_payload, "cache_read_tokens")
-        ),
-        cache_write_tokens=(
-            context_cache_write_tokens
-            if explicit_context_scope
-            else _int_usage_value(usage_payload, "cache_write_tokens")
-        ),
-        provider=provider,
-        configured_provider=model_config.provider if model_config is not None else None,
-        model_id=model_id,
-    )
-    if resolved_context_input_tokens is None:
-        resolved_context_input_tokens = context_input_tokens
-    resolved_context_cache_read_tokens = context_cache_read_tokens
-    if resolved_context_cache_read_tokens is None and not explicit_context_scope:
-        resolved_context_cache_read_tokens = _int_usage_value(usage_payload, "cache_read_tokens")
-    resolved_context_cache_write_tokens = context_cache_write_tokens
-    if resolved_context_cache_write_tokens is None and not explicit_context_scope:
-        resolved_context_cache_write_tokens = _int_usage_value(usage_payload, "cache_write_tokens")
+    configured_provider = model_config.provider if model_config is not None else None
 
     payload: dict[str, Any] = {"version": _AI_RUN_METADATA_VERSION}
     if run_id is not None:
@@ -330,14 +256,32 @@ def build_ai_run_metadata_content(  # noqa: C901, PLR0912, PLR0915
     if provider is not None:
         model_payload["provider"] = provider
     payload["model"] = model_payload
-    if usage_payload:
-        payload["usage"] = usage_payload
-    context_payload = _build_context_payload(
-        context_input_tokens=resolved_context_input_tokens,
-        cache_read_tokens=resolved_context_cache_read_tokens,
-        cache_write_tokens=resolved_context_cache_write_tokens,
-        model_config=model_config,
+    if metrics is not None:
+        uncached_input_tokens = _uncached_input_tokens(
+            metrics,
+            provider=provider,
+            configured_provider=configured_provider,
+            model_id=model_id,
+        )
+        if usage := _ReplyUsage.of(metrics, uncached_input_tokens=uncached_input_tokens).to_wire():
+            payload["usage"] = usage
+    cost = run_cost_usd(
+        metrics,
+        metrics.tokens.to_dict() if metrics is not None else None,
+        model_provider=model_provider,
+        model_id=model_id,
+        prices=prices,
     )
+    if cost is not None:
+        payload["cost"] = {"usd": format_cost_usd(cost)}
+    context = _reply_context_tokens(
+        context_run,
+        prepared_history,
+        provider=provider,
+        configured_provider=configured_provider,
+        model_id=model_id,
+    )
+    context_payload = _build_context_payload(context, model_config)
     if context_payload:
         payload["context"] = context_payload
     if prepared_history is not None and prepared_history.prepared_context_tokens is not None:

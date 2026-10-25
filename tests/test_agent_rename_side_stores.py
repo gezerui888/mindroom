@@ -10,9 +10,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
-from agno.run.agent import RunOutput
-from agno.run.base import RunStatus
-from agno.session.agent import AgentSession
 
 from mindroom.agent_modes import resolve_agent_mode
 from mindroom.agent_rename.entity_state import entity_state_steps
@@ -43,6 +40,7 @@ from mindroom.delegation.storage import freeze_delegation_storage
 from mindroom.desktop.pairing import DesktopPairingError, claim_desktop_pairing
 from mindroom.dynamic_workflows.store import DynamicWorkflowStore
 from mindroom.external_triggers.store import ExternalTriggerStore
+from mindroom.llm.runs import RunRecord, RunStatus
 from mindroom.matrix.invited_rooms_store import invited_rooms_path, load_invited_rooms
 from mindroom.matrix.personal_room_store import (
     retained_personal_rooms,
@@ -56,6 +54,7 @@ from mindroom.oauth.state import read_opaque_oauth_state
 from mindroom.report_publishing.store import ReportPublishingStore
 from mindroom.script_runs.store import ScriptRunStore
 from mindroom.session_storage.agent_storage import create_state_storage
+from mindroom.session_storage.types import ConversationSession
 from mindroom.shared_directories.store import (
     SharedDirectory,
     create_shared_directory,
@@ -457,7 +456,7 @@ def test_published_workflow_reports_follow_the_agent(tmp_path: Path) -> None:
         assert publishing.report_asset_path(other).is_file()
 
 
-def _paused_delegation(run_id: str, session_id: str, *, caller: str, child: str, status: RunStatus) -> RunOutput:
+def _paused_delegation(run_id: str, session_id: str, *, caller: str, child: str, status: RunStatus) -> RunRecord:
     """Return a parent run whose saved delegation state, as the delegation driver persists it, waits on a child."""
     config = side_store_config(OLD)
     child_record = DelegationChild(
@@ -475,7 +474,7 @@ def _paused_delegation(run_id: str, session_id: str, *, caller: str, child: str,
         status="paused",
     )
     state = DelegationState(children=[child_record], storage_bindings=freeze_delegation_storage(config, [caller]))
-    return RunOutput(
+    return RunRecord(
         run_id=run_id,
         agent_id=caller,
         session_id=session_id,
@@ -498,15 +497,13 @@ def test_unfinished_delegations_naming_the_agent_are_reported(tmp_path: Path) ->
         PREFIX: [_paused_delegation("r5", "s-prefix", caller=PREFIX, child=HELPER, status=RunStatus.paused)],
     }
     for agent, agent_runs in runs.items():
-        storage = create_state_storage(
-            agent,
-            agent_state_root_path(runtime_paths.storage_root, agent),
-            subdir="sessions",
-            session_table=f"{agent}_sessions",
-        )
-        for session_id in sorted({run.session_id for run in agent_runs}):
+        storage = create_state_storage(agent, agent_state_root_path(runtime_paths.storage_root, agent))
+        for session_id in sorted({run.session_id for run in agent_runs if run.session_id is not None}):
             session_runs = [run for run in agent_runs if run.session_id == session_id]
-            seed_session(storage, AgentSession(session_id=session_id, agent_id=agent, user_id=ALICE, runs=session_runs))
+            seed_session(
+                storage,
+                ConversationSession(session_id=session_id, kind="agent", owner_id=agent, runs=session_runs),
+            )
 
     broken = agent_state_root_path(runtime_paths.storage_root, "broken") / "sessions" / "broken.db"
     broken.parent.mkdir(parents=True)

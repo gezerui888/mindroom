@@ -44,8 +44,7 @@ from mindroom.tool_approval_grants import (
 from mindroom.tool_system.tool_calls import sanitize_failure_text, sanitize_failure_value
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-    from pathlib import Path
+    from collections.abc import AsyncIterator, Iterator
 
     from mindroom.approval.recovery import ApprovalRecovery
     from mindroom.approval.tool_approval import BackgroundScriptToolOrigin
@@ -762,16 +761,10 @@ class ApprovalManager:
                 await before_consume()
             self._ensure_deadline_sweep()
             return ApprovalActionResult(consumed=True, card_event_id=card_event_id)
-        transport_sender = None if self.transport_sender is None else self.transport_sender()
-        pending = (
-            None
-            if transport_sender is None
-            else self._trusted_pending_from_card_event(
-                stored.card,
-                room_id=room_id,
-                transport_sender=transport_sender,
-                expected_card_event_id=card_event_id,
-            )
+        pending = self._trusted_pending_from_card_event(
+            stored.card,
+            room_id=room_id,
+            expected_card_event_id=card_event_id,
         )
         if (
             pending is None
@@ -1006,26 +999,64 @@ class ApprovalManager:
             return False
         complete = True
         for room_id in await self.cards.pending_approval_room_ids():
-            cursor: tuple[int, str] | None = None
-            while True:
-                page = await self.cards.pending_approval_cards(
-                    room_id=room_id,
-                    limit=_STARTUP_RECOVERY_SCAN_PAGE,
-                    after=cursor,
-                )
-                if not page:
-                    break
-                cursor = (page[-1].created_at_ns, page[-1].delivery_id)
-                for stored in page:
-                    if isinstance(stored, UnreadableApprovalCard):
-                        if stored.continuation_id == continuation_id:
-                            complete = False
-                        continue
-                    if stored.target_kind == "continuation" and stored.continuation_id == continuation_id:
-                        complete = await self._expire_stored(room_id, stored) and complete
-                if len(page) < _STARTUP_RECOVERY_SCAN_PAGE:
-                    break
+            async for stored in self._pending_cards(self.cards, room_id):
+                if isinstance(stored, UnreadableApprovalCard):
+                    if stored.continuation_id == continuation_id:
+                        complete = False
+                    continue
+                if stored.target_kind == "continuation" and stored.continuation_id == continuation_id:
+                    complete = await self._expire_stored(room_id, stored) and complete
         return complete
+
+    @staticmethod
+    async def _pending_cards(
+        cards: ApprovalDeliveryView,
+        room_id: str,
+    ) -> AsyncIterator[StoredApprovalCard | UnreadableApprovalCard]:
+        """Yield one room's recorded cards oldest first, one page at a time."""
+        cursor: tuple[int, str] | None = None
+        while True:
+            page = await cards.pending_approval_cards(room_id=room_id, limit=_STARTUP_RECOVERY_SCAN_PAGE, after=cursor)
+            if not page:
+                return
+            cursor = (page[-1].created_at_ns, page[-1].delivery_id)
+            for stored in page:
+                yield stored
+            if len(page) < _STARTUP_RECOVERY_SCAN_PAGE:
+                return
+
+    async def pending_card_event_ids(
+        self,
+        *,
+        room_id: str,
+        thread_id: str | None,
+        approver_user_id: str,
+    ) -> tuple[str, ...]:
+        """Return the unexpired, unanswered, approvable cards one approver has in one conversation, scheduled calls aside."""
+        if self.cards is None:
+            return ()
+        event_ids = []
+        now = _utcnow()
+        async for stored in self._pending_cards(self.cards, room_id):
+            if (
+                not isinstance(stored, StoredApprovalCard)
+                or stored.resolution is not None
+                or stored.card_event_id is None
+                or stored.target_kind == "scheduled_call"
+            ):
+                continue
+            content = stored.card["content"]
+            if (
+                content.get("thread_id") != thread_id
+                or content.get("approver_user_id") != approver_user_id
+                or content.get("approvable", True) is not True
+            ):
+                continue
+            # A card past its deadline expires when answered, until the deadline sweep retires it.
+            expires_at = parse_approval_datetime(content.get("expires_at"))
+            if expires_at is not None and expires_at > now:
+                event_ids.append(stored.card_event_id)
+        return tuple(event_ids)
 
     async def _expire_stored(self, room_id: str, stored: StoredApprovalCard) -> bool:
         if self.cards is None or (stored.card_event_id is None and stored.resolution is not None):
@@ -1035,16 +1066,10 @@ class ApprovalManager:
             if recorded.recorded and recorded.continuation_ready:
                 await self._wake_continuation(recorded)
             return False
-        transport_sender = None if self.transport_sender is None else self.transport_sender()
-        pending = (
-            None
-            if transport_sender is None
-            else self._trusted_pending_from_card_event(
-                stored.card,
-                room_id=room_id,
-                transport_sender=transport_sender,
-                expected_card_event_id=stored.card_event_id,
-            )
+        pending = self._trusted_pending_from_card_event(
+            stored.card,
+            room_id=room_id,
+            expected_card_event_id=stored.card_event_id,
         )
         if pending is None:
             return False
@@ -1122,31 +1147,19 @@ class ApprovalManager:
         scanned = 0
         retired = 0
         for room_id in await self.cards.pending_approval_room_ids():
-            cursor: tuple[int, str] | None = None
-            while True:
-                page = await self.cards.pending_approval_cards(
-                    room_id=room_id,
-                    limit=_STARTUP_RECOVERY_SCAN_PAGE,
-                    after=cursor,
+            async for stored in self._pending_cards(self.cards, room_id):
+                scanned += 1
+                settled = await self._settle_startup_card(room_id, stored)
+                had_transport_failure = any(
+                    delivery_id == stored.delivery_id for delivery_id, _stage in transport_failures
                 )
-                if not page:
-                    break
-                cursor = (page[-1].created_at_ns, page[-1].delivery_id)
-                for stored in page:
-                    scanned += 1
-                    settled = await self._settle_startup_card(room_id, stored)
-                    had_transport_failure = any(
-                        delivery_id == stored.delivery_id for delivery_id, _stage in transport_failures
-                    )
-                    if settled is True:
-                        transport_failures = {
-                            delivery for delivery in transport_failures if delivery[0] != stored.delivery_id
-                        }
-                        retired += 1
-                    elif settled is False and not had_transport_failure:
-                        failed += 1
-                if len(page) < _STARTUP_RECOVERY_SCAN_PAGE:
-                    break
+                if settled is True:
+                    transport_failures = {
+                        delivery for delivery in transport_failures if delivery[0] != stored.delivery_id
+                    }
+                    retired += 1
+                elif settled is False and not had_transport_failure:
+                    failed += 1
         self._ensure_deadline_sweep()
         return _ApprovalStartupSweep(
             discarded=retired,
@@ -1184,10 +1197,6 @@ class ApprovalManager:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-    def _uses_storage_root(self, storage_root: Path) -> bool:
-        """Check whether a runtime rebind belongs to this store."""
-        return self.runtime_paths.storage_root == storage_root
-
     def _has_live_work(self) -> bool:
         """Report decisions currently committing in this process."""
         with self._live_lock:
@@ -1208,14 +1217,17 @@ class ApprovalManager:
             with self._live_lock:
                 self._resolving_card_event_ids.discard(card_event_id)
 
-    @staticmethod
     def _trusted_pending_from_card_event(
+        self,
         card_event: dict[str, Any],
         *,
         room_id: str,
-        transport_sender: str,
         expected_card_event_id: str,
     ) -> PendingApproval | None:
+        """Return the still-pending card this process's transport account sent, or None without one."""
+        transport_sender = None if self.transport_sender is None else self.transport_sender()
+        if transport_sender is None:
+            return None
         event = dict(card_event)
         event.setdefault("sender", transport_sender)
         try:
@@ -1224,7 +1236,7 @@ class ApprovalManager:
             return None
         if pending.card_event_id != expected_card_event_id or pending.card_sender_id != transport_sender:
             return None
-        return pending if pending.latest_status(None) == "pending" else None
+        return pending if pending.initial_status == "pending" else None
 
     @staticmethod
     def _pending_event_content(
@@ -1301,7 +1313,7 @@ def initialize_approval_store(
 ) -> ApprovalManager:
     """Initialize the module-level approval domain for one runtime context."""
     global _MANAGER
-    if _MANAGER is not None and _MANAGER._uses_storage_root(runtime_paths.storage_root):
+    if _MANAGER is not None and _MANAGER.runtime_paths.storage_root == runtime_paths.storage_root:
         _MANAGER._configure_transport(
             prepare_event=prepare_event,
             send_delivery=send_delivery,

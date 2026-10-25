@@ -12,8 +12,8 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 from mindroom.agent_cli.shell_contract import SHELL_OPERATION_NAMES
-from mindroom.agent_knowledge_descriptions import KNOWLEDGE_SEARCH_TOOL_NAME
 from mindroom.delegation.state import SubagentPersona
+from mindroom.knowledge.search import KNOWLEDGE_SEARCH_TOOL_NAME
 from mindroom.knowledge.utils import semantic_agent_knowledge_base_ids
 from mindroom.path_confinement import open_directory_within_root, read_regular_file_within_root
 from mindroom.tool_system.catalog import TOOL_METADATA
@@ -22,7 +22,7 @@ from mindroom.tool_system.dynamic_toolkits import visible_tool_surface
 from mindroom.tool_system.skills import (
     SKILL_FUNCTION_NAMES,
     SkillMarkdownError,
-    build_agent_skills,
+    build_skills_toolkit,
     parse_skill_markdown,
     workspace_entry_names,
 )
@@ -31,12 +31,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping, Sequence
     from pathlib import Path
 
-    from agno.tools.function import Function
-
     from mindroom.agent_modes import AgentMode
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.delegation.state import PersonaSourceKind
+    from mindroom.tool_system.tool_function import ToolFunction
 
 _MAX_PERSONA_PROMPT_BYTES = 64 << 10
 _PROFILE_DIRNAME = "subagents"
@@ -260,7 +259,7 @@ def render_profile_listing(entries: Sequence[_PersonaProfile | _InvalidPersonaPr
 
 
 def caller_toolkit_names(agent_name: str, config: Config, *, delegation_depth: int) -> list[str]:
-    """Return every toolkit this agent may use, including deferred toolkits it loads on demand.
+    """Return every toolkit this agent may use, deferred toolkits included.
 
     Matrix room tools are listed too; a child naming one outside a Matrix room refuses to start.
     The deferred-tool manager is not, since an explicit tool list loads every toolkit it names.
@@ -268,13 +267,10 @@ def caller_toolkit_names(agent_name: str, config: Config, *, delegation_depth: i
     if agent_name not in config.agents:
         # A reload can remove the caller mid-response; its copies then have no tools to inherit.
         return []
-    deferred = [entry.name for entry in config.resolve_entity(agent_name).authored_deferred_tool_configs]
     surface = visible_tool_surface(
         agent_name=agent_name,
         config=config,
-        loaded_tools=deferred,
         delegation_depth=delegation_depth,
-        enable_dynamic_tools_manager=False,
         include_matrix_room_runtime_tools=True,
     )
     # A preset has no functions of its own; its member toolkits are listed by their own names.
@@ -290,8 +286,8 @@ def caller_skill_names(
     """Return every skill this agent may use: its configured skills and the skills in its workspace."""
     if agent_name not in config.agents:
         return []
-    skills = build_agent_skills(agent_name, config, runtime_paths, workspace_root=workspace_root)
-    return [] if skills is None else skills.get_skill_names()
+    toolkit = build_skills_toolkit(agent_name, config, runtime_paths, workspace_root=workspace_root)
+    return [] if toolkit is None else [skill.name for skill in toolkit.skills]
 
 
 def caller_knowledge_names(agent_name: str, config: Config) -> list[str]:
@@ -552,9 +548,9 @@ def _capped_names(
 def persona_tool_policy(
     persona_tools: tuple[str, ...] | None,
     available_toolkits: Callable[[], Sequence[str]],
-    tool_function_filter: Callable[[Function], bool] | None,
+    tool_function_filter: Callable[[ToolFunction], bool] | None,
     disabled_tool_names: frozenset[str],
-) -> tuple[Callable[[Function], bool] | None, frozenset[str]]:
+) -> tuple[Callable[[ToolFunction], bool] | None, frozenset[str]]:
     """Narrow an agent's own tools to an authored persona's explicit list; its principal is unchanged.
 
     Toolkits the list never names are not built, nor is the deferred-tool manager, since a persona
@@ -567,8 +563,8 @@ def persona_tool_policy(
     named = {entry.partition(".")[0] for entry in persona_tools}
     unused = {toolkit for toolkit in available_toolkits() if toolkit not in named}
 
-    def visible(function: Function) -> bool:
-        return (function.owning_toolkit is not None or function.name in _GENERATED_PERSONA_FUNCTIONS) and (
+    def visible(function: ToolFunction) -> bool:
+        return (function.toolkit is not None or function.name in _GENERATED_PERSONA_FUNCTIONS) and (
             tool_function_filter is None or tool_function_filter(function)
         )
 

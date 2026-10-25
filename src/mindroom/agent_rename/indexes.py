@@ -58,7 +58,7 @@ _MEM0_DIR_VARIABLE = "MEM0_DIR"
 _MEM0_HISTORY_DATABASE = "history.db"
 # mem0/memory/storage.py's SQLiteManager keeps the recent messages in this table; older mem0 versions had none.
 _MEM0_MESSAGES_TABLE = "messages"
-# hooks/context.py's _resolve_plugin_state_root and tool_system/runtime_context.py's get_plugin_state_root.
+# hooks/context.py's _resolve_plugin_state_root keeps each plugin's state in plugins/<plugin name>/.
 _PLUGINS = "plugins"
 # legacy_handled_turns.py's import_legacy_ledger renames an imported ledger with this suffix appended.
 _IMPORTED_LEDGER_SUFFIX = ".imported"
@@ -67,6 +67,8 @@ _IMPORTED_LEDGER_SUFFIX = ".imported"
 # state roots, and the file-memory search indexes before knowledge indexes (#1165), `<scope id>_<16 hex digits>`.
 _DISPATCH_OBLIGATIONS_PREFIX = "dispatch_obligations-"
 _LEGACY_SESSIONS = "sessions"
+# config/agent.py's LEGACY_COMPAT note: retired Agno Learning left `learning/<agent>.db` in the agent's state root.
+_LEGACY_LEARNING = "learning"
 _LEGACY_MEMORY_SEARCH = "memory_search_db"
 # Agent names are letters, digits and `_`, so a name is mentioned where neither side continues it.
 _NAME_CHARACTER = "A-Za-z0-9_"
@@ -107,7 +109,7 @@ def index_steps(
         _plugin_state_reports(runtime_paths, old_name),
         _config_line_reports(runtime_paths, old_name, new_name),
         ([scheduled_tasks], []),
-        _legacy_file_reports(runtime_paths, old_name, moved_ledger=bool(ledger_steps)),
+        _legacy_file_reports(runtime_paths, old_name, new_name, moved_ledger=bool(ledger_steps)),
     ]
     reports = [report for lines, _ in reported for report in lines]
     staying = [path for _, paths in reported for path in paths]
@@ -323,8 +325,18 @@ def _config_line_reports(runtime_paths: RuntimePaths, old_name: str, new_name: s
     return [report], mentioning
 
 
-def _legacy_file_reports(runtime_paths: RuntimePaths, name: str, *, moved_ledger: bool) -> tuple[list[str], list[Path]]:
-    """Report the files older MindRoom versions kept for the agent under its name, except a ledger that moves."""
+def _legacy_file_reports(
+    runtime_paths: RuntimePaths,
+    name: str,
+    new_name: str,
+    *,
+    moved_ledger: bool,
+) -> tuple[list[str], list[Path]]:
+    """Report the files older MindRoom versions kept for the agent under its name, except a ledger that moves.
+
+    The retired Agno Learning database ``learning/<name>.db`` moves with the state root to ``agents/<new name>/``
+    and keeps its name there.
+    """
     storage = runtime_paths.storage_root
     tracking = tracking_dir(runtime_paths)
     ledger = legacy_responses_file_path(storage, name)
@@ -338,7 +350,10 @@ def _legacy_file_reports(runtime_paths: RuntimePaths, name: str, *, moved_ledger
         # The pre-journal handled-turn ledger once imported, and copies of it older readers set aside.
         return entry.startswith(ledger.name) and not (moved_ledger and entry == ledger.name)
 
+    learning = agent_state_root_path(storage, name) / _LEGACY_LEARNING
+    moved_learning = agent_state_root_path(storage, new_name) / _LEGACY_LEARNING
     paths = [
+        *(moved_learning / entry.name for entry in _entries(learning, session_database)),
         *_entries(tracking, lambda entry: entry.startswith(f"{_DISPATCH_OBLIGATIONS_PREFIX}{name}-")),
         *_entries(storage / _LEGACY_SESSIONS, session_database),
         *_entries(storage, session_database),

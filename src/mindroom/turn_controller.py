@@ -96,7 +96,7 @@ from mindroom.response_payload_preparation import (
 from mindroom.response_runner import PostLockRequestPreparationError, ResponseRequest
 from mindroom.response_sources import ResponseSources
 from mindroom.router_relay import execute_router_relay
-from mindroom.teams import TeamIntent, TeamMode, select_ad_hoc_team_mode
+from mindroom.teams.formation import TeamIntent, select_ad_hoc_team_mode
 from mindroom.text_ingress_dispatch import dispatch_text_message
 from mindroom.thread_utils import (
     check_agent_mentioned,
@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     from mindroom.message_target import MessageTarget, ResponseLifecycleKey
     from mindroom.response_lifecycle import QueuedHumanNoticeReservation
     from mindroom.response_runner import ResponseRunner
+    from mindroom.teams.spec import TeamMode
     from mindroom.tool_system.runtime_context import ToolRuntimeSupport
     from mindroom.turn_store import TurnStore
     from mindroom.visible_response_reconciliation import VisibleResponseReconciler
@@ -881,7 +882,12 @@ class TurnController:
         prechecked_event: _PrecheckedEvent[nio.RoomMessageFormatted],
         event_info: EventInfo,
     ) -> bool | None:
-        """Hand one edited user turn to the edit regenerator."""
+        """Apply a person's edit to their message still waiting in a queue, or hand it to the edit regenerator.
+
+        An entity's edit changes neither, so a queued message from an entity answers the text it was queued with.
+        """
+        if self.deps.ingress.managed_entity_name_for_sender(prechecked_event.event.sender) is not None:
+            return None
         async with admitted_response_decision(
             self.deps.runtime.response_admission_gate,
             self.deps.response_runner.wait_for_admission_or_shutdown,
@@ -1784,7 +1790,7 @@ class TurnController:
             selection_handled_turn,
             target=response_target,
             response_text=(
-                f"You selected: {selection.selection_key} {selection.selected_value}\n\nProcessing your response..."
+                f"You selected: {selection.selection_key} {selection.selected_label}\n\nProcessing your response..."
             ),
             delivery_turn_id=source_event_id,
         )
@@ -2038,8 +2044,7 @@ class TurnController:
                 assert action.form_team.mode is not None
                 registry = entity_identity_registry(self.deps.runtime.config, self.deps.runtime_paths)
                 target_member_names = tuple(
-                    registry.current_entity_name_for_user_id(member.full_id) or member.username
-                    for member in action.form_team.eligible_members
+                    registry.entity_name_or_username(member) for member in action.form_team.eligible_members
                 )
 
             context_ready_monotonic = time.monotonic()
@@ -2239,7 +2244,9 @@ class TurnController:
         is_nonterminal_stream = (
             isinstance(event_content, dict) and event_content.get(STREAM_STATUS_KEY) in UNFINISHED_REPLY_STATUSES
         )
-        if not isinstance(event.body, str) or (is_nonterminal_stream and event_info.is_edit):
+        # A placeholder still streaming names no requester, so refusing it here would mark the turn its finished
+        # reply needs as handled.
+        if not isinstance(event.body, str) or is_nonterminal_stream:
             return TurnDispatchOutcome.INTENTIONALLY_IGNORED
         # Another entity's finished reply arrives as an edit of its placeholder; its mentions dispatch like a message.
         final_reply = self._mentioned_entity_final_reply(room, event) if event_info.is_edit else None
@@ -2248,8 +2255,6 @@ class TurnController:
         is_edit = event_info.is_edit and final_reply is None
         prechecked_event = await self._precheck_dispatch_event(room, event, is_edit=is_edit)
         if prechecked_event is None:
-            return TurnDispatchOutcome.INTENTIONALLY_IGNORED
-        if is_nonterminal_stream:
             return TurnDispatchOutcome.INTENTIONALLY_IGNORED
         await ensure_room_membership_synced(
             self._client(),

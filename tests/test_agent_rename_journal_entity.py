@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID, uuid4
 
 import pytest
-from agno.models.response import ToolExecution
 
 from mindroom import reply_lifecycle as rl
 from mindroom.agent_rename.journal_entity import journal_entity_steps
@@ -37,9 +36,10 @@ from mindroom.event_journal.opening import event_journal_sqlite_path
 from mindroom.event_journal.replies import PreparedReplyRow, ReplyRowRequest
 from mindroom.handled_turns import HandledTurnLedger, TurnRecord, _reset_handled_turn_ledger_runtime
 from mindroom.history.types import HistoryScope
+from mindroom.llm.events import ReportedCall
 from mindroom.reply_presentation import Presentation, Segment, current_answer, decode_presentation, encode_presentation
 from mindroom.response_sources import ResponseSources
-from mindroom.teams import _TeamStreamPresentation
+from mindroom.teams.presentation import TeamStreamPresentation
 from mindroom.tool_jobs.runtime import BackgroundJob
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.agent_rename_fixtures.journal import (
@@ -366,13 +366,13 @@ def _team_continuation() -> ApprovalContinuation:
 
 def _team_presentation(span_id: str) -> str:
     """The team document a paused team reply shows, written by MindRoom's team stream with hidden tool calls."""
-    team = _TeamStreamPresentation.new(TEAM_MEMBERS, ["Code", "Code Team", "Helper"], show_tool_calls=False)
+    team = TeamStreamPresentation.new(TEAM_MEMBERS, ["Code", "Code Team", "Helper"], show_tool_calls=False)
     for member_id in team.member_ids:
         team.append_member(member_id, f"{member_id} thinks")
-    team.start_member_tool("code", ToolExecution(tool_call_id="call-1", tool_name="shell", tool_args={"cmd": "ls"}))
+    team.start_member_tool("code", ReportedCall(tool_call_id="call-1", tool_name="shell", tool_args={"cmd": "ls"}))
     team.start_member_tool(
         "code-team",
-        ToolExecution(tool_call_id="call-2", tool_name="shell", tool_args={"cmd": "ls"}),
+        ReportedCall(tool_call_id="call-2", tool_name="shell", tool_args={"cmd": "ls"}),
     )
     segment = Segment(
         kind="answer",
@@ -604,11 +604,11 @@ def _without_times(job: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in job.items() if key not in {"created_at", "updated_at"}}
 
 
-def _restore_team_document(stored: str, member_names: tuple[str, ...]) -> _TeamStreamPresentation:
-    """Restore a stored team document the way an approval resume does (teams.py's continue_paused_team_run)."""
+def _restore_team_document(stored: str, member_names: tuple[str, ...]) -> TeamStreamPresentation:
+    """Restore a stored team document the way an approval resume does (teams/resume.py's continue_paused_team_run)."""
     segment = current_answer(decode_presentation(stored), None)
     assert segment is not None
-    return _TeamStreamPresentation.restore(
+    return TeamStreamPresentation.restore(
         config_names=member_names,
         show_tool_calls=False,
         state=segment.team_state,

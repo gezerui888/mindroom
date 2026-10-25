@@ -11,7 +11,6 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
-from agno.session.team import TeamSession
 
 from mindroom import constants
 from mindroom.agent_rename.steps import (
@@ -46,7 +45,6 @@ from tests.agent_rename_fixtures.teams import (
     install_teams,
     seed_team,
     team_config,
-    team_context,
     team_history,
 )
 from tests.agent_rename_helpers import sqlite_schema, tree_rows, tree_snapshot
@@ -120,7 +118,6 @@ def test_ad_hoc_history_visible_under_recomputed_scope(tmp_path: Path, team: Tea
     assert history.member_runs == [(NEW, f"r2-{OLD}"), (other, f"r2-{other}")]
     assert history.member_responses == [[NEW, other]]
     assert history.requirement_members == [NEW]
-    assert history.member_messages == ["task r2", "done"]
     assert not _store(runtime_paths, old_scope_id).exists()
     assert sorted(path.name for path in (_store(runtime_paths, history.scope_id) / "sessions").iterdir()) == [
         f"{_store(runtime_paths, history.scope_id).name}.db",
@@ -161,10 +158,6 @@ def test_configured_team_member_runs_visible_as_new_name(tmp_path: Path) -> None
     assert history.member_runs == [(NEW, "r2-code"), (HELPER, "r2-helper")]
     assert history.member_responses == [[NEW, HELPER]]
     assert history.requirement_members == [NEW]
-    assert history.member_messages == ["task r2", "done"]
-    with team_context(runtime_paths, team_config(NEW), CONFIGURED.renamed()) as context:
-        assert isinstance(context.session, TeamSession)
-        assert context.session.get_messages(member_ids=[OLD]) == []
 
 
 def test_scopes_without_agent_untouched(tmp_path: Path) -> None:

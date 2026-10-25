@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal, cast
@@ -49,6 +49,7 @@ from mindroom.response_sources import ResponseSources
 from mindroom.turn_policy import PreparedDispatch, TurnPolicy
 from tests.access_schema_support import with_current_room_member_access
 from tests.conftest import (
+    SETTLE_TIMEOUT_SECONDS,
     TEST_PASSWORD,
     bind_runtime_paths,
     drain_coalescing,
@@ -67,13 +68,12 @@ from tests.journal_helpers import admit_dispatch_event
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 
-    from agno.knowledge.document import Document
-
     from mindroom.bot import AgentBot, TeamBot
     from mindroom.coalescing.gate import ReadyPendingEvent
     from mindroom.config.knowledge import KnowledgeBaseConfig
     from mindroom.conversation_resolver import MessageContext
     from mindroom.inbound_turn_normalizer import DispatchPayload
+    from mindroom.knowledge.read_protocol import SearchHit
     from mindroom.media_inputs import MediaInputs
     from mindroom.orchestrator import (
         _MultiAgentOrchestrator,
@@ -210,33 +210,31 @@ async def _run_orchestrator_start_until_ready(
 ) -> None:
     """Run start() until readiness, then explicitly shut the runtime down."""
     ready = asyncio.Event()
+    start_sync_task = orchestrator._start_sync_task
 
     def mark_ready() -> None:
         ready.set()
 
-    with patch("mindroom.orchestrator.set_runtime_ready", side_effect=mark_ready):
+    def start_sync_task_and_publish_router_readiness(entity_name: str, bot: object) -> None:
+        # Stand in for the router's first sync, which publishes its reply memberships.
+        start_sync_task(entity_name, bot)
+        if entity_name == ROUTER_AGENT_NAME:
+            orchestrator._router_reply_memberships_live_sync_ready.set()
+
+    with (
+        patch("mindroom.orchestrator.set_runtime_ready", side_effect=mark_ready),
+        patch.object(orchestrator, "_start_sync_task", side_effect=start_sync_task_and_publish_router_readiness),
+    ):
         runtime_task = asyncio.create_task(orchestrator.start())
-
-        async def publish_router_membership_readiness() -> None:
-            while ROUTER_AGENT_NAME not in orchestrator._sync_tasks and not runtime_task.done():  # noqa: ASYNC110
-                await asyncio.sleep(0)
-            if not runtime_task.done():
-                orchestrator._router_reply_memberships_live_sync_ready.set()
-
-        router_ready_task = asyncio.create_task(publish_router_membership_readiness())
         try:
-            await asyncio.wait_for(ready.wait(), timeout=1.0)
+            await asyncio.wait_for(ready.wait(), timeout=SETTLE_TIMEOUT_SECONDS)
             if wait_for_startup_maintenance:
                 maintenance_task = orchestrator._startup_maintenance.task
                 assert maintenance_task is not None
                 await maintenance_task
             await orchestrator.stop()
-            await asyncio.wait_for(runtime_task, timeout=1.0)
+            await asyncio.wait_for(runtime_task, timeout=SETTLE_TIMEOUT_SECONDS)
         finally:
-            if not router_ready_task.done():
-                router_ready_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await router_ready_task
             if not runtime_task.done():
                 runtime_task.cancel()
                 with suppress(asyncio.CancelledError):
@@ -843,55 +841,25 @@ def make_mock_agent_user() -> AgentMatrixUser:
 
 
 @dataclass
-class _SyncStubVectorDb:
-    documents: list[Document]
+class _StubIndex:
+    """Published knowledge index stub that returns fixed hits and records each search."""
 
-    def search(
-        self,
-        *,
-        query: str,
-        limit: int,
-        filters: dict[str, Any] | list[Any] | None = None,
-    ) -> list[Document]:
-        _ = (query, filters)
-        return self.documents[:limit]
+    hits: list[SearchHit]
+    calls: list[tuple[str, int]] = field(default_factory=list)
+
+    async def asearch(self, query: str, *, limit: int) -> list[SearchHit]:
+        self.calls.append((query, limit))
+        return self.hits[:limit]
 
 
 @dataclass
-class _AsyncStubVectorDb(_SyncStubVectorDb):
-    async def async_search(
-        self,
-        *,
-        query: str,
-        limit: int,
-        filters: dict[str, Any] | list[Any] | None = None,
-    ) -> list[Document]:
-        _ = (query, filters)
-        return self.documents[:limit]
+class _FailingStubIndex:
+    """Published knowledge index stub whose every search fails."""
 
-
-@dataclass
-class _FailingStubVectorDb:
     error_message: str = "search failed"
 
-    def search(
-        self,
-        *,
-        query: str,
-        limit: int,
-        filters: dict[str, Any] | list[Any] | None = None,
-    ) -> list[Document]:
-        _ = (query, limit, filters)
-        raise RuntimeError(self.error_message)
-
-    async def async_search(
-        self,
-        *,
-        query: str,
-        limit: int,
-        filters: dict[str, Any] | list[Any] | None = None,
-    ) -> list[Document]:
-        _ = (query, limit, filters)
+    async def asearch(self, query: str, *, limit: int) -> list[SearchHit]:
+        _ = (query, limit)
         raise RuntimeError(self.error_message)
 
 

@@ -13,7 +13,7 @@ These built-in tools let an agent hand tasks to other agents, build and run reus
 
 Related tools documented elsewhere:
 
-- [`egress_credentials`](https://docs.mindroom.chat/deployment/egress-broker/#agent-tool) - List which Agent Keys services have a key or connected account for this agent, and where to add missing ones.
+- [`egress_credentials`](https://docs.mindroom.chat/deployment/egress-broker/#agent-tool) - Opt this agent's `shell` and `python` calls into Agent Keys, and list which services have a key or connected account for it and where to add missing ones.
 - [`oauth_connections`](https://docs.mindroom.chat/oauth-framework/#oauth_connections) - Issue a browser-confirmed reset for one OAuth connection.
 - [`openclaw_compat`](https://docs.mindroom.chat/openclaw/#openclaw_compat) - Config-only preset that expands to native MindRoom tools.
 - [`usage_stats`](https://docs.mindroom.chat/usage/#usage_stats) - Read-only summaries of retained usage.
@@ -45,6 +45,7 @@ agents:
     display_name: Code
     role: Implement and debug code changes
     model: sonnet
+    memory_backend: file  # gives the agent a workspace for file paths
     tools: [coding, shell]
     delegate_to: [research]  # can delegate further
 
@@ -129,7 +130,7 @@ The runtime guidance every agent gets still follows, such as its tool execution 
 `system_prompt` is limited to 64 KiB, and `model`, `minimal`, and `continue_subagent` work as for other subagents.
 An authored subagent with `delegate` can author further copies only within its own `tools`, `skills`, and `knowledge` lists: a copy that omits `tools` inherits its tools, except `delegate` at the maximum depth, one that also omits `skills` or `knowledge` inherits those, and an authored subagent with any of these lists cannot start an unauthored copy of its caller; other agents it delegates to keep their own tools, skills, and knowledge.
 Typical uses are reading untrusted pages or email with only read tools, an independent critique without the caller's conversation, and a cheap specialist on a fast model.
-A tool subset narrows what the child is offered, not what its principal can reach, so code-execution tools such as `shell` or `script` in a subset can still reach the caller's other tools, a kept configured skill can run its scripts, and file tools can still read `files`-mode knowledge bases.
+A tool subset narrows what the child is offered, not what its principal can reach, so code-execution tools such as `shell` or `script` in a subset can still reach the caller's other tools, and file tools can still read `files`-mode knowledge bases.
 
 ```python
 run_subagent(
@@ -195,9 +196,9 @@ Tools that can run as background jobs accept an optional `background_after` argu
 It is how many seconds the call may hold the reply before it continues in the background, separate from a tool's own execution or network timeout.
 The name `background_after` is reserved on managed tools.
 If a custom or plugin tool already declares that application parameter, exclude its toolkit as shown below or rename the parameter; the affected call is rejected before execution without breaking the agent's other tools.
-Tools that stop the current model step, including model switching and dynamic tool loading, stay inline so the continuation receives their actual control result.
+Tools that stop the current model step, such as model switching, stay inline so the continuation receives their actual control result.
 Their schemas omit `background_after`, and a value for it is rejected before execution.
-Knowledge search, skill access, learning, team delegation, and toolkits whose connection lasts only for one run, such as `postgres`, `redshift`, and Agno MCP toolkits, always run inline without `background_after`.
+Knowledge search, skill access, team delegation, and toolkits whose connection lasts only for one run, such as `postgres`, `redshift`, and Agno MCP toolkits, always run inline without `background_after`.
 
 Exclude complete toolkits in YAML when they should retain native execution:
 
@@ -312,7 +313,7 @@ Listing jobs does not count as reading their results.
 Completed outcomes survive restart; abandoned local execution becomes interrupted and is never restarted automatically.
 A reply that a crash or shutdown cuts short is answered again in place and told which calls its stopped attempt already finished, including detached job starts with their job IDs.
 Reading a result again returns its original output and does not repeat its effects.
-A result remains available for 30 days after the job ended or was last read; the job is then deleted once its turn has finished and no approval is pending in the conversation.
+A result remains available for 30 days after the job ended or was last read, or for one day when the call that started the job returned it directly; the job is then deleted once its turn has finished and no approval is pending in the conversation.
 Active jobs are never deleted.
 A deleted job is unavailable like any unknown job, and its original tool call cannot run again.
 Jobs of a plugin tool require the same plugin installation path and current grants; moving the plugin directory makes them unavailable.
@@ -355,7 +356,7 @@ The top-level fields are `id`, `name`, `description`, `kind`, `inputs`, `partici
 - **`participants`**: Up to 8 entries with `kind` set to `subagent` (the default) or `room_agent`.
   - A `subagent` is an [authored subagent](#authored-subagents) of the caller: it declares `id`, an optional `description`, and either `profile`, naming a `subagents/<name>.md` profile in the caller's workspace, or an inline `system_prompt` with optional `tools`, `skills`, `model`, and `mode`.
     Its `tools` must be the caller's own toolkits or `toolkit.function` entries, never `memory`, `delegate`, `self_config`, `skill_manage`, `compact_context`, `dynamic_workflow`, `dynamic_tools`, `invite_router`, or `thread_model`, and a participant that names no tools, inline or in its profile, gets none.
-    Its `skills` must be the caller's own skills, and a participant that names no skills gets none; it reads its skills whenever the caller could without approval, but reads or runs a skill's scripts only when an operator `auto_approve` rule allows `get_skill_script`.
+    Its `skills` must be the caller's own skills, and a participant that names no skills gets none; it reads its skills whenever the caller could without approval, but reads a skill's scripts only when an operator `auto_approve` rule allows `get_skill_script`.
     It searches no knowledge bases, even when its profile lists `knowledge`.
     Its `model` is any alias or model ID in `models:` and defaults to the caller's current model; when `permissions.models` is set, it must also list it.
     A participant used by several steps continues one session.
@@ -503,6 +504,7 @@ If the dashboard frontend and the Python backend sit behind separate upstreams, 
 
 `config_manager` is the full configuration control plane: it reads and patches any authored config field and creates or updates agents and teams.
 It can change every agent and team, so give it only to agents that administrators drive; use [`self_config`](#self_config) for narrow self-tuning.
+The starter configuration from `mindroom config init` or a new hosted instance gives it to Mind, with [tool approval](https://docs.mindroom.chat/tool-approval/) rules that make each `manage_config` patch, `manage_agent` create or update, and `manage_team` call wait for the requester's approval.
 
 ```yaml
 agents:
@@ -527,7 +529,7 @@ The tool exposes four functions:
   `dry_run=True` validates a patch without saving it.
   The receipt lists the changed paths without echoing their values.
   When `config.yaml` uses `!include`, inspection works but patching is refused; edit the source files instead.
-- **`manage_agent(operation, agent_name, ...)`**: `operation` is `create`, `update`, or `validate`, and the optional fields are `display_name`, `role`, `tools`, `instructions`, `model`, `rooms`, `knowledge_bases`, `include_default_tools`, `markdown`, `learning`, and `learning_mode`.
+- **`manage_agent(operation, agent_name, ...)`**: `operation` is `create`, `update`, or `validate`, and the optional fields are `display_name`, `role`, `tools`, `instructions`, `model`, `rooms`, `knowledge_bases`, `include_default_tools`, and `markdown`.
   Creating requires `display_name`, takes a lowercase name of letters, digits, and underscores, defaults `model` to `default`, and defaults `include_default_tools` to `true`.
   Tool names and knowledge base IDs must exist.
 - **`manage_team(team_name, display_name, role, agents, mode="coordinate")`**: Creates a new team in `coordinate` or `collaborate` mode; it rejects unknown member agents and existing team names, and it cannot update a team.
@@ -565,8 +567,8 @@ manage_team(
 These rules apply to both `config_manager` and `self_config`.
 Reading configuration (`manage_config` inspection, `get_info("agent_config")`, `get_own_config()`) and every write require a requester listed in `administrators`; other requesters get an authorization error.
 Redacted output masks every value inside fields the config schema marks secret, such as MCP server `env` and `headers`, plugin `settings`, and model `extra_kwargs`, except `${NAME}` environment references, which are shown as written.
-It also masks free-form map entries whose key names look like credentials, and credential patterns such as URL passwords and bearer tokens in any text.
-A write whose value contains the `***redacted***` marker or a masked URL password such as `user:***@host` is refused, so copying redacted output back cannot overwrite a hidden real value.
+It also masks free-form map entries whose key names look like credentials, and credential patterns such as URL credentials and bearer tokens in any text.
+A write whose value contains the `***redacted***` marker or masked URL credentials such as `***@host` is refused, so copying redacted output back cannot overwrite a hidden real value.
 Every write is validated against the full runtime config before `config.yaml` is saved, and an invalid change saves nothing.
 Saved changes take effect through the normal config hot reload after the current response.
 When a plain list of tool names replaces an agent's tools, inline overrides for tools that stay in the list are kept.
@@ -589,7 +591,7 @@ agents:
 ```
 
 `get_own_config()` returns the agent's redacted YAML.
-`update_own_config()` changes only the fields you pass: `display_name`, `role`, `instructions`, `tools`, `model`, `rooms`, `markdown`, `learning`, `learning_mode`, `knowledge_bases`, `skills`, `include_default_tools`, `show_tool_calls`, `thread_mode`, `num_history_runs`, `num_history_messages`, `compress_tool_results`, `max_tool_calls_from_history`, and `context_files`.
+`update_own_config()` changes only the fields you pass: `display_name`, `role`, `instructions`, `tools`, `model`, `rooms`, `markdown`, `knowledge_bases`, `skills`, `include_default_tools`, `show_tool_calls`, `thread_mode`, `num_history_runs`, `num_history_messages`, `max_tool_calls_from_history`, and `context_files`.
 Every `update_own_config()` call shows an approval card, even when `tool_approval.default` is `auto_approve`.
 An agent cannot give itself `config_manager`, and `include_default_tools=True` is refused when `defaults.tools` contains `config_manager`.
 Access, redaction, and saving follow the [shared rules above](#access-redaction-and-saving).

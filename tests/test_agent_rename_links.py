@@ -23,7 +23,7 @@ from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.history.replay import scope_visible_runs
 from mindroom.history.types import HistoryScope
-from mindroom.session_storage.agent_storage import create_session_storage, get_agent_session
+from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.tool_system.worker_routing import agent_state_root_path
 from tests.agent_rename_fixtures.entity_state import SESSION, seed_agent
 from tests.agent_rename_helpers import tree_rows, tree_snapshot
@@ -98,16 +98,11 @@ def test_a_sibling_link_follows_the_moved_state_root(tmp_path: Path) -> None:
     assert sessions.is_file()
     # MindRoom's own resolution opens the same database and finds sidekick's history in it.
     database = create_session_storage(SHARER, SHARER_CONFIG, runtime_paths, execution_identity=None)
-    try:
-        assert getattr(database, "db_file", None) == str(sessions)
-        session = get_agent_session(database, SESSION)
-        assert session is not None
-        # The seed summarized r1, so r2 is the run history replays.
-        assert [run.run_id for run in scope_visible_runs(session, HistoryScope(kind="agent", scope_id=SHARER))] == [
-            "r2",
-        ]
-    finally:
-        database.close()
+    assert database.path == sessions
+    session = database.load_session(SESSION, "agent")
+    assert session is not None
+    # The seed summarized r1, so r2 is the run history replays.
+    assert [run.run_id for run in scope_visible_runs(session, HistoryScope(kind="agent", scope_id=SHARER))] == ["r2"]
     # Opening sidekick's store went through the retargeted link, so nothing recreated the old root.
     assert not os.path.lexists(storage / "agents" / OLD)
 

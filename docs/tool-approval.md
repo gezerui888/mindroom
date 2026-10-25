@@ -4,9 +4,9 @@ icon: lucide/shield-check
 
 # Tool Approval
 
-<video controls playsinline preload="metadata" aria-label="An agent pauses for approval before it books a meeting" style="width: 100%" poster="https://github.com/user-attachments/assets/444fee69-b77f-4c48-b7d1-b92043159bb3" data-poster-light="https://github.com/user-attachments/assets/444fee69-b77f-4c48-b7d1-b92043159bb3" data-poster-dark="https://github.com/user-attachments/assets/94181525-4b2b-43b4-b366-d85aa18f59b8">
-  <source src="https://github.com/user-attachments/assets/f3792ec9-ea73-4169-97ee-d09146cd65cc" type="video/mp4" media="(prefers-color-scheme: dark)">
-  <source src="https://github.com/user-attachments/assets/cf813bb1-5f9d-43b2-a197-b4749696a86e" type="video/mp4">
+<video controls playsinline preload="metadata" aria-label="An agent pauses for approval before it books a meeting" style="width: 100%" poster="https://github.com/user-attachments/assets/72632152-a056-40de-961e-2435119812d6" data-poster-light="https://github.com/user-attachments/assets/72632152-a056-40de-961e-2435119812d6" data-poster-dark="https://github.com/user-attachments/assets/44197f0e-da33-4076-b859-ac4e2ca39513">
+  <source src="https://github.com/user-attachments/assets/502962b4-4dc6-4819-ae5a-eef572a41422" type="video/mp4" media="(prefers-color-scheme: dark)">
+  <source src="https://github.com/user-attachments/assets/cd2e754b-dbb7-4af7-a050-c29514ab712e" type="video/mp4">
 </video>
 
 Use the top-level `tool_approval` block to make chosen tool calls wait for a person to approve them in the Matrix conversation.
@@ -37,6 +37,8 @@ tool_approval:
 | `rules[].timeout_days` | number, greater than 0 and at most 36500 | `tool_approval.timeout_days` | Expiry window for this rule |
 | `scheduled_any_arguments` | boolean | `true` | Let a requester approve a scheduled tool call for any arguments to the same tool, not only the exact arguments; see [Pre-Approved Tool Calls](scheduling.md#pre-approved-tool-calls) |
 
+[`config_manager`](tools/agent-orchestration.md#config_manager) calls that only read configuration, `manage_config(operation="inspect")` and `manage_agent(operation="validate")`, never ask for approval, even when a rule matches them or `default` is `require_approval`.
+
 ## Approving and Denying
 
 - React to the approval card with `✅` to approve the tool call.
@@ -59,6 +61,16 @@ It covers the original call, matching pending calls, and later calls for the sam
 It is offered only in a thread and when the card shows the complete arguments, and never for tools that request confirmation themselves, background-script approvals, or scheduled calls.
 The requester can stop auto-approval from the originating card, and any config change or room membership change ends matching grants; calls already approved still run.
 
+### Auto-Approve Everything
+
+Send `!auto_approve 30` (minutes) or `!auto_approve 2h` in a thread to run every tool call you request there without approval cards, for 1 minute up to 24 hours.
+It covers every agent and team in that thread, script rules, tools that ask for their own confirmation, background jobs, and background scripts, and turning it on approves the cards already waiting for you there.
+Other people in the thread still approve their own calls, an agent cannot turn it on for you, and a tool call scheduled to run later still asks when it is scheduled.
+In a room that uses `thread_mode: room`, the window covers the whole room.
+`!auto_approve` shows when the window ends and `!auto_approve off` ends it early; restarts and config reloads keep it.
+`!auto_approve off` does not stop auto-approval started from an approval card; stop that on the card.
+MindRoom Chat shows the open window in the thread header in rooms where the router may send the `io.mindroom.auto_approve` state event, which the rooms MindRoom creates allow.
+
 ## Approval Card Contents
 
 Cards show a redacted preview of the tool arguments, and clients can expand the complete redacted arguments when the preview is truncated.
@@ -73,7 +85,7 @@ Have the agent retry with a smaller payload, such as saving large content to a w
 ## Tools That Cannot Pause for Approval
 
 The [OpenAI-compatible API](openai-api.md) has no approval cards, so it hides every tool function that matches a required-approval rule, including script rules.
-Skill, knowledge-search, and learning functions such as `get_skill_script`, `search_knowledge_base`, and `update_user_memory` cannot pause for approval on any channel, so they are hidden when a required-approval rule or `default: require_approval` applies to them.
+Skill and knowledge-search functions such as `get_skill_script` and `search_knowledge_base` cannot pause for approval on any channel, so they are hidden when a required-approval rule or `default: require_approval` applies to them.
 Add an `auto_approve` rule for such a function to keep it available.
 
 ## When the Router Is Missing

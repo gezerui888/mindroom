@@ -101,7 +101,7 @@ After `--apply` the command prints, in order:
 4. A `Warning:` line for each problem that does not undo the rename, such as an old Docker worker that could not be removed.
 5. A leftover scan of the storage directory, see [Leftover scan](#leftover-scan).
 
-Steps run in this order: the event journal, the state directory with its session and learning databases, the symlinks into it, memory, teams, tracking and side stores, credentials, workers, derived indexes, `matrix_state.yaml`, `.env`, and `config.yaml` last.
+Steps run in this order: the event journal, the state directory with its session database, the symlinks into it, memory, teams, tracking and side stores, credentials, workers, derived indexes, `matrix_state.yaml`, `.env`, and `config.yaml` last.
 Every move runs before the edits to what it moved.
 The config goes last on purpose, because a run that stops early then still has the old name configured, see [Killed runs and reruns](#killed-runs-and-reruns).
 
@@ -137,10 +137,10 @@ Running the same command again after it succeeded exits 1 with `OLD is not a con
 - Its username, password, device ID, and access token stay, so the agent keeps its Matrix ID and device.
 - An agent without a stored account has nothing to move.
 
-### State directory, sessions, learning, and memory
+### State directory, sessions, and memory
 
 - `agents/<OLD>/` moves to `agents/<NEW>/` as a whole.
-  That holds the workspace, file-backed memory, the memory store, and the learning and session databases.
+  That holds the workspace, file-backed memory, the memory store, and the session database.
   With `MINDROOM_SESSION_STORAGE_PATH` set, the agent's directory in that root moves too.
   An agent that never ran has no directory and gets no step.
 - Symlinks in the storage directory or directly in the config directory that point into `agents/<OLD>`, such as `agents/other -> <OLD>` for an agent sharing the directory, are retargeted to `agents/<NEW>`, keeping relative links relative.
@@ -148,7 +148,7 @@ Running the same command again after it succeeded exits 1 with `OLD is not a con
   In one transaction the command renames the tables `<OLD>_sessions` and `<OLD>_sessions_*` and recreates their indexes under the new names.
   It updates the schema version rows, sets the agent ID of every session and run to the new name, and renames the history summary scope `agent:<OLD>`.
   MindRoom only loads runs whose agent ID is the agent's name, so this is what keeps the old history visible.
-- `learning/<OLD>.db` becomes `<NEW>.db` the same way, including the table `<OLD>_learning_sessions` and the agent ID in `agno_learnings`.
+- The database `learning/<OLD>.db` of the retired Agno Learning moves with the directory and keeps its name, because MindRoom no longer reads it; the plan lists it with the legacy files.
 - Memories tagged `agent_<OLD>` in the Chroma store get the tag `agent_<NEW>`.
   Team memories tagged `team_<members>` with the agent among the members get the member list sorted again with the new name.
   A team's memory sits in the store of every member, so the command edits the store of every configured agent.
@@ -273,7 +273,7 @@ Read them before you start MindRoom.
   A delegation that had not finished keeps the old name in its saved run, so it cannot resume.
   The plan lists the sessions, and you ask again there.
 - **Legacy files.**
-  Files that older MindRoom versions kept under the name stay: dispatch obligations, session databases directly under the storage directory, the old memory search index, and an imported handled-turn ledger.
+  Files that older MindRoom versions kept under the name stay: dispatch obligations, session databases directly under the storage directory, the old memory search index, an imported handled-turn ledger, and the retired learning database in the moved state directory.
 - **The mem0 history database.**
   It is outside the storage directory, at `~/.mem0/history.db` or in `MEM0_DIR`.
   It keeps recent messages under the old memory scope, so memory extraction for the new name starts without their context.

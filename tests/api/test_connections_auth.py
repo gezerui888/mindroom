@@ -12,21 +12,19 @@ from fastapi.testclient import TestClient
 
 from mindroom import constants
 from mindroom.api import auth, config_lifecycle, frontend, main
-from tests.api.test_api import _trusted_upstream_jwks, _trusted_upstream_jwt, _trusted_upstream_jwt_key
+from tests.api.conftest import trusted_upstream_jwks, trusted_upstream_jwt, trusted_upstream_jwt_key
 
 
 @pytest.fixture
 def signed_connections_headers(monkeypatch: pytest.MonkeyPatch) -> Callable[[str], dict[str, str]]:
     """Sign real upstream JWTs while keeping JWKS retrieval local."""
-    private_key = _trusted_upstream_jwt_key()
-    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda _client: _trusted_upstream_jwks(private_key))
+    private_key = trusted_upstream_jwt_key()
+    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", lambda _client: trusted_upstream_jwks(private_key))
 
     def headers(user: str = "alice") -> dict[str, str]:
         email = f"{user}@example.org"
         return {
-            "X-Trusted-User": user,
-            "X-Trusted-Email": email,
-            "X-Trusted-Jwt": _trusted_upstream_jwt(
+            "X-Trusted-Jwt": trusted_upstream_jwt(
                 private_key,
                 user_id=user,
                 email=email,
@@ -49,9 +47,6 @@ def connections_auth_client(
         env = {
             "MINDROOM_CONNECTIONS_AGENT": "test_agent",
             "MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true",
-            "MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER": "X-Trusted-User",
-            "MINDROOM_TRUSTED_UPSTREAM_EMAIL_HEADER": "X-Trusted-Email",
-            "MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT": "true",
             "MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER": "X-Trusted-Jwt",
             "MINDROOM_TRUSTED_UPSTREAM_JWKS_URL": "https://issuer.example.org/jwks",
             "MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE": "mindroom-dashboard",
@@ -140,11 +135,7 @@ def test_oversized_trusted_upstream_jwt_is_rejected_before_key_lookup(
     monkeypatch.setattr(jwt.PyJWKClient, "get_signing_key_from_jwt", record_key_lookup)
     response = connections_auth_client().get(
         "/api/connections/identity",
-        headers={
-            "X-Trusted-User": "alice",
-            "X-Trusted-Email": "alice@example.org",
-            "X-Trusted-Jwt": "x" * (16 * 1024 + 1),
-        },
+        headers={"X-Trusted-Jwt": "x" * (16 * 1024 + 1)},
     )
 
     assert response.status_code == 401
@@ -179,7 +170,6 @@ def test_personal_identity_accepts_signed_matrix_user(
     [
         # Without signed upstream auth, only a Connections session authenticates, so the page must sign in.
         ({"MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "false", "MINDROOM_API_KEY": "owner-key"}, 401),
-        ({"MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT": "false"}, 401),
         ({"MINDROOM_TRUSTED_UPSTREAM_JWT_MATRIX_USER_ID_CLAIM": None}, 403),
     ],
 )
@@ -189,7 +179,7 @@ def test_personal_identity_rejects_unverified_identity_modes(
     connections_auth_client: Callable[..., TestClient],
     signed_connections_headers: Callable[[str], dict[str, str]],
 ) -> None:
-    """API keys, unsigned headers and JWTs without a bound Matrix identity cannot own personal credentials."""
+    """API keys and JWTs without a bound Matrix identity cannot own personal credentials."""
     headers = {**signed_connections_headers("alice"), "Authorization": "Bearer owner-key"}
     response = connections_auth_client(**overrides).get("/api/connections/identity", headers=headers)
     assert response.status_code == expected_status
@@ -206,15 +196,15 @@ def test_personal_identity_rejects_spoofed_headers_without_signed_assertion(
     assert response.status_code == 401
 
 
-@pytest.mark.parametrize(("portal_enabled", "user"), [(True, "owner"), (False, "alice")])
-def test_administrator_and_disabled_portal_preserve_dashboard_access(
-    portal_enabled: bool,
+@pytest.mark.parametrize(("agent_set", "user"), [(True, "owner"), (False, "alice")])
+def test_administrator_and_unset_connections_agent_preserve_dashboard_access(
+    agent_set: bool,
     user: str,
     connections_auth_client: Callable[..., TestClient],
     signed_connections_headers: Callable[[str], dict[str, str]],
 ) -> None:
-    """Configured administrators retain access, and disabled portals preserve prior upstream behavior."""
-    client = connections_auth_client(MINDROOM_CONNECTIONS_AGENT="test_agent" if portal_enabled else None)
+    """Administrators keep the dashboard, and without `MINDROOM_CONNECTIONS_AGENT` every gateway user keeps it."""
+    client = connections_auth_client(MINDROOM_CONNECTIONS_AGENT="test_agent" if agent_set else None)
     response = client.get("/api/config", headers=signed_connections_headers(user))
     assert response.status_code == 200
 
@@ -238,27 +228,6 @@ def test_signed_nonadmin_can_enter_personal_and_oauth_completion_routes(
     """Authentication leaves state-bound completion validation to existing OAuth handlers."""
     response = connections_auth_client().get(path, headers=signed_connections_headers("alice"))
     assert response.status_code == 200
-
-
-@pytest.mark.parametrize("portal_setting", [None, "", "   "])
-@pytest.mark.parametrize("path", ["/connections", "/connections/nested", "/connections/assets/portal.js"])
-def test_disabled_connections_frontend_is_unavailable(
-    portal_setting: str | None,
-    path: str,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    connections_auth_client: Callable[..., TestClient],
-    signed_connections_headers: Callable[[str], dict[str, str]],
-) -> None:
-    """A disabled portal does not serve a frontend whose API cannot be used."""
-    portal = tmp_path / "connections"
-    (portal / "assets").mkdir(parents=True)
-    (portal / "index.html").write_text("connections")
-    (portal / "assets" / "portal.js").write_text("portal asset")
-    monkeypatch.setattr(frontend, "ensure_frontend_dist_dir", lambda _runtime_paths: tmp_path)
-    client = connections_auth_client(MINDROOM_CONNECTIONS_AGENT=portal_setting)
-    response = client.get(path, headers=signed_connections_headers("alice"))
-    assert response.status_code == 404
 
 
 @pytest.mark.parametrize("path", ["/connections", "/connections/", "/connections/nested"])
@@ -385,7 +354,7 @@ def test_connections_static_shell_is_public(
     tmp_path: Path,
     connections_auth_client: Callable[..., TestClient],
 ) -> None:
-    """The enabled portal shell holds no data and signs itself in, so it loads without credentials."""
+    """The portal shell holds no data and signs itself in, so it loads without credentials."""
     (tmp_path / "connections").mkdir()
     (tmp_path / "connections" / "index.html").write_text("connections")
     monkeypatch.setattr(frontend, "ensure_frontend_dist_dir", lambda _runtime_paths: tmp_path)
@@ -429,7 +398,7 @@ def test_signed_administrator_can_load_dashboard_html(
     connections_auth_client: Callable[..., TestClient],
     signed_connections_headers: Callable[[str], dict[str, str]],
 ) -> None:
-    """The enabled portal must preserve configured administrator HTML access."""
+    """The portal must preserve configured administrator HTML access."""
     (tmp_path / "index.html").write_text("administrator dashboard")
     monkeypatch.setattr(frontend, "ensure_frontend_dist_dir", lambda _runtime_paths: tmp_path)
     response = connections_auth_client().get("/", headers=signed_connections_headers("owner"))

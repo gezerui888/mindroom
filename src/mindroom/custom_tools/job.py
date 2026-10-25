@@ -8,9 +8,8 @@ from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
 
 from agno.tools import Toolkit
-from agno.tools.function import ToolResult
 
-from mindroom.tool_jobs.consumption import consume_tool_job, restore_control
+from mindroom.tool_jobs.consumption import consume_tool_job, job_failure_text
 from mindroom.tool_jobs.conversation import current_approval_wait_timeout, current_conversation
 from mindroom.tool_jobs.runtime import (
     JobAccessError,
@@ -23,13 +22,15 @@ from mindroom.tool_jobs.runtime import (
 from mindroom.tool_system.declarations import tool_schema_source
 from mindroom.tool_system.output_files import wrap_toolkit_for_output_files
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
+from mindroom.tool_system.tool_function import ToolValue
 
 if TYPE_CHECKING:
-    from agno.tools.function import Function
+    from collections.abc import Collection
 
     from mindroom.constants import RuntimePaths
     from mindroom.tool_jobs.runtime import BackgroundJob, JobClaim, ToolJobRuntime
     from mindroom.tool_system.output_files import ToolOutputFilePolicy
+    from mindroom.tool_system.tool_function import ToolFunction
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 # One answer for every reason, so a caller never learns whether a job of another conversation or caller exists.
@@ -40,9 +41,9 @@ _UNAVAILABLE = (
 )
 
 
-def is_job_function(function: Function) -> bool:
+def is_job_function(function: ToolFunction) -> bool:
     """Recognize the reserved implementation through SDK and MindRoom output wrappers, never a same-named plugin."""
-    entrypoint = tool_schema_source(inspect.unwrap(function.entrypoint)) if function.entrypoint is not None else None
+    entrypoint = tool_schema_source(inspect.unwrap(function.entrypoint))
     return (
         inspect.ismethod(entrypoint)
         and isinstance(entrypoint.__self__, JobTools)
@@ -50,21 +51,18 @@ def is_job_function(function: Function) -> bool:
     )
 
 
-async def _claimed_result(runtime: ToolJobRuntime, job: BackgroundJob, claim: JobClaim) -> Any:  # noqa: ANN401 - SDK tool value.
-    """Return a claimed outcome as this call's own result, raising its control or failure for the SDK to record."""
+async def _claimed_result(runtime: ToolJobRuntime, job: BackgroundJob, claim: JobClaim) -> Any:  # noqa: ANN401 - Tool value.
+    """Return a claimed outcome as this call's own result, raising its failure for the call to report."""
     value, payload = await consume_tool_job(runtime, job, claim)
-    if payload.control is not None:
-        raise restore_control(payload.control)
     if job.status == "failed":
-        text = value.content if isinstance(value, ToolResult) else value
-        raise RuntimeError(str(payload.error or text or "Background tool job failed."))
+        raise RuntimeError(job_failure_text(value, payload))
     return value
 
 
-async def _collect(runtime: ToolJobRuntime, owner: ToolExecutionIdentity) -> Any:  # noqa: ANN401 - SDK tool value.
+async def _collect(runtime: ToolJobRuntime, owner: ToolExecutionIdentity) -> str | ToolValue:
     """Return every ended, unacknowledged job of this caller with its result, acknowledging each once this call saves."""
     sections: list[str] = []
-    collected: list[ToolResult] = []
+    collected: list[ToolValue] = []
     current = current_conversation()
     for job in () if current is None else await current[0].ended_jobs(current[1]):
         try:
@@ -81,26 +79,20 @@ async def _collect(runtime: ToolJobRuntime, owner: ToolExecutionIdentity) -> Any
             # Unavailable or undecodable; its claim is released, so a later collect reads it, and the others arrive now.
             sections.append(f"{describe_job(job)} {job.status}: its result could not be read now")
             continue
-        if isinstance(value, ToolResult):
+        if isinstance(value, ToolValue):
             collected.append(value)
             value = value.content
-        detail = payload.error or value or ""
+        detail = job_failure_text(value, payload) if job.status == "failed" else value or ""
         sections.append(f"{describe_job(job)} {job.status}:\n{detail}".rstrip())
     if not sections:
         return "No ended background jobs."
     content = "\n\n".join(sections)
-    images = [item for result in collected for item in result.images or ()]
-    audios = [item for result in collected for item in result.audios or ()]
-    videos = [item for result in collected for item in result.videos or ()]
-    files = [item for result in collected for item in result.files or ()]
+    images = tuple(item for result in collected for item in result.images)
+    audios = tuple(item for result in collected for item in result.audios)
+    videos = tuple(item for result in collected for item in result.videos)
+    files = tuple(item for result in collected for item in result.files)
     if images or audios or videos or files:
-        return ToolResult(
-            content=content,
-            images=images or None,
-            audios=audios or None,
-            videos=videos or None,
-            files=files or None,
-        )
+        return ToolValue(content=content, images=images, audios=audios, videos=videos, files=files)
     return content
 
 
@@ -127,11 +119,10 @@ class JobTools(Toolkit):
                 "You can access the jobs you started; when you answer as a team, also the jobs your members started for it."
             ),
         )
-        self.async_functions["job"].owning_toolkit = "job"
 
     @staticmethod
     def build(
-        tools: list[Toolkit],
+        offered: Collection[str],
         runtime_paths: RuntimePaths,
         owner: ToolExecutionIdentity | None,
         *,
@@ -139,7 +130,10 @@ class JobTools(Toolkit):
         enabled: bool,
         output_file_policy: ToolOutputFilePolicy | None = None,
     ) -> Toolkit | None:
-        """Build the reserved toolkit for a top-level Matrix caller while the job runtime runs, else nothing."""
+        """Build the reserved toolkit for a top-level Matrix caller while the job runtime runs, else nothing.
+
+        ``offered`` names the functions the caller's other toolkits offer, none of which may be ``job``.
+        """
         if (
             not enabled
             or depth != 0
@@ -148,7 +142,7 @@ class JobTools(Toolkit):
             or get_background_runtime(runtime_paths) is None
         ):
             return None
-        if any("job" in toolkit.get_async_functions() for toolkit in tools):
+        if "job" in offered:
             msg = "Tool function name job is reserved for managed job controls"
             raise ValueError(msg)
         return wrap_toolkit_for_output_files(JobTools(runtime_paths, owner), output_file_policy)
@@ -183,7 +177,7 @@ class JobTools(Toolkit):
         limit: int = 20,
         offset: int = 0,
         wait_timeout: float | None = None,
-    ) -> Any:  # noqa: ANN401 - Preserve the original SDK tool result type.
+    ) -> Any:  # noqa: ANN401 - Preserve the original tool result type.
         """Discover, wait for, or cancel this caller's managed work.
 
         Args:

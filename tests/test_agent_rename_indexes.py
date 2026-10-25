@@ -32,7 +32,6 @@ from mindroom.knowledge_graph.ingestion import KnowledgeGraphIngestionWorker
 from mindroom.knowledge_graph.scope import graph_scope
 from mindroom.legacy_handled_turns import legacy_responses_file_path
 from mindroom.memory_scope_ids import agent_scope_user_id
-from mindroom.tool_system.runtime_context import get_plugin_state_root
 from mindroom.tool_system.worker_routing import agent_state_root_path
 from tests.agent_rename_fixtures.indexes import (
     HELPER,
@@ -359,10 +358,17 @@ def test_an_unreadable_mem0_history_database_is_reported(tmp_path: Path, damage:
     assert _staying(runtime_paths, index_config()) == {database}
 
 
+def _plugin_state_root(runtime_paths: RuntimePaths, plugin: str) -> Path:
+    """Return a plugin's state root, created like hooks/context.py's ``_resolve_plugin_state_root`` creates it."""
+    root = runtime_paths.storage_root / "plugins" / plugin
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
 def test_plugin_state_paths_naming_the_agent_are_reported(tmp_path: Path) -> None:
     """Paths below a plugin's state root named exactly after the agent, or its JSON file, are listed."""
     runtime_paths = _runtime_paths(tmp_path)
-    notes = get_plugin_state_root("notes", runtime_paths=runtime_paths)
+    notes = _plugin_state_root(runtime_paths, "notes")
     expected = {
         touch_file(notes / "agents" / OLD / "state.json").parent,
         touch_file(notes / f"{OLD}.json"),
@@ -371,7 +377,7 @@ def test_plugin_state_paths_naming_the_agent_are_reported(tmp_path: Path) -> Non
     touch_file(notes / f"{PREFIX}.json")
     touch_file(notes / PREFIX / f"{OLD}-notes.txt")
     # A plugin that happens to share the agent's name is not state of the agent.
-    touch_file(get_plugin_state_root(OLD, runtime_paths=runtime_paths) / "data.json")
+    touch_file(_plugin_state_root(runtime_paths, OLD) / "data.json")
 
     _, reports = _plan(runtime_paths, index_config())
 
@@ -382,7 +388,7 @@ def test_plugin_state_paths_naming_the_agent_are_reported(tmp_path: Path) -> Non
 def test_no_plugin_report_without_paths_naming_the_agent(tmp_path: Path) -> None:
     """A state file of the agent whose name extends the renamed one's is not the agent's."""
     runtime_paths = _runtime_paths(tmp_path)
-    touch_file(get_plugin_state_root("notes", runtime_paths=runtime_paths) / f"{PREFIX}.json")
+    touch_file(_plugin_state_root(runtime_paths, "notes") / f"{PREFIX}.json")
 
     _, reports = _plan(runtime_paths, index_config())
 
@@ -447,9 +453,17 @@ def test_no_config_line_report_when_the_config_edit_renames_every_mention(tmp_pa
 
 
 def test_legacy_files_of_the_agent_are_reported(tmp_path: Path) -> None:
-    """Files older versions kept for the agent are listed; those of the agent whose name extends it are not."""
+    """Files older versions kept for the agent are listed; those of the agent whose name extends it are not.
+
+    The retired learning database moves with the state root and keeps its name, so it is listed where it lands.
+    """
     runtime_paths = _runtime_paths(tmp_path)
-    expected = legacy_files(runtime_paths, OLD)
+    storage = runtime_paths.storage_root
+    for name in ("code.db", "code.db-wal"):
+        touch_file(agent_state_root_path(storage, OLD) / "learning" / name)
+    touch_file(agent_state_root_path(storage, PREFIX) / "learning" / "code_team.db")
+    moved_learning = agent_state_root_path(storage, NEW) / "learning"
+    expected = [*legacy_files(runtime_paths, OLD), moved_learning / "code.db", moved_learning / "code.db-wal"]
     legacy_files(runtime_paths, PREFIX)
 
     _, reports = _plan(runtime_paths, index_config())
@@ -522,7 +536,7 @@ def test_planning_writes_nothing_and_leaves_the_prefix_agent_alone(tmp_path: Pat
         git_dir = knowledge_git(f"{agent}_docs", config, runtime_paths)
         planned += [index, git_dir] if agent == OLD else []
         _mem0_messages(tmp_path / "mem0" / "history.db", agent)
-        touch_file(get_plugin_state_root("notes", runtime_paths=runtime_paths) / f"{agent}.json")
+        touch_file(_plugin_state_root(runtime_paths, "notes") / f"{agent}.json")
         legacy_files(runtime_paths, agent)
     before = tree_snapshot(tmp_path)
 

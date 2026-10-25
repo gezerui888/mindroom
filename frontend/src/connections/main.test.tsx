@@ -24,9 +24,11 @@ beforeEach(() => {
     if (path === "/api/connections/me")
       return json({
         matrix_user_id: "@bob:example.org",
+        display_name: "Bob Builder",
         email: null,
         is_administrator: false,
         egress_enabled: true,
+        dashboard_url: "/",
       });
     if (path === "/api/connections/mcp/selection")
       return json({ enabled: false, agents: {} });

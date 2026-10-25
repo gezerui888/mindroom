@@ -164,19 +164,6 @@
           "description": "Whether to use markdown formatting",
           "title": "Markdown"
         },
-        "learning": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Enable Agno Learning (defaults to true when omitted)",
-          "title": "Learning"
-        },
         "knowledge_graph": {
           "anyOf": [
             {
@@ -189,23 +176,6 @@
           "default": null,
           "description": "Build a knowledge graph from this agent's conversations and give it the knowledge_graph tool",
           "title": "Knowledge Graph"
-        },
-        "learning_mode": {
-          "anyOf": [
-            {
-              "enum": [
-                "always",
-                "agentic"
-              ],
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Learning mode for Agno Learning: always (automatic) or agentic (tool-driven)",
-          "title": "Learning Mode"
         },
         "model": {
           "default": "default",
@@ -353,7 +323,7 @@
             }
           ],
           "default": null,
-          "description": "Number of prior Agno runs to include as history context (per-agent override)",
+          "description": "Number of prior runs to include as history context (per-agent override)",
           "title": "Num History Runs"
         },
         "num_history_messages": {
@@ -369,19 +339,6 @@
           "default": null,
           "description": "Max messages from history (mutually exclusive with num_history_runs)",
           "title": "Num History Messages"
-        },
-        "compress_tool_results": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Compress tool results in history to save context (per-agent override). On Anthropic/Vertex Claude, setting this to true can mutate replayed tool messages and invalidate prompt-cache prefixes.",
-          "title": "Compress Tool Results"
         },
         "max_tool_calls_from_history": {
           "anyOf": [
@@ -1383,27 +1340,11 @@
           "title": "Max Consecutive Agent Replies",
           "type": "integer"
         },
-        "learning": {
-          "default": true,
-          "description": "Default Agno Learning setting",
-          "title": "Learning",
-          "type": "boolean"
-        },
         "knowledge_graph": {
           "default": false,
           "description": "Default knowledge graph setting",
           "title": "Knowledge Graph",
           "type": "boolean"
-        },
-        "learning_mode": {
-          "default": "always",
-          "description": "Default Agno Learning mode",
-          "enum": [
-            "always",
-            "agentic"
-          ],
-          "title": "Learning Mode",
-          "type": "string"
         },
         "cheap_model": {
           "anyOf": [
@@ -1453,7 +1394,7 @@
             }
           ],
           "default": null,
-          "description": "Default number of prior Agno runs to include as history context (None = all)",
+          "description": "Default number of prior runs to include as history context (None = all)",
           "title": "Num History Runs"
         },
         "num_history_messages": {
@@ -1469,12 +1410,6 @@
           "default": null,
           "description": "Default max messages from history (mutually exclusive with num_history_runs)",
           "title": "Num History Messages"
-        },
-        "compress_tool_results": {
-          "default": false,
-          "description": "Compress tool results in history to save context. Disabled by default because on Anthropic/Vertex Claude this can mutate replayed tool messages and invalidate prompt-cache prefixes.",
-          "title": "Compress Tool Results",
-          "type": "boolean"
         },
         "max_tool_calls_from_history": {
           "anyOf": [
@@ -1925,7 +1860,7 @@
             }
           ],
           "default": null,
-          "description": "MindRoom OAuth provider id whose connection supplies the secret when no API key is stored; checked against the provider registry at runtime",
+          "description": "MindRoom OAuth provider id whose connection supplies the secret when no API key is stored, once someone allows Agent Keys to use it for this service; checked against the provider registry at runtime",
           "title": "Oauth Provider"
         },
         "oauth_on_shared_workers": {
@@ -2014,6 +1949,32 @@
           "default": null,
           "description": "Optional embedding dimension override for OpenAI-compatible providers",
           "title": "Dimensions"
+        },
+        "query_prefix": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Text prepended to search queries for OpenAI-compatible providers, for models that expect a query prompt (EmbeddingGemma 2: 'task: search result | query: ')",
+          "title": "Query Prefix"
+        },
+        "document_prefix": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Text prepended to indexed documents for OpenAI-compatible providers, for models that expect a document prompt (EmbeddingGemma 2: 'title: none | text: ')",
+          "title": "Document Prefix"
         }
       },
       "title": "EmbedderConfig",
@@ -2285,9 +2246,23 @@
         },
         "watch": {
           "default": true,
-          "description": "When true, shared local folders watch filesystem changes and schedule background published-index refresh without blocking reads; when false, direct external file edits require explicit reindex or dashboard/API mutations",
+          "description": "When true, shared local folders watch filesystem changes and schedule background published-index refresh without blocking reads; when false, direct external file edits require explicit reindex or dashboard/API mutations unless poll_interval_seconds is set",
           "title": "Watch",
           "type": "boolean"
+        },
+        "poll_interval_seconds": {
+          "anyOf": [
+            {
+              "minimum": 5,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "How often to schedule a background refresh for a local knowledge folder that another host writes to, such as an NFS share, where filesystem watching never sees the writes; unset means no polling; only for semantic mode, and Git-backed bases use git.poll_interval_seconds instead",
+          "title": "Poll Interval Seconds"
         },
         "require_content_before_publish": {
           "default": false,
@@ -2532,7 +2507,7 @@
       "properties": {
         "interval_seconds": {
           "default": 600,
-          "description": "Seconds to wait after an ingestion pass that ingested nothing; one that did is followed at once",
+          "description": "How often to check a graph whose last ingestion pass ingested nothing; one that did is followed at once",
           "minimum": 30,
           "title": "Interval Seconds",
           "type": "integer"
@@ -2998,6 +2973,12 @@
           "description": "Remote URL for SSE or streamable HTTP",
           "title": "Url"
         },
+        "allow_private_network": {
+          "default": false,
+          "description": "Let a remote server's URL reach private-network addresses (RFC 1918 or IPv6 unique-local), such as a cluster-internal service; loopback, link-local and cloud metadata addresses stay blocked",
+          "title": "Allow Private Network",
+          "type": "boolean"
+        },
         "headers": {
           "additionalProperties": {
             "type": "string"
@@ -3244,8 +3225,10 @@
               "api_key": null,
               "credentials_service": null,
               "dimensions": null,
+              "document_prefix": null,
               "host": null,
-              "model": "text-embedding-3-small"
+              "model": "text-embedding-3-small",
+              "query_prefix": null
             }
           },
           "description": "Embedder configuration for memory"
@@ -3707,16 +3690,67 @@
       "title": "ParticipationConfig",
       "type": "object"
     },
+    "PersonalAgentTemplateConfig": {
+      "additionalProperties": false,
+      "description": "Defaults for the agent that every onboarded user gets of their own.",
+      "properties": {
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Agent key pattern with one {username}; defaults to '<template key>_{username}'",
+          "title": "Name"
+        },
+        "matrix_username": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Matrix localpart pattern with one {username} and at least one other character; defaults to the usual mindroom_<agent key> account",
+          "title": "Matrix Username"
+        },
+        "agent": {
+          "$ref": "#/$defs/AgentConfig",
+          "description": "Agent fields shared by every user's agent"
+        },
+        "users": {
+          "additionalProperties": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "default": {},
+          "description": "Per-user agent field overrides keyed by concrete Matrix user ID; each replaces the template field",
+          "title": "Users",
+          "type": "object"
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "title": "PersonalAgentTemplateConfig",
+      "type": "object"
+    },
     "PersonalRoomsConfig": {
       "additionalProperties": false,
       "description": "One private room per eligible human, managed by a selected agent.",
       "properties": {
         "agent": {
-          "description": "Agent that owns and answers in personal rooms",
+          "description": "Agent, or personal_agents template, that owns and answers in personal rooms",
           "title": "Agent",
           "type": "string",
           "x-mindroom": {
-            "reference": "agent"
+            "reference": "personal_room_agent"
           }
         },
         "onboarding_rooms": {
@@ -4005,8 +4039,8 @@
           "type": "string"
         },
         "trigger_tokens": {
-          "default": 50000,
-          "description": "Post the prompt once MEMORY.md and the context files total more than this many estimated tokens",
+          "default": 20000,
+          "description": "Post the prompt once MEMORY.md and the context files total more than this many estimated tokens; a MEMORY.md the preload cannot show whole (memory.file.max_entrypoint_lines or max_entrypoint_tokens) also posts it",
           "minimum": 1,
           "title": "Trigger Tokens",
           "type": "integer"
@@ -4730,13 +4764,13 @@
         },
         "defer": {
           "default": false,
-          "description": "Hide the tool schema until the agent loads the tool for the current session",
+          "description": "Keep the tool's function definitions out of the model's context until the agent searches for them",
           "title": "Defer",
           "type": "boolean"
         },
         "initial": {
           "default": false,
-          "description": "Load a deferred tool at session start and keep it loaded; requires defer",
+          "description": "Send a deferred tool as an ordinary tool on every request; requires defer",
           "title": "Initial",
           "type": "boolean"
         }
@@ -5006,7 +5040,9 @@
             "credentials_service": null,
             "api_key": null,
             "host": null,
-            "dimensions": null
+            "dimensions": null,
+            "query_prefix": null,
+            "document_prefix": null
           },
           "description": "Provider-specific config"
         }
@@ -5216,9 +5252,7 @@
         },
         "show_stop_button": true,
         "max_consecutive_agent_replies": 50,
-        "learning": true,
         "knowledge_graph": false,
-        "learning_mode": "always",
         "cheap_model": null,
         "compaction": {
           "enabled": true,
@@ -5232,7 +5266,6 @@
         },
         "num_history_runs": null,
         "num_history_messages": null,
-        "compress_tool_results": false,
         "max_tool_calls_from_history": null,
         "max_tool_calls_per_turn": 1000,
         "show_tool_calls": true,
@@ -5267,8 +5300,10 @@
             "api_key": null,
             "credentials_service": null,
             "dimensions": null,
+            "document_prefix": null,
             "host": null,
-            "model": "text-embedding-3-small"
+            "model": "text-embedding-3-small",
+            "query_prefix": null
           },
           "provider": "openai"
         },
@@ -5388,6 +5423,15 @@
         "access": null
       },
       "description": "Router configuration"
+    },
+    "personal_agents": {
+      "additionalProperties": {
+        "$ref": "#/$defs/PersonalAgentTemplateConfig"
+      },
+      "default": {},
+      "description": "Templates that give every onboarded user their own agent",
+      "title": "Personal Agents",
+      "type": "object"
     },
     "personal_rooms": {
       "anyOf": [

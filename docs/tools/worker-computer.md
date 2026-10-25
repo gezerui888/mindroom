@@ -94,9 +94,12 @@ Set the trusted origin of the MindRoom runtime API, without a path, in Chat's op
 }
 ```
 
-The shipped value is empty, which hides the Computer action.
-Remote origins require HTTPS; loopback HTTP works for local development.
-Chat shows the Computer action when this origin is set and the room has a joined MindRoom agent; with several agents, the user picks one first.
+When it is empty, as shipped, Chat on a homeserver that binds tokens uses the runtime origin that the room's MindRoom agents publish, the origin of `MINDROOM_PUBLIC_URL` or `http://localhost:<MINDROOM_PORT>`; on other homeservers the Computer action stays hidden.
+The iOS app ignores a published `localhost` origin, which on a phone is the phone itself, so for computers there set `MINDROOM_PUBLIC_URL` to an address the phone can reach.
+Remote origins require HTTPS; plain HTTP works for `localhost` and loopback or private IP addresses.
+Chat shows the Computer action when an origin is known and the room has a joined MindRoom agent with a worker computer.
+With a configured Computers URL, an agent whose MindRoom does not yet publish its server counts as having one; without one, each agent must publish its own server with `computer: true`.
+With several agents, the user picks one first.
 Point `apiUrl` at the runtime that owns the agent's workers; a host that only serves Matrix, Chat, or local provisioning (`/v1/local-mindroom/*`) does not serve computers.
 
 On the runtime, `MINDROOM_COMPUTER_ALLOWED_ORIGINS` is a JSON list of exact Chat origins allowed to open computers.
@@ -107,13 +110,13 @@ Origins with non-ASCII hostnames are refused.
 The iOS app uses Matrix OpenID and computer session tokens; it does not need web sign-in cookies.
 Each entry must be a scheme and host with an optional port, and no wildcard.
 An optional single trailing `/` is accepted, and any other path is invalid.
-HTTP is allowed only for `localhost` and literal loopback addresses.
+HTTP is allowed only for `localhost` and literal loopback or private IP addresses, such as `http://192.168.1.10:8080`.
 One invalid entry disables the whole list.
-The Connections portal's [Matrix sign-in](../deployment/trusted-upstream-auth.md#matrix-sign-in-from-mindroom-chat) reads its own list, `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS`, with these same rules, and Chat uses the same runtime origin for both.
+The [Connections portal](../connections-portal.md#settings) reads its own list, `MINDROOM_CONNECTIONS_ALLOWED_ORIGINS`, with these same rules but its own defaults, and Chat uses the same runtime origin for both.
 
 Chat opens a computer with a Matrix OpenID token that the runtime verifies at the configured homeserver.
-Audience binding, its `MINDROOM_PUBLIC_URL` requirement, and the rollout order are described under [Matrix sign-in from MindRoom Chat](../deployment/trusted-upstream-auth.md#matrix-sign-in-from-mindroom-chat).
-Under binding, the origin of Chat's Computers `apiUrl` must equal the origin of `MINDROOM_PUBLIC_URL`.
+Audience binding and the rollout order are described under [Token binding](../connections-portal.md#token-binding).
+Under binding, the origin of Chat's Computers `apiUrl` must equal the origin of `MINDROOM_PUBLIC_URL`, or `http://localhost:<MINDROOM_PORT>` when it is unset.
 
 Opening a computer requires that the requester and the agent are both joined to the room, that the agent's [access policy](../authorization.md#responder-access) lets the requester use it, and that the requester belongs to the configured Matrix server.
 A session lasts at most one hour.
@@ -139,9 +142,9 @@ Expose only this gateway; the worker's display has no public listener.
 
 ## Watch, take control, and resume
 
-<video controls playsinline preload="metadata" aria-label="A user watches the agent's browser, takes control, and hands it back" style="width: 100%" poster="https://github.com/user-attachments/assets/cb907777-89c8-4e0e-9df5-04969e863ec5" data-poster-light="https://github.com/user-attachments/assets/cb907777-89c8-4e0e-9df5-04969e863ec5" data-poster-dark="https://github.com/user-attachments/assets/19244c17-be66-410f-b2cf-b8e3edb4b228">
-  <source src="https://github.com/user-attachments/assets/6aa0e537-bd5e-462d-89e2-6592cd9e3be9" type="video/mp4" media="(prefers-color-scheme: dark)">
-  <source src="https://github.com/user-attachments/assets/00f08e39-3b52-4556-860b-3b5b0b2d7287" type="video/mp4">
+<video controls playsinline preload="metadata" aria-label="A user watches the agent's browser, takes control, and hands it back" style="width: 100%" poster="https://github.com/user-attachments/assets/f22ef271-53a8-4000-950c-28b2344de13b" data-poster-light="https://github.com/user-attachments/assets/f22ef271-53a8-4000-950c-28b2344de13b" data-poster-dark="https://github.com/user-attachments/assets/be8be64a-6b82-453f-b294-c888bc8bcda0">
+  <source src="https://github.com/user-attachments/assets/5fc87c49-f21b-4a23-8eeb-d66becd2289c" type="video/mp4" media="(prefers-color-scheme: dark)">
+  <source src="https://github.com/user-attachments/assets/db2b13b5-35c0-4b15-bbc9-93dec148f666" type="video/mp4">
 </video>
 
 - **Watch** shows the browser without input rights.

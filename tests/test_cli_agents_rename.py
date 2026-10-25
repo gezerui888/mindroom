@@ -37,7 +37,7 @@ from mindroom.history.types import HistoryScope
 from mindroom.knowledge.indexing_config import knowledge_git_dir
 from mindroom.matrix.state import MatrixState
 from mindroom.matrix.sync_continuity import SyncContinuityStore
-from mindroom.session_storage.agent_storage import create_session_storage, get_agent_session
+from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.tool_system.worker_routing import agent_state_root_path, worker_dir_name
 from mindroom.workers import runtime as workers_runtime
 from mindroom.yaml_io import safe_load
@@ -357,12 +357,9 @@ def test_apply_renames_every_store(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     )
     # History, memory and team history load under the new name through MindRoom's own code.
     storage_db = create_session_storage(NEW, team_fixture.team_config(NEW), runtime_paths, execution_identity=None)
-    try:
-        session = get_agent_session(storage_db, "s1")
-        assert session is not None
-        assert [run.run_id for run in scope_visible_runs(session, HistoryScope(kind="agent", scope_id=NEW))] == ["r2"]
-    finally:
-        storage_db.close()
+    session = storage_db.load_session("s1", "agent")
+    assert session is not None
+    assert [run.run_id for run in scope_visible_runs(session, HistoryScope(kind="agent", scope_id=NEW))] == ["r2"]
     memories = visible_memories(NEW, memory_config(NEW), runtime_paths)
     assert memories[f"agent_{NEW}", "code prefers tabs"] == 1
     for team in (team_fixture.AD_HOC, team_fixture.CONFIGURED):
@@ -403,14 +400,11 @@ def _assert_sharer_keeps_its_history(runtime_paths: RuntimePaths) -> None:
     assert sharer_root.resolve() / "sessions" / f"{SHARER}.db" == sessions
     sharer_config = Config(agents={SHARER: AgentConfig(display_name="Flash")})
     sharer_db = create_session_storage(SHARER, sharer_config, runtime_paths, execution_identity=None)
-    try:
-        assert getattr(sharer_db, "db_file", None) == str(sessions)
-        sharer_session = get_agent_session(sharer_db, "s1")
-        assert sharer_session is not None
-        sharer_scope = HistoryScope(kind="agent", scope_id=SHARER)
-        assert [run.run_id for run in scope_visible_runs(sharer_session, sharer_scope)] == ["r2"]
-    finally:
-        sharer_db.close()
+    assert sharer_db.path == sessions
+    sharer_session = sharer_db.load_session("s1", "agent")
+    assert sharer_session is not None
+    sharer_scope = HistoryScope(kind="agent", scope_id=SHARER)
+    assert [run.run_id for run in scope_visible_runs(sharer_session, sharer_scope)] == ["r2"]
     # Resolving its paths and opening its store went through the retargeted link, so no old state root came back.
     assert not os.path.lexists(storage / "agents" / OLD)
 

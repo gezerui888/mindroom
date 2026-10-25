@@ -835,7 +835,7 @@ The chart supports direct and chain modes:
 
 > [!WARNING]
 > **Direct mode with `egressProxy` bypasses the operator proxy unless the primary uses it.**
-> Each `shell` and `python` call's broker environment replaces the `HTTP_PROXY` and `HTTPS_PROXY` that `egressProxy.injectWorkerProxyEnv` gives worker pods, so that traffic goes to the broker instead of the operator proxy.
+> The broker environment of each `shell` and `python` call of an agent with the `egress_credentials` tool replaces the `HTTP_PROXY` and `HTTPS_PROXY` that `egressProxy.injectWorkerProxyEnv` gives worker pods, so that traffic goes to the broker instead of the operator proxy.
 > The broker then dials from the primary pod: matched hosts always, and unmatched hosts too under the default `unmatched_hosts: passthrough`.
 > Unless the primary's own environment sets `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`, that traffic leaves the cluster directly instead of through the operator proxy.
 > Set the operator proxy on the primary through `env.extra`, or set `egress_broker.unmatched_hosts: deny` in the MindRoom config so only the configured services' hosts are reached directly.
@@ -880,9 +880,9 @@ It cannot be combined with `workers.kubernetes.agentVault`; to switch an existin
 ### Self-service for users
 
 With the broker on, users without dashboard access manage their own keys, services, account connections, and request log on the personal Connections page at `/connections/egress`; see [Connections pages](../../../docs/deployment/egress-broker.md#connections-pages).
-The page needs these settings, which the chart does not render for you:
+Users open it from MindRoom Chat (see [Connections portal](../../../docs/connections-portal.md)); to sign them in through a gateway instead, the page needs these settings, which the chart does not render for you:
 
-- **Trusted upstream auth with JWT.** The gateway in front of the runtime must authenticate users and sign a JWT; header-only mode is not enough.
+- **Trusted upstream auth.** The gateway in front of the runtime must authenticate users and sign a JWT.
   This chart has no values for it, so set the `MINDROOM_TRUSTED_UPSTREAM_*` variables and an HTTPS `MINDROOM_PUBLIC_URL` through `env.extra`, as below.
 - **Routing.** Forward `/connections`, `/connections/*`, `/api/connections`, `/api/connections/*`, and `/api/oauth/*` from the gateway to the runtime Service.
   The chart creates no ingress.
@@ -895,8 +895,6 @@ env:
     MINDROOM_PUBLIC_URL: "https://assistant.example.org"
     MINDROOM_CONNECTIONS_AGENT: personal
     MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED: "true"
-    MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER: X-MindRoom-User-Id
-    MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT: "true"
     MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER: X-Trusted-Jwt
     MINDROOM_TRUSTED_UPSTREAM_JWKS_URL: https://gateway.example.com/.well-known/jwks.json
     MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE: mindroom-dashboard

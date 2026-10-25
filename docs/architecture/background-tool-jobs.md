@@ -12,6 +12,7 @@ What the feature does and how to configure it is on [Agent Orchestration](../too
 - Stop, an edit, or deleting a message stops only the reply, because each job stays visible and cancellable on its own; a job ends only through its own cancel, revoked access, or the bot leaving the room.
 - An ended job reaches the agent as a notice it acknowledges with `collect`, and gets a follow-up only when no reply collected it, so results arrive without a message per job.
   Work that follow-ups start can chain at most 20 follow-ups without a human message, so follow-ups cannot keep each other going.
+  A follow-up gives way to its requester's messages already waiting in its conversation, because the reply to one reports the jobs in its start note; answering first kept that message waiting and made the follow-up stop for a message older than itself.
   A cancellation needs no acknowledgement and gets no follow-up, since the person who cancelled already knows, and a silent schedule's jobs get none, so the schedule stays silent.
 - A gated call that can become a job asks for its approval as the job's first phase, so a pending approval never holds the conversation.
   Its cards belong to the job alone, so no reply pauses for them and no stale card can resume newer work.
@@ -24,8 +25,11 @@ What the feature does and how to configure it is on [Agent Orchestration](../too
 - Progress is the latest report on the runtime entry, never saved and shown only while the job runs, so a report from a thread that outlived its call cannot change a settled job.
 - A command's `mindroom-agent` calls are the agent's own actions, so the command's `timeout` stops its processes but never those calls, and its shell call waits for them; a time limit on them would cancel a call a person approves late, and nothing has to tell a stopped command from one that ended.
 - The response's `mindroom-agent` owner closes through the response's execution resources, so a shell job that outlives its reply keeps the CLI until the last job settles; cancelling one shell window stops only that window's calls.
-- Saved custom generator events replay as fixed SDK subclasses, so saved data never chooses the class or methods that run.
+- A saved job result decodes only to text, media, session-state changes, and an error under fixed wire tags, so saved data never chooses the code that runs; a streamed call's job saves the joined text the model read, not its events.
 - Recovery fails on a saved job it cannot read and names that job, instead of dropping it silently.
+- A job whose own call returned its result inline is kept one day instead of 30, because once it ended no listing, notice, or follow-up names it, so after its turn only a reread by its exact ID reads it; the day is a margin for such a reread, as by an ID a person saw in the jobs bar while the call ran.
+  On a busy deployment about 99% of the stored result bytes belonged to such jobs, mostly images and shell output.
+  Clearing the payload when the result is acknowledged was rejected: the job would stay in memory and in the table, and a reread by ID would find no result.
 
 ## Invariant purposes
 
@@ -61,12 +65,14 @@ Subagent follow-ups use reusable sessions after the previous child turn finishes
 A notice reaches only a model step after a tool batch; a reply that ends without another tool call leaves the job to its follow-up.
 A follow-up in a session switched to minimal mode runs and reports results it cannot acknowledge, so a later standard reply may report them again.
 A follow-up whose turn ends without collecting its jobs is not admitted again in the same process; they wait for the next reply's note.
+A follow-up also gives way to a waiting message the agent then leaves unanswered, such as one addressed to another agent, and its jobs wait for the next reply's note.
+Another person's waiting message does not hold a follow-up back, because that person's reply lists only their own jobs, so the message still waits for the follow-up and stops it as a newer message would.
+A message is waiting only from its arrival during a busy turn until its own turn's dispatch starts, so a follow-up that takes an idle conversation while a message is still being prepared stops for it as for a newer message.
 A bot that left a room cannot clear its jobs state there, so clients ignore jobs state from users who are not joined.
 When denying an ended job's approval cards fails and the process then stops before a retry succeeds, those cards stay answerable until their own deadline; answering one runs nothing, though a timed approval chosen on it still covers later calls.
 A restart interrupts a job that waits for its own call's approval, so that call never runs, and the model is told it did not run.
-Only functions of toolkits MindRoom assembles become jobs; SDK-generated knowledge search, skill access, learning, and team delegation run inline.
+Only functions of toolkits MindRoom assembles become jobs; SDK-generated knowledge search, skill access, and team delegation run inline.
 A wait that ends while the mid-turn judge is still deciding cancels that judgment, so the post-batch check judges the same queue again.
 A primary that dies without closing its connection leaves a worker command running until the runner notices the dead connection, and a local shell job whose process is killed with SIGKILL keeps running.
-Unhooked synchronous local tools in a job run on Agno's shared thread pool, because Agno chooses that thread; worker calls and calls that async entrypoints offload get their own threads.
 A shell job's `mindroom-agent` calls fail once its response's CLI grant reaches its 24-hour cap, which bounds how long a leaked grant stays usable.
 The jobs bar does not show progress.

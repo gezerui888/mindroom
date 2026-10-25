@@ -12,12 +12,12 @@ from mindroom.redaction import REDACTED, redact_config_text, redact_sensitive_da
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-# Display redaction shows a URL password as ``user:***@host`` instead of the marker.
-# The username may itself contain ``@``, so match anywhere in the authority.
+# Display redaction shows URL credentials as ``***@host`` instead of the marker.
+# Match a mask anywhere in the authority, so a masked password after a username (``user:***@host``) is refused too.
 _MASKED_URL_USERINFO = re.compile(r"://[^/?#\s]*\*\*\*@")
 
 # The dashboard's configSchema.ts mirrors these kinds and the hint key.
-type _ReferenceKind = Literal["model", "agent", "room", "tool"]
+type _ReferenceKind = Literal["model", "agent", "personal_room_agent", "room", "tool"]
 _HINT_KEY = "x-mindroom"
 
 

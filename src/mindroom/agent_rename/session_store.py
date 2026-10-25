@@ -1,4 +1,4 @@
-"""Rename an agent inside an Agno session store: its tables, agent ids, team ids and history scope keys.
+"""Rename an agent inside a session store: its tables, agent ids, team ids and history scope keys.
 
 A session store is a SQLite database ``<name>.db`` holding the tables ``<name>_sessions`` and
 ``<name>_sessions_*`` (runs, usage, summaries, removed runs, legacy compactions). An agent's own store and the
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 # A crashed writer can leave commits or a rollback journal beside a database; SQLite finds them by name.
 _SQLITE_SIDE_FILES = ("-journal", "-wal", "-shm")
-# Agno's default schema-version table (agno/db/base.py), which MindRoom does not rename.
+# The schema-version table Agno-era releases kept beside their tables; its rows name the tables it versions.
 _SCHEMA_VERSIONS_TABLE = "agno_schema_versions"
 # The stored head of a CREATE INDEX statement and the index name it names.
 _INDEX_HEAD = re.compile(
@@ -110,12 +110,10 @@ def rename_session_database(
     old_table: str,
     new_table: str,
     rename: StoreRename,
-    other_tables: tuple[str, ...] = (),
 ) -> None:
     """Rename the tables named ``old_table`` or ``old_table_*`` with their indexes, then the agent inside them.
 
-    With ``new_table`` equal to ``old_table`` the tables keep their names. ``other_tables`` are tables whose
-    names stay but whose rows name the agent too.
+    With ``new_table`` equal to ``old_table`` the tables keep their names.
     """
     # Renaming a table then also renames it in other tables' foreign keys, indexes and triggers.
     connection.execute("PRAGMA legacy_alter_table = OFF")
@@ -135,7 +133,7 @@ def rename_session_database(
                     f"UPDATE {_SCHEMA_VERSIONS_TABLE} SET table_name = ? WHERE table_name = ?",  # noqa: S608
                     (new, old),
                 )
-    for table in (*renamed.values(), *(name for name in other_tables if _table_exists(connection, name))):
+    for table in renamed.values():
         _rename_in_table(connection, table, rename)
 
 
@@ -147,7 +145,8 @@ def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
 def _rename_indexes(connection: sqlite3.Connection, tables: Iterable[str], *, old_table: str, new_table: str) -> None:
     """Recreate the indexes of ``tables`` whose names start with the old table name under the new one.
 
-    Agno names indexes ``idx_<table>_<columns>`` and ``<table>_<name>``, MindRoom ``<table>_<name>``.
+    The sessions and runs tables name theirs ``idx_<table>_<columns>`` (session_storage/schema.py), the other tables
+    ``<table>_<name>``, and Agno-era releases added some ``<table>_<name>`` too.
     SQLite's own indexes have no SQL and take the new name with their table.
     """
     rows = connection.execute(
@@ -204,7 +203,7 @@ def _rename_in_table(connection: sqlite3.Connection, table: str, rename: StoreRe
         "agent_data": partial(_renamed_field, field="agent_id", values=(rename.old_name, rename.new_name)),
         "team_data": partial(_renamed_field, field="team_id", values=team_ids),
         "run_data": partial(_renamed_run, rename=rename),
-        # The Agno 2 run list that the open-time migration turns into run rows (legacy_session_storage.py).
+        # The Agno 2 run list that the open-time migration turns into run rows (legacy_agno2_runs.py).
         "runs": partial(_renamed_runs, rename=rename),
         # A mid-turn fold's segment holds the member responses it took out of its run (history/summary_rows.py).
         "segment": partial(_renamed_run, rename=rename),
@@ -247,7 +246,7 @@ def _renamed_json(raw: object, rename: Callable[[object], object]) -> str | None
     renamed = rename(value)
     if renamed == value:
         return None
-    # Agno writes its JSON columns through SQLAlchemy's default serializer, json.dumps.
+    # The store writes its JSON columns with json.dumps' defaults (session_storage/store.py), as Agno did before it.
     text = json.dumps(renamed)
     return json.dumps(text) if nested else text
 
@@ -260,11 +259,11 @@ def _renamed_field(value: object, *, field: str, values: tuple[str, str] | None)
 
 
 def _renamed_run(value: object, *, rename: StoreRename) -> object:
-    """Rename the agent and team ids Agno 3.0.9 writes into a run and into the runs and events nested in it.
+    """Rename the agent and team ids a stored run holds, and those of the runs and events nested in it.
 
     A run names its agent in ``agent_id`` or its team in ``team_id``, and its requirements name the member that
-    raised them in ``member_agent_id``. A team run nests its members' runs in ``member_responses``, and both kinds
-    nest their events, which carry the same fields; those are renamed the same way.
+    raised them in ``member_agent_id`` (llm/runs.py). A team run nests its members' runs in ``member_responses``, and
+    runs Agno-era releases wrote also nest their events, which carry the same fields; those are renamed the same way.
     """
     run = _renamed_field(value, field="agent_id", values=(rename.old_name, rename.new_name))
     run = _renamed_field(run, field="team_id", values=rename.team_ids())
@@ -308,7 +307,7 @@ def _renamed_scope_states(value: object, *, scope_keys: tuple[str, str] | None) 
 
 
 def _renamed_pending_compactions(value: object, *, scope_keys: tuple[str, str] | None) -> object:
-    """Rename the old scope in the compactions MindRoom queues in Agno's ``session_state``; nothing else there."""
+    """Rename the old scope in the compactions MindRoom queues in the session's ``session_state``; nothing else there."""
     session_state = cast("dict[str, object]", value).get("session_state") if isinstance(value, dict) else None
     pending = (
         cast("dict[str, object]", session_state).get(PENDING_COMPACTION_SCOPE_KEYS_SESSION_STATE_KEY)

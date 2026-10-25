@@ -363,7 +363,7 @@ def _renamed_team_segment(segment: object, rename: _EntityRename) -> object:
 
     A team document freezes each member as ``{"id", "config_name", ...}``, the id being the config name made URL safe,
     and names a member's slot ``agent:<id>`` in its hidden-tool separators and its tool calls' scope keys
-    (teams.py's ``_TeamStreamPresentation``). An approval resume restores the document only when those agree with the
+    (teams/presentation.py's ``TeamStreamPresentation``). An approval resume restores the document only when those agree with the
     continuation's member names, so the agent's entry, separators and scope keys all take the new name.
     """
     members = _field(_field(segment, "team_state"), "members")

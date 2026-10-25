@@ -9,20 +9,22 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from agno.models.message import Message
-from agno.run.agent import RunOutput
-from agno.run.base import RunStatus
-from agno.session.agent import AgentSession
+from structlog.testing import capture_logs
 
 import mindroom.memory._semantic_file_search as semantic_file_search
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.main import Config
 from mindroom.constants import HOOK_SOURCE_RUN_METADATA_KEY, MATRIX_EVENT_ID_METADATA_KEY, resolve_runtime_paths
 from mindroom.hooks import EnrichmentItem, render_enrichment_block
+from mindroom.llm.errors import ModelSafeguardRefusal, ProviderError
+from mindroom.llm.messages import Message
+from mindroom.llm.runs import RunRecord, RunStatus
+from mindroom.llm.usage import MessageMetrics
 from mindroom.memory import MemoryAutoFlushWorker, add_agent_memory, auto_flush
 from mindroom.memory.functions import append_agent_daily_memory
 from mindroom.prompt_message_tags import render_msg_tag
 from mindroom.session_storage.agent_storage import create_session_storage
+from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
     agent_workspace_root_path,
@@ -31,7 +33,9 @@ from mindroom.tool_system.worker_routing import (
     resolve_worker_key,
     tool_execution_identity,
 )
-from tests.conftest import FakeModel, bind_runtime_paths, runtime_paths_for, seed_session
+from mindroom.usage.storage import quote_identifier
+from tests.conftest import bind_runtime_paths, install_model_providers, runtime_paths_for, seed_session
+from tests.fakes.scripted_model import Await, ScriptedModel, answer
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -92,7 +96,7 @@ def _run(
     status: RunStatus = RunStatus.completed,
     hook_source: str | None = None,
     messages: list[Message] | None = None,
-) -> RunOutput:
+) -> RunRecord:
     metadata: dict[str, object] = {
         "room_id": session_id.rsplit(":$", 1)[0],
         "requester_id": ALICE,
@@ -100,7 +104,7 @@ def _run(
     }
     if hook_source is not None:
         metadata[HOOK_SOURCE_RUN_METADATA_KEY] = hook_source
-    return RunOutput(
+    return RunRecord(
         run_id=run_id,
         session_id=session_id,
         agent_id="general",
@@ -118,7 +122,7 @@ def _run(
 def _seed(
     config: Config,
     session_id: str,
-    runs: list[RunOutput],
+    runs: list[RunRecord],
     *,
     agent: str = "general",
     identity: ToolExecutionIdentity | None = None,
@@ -126,18 +130,15 @@ def _seed(
 ) -> None:
     """Store a conversation, last updated a second after its newest run unless told otherwise."""
     storage = create_session_storage(agent, config, runtime_paths_for(config), execution_identity=identity)
-    try:
-        for run in runs:
-            run.agent_id = agent
-        seed_session(storage, AgentSession(session_id=session_id, agent_id=agent, runs=runs))
-        newest = max((run.created_at or 0 for run in runs), default=T0)
-        with storage.db_engine.begin() as connection:
-            connection.exec_driver_sql(
-                f"UPDATE {storage.session_table_name} SET updated_at = ? WHERE session_id = ?",  # noqa: S608
-                (updated_at if updated_at is not None else newest + 1, session_id),
-            )
-    finally:
-        storage.close()
+    for run in runs:
+        run.agent_id = agent
+    seed_session(storage, ConversationSession(session_id=session_id, kind="agent", owner_id=agent, runs=runs))
+    newest = max((run.created_at or 0 for run in runs), default=T0)
+    with storage.transaction(write=True) as connection:
+        connection.execute(
+            f"UPDATE {quote_identifier(storage.names.sessions)} SET updated_at = ? WHERE session_id = ?",  # noqa: S608
+            (updated_at if updated_at is not None else newest + 1, session_id),
+        )
 
 
 async def _no_redactions(agent_name: str, room_id: str, event_ids: tuple[str, ...]) -> frozenset[str] | None:
@@ -596,7 +597,7 @@ async def test_a_conversation_still_active_is_not_read_and_reads_happen_off_the_
     reads: list[bool] = []
     real_session_runs = auto_flush.session_runs
 
-    def session_runs(storage: object, session_id: str) -> list[RunOutput]:
+    def session_runs(storage: object, session_id: str) -> list[RunRecord]:
         reads.append(threading.get_ident() != loop_thread)
         return real_session_runs(storage, session_id)
 
@@ -785,7 +786,7 @@ async def test_an_unreadable_conversation_backs_off_without_blocking_the_others(
     _seed(config, fine, [_run("f1", fine, T0 + 20)])
     real_session_runs = auto_flush.session_runs
 
-    def session_runs(storage: object, session_id: str) -> list[RunOutput]:
+    def session_runs(storage: object, session_id: str) -> list[RunRecord]:
         if session_id == broken:
             msg = "session database is locked"
             raise OSError(msg)
@@ -1064,11 +1065,11 @@ async def test_extraction_runs_on_the_extractor_model_when_one_is_set(
     _seed(config, session, [_run("r1", session, T0 + 10)])
     requested: list[str] = []
 
-    def model_instance(_config: object, _runtime_paths: object, model_name: str) -> FakeModel:
+    def model_provider(_config: object, _runtime_paths: object, model_name: str) -> ScriptedModel:
         requested.append(model_name)
-        return FakeModel(id=model_name, provider="fake")
+        return ScriptedModel([answer("NO_REPLY")])
 
-    monkeypatch.setattr(auto_flush.model_loading, "get_model_instance", model_instance)
+    monkeypatch.setattr("mindroom.providers.registry.build_model_provider", model_provider)
 
     await auto_flush._extract_memory_summary(
         config=config,
@@ -1081,6 +1082,56 @@ async def test_extraction_runs_on_the_extractor_model_when_one_is_set(
     )
 
     assert requested == [used_model]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_extraction_run_is_a_failure_not_a_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider failure raises out of extraction, so the pass backs off instead of saving the error as a memory."""
+    config = _config(tmp_path)
+    session = _thread("t1")
+
+    async def fail() -> None:
+        message = "Error code: 401 - {'type': 'error', 'error': {'type': 'authentication_error', 'message': 'invalid x-api-key'}}"
+        raise ProviderError(message, provider="Synthetic")
+
+    install_model_providers(monkeypatch, {"default": ScriptedModel([[Await(fail)]])})
+    with pytest.raises(ProviderError, match=r"^Error code: 401"):
+        await auto_flush._extract_memory_summary(
+            config=config,
+            runtime_paths=runtime_paths_for(config),
+            agent_name="general",
+            session_id=session,
+            lines=_lines("r1"),
+            existing_context="",
+            execution_identity=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_extraction_is_given_up_at_once_and_the_next_turns_flush(
+    tmp_path: Path,
+    extractor: _Extractor,
+) -> None:
+    """A safeguard refusal never changes on a retry, so the pass warns once and moves past the refused turns."""
+    config = _config(tmp_path, extractor={"max_messages_per_flush": 2})
+    worker = await _started(config)
+    session = _thread("t1")
+    _seed(config, session, [_run("r1", session, T0 + 10), _run("r2", session, T0 + 11)])
+    extractor.error = ModelSafeguardRefusal(provider="Synthetic", usage=MessageMetrics())
+
+    with capture_logs() as logs:
+        await worker._run_cycle(config)
+
+    assert [entry["log_level"] for entry in logs] == ["warning"]
+    entry = _entry(tmp_path, session)
+    assert (entry["failures"], entry["retry_at"], entry["marker"]) == (0, 0, [T0 + 10, "r1"])
+    extractor.error = None
+    await worker._run_cycle(config)
+    assert extractor.lines() == [_lines("r1"), _lines("r2")]
+    assert len(_general_notes(tmp_path)) == 1
 
 
 def test_credentials_are_removed_before_the_extractor() -> None:

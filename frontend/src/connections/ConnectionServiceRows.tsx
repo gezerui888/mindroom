@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
-import { CheckCircle2, Loader2 } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -13,7 +13,7 @@ import { connectWithPopup, type OAuthAuthorization } from "./oauthPopup";
 import { errorText, requestConnection } from "./request";
 import { SharedAccountDialog } from "./SharedAccountDialog";
 import { STACKED, STACKED_CELL, STACKED_LABEL } from "./stackedTable";
-import { ToolName, ToolExposure } from "./ToolRow";
+import { StatusLabel, ToolName, ToolExposure } from "./ToolRow";
 import type {
   AgentConnections,
   ConnectionService,
@@ -157,8 +157,11 @@ export function ConnectionServiceRows({
     <>
       {tools.map((tool, index) => (
         <Fragment key={tool.name}>
+          {/* The Connection and Actions cells span the service's tools, so a line
+              between those tools would stop at them; only phones, where each
+              row is a card, separate them. */}
           <tr
-            className={`border-t border-border/60 ${STACKED.row} max-sm:py-2`}
+            className={`${index === 0 ? "border-t" : "max-sm:border-t"} border-border/60 ${STACKED.row} max-sm:py-2`}
           >
             <th
               scope="row"
@@ -170,7 +173,7 @@ export function ConnectionServiceRows({
               <td
                 rowSpan={tools.length}
                 data-label="Connection"
-                className={`px-4 py-3 align-top ${STACKED_CELL} ${STACKED_LABEL} max-sm:py-1`}
+                className={`px-5 py-3 align-top ${STACKED_CELL} ${STACKED_LABEL} max-sm:px-4 max-sm:py-1`}
               >
                 {loading ? (
                   <span
@@ -186,13 +189,16 @@ export function ConnectionServiceRows({
                 ) : (
                   status && (
                     <>
-                      <span className="flex items-center gap-1.5 text-sm">
-                        {status.connected && (
-                          <CheckCircle2
-                            className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
-                            aria-hidden="true"
-                          />
-                        )}
+                      <StatusLabel
+                        // Someone who cannot manage the account is told only whether it is there, and the dot says the same.
+                        tone={
+                          status.reset_required && service.can_manage
+                            ? "attention"
+                            : status.connected
+                              ? "set"
+                              : "unset"
+                        }
+                      >
                         {sharedConnected
                           ? sharedAccountStatus(
                               status.account_label,
@@ -207,7 +213,7 @@ export function ConnectionServiceRows({
                               : status.connected
                                 ? "Connected"
                                 : "Not connected"}
-                      </span>
+                      </StatusLabel>
                       {status.account_label && !sharedConnected && (
                         <p className="mt-1 max-w-56 break-all text-xs text-muted-foreground">
                           {status.account_label}
@@ -273,6 +279,7 @@ export function ConnectionServiceRows({
                     ) : (
                       <Button
                         size="sm"
+                        variant="outline"
                         disabled={busy !== null || !status.can_connect}
                         aria-label={`Connect ${service.display_name}`}
                         onClick={() =>
@@ -298,7 +305,9 @@ export function ConnectionServiceRows({
                       !status.can_connect &&
                       !status.reset_required && (
                         <p className="w-full text-sm text-muted-foreground">
-                          This service is not ready to connect yet.
+                          {status.service_account
+                            ? "This service uses a shared service account, so there is no account to connect here."
+                            : "This service needs its OAuth client saved in the MindRoom dashboard before it can connect."}
                         </p>
                       )}
                   </div>

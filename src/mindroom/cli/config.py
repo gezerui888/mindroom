@@ -970,8 +970,8 @@ def config_use_local_model(
 
 def _shared_key_providers(config: Config, runtime_paths: RuntimePaths) -> set[str]:
     """Return the providers with a model that has no credential of its own, so it needs the shared key."""
-    # model_loading pulls in the Agno runtime, which CLI startup must not import.
-    from mindroom.providers.model_loading import model_uses_own_credential  # noqa: PLC0415
+    # providers.credentials opens the credential store, which CLI startup must not import.
+    from mindroom.providers.credentials import model_uses_own_credential  # noqa: PLC0415
 
     try:
         return {
@@ -1207,7 +1207,6 @@ agents:
     role: Personal assistant with persistent file-based identity and memory
     model: default
     include_default_tools: false
-    learning: false
     memory_backend: file
     rooms:
       - personal
@@ -1226,28 +1225,41 @@ agents:
       - HEARTBEAT.md
     tools:
       - shell
-      - coding
       - memory
-      - name: config_manager
-        defer: true
-      - duckduckgo
-      - website
-      - browser
       - scheduler
       - update_awareness
       - todo
       - matrix_message
+      - name: config_manager
+        defer: true
+      - name: duckduckgo
+        defer: true
+      - name: website
+        defer: true
+      - name: browser
+        defer: true
       - name: matrix_room
         defer: true
       - name: thread_model
         defer: true
-      - thread_tags
-      - thread_summary
-      - thread_resolution
-      - compact_context
-      - callback_manager
-      - chat_ui
-      - script
+      - name: thread_tags
+        defer: true
+      - name: thread_summary
+        defer: true
+      - name: thread_resolution
+        defer: true
+      - name: compact_context
+        defer: true
+      - name: callback_manager
+        defer: true
+      - name: chat_ui
+        defer: true
+        overrides:
+          enable_show_canvas: true
+      - name: usage_stats
+        defer: true
+      - name: script
+        defer: true
       - name: mcp_matrix_mcp
         defer: true
     delegate_to:
@@ -1315,6 +1327,13 @@ authorization:
 tool_approval:
   rules:
     - match: resolve_thread
+      action: require_approval
+    # Ask before config_manager changes the configuration; its inspect and validate calls never ask.
+    - match: manage_config
+      action: require_approval
+    - match: manage_agent
+      action: require_approval
+    - match: manage_team
       action: require_approval
 
 background_tool_jobs:
@@ -1492,6 +1511,8 @@ def _provider_env_template(  # noqa: PLR0911
         # or set GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
         """).rstrip()
 
+    # TODO(simplify): the generated .env credits Agno with the default Azure OpenAI API version, which
+    # providers/openai/build.py sets. Say "the default Azure OpenAI API version". Users reading a new .env would notice.
     if provider_preset == "azure":
         return textwrap.dedent(f"""\
         # Azure OpenAI configuration

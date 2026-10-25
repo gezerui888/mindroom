@@ -875,7 +875,7 @@ async def test_existing_single_branch_checkout_switches_to_new_remote_branch(tmp
     await refresh_knowledge_binding("docs", config=main_config, runtime_paths=runtime_paths)
     main_lookup = get_published_index("docs", config=main_config, runtime_paths=runtime_paths)
     assert main_lookup.index is not None
-    assert [document.content for document in main_lookup.index.knowledge.search("branch", max_results=5)] == [
+    assert [document.content for document in await main_lookup.index.reader.asearch("branch", limit=5)] == [
         "main branch content",
     ]
 
@@ -895,7 +895,7 @@ async def test_existing_single_branch_checkout_switches_to_new_remote_branch(tmp
 
     assert result.index_published is True
     assert release_lookup.index is not None
-    assert [document.content for document in release_lookup.index.knowledge.search("branch", max_results=5)] == [
+    assert [document.content for document in await release_lookup.index.reader.asearch("branch", limit=5)] == [
         "release branch content",
     ]
 
@@ -953,7 +953,7 @@ async def test_refresh_recovers_orphaned_git_index_lock(tmp_path: Path) -> None:
     assert lock_path.exists() is False
     assert result.index_published is True
     assert lookup.index is not None
-    assert [document.content for document in lookup.index.knowledge.search("crash", max_results=5)] == [
+    assert [document.content for document in await lookup.index.reader.asearch("crash", limit=5)] == [
         "after crash",
     ]
 
@@ -1419,7 +1419,7 @@ def _published_row_ids() -> dict[str, list[object]]:
 async def _search(config: Config, runtime_paths: RuntimePaths, query: str) -> list[str]:
     lookup = get_published_index("docs", config=config, runtime_paths=runtime_paths)
     assert lookup.index is not None
-    return [document.content for document in lookup.index.knowledge.search(query, max_results=5)]
+    return [document.content for document in await lookup.index.reader.asearch(query, limit=5)]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX shell hooks and filters are required")
@@ -2007,6 +2007,25 @@ async def test_changed_files_between_preserves_special_character_paths(
     changed = await manager.git_source.changed_files_between("before", "after")
 
     assert changed == frozenset({newline_path, "unicodé.md"})
+
+
+@pytest.mark.asyncio
+async def test_changed_files_between_never_reads_a_stored_revision_as_an_option(tmp_path: Path) -> None:
+    """A revision read back from index metadata must reach Git as a revision, never as an option such as --output."""
+    _remote_work, remote_bare = _committed_remote(tmp_path, "content")
+    docs_path = tmp_path / "docs"
+    config = _git_docs_config(tmp_path, docs_path, remote_bare)
+    runtime_paths = runtime_paths_for(config)
+    await refresh_knowledge_binding("docs", config=config, runtime_paths=runtime_paths)
+    manager = KnowledgeManager("docs", config=config, runtime_paths=runtime_paths)
+    head = await manager.git_source.head()
+    output = tmp_path / "written-by-git"
+    assert head is not None
+
+    changed = await manager.git_source.changed_files_between(f"--output={output}", head)
+
+    assert changed is None
+    assert not output.exists()
 
 
 @pytest.mark.asyncio

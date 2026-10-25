@@ -95,7 +95,7 @@ async def test_orderly_shutdown_preserves_edit_callback_and_revision(
     principal = journal_store.principal("agent@alice")
     store = await _store_with_storage(
         journal_store,
-        create_state_storage(AGENT_NAME, tmp_path / "history", subdir="sessions", session_table="sessions"),
+        create_state_storage(AGENT_NAME, tmp_path / "history"),
         agent_name=AGENT_NAME,
     )
     await store.record_responded_turn(_turn_record(source_event_prompts={ORIGINAL_EVENT_ID: "original"}))
@@ -274,7 +274,6 @@ async def test_shutdown_closes_callbacks_before_membership_invalidation(  # noqa
         assert isinstance(leave, nio.RoomMemberEvent)
         memberships.apply_member_event(
             bot.config,
-            bot.runtime_paths,
             "!grant:localhost",
             leave,
             control_user_id="@mindroom_router:localhost",

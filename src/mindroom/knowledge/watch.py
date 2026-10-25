@@ -36,10 +36,11 @@ class _WatchTarget:
 
 
 @dataclass(frozen=True, slots=True)
-class _GitPollTarget:
+class _PollTarget:
     key: KnowledgeRefreshTarget
     base_id: str
     poll_interval_seconds: float
+    git: bool
 
 
 @dataclass(slots=True)
@@ -55,6 +56,26 @@ def _ensure_watch_root(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _skip_unusable_base(base_ids: list[str], exc: OSError | ValueError) -> None:
+    logger.warning("Knowledge source not watched: its path is unusable", base_ids=base_ids, error=str(exc))
+
+
+def _refresh_target_or_none(
+    base_id: str,
+    config: Config,
+    runtime_paths: RuntimePaths,
+) -> KnowledgeRefreshTarget | None:
+    """Resolve one base's refresh target, or None when its path is unusable, so other bases still start.
+
+    Worker code can replace a shared base's folder inside its own workspace with a link or a file.
+    """
+    try:
+        return resolve_refresh_target(base_id, config=config, runtime_paths=runtime_paths, create=True)
+    except (OSError, ValueError) as exc:
+        _skip_unusable_base([base_id], exc)
+        return None
+
+
 def _shared_local_watch_targets(config: Config, runtime_paths: RuntimePaths) -> dict[KnowledgeSourceRoot, _WatchTarget]:
     targets_by_key: dict[KnowledgeSourceRoot, list[str]] = {}
     for base_id in sorted(config.knowledge_bases):
@@ -64,44 +85,44 @@ def _shared_local_watch_targets(config: Config, runtime_paths: RuntimePaths) -> 
         if config.get_private_knowledge_base_agent(base_id) is not None:
             continue
 
-        refresh_target = resolve_refresh_target(
-            base_id,
-            config=config,
-            runtime_paths=runtime_paths,
-            create=True,
-        )
+        refresh_target = _refresh_target_or_none(base_id, config, runtime_paths)
+        if refresh_target is None:
+            continue
         targets_by_key.setdefault(source_root_for_refresh_target(refresh_target), []).append(base_id)
 
     targets: dict[KnowledgeSourceRoot, _WatchTarget] = {}
     for key, base_ids in targets_by_key.items():
         path = Path(key.knowledge_path)
-        _ensure_watch_root(path)
+        try:
+            _ensure_watch_root(path)
+        except (OSError, ValueError) as exc:
+            _skip_unusable_base(base_ids, exc)
+            continue
         targets[key] = _WatchTarget(key=key, path=path, base_ids=tuple(base_ids))
     return targets
 
 
-def _shared_git_poll_targets(
+def _shared_poll_targets(
     config: Config,
     runtime_paths: RuntimePaths,
-) -> dict[KnowledgeRefreshTarget, _GitPollTarget]:
-    targets: dict[KnowledgeRefreshTarget, _GitPollTarget] = {}
+) -> dict[KnowledgeRefreshTarget, _PollTarget]:
+    targets: dict[KnowledgeRefreshTarget, _PollTarget] = {}
     for base_id in sorted(config.knowledge_bases):
         base_config = config.get_knowledge_base_config(base_id)
-        if base_config.git is None:
+        poll_interval_seconds = base_config.effective_poll_interval_seconds
+        if poll_interval_seconds is None:
             continue
         if config.get_private_knowledge_base_agent(base_id) is not None:
             continue
 
-        refresh_target = resolve_refresh_target(
-            base_id,
-            config=config,
-            runtime_paths=runtime_paths,
-            create=True,
-        )
-        targets[refresh_target] = _GitPollTarget(
+        refresh_target = _refresh_target_or_none(base_id, config, runtime_paths)
+        if refresh_target is None:
+            continue
+        targets[refresh_target] = _PollTarget(
             key=refresh_target,
             base_id=base_id,
-            poll_interval_seconds=float(base_config.git.poll_interval_seconds),
+            poll_interval_seconds=float(poll_interval_seconds),
+            git=base_config.git is not None,
         )
     return targets
 
@@ -136,7 +157,7 @@ class KnowledgeSourceWatcher:
     def __init__(self, refresh_scheduler: KnowledgeRefreshScheduler) -> None:
         self._refresh_scheduler = refresh_scheduler
         self._filesystem_tasks: dict[KnowledgeSourceRoot, _WatchTask] = {}
-        self._git_poll_tasks: dict[KnowledgeRefreshTarget, _WatchTask] = {}
+        self._poll_tasks: dict[KnowledgeRefreshTarget, _WatchTask] = {}
 
     async def sync(self, *, config: Config | None, runtime_paths: RuntimePaths) -> None:
         """Replace watcher tasks so they match the current shared knowledge config."""
@@ -156,24 +177,25 @@ class KnowledgeSourceWatcher:
                 base_ids=list(watch_target.base_ids),
             )
 
-        for poll_target in _shared_git_poll_targets(config, runtime_paths).values():
+        for poll_target in _shared_poll_targets(config, runtime_paths).values():
             stop_event = asyncio.Event()
             task = asyncio.create_task(
-                self._poll_git_source(poll_target, config=config, runtime_paths=runtime_paths, stop_event=stop_event),
+                self._poll_source(poll_target, config=config, runtime_paths=runtime_paths, stop_event=stop_event),
             )
-            self._git_poll_tasks[poll_target.key] = _WatchTask(stop_event=stop_event, task=task)
+            self._poll_tasks[poll_target.key] = _WatchTask(stop_event=stop_event, task=task)
             logger.info(
-                "Knowledge Git poller started",
+                "Knowledge poller started",
                 base_id=poll_target.base_id,
                 poll_interval_seconds=poll_target.poll_interval_seconds,
+                git=poll_target.git,
             )
 
     async def shutdown(self) -> None:
         """Stop all source watchers owned by this instance."""
         tasks = list(self._filesystem_tasks.values())
-        tasks.extend(self._git_poll_tasks.values())
+        tasks.extend(self._poll_tasks.values())
         self._filesystem_tasks.clear()
-        self._git_poll_tasks.clear()
+        self._poll_tasks.clear()
         for watch_task in tasks:
             watch_task.stop_event.set()
             watch_task.task.cancel()
@@ -209,9 +231,9 @@ class KnowledgeSourceWatcher:
                 base_ids=list(target.base_ids),
             )
 
-    async def _poll_git_source(
+    async def _poll_source(
         self,
-        target: _GitPollTarget,
+        target: _PollTarget,
         *,
         config: Config,
         runtime_paths: RuntimePaths,
@@ -232,16 +254,22 @@ class KnowledgeSourceWatcher:
                     runtime_paths=runtime_paths,
                 )
                 logger.debug(
-                    "Knowledge Git poller scheduled refresh",
+                    "Knowledge poller scheduled refresh",
                     base_id=target.base_id,
                     poll_interval_seconds=target.poll_interval_seconds,
+                    git=target.git,
                 )
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Knowledge Git poller stopped after failure", base_id=target.base_id)
+            logger.exception("Knowledge poller stopped after failure", base_id=target.base_id, git=target.git)
         finally:
-            logger.info("Knowledge Git poller stopped", base_id=target.base_id)
+            logger.info(
+                "Knowledge poller stopped",
+                base_id=target.base_id,
+                poll_interval_seconds=target.poll_interval_seconds,
+                git=target.git,
+            )
 
     async def _schedule_refresh_for_target(
         self,

@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import nio
 import pytest
-from agno.tools.toolkit import Toolkit
 
 from mindroom import agents
 from mindroom.agent_cli import minimal_mode_preflight
@@ -238,11 +237,6 @@ def test_mode_parser_preserves_target_and_action() -> None:
             "the MindRoom API; the dashboard then asks for this key.",
         ),
         (
-            {"MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED": "true"},
-            "Set `MINDROOM_TRUSTED_UPSTREAM_REQUIRE_JWT=true`, because worker shells could forge "
-            "trusted-upstream headers.",
-        ),
-        (
             {"OPENAI_COMPAT_ALLOW_UNAUTHENTICATED": "true"},
             "Unset `OPENAI_COMPAT_ALLOW_UNAUTHENTICATED`, because worker shells could run agents through "
             "the unauthenticated OpenAI-compatible API.",
@@ -402,15 +396,13 @@ def test_selection_checks_effective_shell_permissions(
         context.config,
         paths,
         identity,
-        session_id=context.session_id,
         persist_runtime_state=False,
     )
-    assert isinstance(canonical.tools, list)
     shell_functions = {
-        name
-        for tool in canonical.tools
-        if isinstance(tool, Toolkit) and tool.name == "shell_tools"
-        for name in tool.get_async_functions()
+        function.name
+        for toolkit in canonical.spec.toolkits
+        if toolkit.name == "shell_tools"
+        for function in toolkit.functions
     }
     assert ("run_shell_command" in shell_functions) is permitted
     assert ("uses `minimal`" if permitted else "Allow the `run_shell_command` shell function") in result

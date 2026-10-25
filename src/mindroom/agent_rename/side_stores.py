@@ -65,9 +65,9 @@ _WORKFLOWS_DIRNAME = "dynamic_workflows"
 _AGENT_WORKFLOW_SCOPE = "agent"
 # report_publishing/store.py's _public_report_path: each public link's record names its artifact's storage path.
 _PUBLIC_REPORTS = ("report_publishing", "public_reports", "pub_*.json")
-# Agno's statuses of a run that has not finished (agno/run/base.py's RunStatus).
+# The statuses of a run that has not finished (llm/runs.py's RunStatus).
 _UNFINISHED_RUN_STATUSES = ("PENDING", "RUNNING", "PAUSED")
-# A state root keeps its session database in sessions/<name>.db (session_storage/agent_storage.py's subdir).
+# A state root keeps its session database in sessions/<name>.db (session_storage/schema.py's TableNames).
 _SESSION_DATABASES = "sessions/*.db"
 # The run states of a background script that has not finished (script_runs/store.py's _TERMINAL_RUN_STATES).
 _UNFINISHED_SCRIPT_STATES = (ScriptRunState.STARTING.value, ScriptRunState.RUNNING.value)

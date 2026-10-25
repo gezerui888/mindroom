@@ -25,6 +25,7 @@ personal_rooms:
 ```
 
 The router watches the onboarding rooms, so the selected agent does not need to join them.
+To give each user their own agent instead of one shared agent, see [Personal Agents](personal-agents.md).
 The human must still be allowed to use the agent under its access rules; listing the onboarding rooms in `access.members_of_rooms`, as above, grants that (see [Responder access](authorization.md#responder-access)).
 
 ## Configuration
@@ -33,7 +34,7 @@ The human must still be allowed to use the agent under its access rules; listing
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `agent` | string | Required | Configured agent that owns and answers in personal rooms. |
+| `agent` | string | Required | Configured agent, or a [`personal_agents`](personal-agents.md) template, that owns and answers in personal rooms; a template gives each user their own agent. |
 | `onboarding_rooms` | list of strings | Required | Nonempty list of configured rooms whose human joins trigger onboarding. |
 | `commands` | list of strings | `[]` | Exact self-onboarding commands accepted in onboarding rooms; each starts with `!` and contains no whitespace or arguments. |
 | `alias_prefix` | string | `"personal"` | Room alias prefix matching `[a-z0-9_-]{1,40}`, followed by a hash of the user ID and the installation namespace. |
@@ -63,7 +64,7 @@ It applies only when MindRoom creates the room, and never joins someone who alre
   Leaving and rejoining an onboarding room re-invites them to their existing personal room, except after a ban or for an adopted room.
 - In a personal room MindRoom created, the owner may invite other MindRoom agents, and an invited agent sees only messages sent after its invite.
   Anyone else invited into such a room is removed with a notice explaining that the room is private.
-  Adopted rooms instead allow only the participants listed in their record.
+  Adopted rooms instead allow only the participants listed in their record, and any other MindRoom agent invited there is removed the same way, because an adopted room may share its earlier history.
 - Personal rooms survive restarts and room cleanup, even after `personal_rooms` is removed.
   Disabling the feature stops new onboarding but does not remove existing rooms or access.
 
@@ -71,13 +72,15 @@ It applies only when MindRoom creates the room, and never joins someone who alre
 
 An onboarding failure affects only that human, and the onboarding room keeps working for everyone else.
 Failed onboarding is retried automatically, first after 30 seconds and then at doubling intervals up to one hour, and a config reload retries it immediately.
+A personal room that fails its ownership or membership checks keeps retrying only while its reconciliation is still failing; otherwise it is checked again on restart or config reload.
 A join or command that arrives before the personal-room agent connects is handled once it does.
 Revoking the human's access to the agent, or disabling `personal_rooms`, cancels a welcome that has not been sent yet.
 
 | Log message | Meaning |
 | --- | --- |
 | `Personal-room validation failed for an onboarding trigger` | An existing personal room failed ownership or membership checks, for example because another account already holds the alias, or a guest the agent cannot remove was raised to the agent's power level. |
-| `Personal-room imported roster has unattested members` | An adopted room contains members its record does not list; the warning names them, and MindRoom does not change the room. |
+| `Personal-room imported roster has unattested members` | An adopted room contains someone other than a MindRoom agent that its record does not list; the warning names every unlisted member, and MindRoom does not change the room. |
+| `Personal-room validation failed for an owner membership event` | The owner joined or changed their profile in a personal room that fails these checks; the agent keeps answering there. A room whose reconciliation is still failing keeps retrying up to hourly; otherwise the room is checked again on restart or config reload. |
 | `Personal-room onboarding trigger failed` | Any other failure, such as an invite refused by the human's homeserver. |
 | `Personal-room reconciliation failed` | An automatic retry failed; the log shows the attempt number and the delay before the next try. |
 
@@ -117,6 +120,6 @@ For a room with shared history and one existing guest, a record looks like this:
 - `additional_user_ids` (default `[]`) lists the only other participants allowed to stay joined, invited, or knocking; it does not invite anyone or grant power.
 - Set `welcome_completed: true` to skip the welcome; otherwise MindRoom sends the configured welcome.
 
-If the room's history setting or members stop matching the record, onboarding for that human fails with one of the log messages above until someone fixes the room.
-MindRoom does not change an adopted room's name, topic, or history setting, and never removes anyone from it.
+If the room's history setting stops matching the record, or anyone other than a MindRoom agent it does not list joins, is invited, or knocks, onboarding for that human fails with one of the log messages above until someone fixes the room.
+MindRoom does not change an adopted room's name, topic, or history setting, and removes only MindRoom agents the record does not list.
 It invites the requester if they are not in the room yet and applies the configured `requester_admin`, avatar, and welcome settings.

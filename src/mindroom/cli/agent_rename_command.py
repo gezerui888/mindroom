@@ -156,7 +156,7 @@ def _require_new_name(config: Config, *, old: str, new: str) -> None:
     from agno.utils.string import url_safe_string  # noqa: PLC0415
 
     from mindroom.agent_rename.steps import RenameRefusedError  # noqa: PLC0415
-    from mindroom.config.main import AGENT_NAME_PATTERN, RESERVED_ENTITY_NAMES  # noqa: PLC0415
+    from mindroom.constants import AGENT_NAME_PATTERN, RESERVED_ENTITY_NAMES  # noqa: PLC0415
     from mindroom.tool_system.worker_routing import normalize_worker_key_part  # noqa: PLC0415
 
     worker_spelling = normalize_worker_key_part(new)

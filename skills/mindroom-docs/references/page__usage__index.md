@@ -68,6 +68,16 @@ Usage from session history that predates usage tracking is imported once at star
 Because of these gaps, model, user, and daily rows do not necessarily sum to the top-level totals.
 Totals support cost estimates, but provider-specific charging rules and calls outside retained storage are not captured.
 
+## Reply Cost
+
+With [prices](https://docs.mindroom.chat/configuration/models/#model-config-fields) set on a model, each agent or team reply that uses it records its cost in USD, priced the same way as [budget spend](https://docs.mindroom.chat/budgets/#how-spend-is-counted).
+In MindRoom Chat, open **Reply details** from a reply's ⓘ button or message menu to see its cost and the conversation's cost up to that reply.
+A reply's cost covers every model call made within the reply, including team members on other models and [native compaction](https://docs.mindroom.chat/configuration/history/#native-compaction).
+Subagents it delegates to and separate helper work, such as text compaction summaries, memory-backend extraction, and thread titles, are left out of it but still count toward budgets.
+The conversation cost adds up the replies MindRoom Chat has loaded and reads "at least" while older messages are not loaded.
+A regenerated reply shows the cost of its latest run only.
+Replies on models without prices, and replies that report no token usage, show no cost.
+
 ## Usage Report API
 
 `GET /api/usage` returns the organization-wide report under standard dashboard authentication, like other administrator APIs.
@@ -158,17 +168,17 @@ Counter values can change between reports as coverage improves.
 `GET /api/usage/me/private-agents` returns the signed-in user's usage across their own private agents, with the same rows as `get_my_private_usage()` but without `user_id` or `user_breakdown`.
 The only accepted query parameter is `include_daily` (default `false`); any other parameter returns `400` `Usage target overrides are not accepted`.
 
-The endpoint requires [strict JWT mode](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#strict-jwt-mode) with a verified Matrix identity.
-A [Connections portal](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#connections-portal) session from Matrix sign-in does not authorize it.
+The endpoint requires [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/) with a [Matrix identity](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#matrix-identity).
+A [Connections portal](https://docs.mindroom.chat/connections-portal/) session from MindRoom Chat does not authorize it.
 Without it, requests fail with `403` `Personal APIs require trusted signed authentication` or `Personal APIs require a verified Matrix identity`; an API key alone cannot select a user.
 Any signed-in user can call it, and it grants no administrator or export access.
 
 ## Usage Export Service
 
-Strict JWT deployments can let a collector service call `GET /api/usage/export` without giving it a browser or administrator identity.
+Deployments with trusted upstream auth can let a collector service call `GET /api/usage/export` without giving it a browser or administrator identity.
 The route returns the same report, parameters, and polling behavior as [`GET /api/usage`](#usage-report-api).
 
-Configure [trusted-upstream strict JWT mode](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#strict-jwt-mode), including `MINDROOM_TRUSTED_UPSTREAM_USER_ID_HEADER`, then add a dedicated service audience and client ID:
+Configure [trusted upstream auth](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#setup), then add a dedicated service audience and client ID:
 
 ```bash
 MINDROOM_USAGE_SERVICE_JWT_AUDIENCE=mindroom-usage-export
@@ -181,7 +191,7 @@ It must also contain `type=app`, `common_name` exactly equal to `MINDROOM_USAGE_
 
 | Status | Meaning |
 | --- | --- |
-| `503` `Usage export service authentication is not configured` | Trusted-upstream auth, a strict-JWT setting, or a service setting is missing |
+| `503` `Usage export service authentication is not configured` | Trusted upstream auth, one of its JWT settings, or a service setting is missing |
 | `401` `Invalid usage service JWT` | Missing or invalid assertion |
 
 A service assertion authorizes only `/api/usage/export`, not `/api/usage`, personal usage, configuration, or other administrator routes.
@@ -206,6 +216,8 @@ agents:
     tools:
       - usage_stats
 ```
+
+`mindroom config init` and newly provisioned hosted instances give the starter Mind agent these self-service functions.
 
 Enable `get_all_usage()` with the per-agent `admin_scope` option (boolean, default `false`), which cannot be set in `defaults.tools`:
 

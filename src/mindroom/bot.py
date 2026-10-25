@@ -66,6 +66,8 @@ from mindroom.matrix.users import AgentMatrixUser, login_agent_owned_session
 from mindroom.matrix_rtc.call_manager import CallManager, maybe_build_call_manager
 from mindroom.message_target import MessageTarget  # noqa: TC001
 from mindroom.model_catalog_receiver import register_model_catalog_receiver
+from mindroom.orchestration.server_state import publish_server_state, server_state_content
+from mindroom.personal_agents import provision_personal_agent
 from mindroom.personal_room_lifecycle import PersonalRoomLifecycle, PersonalRoomTarget
 from mindroom.post_response_effects import PostResponseEffectsSupport
 from mindroom.runtime_shutdown import (
@@ -78,12 +80,12 @@ from mindroom.runtime_shutdown import (
     ShutdownBudget,
     restart_reason_category_for,
 )
-from mindroom.teams import TeamMode, TeamOutcome, resolve_configured_team
+from mindroom.teams.formation import TeamOutcome, resolve_configured_team
+from mindroom.teams.spec import TeamMode
 from mindroom.timestamp_formatting import format_timestamp_ms
 from mindroom.tool_system.runtime_context import ToolRuntimeSupport
 
 from . import constants
-from .agents import create_agent, show_tool_calls_for_agent
 from .background_tasks import create_background_task, wait_for_background_tasks
 from .coalescing.batch import CoalescingKey, PendingEvent, is_active_follow_up_coalescing_key
 from .coalescing.gate import CoalescingGate
@@ -104,6 +106,7 @@ from .entity_rooms import get_rooms_for_entity
 from .event_journal import (
     EventJournalStore,
     EventKind,
+    HistoryRecoveryState,
     PrincipalStore,
     SemanticConsumer,
 )
@@ -147,8 +150,10 @@ from .scheduling.tasks import (
     clear_scheduled_task_runner_owner,
     drain_deferred_overdue_tasks,
     has_deferred_overdue_tasks,
+    register_scheduled_task_state_writer,
     restore_scheduled_tasks,
     set_scheduled_task_runner_owner,
+    unregister_scheduled_task_state_writer,
 )
 from .startup_errors import PermanentStartupError
 from .tool_jobs.client_cancel import cancel_room_jobs, handle_job_cancel_event, person_may_cancel
@@ -167,7 +172,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import structlog
-    from agno.agent import Agent
     from nio.durable import DurableSync
 
     from mindroom.agent_reply_membership import AgentReplyMembershipIndex
@@ -510,6 +514,7 @@ class AgentBot:
             self.personal_rooms,
             self._lookup_personal_room_target,
             lambda event: self._ingress_validator.requester_user_id(sender=event.sender, source=event.source),
+            self._provision_personal_agent,
         )
         self._room_lifecycle = BotRoomLifecycle(
             BotRoomLifecycleDeps(
@@ -539,7 +544,14 @@ class AgentBot:
         return self._journal_store.principal(self._journal_principal_id)
 
     async def redacted_event_ids(self, room_id: str, event_ids: tuple[str, ...]) -> frozenset[str]:
-        """Return which of a room's events this bot saw redacted, for readers of its stored conversations."""
+        """Return which of a room's events this bot saw redacted, for readers of its stored conversations.
+
+        Redactions inside a gap its sync skipped reach the journal only when the room is repaired, so the lookup runs
+        that repair first, as a strict read of the room would.
+        """
+        recovery = await self.journal_principal().room_history_recovery(room_id)
+        if recovery is not None and recovery.state is HistoryRecoveryState.REPAIRABLE:
+            await self._conversation_reader.hydrator.ensure_hydrated(room_id=room_id, thread_id=None)
         return await self._turn_store.redacted_event_ids(room_id, event_ids)
 
     def _open_own_journal(self) -> OpenEventJournal:
@@ -1256,32 +1268,6 @@ class AgentBot:
         )
         await emit(self.hook_registry, event_name, context)
 
-    @property
-    def show_tool_calls(self) -> bool:
-        """Whether to show tool call details inline in responses."""
-        return show_tool_calls_for_agent(self.config, self.agent_name)
-
-    @property  # Not cached_property because Team mutates it!
-    def agent(self) -> Agent:
-        """Get the Agno Agent instance for this bot."""
-        if self.agent_name != ROUTER_AGENT_NAME and self.config.agents[self.agent_name].private is not None:
-            msg = (
-                f"AgentBot.agent is only available for shared agents. "
-                f"Private agent '{self.agent_name}' requires an explicit execution identity."
-            )
-            raise ValueError(msg)
-        assert self.orchestrator is not None
-        knowledge = self._knowledge_access_support.for_agent(self.agent_name)
-        return create_agent(
-            agent_name=self.agent_name,
-            config=self.config,
-            runtime_paths=self.runtime_paths,
-            knowledge=knowledge,
-            execution_identity=None,
-            hook_registry=self.hook_registry,
-            refresh_scheduler=self.orchestrator.knowledge_refresh_scheduler,
-        )
-
     async def join_configured_rooms(self) -> None:
         """Join all rooms this agent is configured for."""
         await self._room_lifecycle.join_configured_rooms()
@@ -1325,13 +1311,17 @@ class AgentBot:
         *,
         is_authorized: Callable[[], bool] | None = None,
     ) -> bool:
-        """Serialize one local membership command while ingestion keeps draining."""
+        """Serialize one local membership command while ingestion keeps draining.
+
+        Every join, including configured, invited, and personal rooms and the rejoin at startup, publishes the entity's
+        MindRoom server in the room, so MindRoom Chat can find it.
+        """
         session = self._ingestion_session
         if session is None:
             message = "owned Matrix ingestion session is missing"
             raise PermanentMatrixStartupError(message)
         async with self._local_membership_lock:
-            return await change_local_membership(
+            changed = await change_local_membership(
                 session,
                 account_id=self.agent_user.user_id,
                 room_id=room_id,
@@ -1340,6 +1330,11 @@ class AgentBot:
                 admission_progress=self._ingestion_admission_progress,
                 is_authorized=is_authorized,
             )
+        if changed and target_membership == "join" and self.client is not None:
+            api_enabled = self.orchestrator is None or self.orchestrator.api_enabled
+            content = server_state_content(self.agent_name, self.config, self.runtime_paths, api_enabled=api_enabled)
+            await publish_server_state(self.client, room_id, content)
+        return changed
 
     async def leave_unconfigured_rooms(self) -> None:
         """Leave any rooms this agent is no longer configured for."""
@@ -1948,6 +1943,7 @@ class AgentBot:
             await self._emit_agent_lifecycle_event(EVENT_AGENT_STARTED)
             if self.agent_name == ROUTER_AGENT_NAME:
                 set_scheduled_task_runner_owner(ScheduledTaskRunnerOwner(client, self._conversation_reader))
+            register_scheduled_task_state_writer(client)
         except BaseException:
             await self._close_owned_matrix_after_start_failure()
             raise
@@ -2304,6 +2300,8 @@ class AgentBot:
     ) -> None:
         """Release resources after every response owner is terminal."""
         try:
+            if self.client is not None:
+                unregister_scheduled_task_state_writer(self.client)
             if self.agent_name == ROUTER_AGENT_NAME:
                 self._mark_deferred_stop_phase(DeferredStopPhase.ROUTER_OVERDUE_TASKS)
                 clear_scheduled_task_runner_owner()
@@ -2786,6 +2784,36 @@ class AgentBot:
             return None
         return PersonalRoomTarget(target.personal_rooms, target.first_sync_complete)
 
+    async def _provision_personal_agent(
+        self,
+        template: str,
+        user_id: str,
+        source_user_id: str,
+        source_room_id: str,
+    ) -> None:
+        """Create one user's agent from a template and reload the config so the runtime starts it."""
+        client = self.client
+        assert client is not None
+        profile = await client.get_displayname(user_id)
+        _, changed = await provision_personal_agent(
+            self.config,
+            self.runtime_paths,
+            template=template,
+            user_id=user_id,
+            user_display_name=profile.displayname if isinstance(profile, nio.ProfileGetDisplayNameResponse) else None,
+            source_user_id=source_user_id,
+            source_room_id=source_room_id,
+        )
+        # This runs only while the live config lacks the agent, so an existing entry still needs a reload,
+        # but re-requesting a queued one would restart its debounce and response drain on every retry.
+        orchestrator = self.orchestrator
+        if orchestrator is not None and (changed or orchestrator.config_reload.status.status != "pending"):
+            orchestrator.config_reload.request_reload()
+
+    def personal_room_target_ready(self) -> None:
+        """Let the router onboard a user at once because their own agent finished its first sync."""
+        self._personal_room_lifecycle.target_ready()
+
     async def _reconcile_reply_membership_effects(self) -> None:
         """Run effects that depend on one committed reply-membership change."""
         orchestrator = self.orchestrator
@@ -2816,7 +2844,6 @@ class AgentBot:
             return
         await self._router_reply_membership_sync.apply_live_transition(
             self.config,
-            self.runtime_paths,
             room_id,
             event,
             control_user_id=self.matrix_id.full_id,
@@ -2983,11 +3010,6 @@ class AgentBot:
 
 class TeamBot(AgentBot):
     """A bot that represents a team of agents working together."""
-
-    @cached_property
-    def agent(self) -> Agent | None:
-        """Teams don't have individual agents, return None."""
-        return None
 
     def current_configured_team_agents(self) -> list[MatrixID]:
         """Return this configured team's current persisted member Matrix IDs."""

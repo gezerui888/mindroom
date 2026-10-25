@@ -42,7 +42,11 @@ from mindroom.entity_resolution import (
     is_configured_room,
 )
 from mindroom.entity_rooms import get_rooms_for_entity
-from mindroom.event_loop_stall import EventLoopStallDetector, start_event_loop_stall_detector
+from mindroom.event_loop_stall import (
+    EventLoopStallDetector,
+    shorten_gil_switch_interval,
+    start_event_loop_stall_detector,
+)
 from mindroom.file_locks import release_file_lock, try_exclusive_file_lock
 from mindroom.heap_probe import freeze_startup_heap, start_heap_tasks
 from mindroom.hooks import (
@@ -87,6 +91,7 @@ from mindroom.mcp.registry import mcp_tool_name
 from mindroom.mcp.toolkit import bind_mcp_server_manager
 from mindroom.memory import MemoryAutoFlushWorker, auto_flush_enabled
 from mindroom.private_storage.legacy_private_storage import migrate_private_storage
+from mindroom.providers.model_http_client import aclose_model_http_client
 from mindroom.response_activity import ResponseIdentity
 from mindroom.response_admission import ResponseAdmissionGate
 from mindroom.runtime_shutdown import (
@@ -1141,6 +1146,12 @@ class _MultiAgentOrchestrator:
             return config.teams[entity_name].display_name
         return entity_name
 
+    @staticmethod
+    def _entity_requested_username(config: Config, entity_name: str) -> str | None:
+        """Return a generated agent's stored Matrix username, so a wiped matrix_state recreates the same ID."""
+        instance = config.personal_agent_instance(entity_name)
+        return None if instance is None else instance.matrix_username
+
     async def _prepare_entity_accounts(
         self,
         config: Config,
@@ -1161,6 +1172,7 @@ class _MultiAgentOrchestrator:
                     entity_name,
                     self._entity_display_name(config, entity_name),
                     runtime_paths=self.runtime_paths,
+                    username=self._entity_requested_username(config, entity_name),
                 )
             self._validate_entity_accounts(config)
             users = prepared_users
@@ -1196,7 +1208,13 @@ class _MultiAgentOrchestrator:
                     username=config.mindroom_user.username,
                 ),
             )
-        requests.extend(ManagedAccountProvisioningRequest(entity_name) for entity_name in entity_names)
+        requests.extend(
+            ManagedAccountProvisioningRequest(
+                entity_name,
+                username=self._entity_requested_username(config, entity_name),
+            )
+            for entity_name in entity_names
+        )
         preflight_managed_account_provisioning(requests, self.runtime_paths)
 
     def validate_managed_entity_identities(self) -> None:
@@ -1568,6 +1586,10 @@ class _MultiAgentOrchestrator:
             self._router_reply_memberships_live_sync_ready.set()
         if bot.agent_name == ROUTER_AGENT_NAME and bot.running and bot.client is not None:
             await self._approval_recovery.mark_router_ready()
+        if self.config is not None and self.config.personal_agent_instance(bot.agent_name) is not None:
+            router = self.agent_bots.get(ROUTER_AGENT_NAME)
+            if isinstance(router, AgentBot):
+                router.personal_room_target_ready()
         self._schedule_ready_turn_dispatch_recovery()
 
     def invalidate_agent_reply_memberships(self, *, reason: str) -> None:
@@ -3052,6 +3074,7 @@ async def _finish_runtime_shutdown(
         reset_matrix_sync_health()
         reset_runtime_state()
         shutdown_primary_worker_manager()
+        await aclose_model_http_client()
 
 
 async def _wait_for_runtime_shutdown_cleanup(
@@ -3201,6 +3224,7 @@ async def _run_runtime(  # noqa: PLR0915
         # Configure logging before any background tasks or account setup begin.
         setup_logging(level=log_level, runtime_paths=runtime_paths)
 
+        shorten_gil_switch_interval()
         stall_detector = start_event_loop_stall_detector(runtime_paths)
 
         # Credential synchronization and storage setup are synchronous. Keep the

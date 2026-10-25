@@ -8,7 +8,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import nio
 import pytest
-from agno.models.response import ToolExecution
 
 from mindroom.approval.inbound import parse_approval_response_event
 from mindroom.approval.manager import ApprovalActionResult, ApprovalManager
@@ -31,6 +30,7 @@ from mindroom.event_journal import (
     MatrixDelivery,
     StoredApprovalCard,
 )
+from mindroom.llm.runs import ToolExecution
 from mindroom.matrix.large_messages import content_fits_normal_event
 from mindroom.mcp.config import MCPServerConfig
 from mindroom.message_target import MessageTarget
@@ -156,11 +156,13 @@ async def test_only_policy_pause_offers_timed_approval(
         approval_type=approval_type,
     )
     plan = await plan_approval_calls(
-        ((tool, "call-authored", "shell", "code"),),
+        ((tool, "code"),),
         config=coordinator.config(),
         runtime_paths=coordinator.runtime_paths,
         requester_id="@human:test",
         toolkit_owners={("code", "shell"): "test_toolkit"},
+        room_id="!room:test",
+        thread_id="$thread",
     )
     await responder.admit(
         InboundEvent(
@@ -255,11 +257,13 @@ async def test_policy_pause_receipt_accepts_timed_authorization_without_claiming
                 approval_type="mindroom_policy",
             )
             plan = await plan_approval_calls(
-                ((tool, "call-" + name, "shell", "code"),),
+                ((tool, "code"),),
                 config=coordinator.config(),
                 runtime_paths=coordinator.runtime_paths,
                 requester_id="@human:test",
                 toolkit_owners={("code", "shell"): "test_toolkit"},
+                room_id="!room:test",
+                thread_id="$thread",
             )
             assert plan.calls[0].human_approval_required is True
             await responder.admit(

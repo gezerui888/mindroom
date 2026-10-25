@@ -1,4 +1,4 @@
-"""Tests for moving an agent's state root and renaming its session and learning databases with its config key."""
+"""Tests for moving an agent's state root and renaming its session database with its config key."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from agno.session.agent import AgentSession
 
 from mindroom import constants
 from mindroom.agent_rename.entity_state import entity_state_steps, matrix_state_key_step
@@ -37,17 +36,14 @@ from mindroom.history.storage import (
 )
 from mindroom.history.types import HistoryScope
 from mindroom.matrix.state import MatrixState
-from mindroom.session_storage.agent_storage import (
-    create_session_storage,
-    get_agent_session,
-)
+from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.usage.stats import collect_admin_usage
 from tests.agent_rename_fixtures.entity_state import (
     ALICE,
     SESSION,
     agent_root,
     agent_run,
-    learning_storage,
+    agent_session,
     seed_agent,
     session_storage,
 )
@@ -149,39 +145,30 @@ def _config() -> Config:
 
 
 def test_history_visible_to_new_name(tmp_path: Path) -> None:
-    """After the rename the agent replays its old runs, summary, seen events, queued compaction and learnings."""
+    """After the rename the agent replays its old runs, summary, seen events and queued compaction."""
     runtime_paths = _install(tmp_path)
 
     _apply(runtime_paths, entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW))
 
     scope = HistoryScope(kind="agent", scope_id=NEW)
     storage = create_session_storage(NEW, _config(), runtime_paths, execution_identity=None)
-    try:
-        session = get_agent_session(storage, SESSION)
-        assert session is not None
-        # r1 is behind the summary row, so only r2 replays; without the summary's scope renamed both would.
-        assert [run.run_id for run in scope_visible_runs(session, scope)] == ["r2"]
-        assert current_summary_text(session) == "summary of code's r1"
-        assert [message.content for message in session.get_messages(agent_id=NEW)] == ["question r2", "answer"]
-        assert read_scope_seen_event_ids(storage, session, scope) == {"$preserved", "$r1", "$r2"}
-        assert has_queued_force_compaction(storage, SESSION, scope)
-    finally:
-        storage.close()
-    learning = learning_storage(runtime_paths, NEW)
-    try:
-        learnings = learning.get_learnings(agent_id=NEW)
-    finally:
-        learning.close()
-    assert [row["content"] for row in learnings] == [{"memories": ["code learned this"]}]
+    session = storage.load_session(SESSION, "agent")
+    assert session is not None
+    # r1 is behind the summary row, so only r2 replays; without the summary's scope renamed both would.
+    replayed = scope_visible_runs(session, scope)
+    assert [run.run_id for run in replayed] == ["r2"]
+    assert current_summary_text(session) == "summary of code's r1"
+    assert [message.content for run in replayed for message in run.messages] == ["question r2", "answer"]
+    assert read_scope_seen_event_ids(storage, session, scope) == {"$preserved", "$r1", "$r2"}
+    assert has_queued_force_compaction(storage, SESSION, scope)
     assert not agent_root(runtime_paths, OLD).exists()
     assert (agent_root(runtime_paths, NEW) / "workspace" / "notes.md").read_text(encoding="utf-8") == "code notes\n"
 
 
 def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
-    """Every table, index and schema-version row of the agent's sessions and learning takes the new name."""
+    """Every table, index and schema-version row of the agent's sessions takes the new name."""
     runtime_paths = _install(tmp_path)
     old_sessions = agent_root(runtime_paths, OLD) / "sessions" / f"{OLD}.db"
-    old_learning = agent_root(runtime_paths, OLD) / "learning" / f"{OLD}.db"
     with closing(sqlite3.connect(old_sessions)) as connection:
         # Agno also writes partial unique indexes named ``<table>_<name>``; one must keep its clauses.
         connection.execute(
@@ -192,17 +179,12 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
         tuple(part.replace("code_sessions", "coder_sessions") for part in entry)
         for entry in sqlite_schema(old_sessions)
     }
-    expected_learning = {
-        tuple(part.replace("code_learning_sessions", "coder_learning_sessions") for part in entry)
-        for entry in sqlite_schema(old_learning)
-    }
 
     steps = entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW)
     _apply(runtime_paths, steps)
 
     sessions = agent_root(runtime_paths, NEW) / "sessions" / f"{NEW}.db"
-    learning = agent_root(runtime_paths, NEW) / "learning" / f"{NEW}.db"
-    assert [type(step) for step in steps] == [MovePath, SqliteEdit, MovePath, SqliteEdit, MovePath]
+    assert [type(step) for step in steps] == [MovePath, SqliteEdit, MovePath]
     assert sqlite_schema(sessions) == expected_sessions
     assert {name for _type, name, _table, _sql in expected_sessions} >= {
         "coder_sessions_runs",
@@ -214,7 +196,6 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
         "coder_sessions_removed_runs_session",
         "coder_sessions_runs_one_child",
     }
-    assert sqlite_schema(learning) == expected_learning
     with closing(sqlite3.connect(sessions)) as connection:
         stored_sql = connection.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL").fetchall()
         assert all("code_sessions" not in sql for (sql,) in stored_sql)
@@ -244,13 +225,6 @@ def test_tables_indexes_and_schema_versions_renamed(tmp_path: Path) -> None:
         assert [(agent_id, json.loads(run_data)["agent_id"]) for agent_id, run_data in runs] == [(NEW, NEW), (NEW, NEW)]
         assert [json.loads(run_data)["events"][0]["agent_id"] for _agent_id, run_data in runs] == [NEW, NEW]
         assert connection.execute("SELECT scope_key FROM coder_sessions_summaries").fetchall() == [(f"agent:{NEW}",)]
-    with closing(sqlite3.connect(learning)) as connection:
-        assert set(connection.execute("SELECT table_name FROM agno_schema_versions")) == {
-            ("agno_learnings",),
-            ("coder_learning_sessions",),
-        }
-        assert connection.execute("SELECT agent_id FROM agno_learnings").fetchall() == [(NEW,)]
-        assert connection.execute("SELECT agent_id FROM coder_learning_sessions").fetchall() == [(NEW,)]
 
 
 def test_usage_stats_find_new_db(tmp_path: Path) -> None:
@@ -421,9 +395,7 @@ def test_failure_after_any_step_restores_the_tree(tmp_path: Path, crash: str | N
 def _legacy_install(tmp_path: Path) -> RuntimePaths:
     """Return an install whose session database an older release left: Agno 2 blob runs and a compaction archive."""
     runtime_paths = test_runtime_paths(tmp_path)
-    storage = session_storage(runtime_paths, OLD)
-    seed_session(storage, AgentSession(session_id=SESSION, agent_id=OLD, user_id=ALICE, runs=[agent_run(OLD, "r2")]))
-    storage.close()
+    seed_session(session_storage(runtime_paths, OLD), agent_session(OLD, agent_run(OLD, "r2")))
     with closing(sqlite3.connect(agent_root(runtime_paths, OLD) / "sessions" / f"{OLD}.db")) as connection:
         connection.execute("DROP TABLE code_sessions_summaries")
         connection.execute("DROP TABLE code_sessions_removed_runs")
@@ -453,13 +425,10 @@ def _replay(runtime_paths: RuntimePaths, agent: str) -> tuple[str | None, list[s
     """Open the agent's sessions as MindRoom does and return its summary, replayed runs and seen events."""
     scope = HistoryScope(kind="agent", scope_id=agent)
     storage = session_storage(runtime_paths, agent)
-    try:
-        session = get_agent_session(storage, SESSION)
-        assert session is not None
-        runs = [run.run_id for run in scope_visible_runs(session, scope)]
-        return current_summary_text(session), runs, read_scope_seen_event_ids(storage, session, scope)
-    finally:
-        storage.close()
+    session = storage.load_session(SESSION, "agent")
+    assert session is not None
+    runs = [run.run_id for run in scope_visible_runs(session, scope)]
+    return current_summary_text(session), runs, read_scope_seen_event_ids(storage, session, scope)
 
 
 def test_legacy_archive_and_blob_visible_to_new_name(tmp_path: Path) -> None:
@@ -483,19 +452,14 @@ def test_separate_session_storage_moves_too(tmp_path: Path) -> None:
         process_env={**base.process_env, "MINDROOM_SESSION_STORAGE_PATH": str(session_root)},
     )
     storage = create_session_storage(OLD, Config(agents={OLD: AgentConfig(display_name="Code")}), runtime_paths, None)
-    seed_session(storage, AgentSession(session_id=SESSION, agent_id=OLD, user_id=ALICE, runs=[agent_run(OLD, "r1")]))
-    storage.close()
+    seed_session(storage, agent_session(OLD, agent_run(OLD, "r1")))
     assert (session_root / "agents" / OLD / "sessions" / f"{OLD}.db").is_file()
 
     _apply(runtime_paths, entity_state_steps(runtime_paths, old_name=OLD, new_name=NEW))
 
-    storage = create_session_storage(NEW, _config(), runtime_paths, None)
-    try:
-        session = get_agent_session(storage, SESSION)
-        assert session is not None
-        assert [run.run_id for run in scope_visible_runs(session, HistoryScope(kind="agent", scope_id=NEW))] == ["r1"]
-    finally:
-        storage.close()
+    session = create_session_storage(NEW, _config(), runtime_paths, None).load_session(SESSION, "agent")
+    assert session is not None
+    assert [run.run_id for run in scope_visible_runs(session, HistoryScope(kind="agent", scope_id=NEW))] == ["r1"]
     assert not (session_root / "agents" / OLD).exists()
 
 

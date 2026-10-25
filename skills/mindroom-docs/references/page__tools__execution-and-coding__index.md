@@ -2,9 +2,9 @@
 
 Use these tools to inspect and edit files, run shell commands or Python, manage Docker resources, do exact arithmetic, and generate files and charts.
 
-<video controls playsinline preload="metadata" aria-label="An agent writes and runs an analysis script in its own workspace and posts the plot" style="width: 100%" poster="https://github.com/user-attachments/assets/64437d95-27eb-4ec7-916f-c09150c5fb95" data-poster-light="https://github.com/user-attachments/assets/64437d95-27eb-4ec7-916f-c09150c5fb95" data-poster-dark="https://github.com/user-attachments/assets/b9ccd95c-1899-4fa2-9beb-a03d22ec6c46">
-  <source src="https://github.com/user-attachments/assets/e1a47a55-05a6-4035-b50c-b631e867b8c8" type="video/mp4" media="(prefers-color-scheme: dark)">
-  <source src="https://github.com/user-attachments/assets/a9d21f4f-d9c7-480f-b71b-8a7155903bfc" type="video/mp4">
+<video controls playsinline preload="metadata" aria-label="An agent writes and runs an analysis script in its own workspace and posts the plot" style="width: 100%" poster="https://github.com/user-attachments/assets/524efcc4-9b4c-4ee1-85c3-bca8dc13e1f8" data-poster-light="https://github.com/user-attachments/assets/524efcc4-9b4c-4ee1-85c3-bca8dc13e1f8" data-poster-dark="https://github.com/user-attachments/assets/e62497d7-3133-4abe-afc2-ec3db2889552">
+  <source src="https://github.com/user-attachments/assets/36d029f7-b67d-46c7-ae38-f76517dcd354" type="video/mp4" media="(prefers-color-scheme: dark)">
+  <source src="https://github.com/user-attachments/assets/1e73d587-9a0e-44c3-a66d-8b6631cdbf61" type="video/mp4">
 </video>
 
 ## Tools On This Page
@@ -32,14 +32,15 @@ None of these tools needs credentials or dashboard setup; `docker` needs Docker 
 Whether the other tools here also run in a worker depends on the [execution mode](https://docs.mindroom.chat/deployment/sandbox-proxy/#execution-modes).
 Change this with `defaults.worker_tools` or `agents.<name>.worker_tools`, as described in [Worker Routing](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-routing).
 `worker_scope` decides how worker runtimes are shared between agents and users; see [Worker scopes](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-scopes).
-With [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/) on, worker-routed `shell` and `python` calls can use stored API keys and connected accounts that the worker never sees.
+With [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/) on, worker-routed `shell` and `python` calls of an agent with the [`egress_credentials` tool](https://docs.mindroom.chat/deployment/egress-broker/#agent-tool) can use stored API keys and connected accounts that the worker never sees.
 Only a worker isolates `shell`, `python`, and `docker`, because they execute code and are never confined by the agent's [`file_access`](https://docs.mindroom.chat/architecture/security-posture/#file-access) setting.
 
 ### Workspace and tool output files
 
 When an agent has a workspace, it is the working directory (`base_dir`) of `file`, `shell`, `coding`, and worker-routed `python`, and generated files and charts are saved inside it.
 `python` in the primary process resolves its file functions against the workspace, but the code it runs uses the process's current directory, so relative paths such as `open("data.csv")` may miss workspace files.
-`base_dir` is managed by MindRoom and cannot be set inline in `config.yaml`; without a workspace, these tools use the process's current directory.
+`base_dir` is managed by MindRoom and cannot be set inline in `config.yaml`; without a workspace, `shell` and `python` use the process's current directory, and so do `file` and `coding` under `file_access: unrestricted`.
+Under the default `file_access: workspace`, `file` and `coding` of an agent without a workspace refuse every path outside its shared directories, except in a worker with worker-specific storage (Docker and Kubernetes workers, and `static_runner` calls of agents with a [`worker_scope`](https://docs.mindroom.chat/deployment/sandbox-proxy/#worker-scopes)), where they use that worker's own directory; give the agent a workspace with `memory_backend: file` or a `private` configuration.
 
 Agents with a workspace also get an optional `mindroom_output_path` argument on supported tools.
 Set it to a workspace-relative file path to save the tool's full output to that file and return a short receipt to the model instead.
@@ -105,6 +106,7 @@ Prefer [`coding`](#coding) for code-editing agents.
 ```yaml
 agents:
   editor:
+    memory_backend: file  # gives the agent a workspace for file paths
     tools:
       - file:
           enable_delete_file: true
@@ -227,6 +229,7 @@ Paths follow the agent's [`file_access`](https://docs.mindroom.chat/architecture
 ```yaml
 agents:
   code:
+    memory_backend: file  # gives the agent a workspace for file paths
     tools:
       - coding
 ```

@@ -15,7 +15,7 @@ from mem0 import AsyncMemory
 from mem0.llms.openai import OpenAILLM
 from ollama import ChatResponse as OllamaChatResponse
 from ollama import Message as OllamaMessage
-from openai import AuthenticationError
+from openai import AuthenticationError, InternalServerError
 from openai.types.chat import ChatCompletion
 from structlog.testing import capture_logs
 
@@ -24,7 +24,7 @@ from mindroom.config.main import Config
 from mindroom.config.memory import _MemoryLLMConfig
 from mindroom.constants import resolve_runtime_paths
 from mindroom.embeddings.embedder_health import capture_embedder_health_recorder, get_embedder_failure
-from mindroom.embeddings.errors import EmbedderRequestError
+from mindroom.embeddings.errors import EmbedderRequestError, embedder_failure_is_transient, openai_embedder_error
 from mindroom.helper_usage import HelperUsageOwner, helper_usage_owner_context
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 from mindroom.memory import (
@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from pathlib import Path
 
-    from agno.run.agent import RunOutput
+    from mindroom.llm.runs import RunRecord
 
 
 async def _search_memory_results(*args: object, **kwargs: object) -> list:
@@ -205,10 +205,14 @@ async def test_store_conversation_memory_detects_embedding_failure_swallowed_by_
     failure_detail = "embedder authentication failed (HTTP 401)"
 
     class FailingEmbedder:
-        def get_embedding(self, _text: str) -> list[float]:
+        sends_batches = True
+
+        def embed(self, _texts: list[str], *, purpose: str) -> list[list[float]]:
+            del purpose
             raise EmbedderRequestError(failure_detail)
 
-        def get_embeddings_batch(self, _texts: list[str]) -> list[list[float]]:
+        async def aembed(self, _texts: list[str], *, purpose: str) -> list[list[float]]:
+            del purpose
             raise EmbedderRequestError(failure_detail)
 
     class SwallowingMemory:
@@ -245,6 +249,44 @@ async def test_store_conversation_memory_detects_embedding_failure_swallowed_by_
         assert "Memory added" not in str(logs)
     finally:
         capture_embedder_health_recorder().record(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classified", [False, True], ids=["raw_sdk_error", "embedder_error"])
+async def test_mem0_write_failure_keeps_the_embedder_retry_judgment(
+    storage_path: Path,
+    config: Config,
+    classified: bool,
+) -> None:
+    """A failed Mem0 write raises the classified error with its retry flag and hint, and without the raw error."""
+    config.memory.backend = "mem0"
+    request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
+    response = httpx.Response(503, request=request, headers={"retry-after": "3"}, json={"error": {"message": "busy"}})
+    raw_error = InternalServerError("busy", response=response, body=None)
+
+    class FailingMemory:
+        async def add(self, *_args: object, **_kwargs: object) -> None:
+            # Mem0's own model calls raise the raw SDK error; MindRoom's embedder raises the classified one.
+            if classified:
+                raise openai_embedder_error(raw_error) from raw_error
+            raise raw_error
+
+    async def create_failing_memory(*_args: object, **_kwargs: object) -> FailingMemory:
+        return FailingMemory()
+
+    try:
+        with (
+            patch("mindroom.memory._backend.create_memory_instance", side_effect=create_failing_memory),
+            pytest.raises(EmbedderRequestError) as excinfo,
+        ):
+            await add_agent_memory("Atlas ships Friday.", "general", storage_path, config, runtime_paths_for(config))
+    finally:
+        capture_embedder_health_recorder().record(None)
+
+    assert str(excinfo.value) == "embedder request failed (HTTP 503)"
+    assert embedder_failure_is_transient(excinfo.value)
+    assert excinfo.value.retry_after_seconds == 3.0
+    assert excinfo.value.__cause__ is None
 
 
 @pytest.mark.asyncio
@@ -759,10 +801,10 @@ def _mem0_memory_reporting_usage(
     return from_config
 
 
-def _recorder() -> tuple[list[tuple[RunOutput, dict[str, object]]], Callable[..., Awaitable[None]]]:
-    recorded: list[tuple[RunOutput, dict[str, object]]] = []
+def _recorder() -> tuple[list[tuple[RunRecord, dict[str, object]]], Callable[..., Awaitable[None]]]:
+    recorded: list[tuple[RunRecord, dict[str, object]]] = []
 
-    async def record(response: RunOutput, **kwargs: object) -> None:
+    async def record(response: RunRecord, **kwargs: object) -> None:
         recorded.append((response, kwargs))
 
     return recorded, record
@@ -795,12 +837,16 @@ async def test_conversation_memory_extraction_records_its_token_usage(storage_pa
         "@alice:example.org",
     )
     assert run.metrics is not None
-    assert (run.metrics.input_tokens, run.metrics.output_tokens, run.metrics.total_tokens) == (120, 30, 150)
+    assert (run.metrics.tokens.input_tokens, run.metrics.tokens.output_tokens, run.metrics.tokens.total_tokens) == (
+        120,
+        30,
+        150,
+    )
     # Each extraction call is one request in usage reports.
     [message] = run.messages or []
     assert message.role == "assistant"
     assert message.metrics is not None
-    assert message.metrics.total_tokens == 150
+    assert message.metrics.tokens.total_tokens == 150
     assert message.provider_data == {"mindroom_model": {"id": "gpt-6-luna", "provider": "OpenAI"}}
 
 
@@ -830,7 +876,7 @@ async def test_team_memory_extraction_counts_as_internal_usage(storage_path: Pat
     assert kwargs == {"runtime_paths": runtime_paths_for(config), "kind": "memory_extraction"}
     assert run.metrics is not None
     # Team memory is extracted once into each store it is kept in.
-    assert run.metrics.total_tokens == 150 * fake_stores.call_count
+    assert run.metrics.tokens.total_tokens == 150 * fake_stores.call_count
     assert len(run.messages or []) == fake_stores.call_count
 
 
@@ -867,7 +913,7 @@ async def test_extraction_usage_is_recorded_when_a_later_store_fails(storage_pat
 
     [(run, _kwargs)] = recorded
     assert run.metrics is not None
-    assert run.metrics.total_tokens == 150
+    assert run.metrics.tokens.total_tokens == 150
 
 
 @pytest.mark.asyncio
@@ -909,7 +955,7 @@ async def test_memory_tool_additions_record_usage_for_the_reply_that_made_them(
         "@alice:example.org",
     )
     assert run.metrics is not None
-    assert run.metrics.total_tokens == 150
+    assert run.metrics.tokens.total_tokens == 150
 
 
 @pytest.mark.asyncio
@@ -926,7 +972,7 @@ async def test_memory_addition_outside_a_reply_counts_as_internal_usage(storage_
     [(run, kwargs)] = recorded
     assert kwargs["kind"] == "memory_extraction"
     assert run.metrics is not None
-    assert run.metrics.total_tokens == 150
+    assert run.metrics.tokens.total_tokens == 150
 
 
 @pytest.mark.asyncio
@@ -948,7 +994,7 @@ async def test_memory_addition_records_usage_when_storing_the_facts_fails(storag
 
     [(run, _kwargs)] = recorded
     assert run.metrics is not None
-    assert run.metrics.total_tokens == 150
+    assert run.metrics.tokens.total_tokens == 150
 
 
 @pytest.mark.asyncio
@@ -1049,11 +1095,11 @@ def test_each_provider_reports_its_extraction_tokens(
     assert run.metrics is not None
     metrics = run.metrics
     assert (
-        metrics.input_tokens,
-        metrics.output_tokens,
-        metrics.cache_read_tokens,
-        metrics.cache_write_tokens,
-        metrics.reasoning_tokens,
+        metrics.tokens.input_tokens,
+        metrics.tokens.output_tokens,
+        metrics.tokens.cache_read_tokens,
+        metrics.tokens.cache_write_tokens,
+        metrics.tokens.reasoning_tokens,
     ) == expected
 
 

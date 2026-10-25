@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 
 from mindroom.access_policy import resolve_responder_access
 from mindroom.approval import manager as approval_manager
+from mindroom.approval.auto_approve_windows import auto_approve_expires_at
 from mindroom.approval.tool_approval import (
     BackgroundScriptToolOrigin,
     ToolApprovalDecision,
@@ -78,6 +79,7 @@ logger = get_logger(__name__)
 
 _SCRIPT_RETENTION_SECONDS_ENV = "MINDROOM_SCRIPT_RETENTION_SECONDS"
 _DEFAULT_SCRIPT_RETENTION_SECONDS = 30 * 24 * 60 * 60
+_DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 # A published generation may remain committed while its backend acquisition retries.
 # preparing_retry suspends that retry while a same-generation reload owns the launch fence.
 _WorkerReplacementPhase = Literal["idle", "preparing", "preparing_retry", "committed"]
@@ -325,6 +327,16 @@ class _LiveScriptRuntimeResolver:
                 approved=False,
                 reason="Background script approval requires a human Matrix requester.",
             )
+        if (
+            auto_approve_expires_at(
+                context.runtime_paths,
+                room_id=context.room_id,
+                thread_id=context.resolved_thread_id,
+                requester_id=approver_user_id,
+            )
+            is not None
+        ):
+            return ToolApprovalDecision(approved=True)
         approvals = self.approval_provider()
         if approvals is None:
             return ToolApprovalDecision(approved=False, reason="Tool approval runtime is not ready.")
@@ -1266,7 +1278,7 @@ class ScriptRuntimeLifecycle:
         except TimeoutError:
             logger.warning(timeout_event, timeout_seconds=self.pass_timeout_seconds)
 
-    async def shutdown(self, *, timeout_seconds: float = 5.0) -> None:
+    async def shutdown(self, *, timeout_seconds: float = _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS) -> None:
         """Run bounded final reconciliation, then clear the process-local tool binding."""
         self.broker.close_call_admission()
         shutdown_deadline = asyncio.get_running_loop().time() + timeout_seconds

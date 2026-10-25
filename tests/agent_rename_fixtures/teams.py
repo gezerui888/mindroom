@@ -2,43 +2,30 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
-
-from agno.agent import Agent
-from agno.metrics import RunMetrics
-from agno.models.message import Message
-from agno.models.response import ToolExecution
-from agno.run.agent import RunOutput, RunStartedEvent
-from agno.run.base import RunStatus
-from agno.run.requirement import RunRequirement
-from agno.run.team import RunStartedEvent as TeamRunStartedEvent
-from agno.run.team import TeamRunOutput
-from agno.session.team import TeamSession
 
 from mindroom import constants
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.history import summary_rows
 from mindroom.history.replay import current_summary_text, scope_visible_runs
-from mindroom.history.session_context import (
-    open_bound_scope_session_context,
-)
+from mindroom.history.session_context import load_bound_scope_session
 from mindroom.history.storage import (
     add_pending_force_compaction_scope,
     has_queued_force_compaction,
     read_scope_seen_event_ids,
-    read_scope_state,
-    set_force_compaction_state,
+    set_force_compaction,
     update_scope_seen_event_ids,
 )
+from mindroom.llm.messages import Message
+from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
+from mindroom.llm.usage import RunMetrics, TokenCounts
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
-from tests.conftest import seed_session
+from tests.agent_rename_fixtures.entity_state import add_agno_era_fields
+from tests.conftest import persist_session
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from mindroom.constants import RuntimePaths
     from mindroom.history.session_context import ScopeSessionContext
 
@@ -96,11 +83,10 @@ def team_config(agent: str) -> Config:
     )
 
 
-@contextmanager
-def team_context(runtime_paths: RuntimePaths, config: Config, team: TeamScope) -> Iterator[ScopeSessionContext]:
+def team_context(runtime_paths: RuntimePaths, config: Config, team: TeamScope) -> ScopeSessionContext:
     """Open a team's history the way a live team run of its members does, scope resolution included."""
-    with open_bound_scope_session_context(
-        agents=[Agent(id=member, name=member.title()) for member in team.members],
+    context = load_bound_scope_session(
+        member_names=team.members,
         session_id=SESSION,
         runtime_paths=runtime_paths,
         config=config,
@@ -114,37 +100,35 @@ def team_context(runtime_paths: RuntimePaths, config: Config, team: TeamScope) -
             session_id=SESSION,
         ),
         team_name=team.team_name,
-        create_session_if_missing=True,
-    ) as context:
-        assert context is not None
-        yield context
+    )
+    assert context is not None
+    return context
 
 
-def member_run_output(member: str, team_run_id: str) -> RunOutput:
+def member_run(member: str, team_run_id: str) -> RunRecord:
     """Return a member's completed run inside a team run."""
-    run_id = f"{team_run_id}-{member}"
-    return RunOutput(
-        run_id=run_id,
+    return RunRecord(
+        run_id=f"{team_run_id}-{member}",
         agent_id=member,
-        agent_name=member.title(),
+        agent_display_name=member.title(),
         parent_run_id=team_run_id,
         session_id=SESSION,
         user_id=ALICE,
         status=RunStatus.completed,
         content=f"{member} did {team_run_id}",
         messages=[Message(role="user", content=f"task {team_run_id}"), Message(role="assistant", content="done")],
-        events=[RunStartedEvent(agent_id=member, run_id=run_id, session_id=SESSION)],
     )
 
 
-def team_run_output(scope_id: str, team: TeamScope, run_id: str) -> TeamRunOutput:
-    """Return a completed team run with its member runs and a pending requirement."""
-    requirement = RunRequirement(tool_execution=ToolExecution(tool_name="approve", tool_call_id=f"{run_id}-call"))
-    requirement.member_agent_id = team.members[0]
-    return TeamRunOutput(
+def team_run(scope_id: str, team: TeamScope, run_id: str) -> TeamRunRecord:
+    """Return a completed team run with its member runs and a requirement a member raised."""
+    requirement = RunRequirement(
+        tool_execution=ToolExecution(tool_name="approve", tool_call_id=f"{run_id}-call"),
+        member_agent_id=team.members[0],
+    )
+    return TeamRunRecord(
         run_id=run_id,
         team_id=scope_id,
-        team_name=f"Team-{'-'.join(team.members)}",
         session_id=SESSION,
         user_id=ALICE,
         status=RunStatus.completed,
@@ -152,9 +136,8 @@ def team_run_output(scope_id: str, team: TeamScope, run_id: str) -> TeamRunOutpu
         model_provider="test-provider",
         content=f"answer {run_id}",
         messages=[Message(role="user", content=f"question {run_id}"), Message(role="assistant", content="answer")],
-        metrics=RunMetrics(input_tokens=2, output_tokens=3, total_tokens=5),
-        member_responses=[member_run_output(member, run_id) for member in team.members],
-        events=[TeamRunStartedEvent(team_id=scope_id, run_id=run_id, session_id=SESSION)],
+        metrics=RunMetrics(tokens=TokenCounts(input_tokens=2, output_tokens=3, total_tokens=5)),
+        member_responses=[member_run(member, run_id) for member in team.members],
         requirements=[requirement],
         metadata={constants.MATRIX_SEEN_EVENT_IDS_METADATA_KEY: [f"${run_id}"]},
     )
@@ -162,36 +145,34 @@ def team_run_output(scope_id: str, team: TeamScope, run_id: str) -> TeamRunOutpu
 
 def seed_team(runtime_paths: RuntimePaths, config: Config, team: TeamScope) -> None:
     """Write a team's history the way MindRoom does: two team runs with their member runs, the first summarized."""
-    with team_context(runtime_paths, config, team) as context:
-        scope, storage = context.scope, context.storage
-        runs: list[RunOutput | TeamRunOutput] = []
-        for run_id in ("r1", "r2"):
-            team_run = team_run_output(scope.scope_id, team, run_id)
-            # Agno saves each member's run into the team session as its own run, then the team's run.
-            runs += [*team_run.member_responses, team_run]
-        session = TeamSession(
-            session_id=SESSION,
-            team_id=scope.scope_id,
-            user_id=ALICE,
-            # Written like agno/team/_telemetry.py's get_team_data.
-            team_data={"name": f"Team-{'-'.join(team.members)}", "team_id": scope.scope_id},
-            session_data={"session_state": add_pending_force_compaction_scope({}, scope)},
-            metadata={},
-            runs=runs,
-        )
-        update_scope_seen_event_ids(session, scope, ["$preserved"])
-        set_force_compaction_state(session, scope, read_scope_state(session, scope), force=True)
-        seed_session(storage, session)
-        covered = summary_rows.covered_runs(storage, session_id=SESSION, run_ids=["r1"])
-        summary_rows.append_summary(
-            storage,
-            session_id=SESSION,
-            scope_key=scope.key,
-            based_on=None,
-            covered=covered,
-            summary=f"summary of {scope.scope_id}'s r1",
-            summary_model="test-model",
-        )
+    context = team_context(runtime_paths, config, team)
+    scope, storage = context.scope, context.storage
+    session = context.first_session()
+    session.session_state = add_pending_force_compaction_scope({}, scope)
+    for run_id in ("r1", "r2"):
+        record = team_run(scope.scope_id, team, run_id)
+        # Each member's run is stored in the team session as its own row, then the team's run.
+        session.runs += [*record.member_responses, record]
+    persist_session(storage, session)
+    update_scope_seen_event_ids(storage, session, scope, ["$preserved"])
+    set_force_compaction(storage, session=session, scope=scope, forced=True)
+    covered = summary_rows.covered_runs(storage, session_id=SESSION, run_ids=["r1"])
+    summary_rows.append_summary(
+        storage,
+        session=session,
+        scope_key=scope.key,
+        based_on=None,
+        covered=covered,
+        summary=f"summary of {scope.scope_id}'s r1",
+        summary_model="test-model",
+    )
+    add_agno_era_fields(
+        storage.path,
+        storage.names.sessions,
+        owner_field="team_id",
+        owner=scope.scope_id,
+        display_name=f"Team-{'-'.join(team.members)}",
+    )
 
 
 def install_teams(runtime_paths: RuntimePaths) -> RuntimePaths:
@@ -213,34 +194,29 @@ class TeamHistory:
     member_runs: list[tuple[str | None, str | None]]
     member_responses: list[list[str | None]]
     requirement_members: list[str | None]
-    member_messages: list[str]
 
 
 def team_history(runtime_paths: RuntimePaths, config: Config, team: TeamScope) -> TeamHistory:
     """Load a team's history through MindRoom's history code, under the scope its members resolve to now."""
-    with team_context(runtime_paths, config, team) as context:
-        session, scope = context.session, context.scope
-        assert context.session_exists
-        assert isinstance(session, TeamSession)
-        replayed = scope_visible_runs(session, scope)
-        return TeamHistory(
-            scope_id=scope.scope_id,
-            replayed=[run.run_id for run in replayed],
-            summary=current_summary_text(session),
-            seen=read_scope_seen_event_ids(context.storage, session, scope),
-            queued=has_queued_force_compaction(context.storage, SESSION, scope),
-            member_runs=[(run.agent_id, run.run_id) for run in session.runs or [] if isinstance(run, RunOutput)],
-            member_responses=[
-                [member.agent_id for member in run.member_responses if isinstance(member, RunOutput)]
-                for run in replayed
-                if isinstance(run, TeamRunOutput)
-            ],
-            requirement_members=[
-                requirement.member_agent_id
-                for run in replayed
-                if isinstance(run, TeamRunOutput)
-                for requirement in run.requirements or []
-            ],
-            # Agno's member filter, which finds a member's interactions in a team session by agent id.
-            member_messages=[str(message.content) for message in session.get_messages(member_ids=[team.members[0]])],
-        )
+    context = team_context(runtime_paths, config, team)
+    session, scope = context.session, context.scope
+    assert session is not None
+    assert session.kind == "team"
+    replayed = scope_visible_runs(session, scope)
+    return TeamHistory(
+        scope_id=scope.scope_id,
+        replayed=[run.run_id for run in replayed],
+        summary=current_summary_text(session),
+        seen=read_scope_seen_event_ids(context.storage, session, scope),
+        queued=has_queued_force_compaction(context.storage, SESSION, scope),
+        member_runs=[(run.agent_id, run.run_id) for run in session.runs if isinstance(run, RunRecord)],
+        member_responses=[
+            [member.agent_id for member in run.member_responses] for run in replayed if isinstance(run, TeamRunRecord)
+        ],
+        requirement_members=[
+            requirement.member_agent_id
+            for run in replayed
+            if isinstance(run, TeamRunRecord)
+            for requirement in run.requirements or []
+        ],
+    )

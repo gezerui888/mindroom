@@ -1,10 +1,10 @@
-"""Plan moving an agent's state root and renaming the session and learning databases inside it.
+"""Plan moving an agent's state root and renaming the session database inside it.
 
 An agent's state lives in ``agents/<name>/`` (``agent_state_root_path``), its conversation history in
-``sessions/<name>.db`` with tables ``<name>_sessions`` and ``<name>_sessions_*``, and its learnings in
-``learning/<name>.db``. History only loads runs whose agent id is the agent's name
-(``history/run_visibility.py``'s ``run_in_scope``) and replays the summary rows of the scope ``agent:<name>``,
-so after the move the tables, the agent ids and the scope keys inside the databases take the new name too.
+``sessions/<name>.db`` with tables ``<name>_sessions`` and ``<name>_sessions_*``. History only loads runs whose
+agent id is the agent's name (``history/run_visibility.py``'s ``run_in_scope``) and replays the summary rows of the
+scope ``agent:<name>``, so after the move the tables, the agent ids and the scope keys inside the database take the
+new name too. The retired Agno Learning database ``learning/<name>.db`` moves with the state root unchanged.
 The Matrix account keeps its username, device and token; only its key in ``matrix_state.yaml`` changes.
 Names match exactly, never as substrings, so renaming ``code`` leaves ``code_team`` alone.
 Building the steps only reads; every refusal happens here, before anything is written.
@@ -29,17 +29,14 @@ if TYPE_CHECKING:
     from mindroom.agent_rename.steps import Step
     from mindroom.constants import RuntimePaths
 
-# The learning store's own table (agno/db/base.py's learnings_table default).
-_LEARNINGS_TABLE = "agno_learnings"
-
 
 def entity_state_steps(runtime_paths: RuntimePaths, *, old_name: str, new_name: str) -> list[Step]:
     """Return the steps that move the agent's state root to the new name and rename its databases there.
 
     The state root ``agents/<OLD>`` moves to ``agents/<NEW>`` first, so the database steps address paths below
     the new root. With ``MINDROOM_SESSION_STORAGE_PATH`` set, the agent's root in that session root moves too.
-    ``sessions/<OLD>.db`` and ``learning/<OLD>.db`` get their tables, indexes, schema-version rows, agent ids
-    and history scope keys renamed in one transaction each, then become ``<NEW>.db``.
+    ``sessions/<OLD>.db`` gets its tables, indexes, schema-version rows, agent ids and history scope keys renamed
+    in one transaction, then becomes ``<NEW>.db``.
     An agent without a state root never ran and gets no steps. Refuses when a destination already exists.
     """
     storage_root = runtime_paths.storage_root
@@ -76,21 +73,6 @@ def entity_state_steps(runtime_paths: RuntimePaths, *, old_name: str, new_name: 
         ),
         edit_label=edit_label,
         move_label=f"the session database of agent {old_name}",
-    )
-    steps += database_steps(
-        old_root / "learning",
-        new_root / "learning",
-        old_stem=old_name,
-        new_stem=new_name,
-        edit=partial(
-            rename_session_database,
-            old_table=f"{old_name}_learning_sessions",
-            new_table=f"{new_name}_learning_sessions",
-            rename=rename,
-            other_tables=(_LEARNINGS_TABLE,),
-        ),
-        edit_label=edit_label,
-        move_label=f"the learning database of agent {old_name}",
     )
     return steps
 

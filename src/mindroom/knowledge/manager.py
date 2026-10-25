@@ -1364,7 +1364,7 @@ class KnowledgeManager:
         checkpoint = await asyncio.to_thread(
             save_candidate_checkpoint,
             self._base_storage_path,
-            replace(checkpoint, completed={}, failed={}),
+            replace(checkpoint, completed={}, failed={}, retired_by=None),
         )
         collection = open_collection(self._collections, checkpoint.collection)
         await asyncio.to_thread(reset_collection, collection)

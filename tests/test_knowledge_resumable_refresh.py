@@ -4152,6 +4152,53 @@ async def test_a_second_interruption_never_revives_a_kept_collection_holding_unc
 
 
 @pytest.mark.asyncio
+async def test_rebuilding_a_lost_kept_collection_stops_it_passing_as_level(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recreating the collection empties it, so an interruption afterwards must not leave it recorded as level."""
+    docs_path = tmp_path / "docs"
+    names = _write_corpus(docs_path, 3)
+    config = _config(tmp_path, docs_path)
+    runtime_paths = runtime_paths_for(config)
+    retired, _published = await _publish_twice(config, docs_path, names)
+    del _FakeVectorDb.store[retired]
+
+    async def _crash_while_reconciling(*_args: object, **_kwargs: object) -> None:
+        raise _Crash
+
+    with monkeypatch.context() as patch:
+        patch.setattr(KnowledgeManager, "_reconcile_candidate", _crash_while_reconciling)
+        with pytest.raises(_Crash):
+            await _manager(config).reindex_all()
+
+    rebuilt = load_candidate_checkpoint(_storage_path(config, runtime_paths))
+    assert rebuilt is not None
+    assert not rebuilt.mirrors(_published_state(config, runtime_paths)), "an emptied collection still passed as level"
+
+
+def test_only_a_kept_checkpoint_is_written_in_a_version_older_releases_refuse(tmp_path: Path) -> None:
+    """A release that ignores ``retired_by`` would change the kept collection while the record still stands."""
+    settings = _manager(_config(tmp_path, tmp_path / "docs"))._indexing_settings
+    claims = {"doc0000.md": (1, 1, "digest")}
+
+    save_candidate_checkpoint(
+        tmp_path,
+        CandidateCheckpoint(collection="kept", settings=settings, completed=claims, retired_by="live"),
+    )
+    kept_version = json.loads(_candidate_checkpoint_path(tmp_path).read_text(encoding="utf-8"))["schema_version"]
+    kept = load_candidate_checkpoint(tmp_path)
+    save_candidate_checkpoint(tmp_path, CandidateCheckpoint(collection="building", settings=settings, completed=claims))
+    building_version = json.loads(_candidate_checkpoint_path(tmp_path).read_text(encoding="utf-8"))["schema_version"]
+
+    assert kept_version == 3
+    assert kept is not None
+    assert kept.retired_by == "live"
+    assert building_version == 2, "candidates that are not kept must stay readable by older releases"
+    assert load_candidate_checkpoint(tmp_path) is not None
+
+
+@pytest.mark.asyncio
 async def test_a_published_row_naming_no_source_keeps_the_retired_collection_from_being_kept(
     tmp_path: Path,
 ) -> None:

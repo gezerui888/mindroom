@@ -41,6 +41,10 @@ if TYPE_CHECKING:
 #: Bumped whenever the persisted candidate layout changes incompatibly. An
 #: unknown version is treated as "no resumable candidate" rather than an error.
 _CANDIDATE_CHECKPOINT_SCHEMA_VERSION = 2
+#: Written instead while ``retired_by`` is set. Releases that cannot honor the
+#: record refuse it and leave the kept collection to cleanup, rather than
+#: changing that collection while the record still claims it matches.
+_KEPT_CHECKPOINT_SCHEMA_VERSION = 3
 
 _CANDIDATE_CHECKPOINT_FILENAME = "candidate_index.json"
 _CANDIDATE_JOURNAL_FILENAME = "candidate_index.jsonl"
@@ -159,7 +163,9 @@ def _parse_failure(value: object) -> CandidateFailure | None:
 
 def _snapshot_payload(checkpoint: CandidateCheckpoint) -> dict[str, object]:
     return {
-        "schema_version": _CANDIDATE_CHECKPOINT_SCHEMA_VERSION,
+        "schema_version": (
+            _CANDIDATE_CHECKPOINT_SCHEMA_VERSION if checkpoint.retired_by is None else _KEPT_CHECKPOINT_SCHEMA_VERSION
+        ),
         "collection": checkpoint.collection,
         "status": checkpoint.status,
         "settings": checkpoint.settings.to_metadata(),
@@ -217,7 +223,7 @@ def _parse_failed(raw_failed: object) -> dict[str, CandidateFailure]:
 
 
 def _parse_snapshot(payload: Mapping[str, object]) -> CandidateCheckpoint | None:
-    if payload.get("schema_version") != _CANDIDATE_CHECKPOINT_SCHEMA_VERSION:
+    if payload.get("schema_version") not in {_CANDIDATE_CHECKPOINT_SCHEMA_VERSION, _KEPT_CHECKPOINT_SCHEMA_VERSION}:
         return None
     collection = payload.get("collection")
     status = payload.get("status")

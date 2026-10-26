@@ -10,7 +10,6 @@ import pytest
 import yaml
 
 from mindroom.agents import create_agent
-from mindroom.approval.tool_approval import POLICY_CONFIRMATION_APPROVAL_TYPE
 from mindroom.config.personal_agents import personal_agent_roster_path, read_personal_agent_roster
 from mindroom.custom_tools.personal_agent_manager import PersonalAgentManagerTools
 from mindroom.message_target import MessageTarget
@@ -59,8 +58,8 @@ def _orchestrator() -> Any:  # noqa: ANN401 - a stub for the orchestrator runtim
     return MagicMock()
 
 
-def test_built_agent_requires_confirmation_for_updates_only(tmp_path: Path) -> None:
-    """The owner confirms each change, because the model making it also reads untrusted content."""
+def test_update_agent_asks_no_confirmation(tmp_path: Path) -> None:
+    """An approval card needs the room's router, which a personal room lacks, so a confirmed update would always fail."""
     config, paths = _setup(tmp_path)
     persist_entity_accounts(config, paths)
     build = create_agent(
@@ -73,9 +72,7 @@ def test_built_agent_requires_confirmation_for_updates_only(tmp_path: Path) -> N
         supports_native_tool_approval=True,
     )
 
-    update = offered_function(build, "update_agent")
-    assert update.requires_confirmation is True
-    assert update.approval_type != POLICY_CONFIRMATION_APPROVAL_TYPE
+    assert offered_function(build, "update_agent").requires_confirmation is not True
     assert offered_function(build, "list_my_agents").requires_confirmation is not True
 
 

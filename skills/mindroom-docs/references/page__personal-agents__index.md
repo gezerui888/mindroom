@@ -144,11 +144,12 @@ An agent changes only itself, never another personal agent.
 
 A generated agent whose template has `owner_edits: true` gets the [`personal_agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#personal_agent_manager) tool automatically.
 `list_my_agents()` returns the agent's key, its editable values, and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
-The owner confirms each change on an approval card, even when `tool_approval.default` is `auto_approve`, because the agent also reads content the owner did not write and that content could try to rewrite it.
+The tool asks for no confirmation, because every edit stays within the template's grant and only the owner can make it.
+An administrator who wants one can add a [`tool_approval`](https://docs.mindroom.chat/tool-approval/) rule for `update_agent`, but approval cards need the router in the room, and personal rooms do not have it by default.
 
 ```text
 Alice: Call yourself Sage and stop using web_search.
-Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}), and Alice approves)
+Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}))
 Agent: Done. I'm Sage from the next reload, and I no longer have web search.
 Alice: Now give yourself shell.
 Agent: (calls update_agent(changes={"tools": ["calculator", "shell"]}))

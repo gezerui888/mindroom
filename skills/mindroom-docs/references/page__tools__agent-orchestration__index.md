@@ -626,7 +626,8 @@ So is removing a tool the agent would still get from `defaults.tools`, a preset,
 
 Only the agent's owner can read or change it, with no administrator bypass, and the change is stored in the roster and applied after a short configuration reload.
 The tool runs in the primary runtime even when `worker_tools` lists it, and it is never available to scripts, [workflow participants](#spec-shape), or deferral.
-Every `update_agent()` call shows the owner an approval card, even when `tool_approval.default` is `auto_approve`, because the model issuing it also reads untrusted content.
+Its calls ask for no confirmation, because every edit stays inside the template's grant and only the owner can make it.
+An administrator who wants one can add a [`tool_approval`](https://docs.mindroom.chat/tool-approval/) rule for `update_agent`, but approval cards need the router in the room, and personal rooms do not have it by default.
 
 ```python
 list_my_agents()

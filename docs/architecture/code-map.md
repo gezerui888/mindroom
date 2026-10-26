@@ -178,8 +178,9 @@ Matrix sync callback
 | `teams/runtime.py` | `run_team` and `continue_team` over the agent loop: members as child runs, member decisions routed by member and call, team usage |
 | `teams/presentation.py` | The team reply document: header, member slots, consensus, tool trace, the durable `team_stream` snapshot an approval resume restores, the live document a resumed run publishes, and `format_team_response`, the blocking Matrix or API reply rendered from a finished run's records, which a stopped or failed blocking turn also records |
 | `teams/envelope.py` | `team_response` and `team_response_stream`: prepare a team turn, run its leader through the turn drivers, and render the reply; `run_prepared_team` runs an OpenAI-compatible API team turn under the same leader hooks and storage |
+| `teams/leader.py` | `LeaderRun`: how a team's leader runs in one turn or resume, its storage, hooks, request settings, and model, which a live turn and a saved approval's resume both build to start or continue the leader's run |
 | `teams/attempt.py` | One attempt of a team run, a turn's or a resume's: the reply document its events build, the records the run hands over, the text an interrupted turn records (a streamed turn's marker-free reply text, a blocking turn's document of the runs' records), and its run metadata |
-| `teams/resume.py` | Resuming a paused team run: `TeamResume` routes decisions to the calls the team waits for, `drive_team_delegations` runs a member's delegations and continues with their results, `continue_paused_team_run` rebuilds the team from a saved approval, and the documents a streamed or blocking pause shows |
+| `teams/resume.py` | Resuming a paused team run: `TeamResume` routes decisions to the calls the team waits for, `drive_team_delegations` runs a member's delegations and continues with their results, `continue_paused_team_run` rebuilds the team from a saved approval, and the document a team pause shows |
 | `agent_policy.py` | Canonical execution-policy derivation from authored agent config |
 | `agent_cli/minimal_agent.py` | Minimal mode: the bootstrap prompt and context documents from the build surface, and the turn's one provider-facing Bash tool over the build's catalog |
 | `agent_cli/checkpoint.py` | Minimal Bash's provider batch, saved as a `before_dispatch` hook before any Bash call takes effect |
@@ -205,7 +206,9 @@ Matrix sync callback
 | `knowledge/collection_lifetime.py` | Compatible publication selection, shared reader locks, and exclusive collection reclamation |
 | `knowledge/search.py` | What an agent searches: its published sources, the `search_knowledge_base` tool and its results, and the `<knowledge_base>` prompt block |
 | `knowledge/readers.py` | The Agno document readers and chunkers knowledge indexing reads files with; the only knowledge module that imports Agno |
-| `knowledge/collections.py` | Chroma collection lifecycle for one knowledge base: naming, opening, probing, writing a file's chunk rows, deleting, reclaiming |
+| `knowledge/collections.py` | Collection lifecycle for one knowledge base: naming, opening, writing a file's chunk rows, deleting, reclaiming superseded collections and legacy Chroma storage |
+| `knowledge/vector_store.py` | One collection as one SQLite file: chunk rows, float32 vectors, and an FTS5 keyword index; in-process search |
+| `knowledge/index_reader.py` | Published index handle: embeds a query and searches the current compatible publication on a worker thread |
 | `knowledge/git_source.py` | The Git checkout a knowledge base indexes: clone, fetch, force-align, LFS hydration, credential injection |
 | `knowledge/refresh_runner.py` | Dispatches one knowledge refresh: subprocess spawn, cancellation cleanup, publish and reconcile decisions |
 | `knowledge/refresh_locks.py` | Process-wide refresh serialization (in-loop and cross-process source-root locks) and active-refresh bookkeeping |
@@ -220,7 +223,7 @@ Matrix sync callback
 | `knowledge_graph/ingestion.py` | Background ingestion passes over several graphs at once, with per-kind markers, backoff, and dropped episodes |
 | `knowledge_graph/runtime.py` | Starts and stops the store and ingestion worker as agents enable the graph |
 | `config/knowledge_graph.py` | The `knowledge_graph` section: extraction model, extraction instructions, ingestion settings, aliases, and generation |
-| `custom_tools/knowledge_graph.py` | The read-only `knowledge_graph` tool |
+| `custom_tools/knowledge_graph.py` | The `knowledge_graph` tool: lookups, and the edits `knowledge_graph_edits` allows |
 | `tool_system/skills.py` | OpenClaw-compatible skill loading from skill roots and workspaces, and the read-only `SkillsToolkit` with its prompt block |
 | `tool_system/skill_usage.py` | Workspace skill usage records the skill learner's archival reads as an inactivity clock |
 | `tool_system/plugins.py` | Plugin loading and tool/skill extension |

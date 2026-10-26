@@ -622,7 +622,7 @@ Send `tools`, `skills`, `knowledge_bases`, and `delegate_to` as names from the a
 The optional first argument `agent_name` defaults to the calling agent and must equal its key when given, because in this version an agent changes only itself.
 The editable fields are `display_name`, `role`, `instructions`, `markdown`, `thread_mode`, `num_history_runs`, `num_history_messages`, `show_tool_calls`, `tools`, `skills`, `knowledge_bases`, and `delegate_to`; the model and where tools run never change.
 A request for a name outside the template's grant is refused whole, with the allowed names in the error.
-So is removing a tool the agent would still get from `defaults.tools`, a preset, or a tool that implies it, because it would arrive without the template's settings.
+A template tool with its own settings cannot be removed; removing any other tool removes only the template's entry, so a tool the agent also gets from `defaults.tools`, a preset, an implied tool, or an automatic feature stays available.
 
 Only the agent's owner can read or change it, with no administrator bypass, and the change is stored in the roster and applied after a short configuration reload.
 The tool runs in the primary runtime even when `worker_tools` lists it, and it is never available to scripts, [workflow participants](#spec-shape), or deferral.

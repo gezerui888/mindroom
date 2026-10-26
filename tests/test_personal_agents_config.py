@@ -401,7 +401,7 @@ def test_owner_overrides_are_clamped_to_a_narrowed_template(tmp_path: Path) -> N
     data["personal_agents"]["mind"] = _owner_template(tools=["calculator"], model="default")
     entry = _entry(overrides={"tools": ["shell", "calculator"]})
     ceiling = personal_agent_data(data["personal_agents"]["mind"], entry)
-    agent, dropped = apply_owner_overrides(ceiling, entry.overrides, default_tools=[])
+    agent, dropped = apply_owner_overrides(ceiling, entry.overrides)
     assert agent["tools"] == ["calculator"]
     assert dropped == {"tools": ["shell"]}
 
@@ -415,13 +415,13 @@ def test_owner_overrides_are_clamped_to_a_narrowed_template(tmp_path: Path) -> N
 def test_selected_tools_keep_the_ceiling_entry() -> None:
     """A selected tool keeps the template's whole entry, and an owner-supplied entry is not a name."""
     ceiling = personal_agent_data(_owner_template(tools=[_SHELL_ENTRY, "calculator"]), _entry())
-    agent, dropped = apply_owner_overrides(ceiling, {"tools": ["shell"]}, default_tools=[])
+    agent, dropped = apply_owner_overrides(ceiling, {"tools": ["shell"]})
     assert agent["tools"] == [_SHELL_ENTRY]
     assert dropped == {}
 
     forged = {"shell": {"extra_env_passthrough": "BAR"}}
-    agent, dropped = apply_owner_overrides(ceiling, {"tools": [forged]}, default_tools=[])
-    assert agent["tools"] == []
+    agent, dropped = apply_owner_overrides(ceiling, {"tools": [forged]})
+    assert agent["tools"] == [_SHELL_ENTRY]
     assert dropped == {"tools": [forged]}
 
 
@@ -437,13 +437,13 @@ def test_fixed_fields_in_overrides_are_dropped() -> None:
         ceiling["worker_tools"],
         ceiling["access"],
     )
-    assert apply_owner_overrides(ceiling, overrides, default_tools=[])[1] == overrides
+    assert apply_owner_overrides(ceiling, overrides)[1] == overrides
 
 
 def test_invalid_free_override_falls_back() -> None:
     """A free field that would make the agent invalid keeps the template's value, and the rest still apply."""
     ceiling = personal_agent_data(_owner_template(thread_mode="room"), _entry())
-    agent, dropped = apply_owner_overrides(ceiling, {"thread_mode": "nonsense", "role": "Mine"}, default_tools=[])
+    agent, dropped = apply_owner_overrides(ceiling, {"thread_mode": "nonsense", "role": "Mine"})
     assert agent["thread_mode"] == "room"
     assert agent["role"] == "Mine"
     assert dropped == {"thread_mode": "nonsense"}
@@ -452,11 +452,7 @@ def test_invalid_free_override_falls_back() -> None:
 def test_free_overrides_that_only_conflict_together_keep_the_first() -> None:
     """Two free fields that are each valid but exclusive cannot both apply, so loading stays valid."""
     ceiling = personal_agent_data(_owner_template(), _entry())
-    agent, dropped = apply_owner_overrides(
-        ceiling,
-        {"num_history_runs": 3, "num_history_messages": 10},
-        default_tools=[],
-    )
+    agent, dropped = apply_owner_overrides(ceiling, {"num_history_runs": 3, "num_history_messages": 10})
     assert (agent["num_history_runs"], "num_history_messages" in agent) == (3, False)
     assert dropped == {"num_history_messages": 10}
 
@@ -467,11 +463,11 @@ def test_subset_overrides_keep_owner_order_and_drop_what_is_not_a_granted_name(f
     granted = ["calculator", "shell"] if field == "tools" else ["a", "b", "c"]
     ceiling = personal_agent_data(_owner_template(**{field: granted}), _entry())
     chosen = ["calculator", "calculator"] if field == "tools" else ["c", "a", "c", "x", 7]
-    agent, dropped = apply_owner_overrides(ceiling, {field: chosen}, default_tools=[])
+    agent, dropped = apply_owner_overrides(ceiling, {field: chosen})
     assert agent[field] == (["calculator"] if field == "tools" else ["c", "a"])
     assert dropped == ({} if field == "tools" else {field: ["x", 7]})
 
-    agent, dropped = apply_owner_overrides(ceiling, {field: "everything"}, default_tools=[])
+    agent, dropped = apply_owner_overrides(ceiling, {field: "everything"})
     assert agent[field] == granted
     assert dropped == {field: "everything"}
 

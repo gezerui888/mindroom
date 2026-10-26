@@ -25,6 +25,7 @@ import yaml
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from structlog.testing import capture_logs
 
 from mindroom import constants, frontend_assets
 from mindroom.api import auth, config_lifecycle, frontend, homeassistant_integration, main
@@ -1506,15 +1507,18 @@ def test_get_personal_agents_lists_active_pending_and_removed_template_entries(
             "@dave:localhost",
             agent_name="mind_dave",
             user_display_name="Dave",
-            overrides={"display_name": "Dee"},
+            overrides={"display_name": "Dee", "model": "x"},
         ),
     )
     matrix_state = MatrixState.load(runtime_paths=runtime_paths)
     matrix_state.add_account("agent_mind_alice_smith", "mindroom_mind_alice_smith_old", None, domain="example.org")
     matrix_state.save(runtime_paths=runtime_paths)
 
-    response = test_client.get("/api/config/personal-agents")
+    with capture_logs() as logs:
+        response = test_client.get("/api/config/personal-agents")
 
+    # Dave's model edit is clamped at every load; the listing must not log that again on every request.
+    assert [log for log in logs if log["event"] == "personal_agent_override_clamped"] == []
     assert response.status_code == 200
     assert response.json() == [
         {

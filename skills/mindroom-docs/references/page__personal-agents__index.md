@@ -118,8 +118,8 @@ A field the owner has edited keeps the owner's value when the template's value c
 
 | Class | Fields | What the owner can set |
 | --- | --- | --- |
-| Free | `display_name`, `role`, `instructions`, `markdown`, `thread_mode`, `num_history_runs`, `num_history_messages`, `show_tool_calls` | Any value that still makes a valid agent. Placeholders such as `{user}` are not replaced in an edit. |
-| Subset | `tools`, `skills`, `knowledge_bases`, `delegate_to` | A list of names, each of them in the ceiling's list. A selected tool keeps the ceiling's whole entry, so its per-tool settings cannot change. A tool the agent would still get another way cannot be removed: one in `defaults.tools`, one in a kept preset such as `openclaw_compat`, or one a kept tool implies, such as `attachments` for `matrix_message`. Such a removal is refused, so the tool never loses the template's settings. |
+| Free | `display_name`, `role`, `instructions`, `markdown`, `thread_mode`, `num_history_runs`, `num_history_messages`, `show_tool_calls` | Any value that still makes a valid agent. Placeholders such as `{user}` are not replaced in an edit. `num_history_runs` and `num_history_messages` exclude each other, so when the template sets one, the owner can change only that one. |
+| Subset | `tools`, `skills`, `knowledge_bases`, `delegate_to` | A list of names, each of them in the ceiling's list. A selected tool keeps the ceiling's whole entry, so its per-tool settings cannot change. A template tool with its own settings (`overrides`, `defer`, or `initial`) cannot be removed. Removing any other tool removes only the template's entry, so a tool the agent also gets from `defaults.tools`, a preset, an implied tool, or an automatic feature such as `knowledge_graph` stays available. |
 | Fixed | Every other field | Nothing; the ceiling's value stays. |
 
 The fixed fields include `model`, `worker_tools`, `worker_scope`, `file_access`, `access`, `credential_managers`, `private`, and `allow_self_config`.
@@ -127,11 +127,12 @@ So an owner cannot pick a dearer model, move a tool between a worker and the mai
 
 ### Where edits live
 
-Edits are stored as `overrides` on the agent's entry in `tracking/personal_agents.json`, never in `config.yaml`, so neither the dashboard's config editor nor `config_manager` can see or change them, and they are backed up with the storage.
-The read-only Agents list shows the edited display name.
+Edits are stored as `overrides` on the agent's entry in `tracking/personal_agents.json`, never in `config.yaml`, so neither the dashboard's config editor nor `config_manager` can change them, and they are backed up with the storage.
+The read-only Agents list shows the edited display name, and `config_manager`'s agent listing shows the edited values.
 Each load clamps them to the current ceiling.
 A name the template no longer grants, or a value that would make the agent invalid, is ignored, and MindRoom logs `personal_agent_override_clamped` with the agent's name and the `dropped` values.
 Loading never fails because of an edit, and the stored edit stays, so granting the name again makes it take effect again.
+After the first owner edit, older MindRoom releases cannot read `tracking/personal_agents.json`, so roll back together with a roster backup from before the first edit.
 
 ### Who can edit
 

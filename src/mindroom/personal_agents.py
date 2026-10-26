@@ -21,6 +21,7 @@ from mindroom.config.personal_agents import (
     personal_agent_roster_lock_path,
     personal_agent_roster_path,
     personal_agent_username,
+    pinned_tool_names,
     read_personal_agent_roster,
 )
 from mindroom.config.yaml_includes import load_yaml_config_source
@@ -279,7 +280,6 @@ def _owner_edit_target(
     """Return the roster entry of one personal agent and the agent its template grants, or refuse.
 
     Only the owner gets that far: the owner check comes before anything about the template is revealed.
-    The template is the one the roster names, which must be the one the loaded config generated the agent from.
     """
     instance = config.personal_agent_instance(agent_name)
     entry = next((other for other in roster if other.agent_name == agent_name), None)
@@ -289,10 +289,7 @@ def _owner_edit_target(
     if resolve_human_requester_alias(requester_id, config, runtime_paths) != entry.user_id:
         msg = f"Only {entry.user_id} can change this agent"
         raise PersonalAgentEditError(msg)
-    if entry.template != instance.template:
-        msg = f"{agent_name} changed template since the configuration loaded; try again once it reloads"
-        raise PersonalAgentEditError(msg)
-    template = config.personal_agents[entry.template]
+    template = config.personal_agents[instance.template]
     if not template.owner_edits:
         msg = "Owner edits are off for this agent's template"
         raise PersonalAgentEditError(msg)
@@ -317,7 +314,7 @@ def owner_agent_summary(
         agent_name,
         requester_id,
     )
-    clamped, _ = apply_owner_overrides(ceiling, entry.overrides, default_tools=config.defaults.tool_names)
+    clamped, _ = apply_owner_overrides(ceiling, entry.overrides)
     agent = AgentConfig.model_validate(clamped)
     editable = {field: getattr(agent, field) for field in sorted(OWNER_FREE_FIELDS | OWNER_SUBSET_FIELDS)}
     editable["tools"] = agent.tool_names
@@ -328,22 +325,9 @@ def owner_agent_summary(
     }
 
 
-def _tool_source(config: Config, tool: str, chosen: list[str]) -> str:
-    """Say what still gives the agent a tool the owner removed: a chosen preset or tool, else defaults.tools."""
-    source = next((other for other in chosen if tool in config.expand_tool_names([other])), None)
-    if source is None:
-        return "defaults.tools also provides it"
-    return f"the preset `{source}` provides it" if config.is_tool_preset(source) else f"`{source}` implies it"
-
-
-def _refusals(
-    config: Config,
-    ceiling: Mapping[str, Any],
-    overrides: Mapping[str, Any],
-    changes: Mapping[str, Any],
-) -> list[str]:
+def _refusals(ceiling: Mapping[str, Any], overrides: Mapping[str, Any], changes: Mapping[str, Any]) -> list[str]:
     """Say why each requested change would not stick: the fields expansion would drop, and those never editable."""
-    agent, dropped = apply_owner_overrides(ceiling, overrides, default_tools=config.defaults.tool_names)
+    _, dropped = apply_owner_overrides(ceiling, overrides)
     editable = OWNER_FREE_FIELDS | OWNER_SUBSET_FIELDS
     refusals: list[str] = []
     for field in changes:
@@ -360,8 +344,8 @@ def _refusals(
             refusals.append(f"{field} has an invalid value, or conflicts with another setting")
         elif field == "tools" and isinstance(chosen := overrides.get(field), list):
             refusals.extend(
-                f"`{tool}` cannot be removed: {_tool_source(config, tool, chosen)}"
-                for tool in ceiling_names(agent, field)
+                f"`{tool}` keeps its template settings and cannot be removed"
+                for tool in pinned_tool_names(ceiling)
                 if tool not in chosen
             )
     return refusals
@@ -389,7 +373,7 @@ def update_owner_overrides(
                 overrides.pop(field, None)
             else:
                 overrides[field] = deepcopy(value)
-        if refusals := _refusals(config, ceiling, overrides, changes):
+        if refusals := _refusals(ceiling, overrides, changes):
             raise PersonalAgentEditError("; ".join(refusals))
         updated = entry.model_copy(update={"overrides": overrides})
         _write_personal_agent_roster(runtime_paths, [updated if other is entry else other for other in roster])

@@ -70,8 +70,6 @@ class PersonalAgentManagerTools(Toolkit):
         Only this agent's owner may ask; anyone else gets an error.
         A request for a name outside the template's grant is refused whole, with the allowed names in the error.
         No confirmation is asked, because every edit stays within the template's grant and only the owner can make it.
-        An administrator can add a `tool_approval` rule for confirmation, but its approval card needs the router
-        in the room, and personal rooms do not have it by default.
         The change applies after a short configuration reload.
 
         Args:

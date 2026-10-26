@@ -955,11 +955,7 @@ async def get_personal_agents(
             agent_name=entry.agent_name,
             matrix_user_id=matrix_user_id,
             display_name=(
-                owner_edited_agent_data(
-                    templates[entry.template],
-                    entry,
-                    default_tools=config.defaults.tool_names,
-                )[0].get("display_name")
+                owner_edited_agent_data(templates[entry.template], entry, log=False)[0].get("display_name")
                 if entry.template in templates
                 else None
             ),

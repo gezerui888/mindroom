@@ -12,6 +12,7 @@ import pytest
 from structlog.testing import capture_logs
 
 from mindroom.config.main import Config
+from mindroom.config.models import ToolConfigEntry
 from mindroom.config.personal_agents import (
     PersonalAgentRosterEntry,
     personal_agent_roster_lock_path,
@@ -51,6 +52,8 @@ def _setup(
     data = deepcopy(BASE)
     if default_tools is not None:
         data["defaults"] = {"tools": default_tools}
+    if agent.get("knowledge_graph"):
+        data["knowledge_graph"] = {"model": "default"}
     data["personal_agents"]["mind"] = {
         "owner_edits": owner_edits,
         "agent": {"display_name": "Mind", "role": "R", "model": "default", "tools": ["calculator", "shell"], **agent},
@@ -338,63 +341,51 @@ def test_a_non_owner_learns_nothing_about_the_template(tmp_path: Path) -> None:
     assert str(edit.value) == str(summary.value) == f"Only {_OWNER} can change this agent"
 
 
-def test_edit_is_refused_when_the_roster_moved_the_agent_to_another_template(tmp_path: Path) -> None:
-    """The roster is read again under the lock, so a template change since the config loaded refuses the edit."""
-    config, paths = _setup(tmp_path)
-    _write_personal_agent_roster(paths, [_entry(_OWNER, template="other")])
-    before = read_personal_agent_roster(paths)
-
-    with pytest.raises(PersonalAgentEditError, match="changed template since the configuration loaded"):
-        _edit(config, paths, {"role": "Mine"})
-    with pytest.raises(PersonalAgentEditError, match="changed template since the configuration loaded"):
-        owner_agent_summary(config, paths, _AGENT, requester_id=_OWNER)
-
-    assert read_personal_agent_roster(paths) == before
-
-
 _LIMIT = {"exclude_tools": ["x"]}
 
 
 @pytest.mark.parametrize(
-    ("tools", "default_tools", "kept", "limited", "reason"),
+    ("tools", "default_tools", "kept", "agent"),
     [
-        (["calculator", {"file": _LIMIT}], ["file"], ["calculator"], "file", "defaults.tools also provides it"),
-        (
-            ["openclaw_compat", {"scheduler": _LIMIT}],
-            [],
-            ["openclaw_compat"],
-            "scheduler",
-            "the preset `openclaw_compat` provides it",
-        ),
-        (
-            ["matrix_message", {"attachments": _LIMIT}],
-            [],
-            ["matrix_message"],
-            "attachments",
-            "`matrix_message` implies it",
-        ),
+        (["calculator", {"file": _LIMIT}], ["file"], ["calculator"], {}),
+        (["openclaw_compat", {"scheduler": _LIMIT}], [], ["openclaw_compat"], {}),
+        (["matrix_message", {"attachments": _LIMIT}], [], ["matrix_message"], {}),
+        ([{"knowledge_graph": {"defer": True}}], [], [], {"knowledge_graph": True, "include_default_tools": False}),
     ],
 )
-def test_a_tool_that_arrives_another_way_keeps_the_template_entry(
+def test_a_template_tool_with_its_own_settings_cannot_be_removed(
     tmp_path: Path,
     tools: list[object],
     default_tools: list[str],
     kept: list[str],
-    limited: str,
-    reason: str,
+    agent: dict[str, object],
 ) -> None:
-    """Dropping a tool that defaults.tools, a preset or an implied tool still gives would strip the template's settings.
+    """The agent keeps a tool entry that carries settings, and a request to drop it is refused.
 
-    So the agent keeps the template's entry, and a request to drop it is refused with the reason.
+    Dropping it would not remove the tool, because defaults.tools, a preset, an implied tool, or an automatic feature
+    still gives it, only without the template's settings.
     """
+    pinned = tools[-1]
+    (name,) = pinned
     entry = _entry(_OWNER, overrides={"tools": kept})
-    config, paths = _setup(tmp_path, entry=entry, default_tools=default_tools, tools=tools)
+    config, paths = _setup(tmp_path, entry=entry, default_tools=default_tools, tools=tools, **agent)
 
-    assert {tool.name: tool.overrides for tool in config.agents[_AGENT].tools}.get(limited) == _LIMIT
-    assert limited in owner_agent_summary(config, paths, _AGENT, requester_id=_OWNER)["editable"]["tools"]
+    assert ToolConfigEntry.model_validate(pinned) in config.agents[_AGENT].tools
+    assert name in owner_agent_summary(config, paths, _AGENT, requester_id=_OWNER)["editable"]["tools"]
     with pytest.raises(PersonalAgentEditError) as raised:
         _edit(config, paths, {"tools": kept})
-    assert str(raised.value) == f"`{limited}` cannot be removed: {reason}"
+    assert str(raised.value) == f"`{name}` keeps its template settings and cannot be removed"
+
+
+def test_a_plain_tool_entry_can_be_removed_while_defaults_still_give_the_tool(tmp_path: Path) -> None:
+    """A plain entry adds no settings, so dropping it is allowed and the tool still comes from defaults.tools."""
+    config, paths = _setup(tmp_path, default_tools=["file"], tools=["calculator", "file"])
+    _edit(config, paths, {"tools": ["calculator"]})
+
+    reloaded = Config.validate_with_runtime(config.authored_model_dump(), paths)
+
+    assert reloaded.agents[_AGENT].tool_names == ["calculator"]
+    assert "file" in reloaded.resolve_entity(_AGENT).available_tools
 
 
 def test_an_accepted_edit_loads_unclamped(tmp_path: Path) -> None:

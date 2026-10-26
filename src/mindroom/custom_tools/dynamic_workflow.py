@@ -87,6 +87,7 @@ _WORKFLOW_RESTRICTED_TOOLS = frozenset(
         "dynamic_workflow",
         "invite_router",
         "memory",
+        "personal_agent_manager",
         "self_config",
         "skill_manage",
         # Switching the thread model would escape the participant's frozen, permitted model.

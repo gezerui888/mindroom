@@ -35,6 +35,7 @@ _SCRIPT_RESTRICTED_TOOLKITS = frozenset(
         "dynamic_tools",
         "dynamic_workflow",
         "memory",
+        "personal_agent_manager",
         "self_config",
         "skill_manage",
     },

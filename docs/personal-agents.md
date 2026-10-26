@@ -131,7 +131,8 @@ So an owner cannot pick a dearer model, move a tool between a worker and the mai
 
 ### Where edits live
 
-Edits are stored as `overrides` on the agent's entry in `tracking/personal_agents.json`, never in `config.yaml`, so they appear neither in the dashboard nor in `config_manager`, and they are backed up with the storage.
+Edits are stored as `overrides` on the agent's entry in `tracking/personal_agents.json`, never in `config.yaml`, so neither the dashboard's config editor nor `config_manager` can see or change them, and they are backed up with the storage.
+The read-only Agents list shows the edited display name.
 Each load clamps them to the current ceiling.
 A name the template no longer grants, or a value that would make the agent invalid, is ignored, and MindRoom logs `personal_agent_override_clamped` with the agent's name and the `dropped` values.
 Loading never fails because of an edit, and the stored edit stays, so granting the name again makes it take effect again.
@@ -146,15 +147,15 @@ An agent changes only itself, never another personal agent.
 ### The tool
 
 A generated agent whose template has `owner_edits: true` gets the [`personal_agent_manager`](tools/agent-orchestration.md#personal_agent_manager) tool automatically.
-`list_my_agents()` returns the agent's editable values and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
+`list_my_agents()` returns the agent's key, its editable values, and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
 The tool asks for no confirmation, because every edit stays within the template's grant; to add one, put a [`tool_approval`](tool-approval.md) rule on `update_agent`.
 
 ```text
 Alice: Call yourself Sage and stop using web_search.
-Agent: (calls list_my_agents, then update_agent("mind_alice", {"display_name": "Sage", "tools": ["calculator"]}))
+Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}))
 Agent: Done. I'm Sage from the next reload, and I no longer have web search.
 Alice: Now give yourself shell.
-Agent: (calls update_agent("mind_alice", {"tools": ["calculator", "shell"]}))
+Agent: (calls update_agent(changes={"tools": ["calculator", "shell"]}))
 Agent: That is not available: tools cannot include shell; allowed: calculator, web_search.
 ```
 
@@ -167,7 +168,7 @@ A refused request changes nothing, and the tool returns one of these reasons as 
 | `tools cannot include shell; allowed: calculator, web_search` | A name is outside the ceiling; the same wording applies to `skills`, `knowledge_bases`, and `delegate_to`. |
 | `model is not editable` | The field is fixed or unknown. |
 | `role has an invalid value, or conflicts with another setting` | The value would make the agent invalid. |
-| `you can only change yourself` | `agent_name` is not the calling agent. |
+| `you can only change yourself (mind_alice); omit agent_name to change yourself` | `agent_name` is given and is not the calling agent's key, for example its display name; the error names the key. |
 | `no changes given` | `changes` is empty. |
 
 ## Onboarding Behavior

@@ -616,9 +616,10 @@ update_own_config(
 Set `owner_edits: true` on the [`personal_agents`](https://docs.mindroom.chat/personal-agents/#owner-edits) template; MindRoom then adds the tool automatically to each generated agent of that template.
 Listing it on any other agent does nothing, because both functions refuse an agent that is not a generated personal agent.
 
-`list_my_agents()` returns the agent's current editable values and the names its template allows for `tools`, `skills`, `knowledge_bases`, and `delegate_to`.
-`update_agent(agent_name, changes)` changes only the fields in `changes`, and a field set to `null` goes back to the template's value.
-`agent_name` must be the calling agent's own name, because in this version an agent changes only itself.
+`list_my_agents()` returns the agent's key, its current editable values, and the names its template allows for `tools`, `skills`, `knowledge_bases`, and `delegate_to`.
+`update_agent(changes)` changes only the fields in `changes`, each value replaces the whole field, and a field set to `null` goes back to the template's value.
+Send `tools`, `skills`, `knowledge_bases`, and `delegate_to` as names from the allowed lists; for `tools` these are toolkit names such as `todo`, not function names such as `add_todo`.
+The optional first argument `agent_name` defaults to the calling agent and must equal its key when given, because in this version an agent changes only itself.
 The editable fields are `display_name`, `role`, `instructions`, `markdown`, `thread_mode`, `num_history_runs`, `num_history_messages`, `show_tool_calls`, `tools`, `skills`, `knowledge_bases`, and `delegate_to`; the model and where tools run never change.
 A request for a name outside the template's grant is refused whole, with the allowed names in the error.
 
@@ -629,8 +630,7 @@ Its calls need no confirmation, because every edit stays inside the template's g
 ```python
 list_my_agents()
 update_agent(
-    "mind_alice",
-    {
+    changes={
         "display_name": "Sage",
         "instructions": ["Answer in two sentences."],
         "tools": ["calculator"],

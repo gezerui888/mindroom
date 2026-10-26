@@ -81,13 +81,13 @@ if TYPE_CHECKING:
 # a durable agent runtime; they can never be granted to workflow participants.
 _WORKFLOW_RESTRICTED_TOOLS = frozenset(
     {
+        "agent_manager",
         "compact_context",
         "delegate",
         "dynamic_tools",
         "dynamic_workflow",
         "invite_router",
         "memory",
-        "personal_agent_manager",
         "self_config",
         "skill_manage",
         # Switching the thread model would escape the participant's frozen, permitted model.

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
@@ -16,7 +15,6 @@ from mindroom.config.models import ToolConfigEntry
 from mindroom.config.personal_agents import (
     PersonalAgentRosterEntry,
     personal_agent_roster_lock_path,
-    personal_agent_roster_path,
     read_personal_agent_roster,
 )
 from mindroom.file_locks import file_lock_is_held
@@ -400,14 +398,3 @@ def test_an_accepted_edit_loads_unclamped(tmp_path: Path) -> None:
     assert agent.role == "Mine"
     assert {tool.name: tool.overrides for tool in agent.tools} == {"calculator": {}, "file": _LIMIT}
     assert [log for log in logs if log["event"] == "personal_agent_override_clamped"] == []
-
-
-def test_an_unedited_entry_is_written_as_older_releases_read_it(tmp_path: Path) -> None:
-    """An entry without edits is written without overrides, so a rollback to a release that forbids the key loads."""
-    paths = test_runtime_paths(tmp_path)
-    _write_personal_agent_roster(paths, [_entry(_OWNER), _entry("@bob:example.org", overrides={"role": "Mine"})])
-
-    written = json.loads(personal_agent_roster_path(paths).read_text(encoding="utf-8"))["entries"]
-
-    assert ["overrides" in entry for entry in written] == [False, True]
-    assert [entry.overrides for entry in read_personal_agent_roster(paths)] == [{}, {"role": "Mine"}]

@@ -254,13 +254,13 @@ def test_launch_grants_exclude_skill_manage(tmp_path: Path) -> None:
     assert all(grant.toolkit_name != "skill_manage" for grant in grants)
 
 
-def test_launch_grants_exclude_personal_agent_manager(tmp_path: Path) -> None:
-    """Like self_config, personal_agent_manager stays with the agent's chat even when the agent lists it."""
+def test_launch_grants_exclude_agent_manager(tmp_path: Path) -> None:
+    """Like self_config, agent_manager stays with the agent's chat even when the agent lists it."""
     context = _context_for_config(
         tmp_path,
         Config(
             agents={
-                "general": AgentConfig(display_name="General Agent", tools=["calculator", "personal_agent_manager"]),
+                "general": AgentConfig(display_name="General Agent", tools=["calculator", "agent_manager"]),
             },
             defaults=DefaultsConfig(tools=[]),
             models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5-5")},
@@ -270,7 +270,7 @@ def test_launch_grants_exclude_personal_agent_manager(tmp_path: Path) -> None:
     grants = resolve_script_launch_grants(context)
 
     assert ScriptToolGrant("calculator", "add") in grants
-    assert all(grant.toolkit_name != "personal_agent_manager" for grant in grants)
+    assert all(grant.toolkit_name != "agent_manager" for grant in grants)
 
 
 def test_launch_grants_exclude_claude_agent(tmp_path: Path) -> None:

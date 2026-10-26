@@ -52,9 +52,8 @@ class PersonalAgentEditError(ValueError):
 
 
 def _write_personal_agent_roster(runtime_paths: RuntimePaths, roster: list[PersonalAgentRosterEntry]) -> None:
-    # Unedited entries omit overrides, so a rollback to a release that forbids the key still loads them.
-    entries = [entry.model_dump(mode="json", exclude=None if entry.overrides else {"overrides"}) for entry in roster]
-    write_json_file_durable(personal_agent_roster_path(runtime_paths), {"entries": entries}, strict_atomic_replace=True)
+    payload = {"entries": [entry.model_dump(mode="json") for entry in roster]}
+    write_json_file_durable(personal_agent_roster_path(runtime_paths), payload, strict_atomic_replace=True)
 
 
 def _append_personal_agent_roster_entry(runtime_paths: RuntimePaths, entry: PersonalAgentRosterEntry) -> None:

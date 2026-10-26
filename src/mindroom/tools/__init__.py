@@ -18,13 +18,13 @@ from mindroom.tool_system.declarations import (
 )
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tools import (
+    agent_manager,  # noqa: F401
     compact_context,  # noqa: F401
     delegate,  # noqa: F401
     dynamic_tools,  # noqa: F401
     dynamic_workflow,  # noqa: F401
     knowledge_graph,  # noqa: F401
     memory,  # noqa: F401
-    personal_agent_manager,  # noqa: F401
     report_publishing,  # noqa: F401
     self_config,  # noqa: F401
     skill_manage,  # noqa: F401

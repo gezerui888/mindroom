@@ -61,7 +61,7 @@ Every generated agent also gets these settings, whatever the template says:
 - The owner is added to `access.users` and `credential_managers` when missing.
 - `access.members_of_rooms` is `[]` when missing or null, so membership of the agent's rooms grants nothing unless you list rooms yourself.
 - `allow_self_config` is `false`, even when `defaults.allow_self_config` is true, because `self_config` edits `agents.<name>`, which a generated agent does not have.
-- The [`personal_agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#personal_agent_manager) tool is added when the template sets `owner_edits: true`.
+- The [`agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#agent_manager) tool is added when the template sets `owner_edits: true`.
 
 Config validation rejects `private` and `allow_self_config: true` in the template's `agent` and in any `users` override, because a personal agent already belongs to one user.
 A template or override that would produce an invalid agent fails validation as soon as you save or load it, even before anyone has onboarded, with `personal_agents would generate an invalid agent for a new user:` and the reason.
@@ -133,25 +133,24 @@ Each load clamps them to the current ceiling.
 A name the template no longer grants, or a value that would make the agent invalid, is ignored, and MindRoom logs `personal_agent_override_clamped` with the agent's name and the `dropped` values.
 Loading never fails because of an edit, and the stored edit stays, so granting the name again makes it take effect again.
 A tool the owner removed comes back if the administrator later gives its template entry its own settings, because such entries cannot be removed.
-After the first owner edit, older MindRoom releases cannot read `tracking/personal_agents.json`, so before rolling back, stop MindRoom, delete the `overrides` key from every entry in the current file, and remove the `owner_edits` key from every template in `config.yaml`, since older releases reject it even when it is `false`; a roster backup from before the first edit would drop everyone onboarded since.
 
 ### Who can edit
 
-Only the owner can view or change the agent's settings through `personal_agent_manager`.
+Only the owner can view or change the agent's settings through `agent_manager`.
 The requester must be the owner's Matrix ID, or a [bridge alias](https://docs.mindroom.chat/authorization/#bridge-aliases) of it, and an administrator or anyone else the template's `access` admits is refused, so a person admitted to work with the agent cannot reshape it.
 An administrator changes someone's agent through the template or `users`.
 An agent changes only itself, never another personal agent.
 
 ### The tool
 
-A generated agent whose template has `owner_edits: true` gets the [`personal_agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#personal_agent_manager) tool automatically.
+A generated agent whose template has `owner_edits: true` gets the [`agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#agent_manager) tool automatically.
 `list_my_agents()` returns the agent's key, its editable values, and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
-The tool asks for no confirmation, because every edit stays within the template's grant and only the owner can make it.
-An administrator who wants one can add a [`tool_approval`](https://docs.mindroom.chat/tool-approval/) rule for `update_agent`, but approval cards need the router in the room, and personal rooms do not have it by default.
+The owner confirms each change on an approval card, even when `tool_approval.default` is `auto_approve`, because the agent also reads content the owner did not write.
+Approval cards need the router, so in a personal room the agent first invites it with its built-in [`invite_router`](https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing) tool, which the router accepts when `router.accept_invites` allows it (the default), and the owner then approves with ✅.
 
 ```text
 Alice: Call yourself Sage and stop using web_search.
-Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}))
+Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}); Alice approves with ✅)
 Agent: Done. I'm Sage from the next reload, and I no longer have web search.
 Alice: Now give yourself shell.
 Agent: (calls update_agent(changes={"tools": ["calculator", "shell"]}))

@@ -876,13 +876,13 @@ async def test_validate_workflow_tool_policy_rejects_unknown_tool(tmp_path: Path
 @pytest.mark.parametrize(
     "restricted_tool",
     [
+        "agent_manager",
         "compact_context",
         "delegate",
         "dynamic_tools",
         "dynamic_workflow",
         "invite_router",
         "memory",
-        "personal_agent_manager",
         "self_config",
         "skill_manage",
         "thread_model",

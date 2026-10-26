@@ -1,4 +1,4 @@
-"""Tests for the personal_agent_manager toolkit, which lets a personal agent change itself for its owner."""
+"""Tests for the agent_manager toolkit, which lets a personal agent change itself for its owner."""
 
 from __future__ import annotations
 
@@ -10,8 +10,9 @@ import pytest
 import yaml
 
 from mindroom.agents import create_agent
+from mindroom.approval.tool_approval import POLICY_CONFIRMATION_APPROVAL_TYPE
 from mindroom.config.personal_agents import personal_agent_roster_path, read_personal_agent_roster
-from mindroom.custom_tools.personal_agent_manager import PersonalAgentManagerTools
+from mindroom.custom_tools.agent_manager import AgentManagerTools
 from mindroom.message_target import MessageTarget
 from mindroom.tool_system.agno_toolkits import adapt_toolkit
 from mindroom.tool_system.runtime_context import tool_runtime_context
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
 
 @contextmanager
 def _as_requester(
-    tool: PersonalAgentManagerTools,
+    tool: AgentManagerTools,
     config: Config,
     paths: RuntimePaths,
     *,
@@ -58,8 +59,8 @@ def _orchestrator() -> Any:  # noqa: ANN401 - a stub for the orchestrator runtim
     return MagicMock()
 
 
-def test_update_agent_asks_no_confirmation(tmp_path: Path) -> None:
-    """An approval card needs the room's router, which a personal room lacks, so a confirmed update would always fail."""
+def test_built_agent_requires_confirmation_for_updates_only(tmp_path: Path) -> None:
+    """The owner confirms each change, because the model making it also reads untrusted content."""
     config, paths = _setup(tmp_path)
     persist_entity_accounts(config, paths)
     build = create_agent(
@@ -72,7 +73,9 @@ def test_update_agent_asks_no_confirmation(tmp_path: Path) -> None:
         supports_native_tool_approval=True,
     )
 
-    assert offered_function(build, "update_agent").requires_confirmation is not True
+    update = offered_function(build, "update_agent")
+    assert update.requires_confirmation is True
+    assert update.approval_type != POLICY_CONFIRMATION_APPROVAL_TYPE
     assert offered_function(build, "list_my_agents").requires_confirmation is not True
 
 
@@ -80,7 +83,7 @@ def test_update_agent_schema_lets_a_model_send_text_and_name_lists() -> None:
     """The offered schema types each change value, so a model is not led to send empty objects for text or lists."""
     function = next(
         function
-        for function in adapt_toolkit(PersonalAgentManagerTools(agent_name=_AGENT)).functions
+        for function in adapt_toolkit(AgentManagerTools(agent_name=_AGENT)).functions
         if function.name == "update_agent"
     )
 
@@ -96,7 +99,7 @@ def test_update_agent_schema_lets_a_model_send_text_and_name_lists() -> None:
 async def test_update_agent_writes_and_requests_reload(tmp_path: Path) -> None:
     """The owner's change lands in the roster and the running orchestrator is asked to reload once."""
     config, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, orchestrator=orchestrator):
@@ -112,7 +115,7 @@ async def test_update_agent_writes_and_requests_reload(tmp_path: Path) -> None:
 async def test_update_agent_without_an_orchestrator_still_writes(tmp_path: Path) -> None:
     """A detached context has no orchestrator to reload, and the change is stored all the same."""
     config, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
 
     with _as_requester(tool, config, paths):
         result = await tool.update_agent(_AGENT, changes={"role": "Mine"})
@@ -125,7 +128,7 @@ async def test_update_agent_without_an_orchestrator_still_writes(tmp_path: Path)
 async def test_update_agent_refusal_is_returned_and_requests_no_reload(tmp_path: Path) -> None:
     """A change outside the template's grant comes back as an error string, with nothing stored or reloaded."""
     config, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, orchestrator=orchestrator):
@@ -140,7 +143,7 @@ async def test_update_agent_refusal_is_returned_and_requests_no_reload(tmp_path:
 async def test_update_agent_with_no_changes_does_nothing(tmp_path: Path) -> None:
     """An empty change set is an error, and neither rewrites the roster nor asks for a reload."""
     config, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
     orchestrator = _orchestrator()
     roster_before = personal_agent_roster_path(paths).read_bytes()
 
@@ -156,7 +159,7 @@ async def test_update_agent_with_no_changes_does_nothing(tmp_path: Path) -> None
 async def test_update_agent_defaults_to_itself(tmp_path: Path) -> None:
     """Leaving agent_name out changes the calling agent's own entry."""
     config, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, orchestrator=orchestrator):
@@ -171,7 +174,7 @@ async def test_update_agent_defaults_to_itself(tmp_path: Path) -> None:
 async def test_update_agent_refuses_a_non_owner(tmp_path: Path) -> None:
     """Someone else in the room cannot change the owner's agent through it."""
     config, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, requester_id="@bob:example.org", orchestrator=orchestrator):
@@ -187,7 +190,7 @@ async def test_update_agent_refuses_a_non_owner(tmp_path: Path) -> None:
 async def test_update_agent_refuses_another_agent(tmp_path: Path, wrong_name: str) -> None:
     """An agent changes only itself, so another agent's name or its own display name is refused, naming its key."""
     config, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, orchestrator=orchestrator):
@@ -204,7 +207,7 @@ async def test_manager_refuses_an_authored_agent(tmp_path: Path) -> None:
     config, paths = _setup(tmp_path)
     roster_file = personal_agent_roster_path(paths)
     before = roster_file.read_bytes()
-    tool = PersonalAgentManagerTools(agent_name="helper")
+    tool = AgentManagerTools(agent_name="helper")
 
     with _as_requester(tool, config, paths):
         listed = await tool.list_my_agents()
@@ -219,7 +222,7 @@ async def test_manager_refuses_an_authored_agent(tmp_path: Path) -> None:
 async def test_update_agent_without_runtime_context_fails_closed(tmp_path: Path) -> None:
     """With no live requester the toolkit refuses instead of guessing who is asking."""
     _, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
 
     result = await tool.update_agent(_AGENT, changes={"role": "Mine"})
 
@@ -231,7 +234,7 @@ async def test_update_agent_without_runtime_context_fails_closed(tmp_path: Path)
 async def test_list_my_agents_without_runtime_context_fails_closed(tmp_path: Path) -> None:
     """Listing needs the requester too, so it refuses without a context."""
     _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
 
     assert (await tool.list_my_agents()).startswith("Error")
 
@@ -240,7 +243,7 @@ async def test_list_my_agents_without_runtime_context_fails_closed(tmp_path: Pat
 async def test_list_my_agents_returns_the_summary_as_yaml(tmp_path: Path) -> None:
     """The owner gets the editable values and the names the template grants."""
     config, paths = _setup(tmp_path, skills=["review"])
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
 
     with _as_requester(tool, config, paths):
         result = await tool.list_my_agents()
@@ -256,7 +259,7 @@ async def test_list_my_agents_returns_the_summary_as_yaml(tmp_path: Path) -> Non
 async def test_list_my_agents_refuses_a_non_owner(tmp_path: Path) -> None:
     """Someone else in the room cannot read the owner's agent settings through it."""
     config, paths = _setup(tmp_path)
-    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    tool = AgentManagerTools(agent_name=_AGENT)
 
     with _as_requester(tool, config, paths, requester_id="@bob:example.org"):
         result = await tool.list_my_agents()

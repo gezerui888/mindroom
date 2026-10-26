@@ -7046,7 +7046,7 @@ Every generated agent also gets these settings, whatever the template says:
 - The owner is added to `access.users` and `credential_managers` when missing.
 - `access.members_of_rooms` is `[]` when missing or null, so membership of the agent's rooms grants nothing unless you list rooms yourself.
 - `allow_self_config` is `false`, even when `defaults.allow_self_config` is true, because `self_config` edits `agents.<name>`, which a generated agent does not have.
-- The [`personal_agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#personal_agent_manager) tool is added when the template sets `owner_edits: true`.
+- The [`agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#agent_manager) tool is added when the template sets `owner_edits: true`.
 
 Config validation rejects `private` and `allow_self_config: true` in the template's `agent` and in any `users` override, because a personal agent already belongs to one user.
 A template or override that would produce an invalid agent fails validation as soon as you save or load it, even before anyone has onboarded, with `personal_agents would generate an invalid agent for a new user:` and the reason.
@@ -7118,25 +7118,24 @@ Each load clamps them to the current ceiling.
 A name the template no longer grants, or a value that would make the agent invalid, is ignored, and MindRoom logs `personal_agent_override_clamped` with the agent's name and the `dropped` values.
 Loading never fails because of an edit, and the stored edit stays, so granting the name again makes it take effect again.
 A tool the owner removed comes back if the administrator later gives its template entry its own settings, because such entries cannot be removed.
-After the first owner edit, older MindRoom releases cannot read `tracking/personal_agents.json`, so before rolling back, stop MindRoom, delete the `overrides` key from every entry in the current file, and remove the `owner_edits` key from every template in `config.yaml`, since older releases reject it even when it is `false`; a roster backup from before the first edit would drop everyone onboarded since.
 
 ### Who can edit
 
-Only the owner can view or change the agent's settings through `personal_agent_manager`.
+Only the owner can view or change the agent's settings through `agent_manager`.
 The requester must be the owner's Matrix ID, or a [bridge alias](https://docs.mindroom.chat/authorization/#bridge-aliases) of it, and an administrator or anyone else the template's `access` admits is refused, so a person admitted to work with the agent cannot reshape it.
 An administrator changes someone's agent through the template or `users`.
 An agent changes only itself, never another personal agent.
 
 ### The tool
 
-A generated agent whose template has `owner_edits: true` gets the [`personal_agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#personal_agent_manager) tool automatically.
+A generated agent whose template has `owner_edits: true` gets the [`agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#agent_manager) tool automatically.
 `list_my_agents()` returns the agent's key, its editable values, and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
-The tool asks for no confirmation, because every edit stays within the template's grant and only the owner can make it.
-An administrator who wants one can add a [`tool_approval`](https://docs.mindroom.chat/tool-approval/) rule for `update_agent`, but approval cards need the router in the room, and personal rooms do not have it by default.
+The owner confirms each change on an approval card, even when `tool_approval.default` is `auto_approve`, because the agent also reads content the owner did not write.
+Approval cards need the router, so in a personal room the agent first invites it with its built-in [`invite_router`](https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing) tool, which the router accepts when `router.accept_invites` allows it (the default), and the owner then approves with ✅.
 
 ```text
 Alice: Call yourself Sage and stop using web_search.
-Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}))
+Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}); Alice approves with ✅)
 Agent: Done. I'm Sage from the next reload, and I no longer have web search.
 Alice: Now give yourself shell.
 Agent: (calls update_agent(changes={"tools": ["calculator", "shell"]}))
@@ -7906,7 +7905,7 @@ These configurations fail validation:
 - `initial: true` without `defer: true` fails with `Tool entry initial=true requires defer=true`.
 - Deferral is per agent, so `defaults.tools` entries reject both flags with `defaults.tools does not support defer or initial flags: <tools>`.
 - Presets such as [`openclaw_compat`](https://docs.mindroom.chat/openclaw/) cannot be deferred; set the flags on the individual member tools instead.
-- The control-plane tools `delegate`, `dynamic_tools`, `external_trigger_manager`, `invite_router`, `personal_agent_manager`, `self_config`, and `skill_manage` cannot be deferred and fail with `'<tool>' is a control-plane tool and cannot be deferred; defer/initial are only valid on runtime tools.`
+- The control-plane tools `agent_manager`, `delegate`, `dynamic_tools`, `external_trigger_manager`, `invite_router`, `self_config`, and `skill_manage` cannot be deferred and fail with `'<tool>' is a control-plane tool and cannot be deferred; defer/initial are only valid on runtime tools.`
 
 ## Native Server-Side Tool Search
 
@@ -8192,7 +8191,7 @@ Each run keeps the limits and `allowed_tools` value in effect when it started.
 - A non-empty `allowed_tools` list restricts the script to those toolkits, and their functions run without approval.
 - An empty list lets the script call every eligible toolkit on the agent, but each call waits for approval unless a `tool_approval` rule auto-approves it.
 - Unknown or ineligible toolkit names, including `*`, make `start_script` fail with an error.
-- The `browser`, `script`, `claude_agent`, `compact_context`, `delegate`, `dynamic_tools`, `dynamic_workflow`, `memory`, `personal_agent_manager`, `self_config`, and `skill_manage` toolkits are never available to scripts, even when the agent has them.
+- The `browser`, `script`, `agent_manager`, `claude_agent`, `compact_context`, `delegate`, `dynamic_tools`, `dynamic_workflow`, `memory`, `self_config`, and `skill_manage` toolkits are never available to scripts, even when the agent has them.
 - Listing `config_manager` or `scheduler` in `allowed_tools` does not auto-approve their calls; only a `tool_approval` rule can.
 - Operator [`tool_approval`](https://docs.mindroom.chat/tool-approval/) rules are checked first, so a matching `require_approval` rule still pauses the call, and functions that declare their own confirmation still ask for it.
 - Only the original requester can approve or deny a script's call, and approval cards for a cancelled or finished run are settled without running the call.
@@ -13594,7 +13593,7 @@ These built-in tools let an agent hand tasks to other agents, build and run reus
 - [`report_publishing`](#report_publishing) - Publish workflow reports or workspace static sites through revocable public links.
 - [`config_manager`](#config_manager) - Inspect and patch the full configuration, and create, update, or validate agents and teams.
 - [`self_config`](#self_config) - Let an agent read and update only its own configuration.
-- [`personal_agent_manager`](#personal_agent_manager) - Let a personal agent change its own settings for its owner, within its template's grant.
+- [`agent_manager`](#agent_manager) - Let a personal agent change its own settings for its owner, within its template's grant.
 - [`claude_agent`](#claude_agent) - Run persistent Claude Agent SDK coding sessions.
 
 Related tools documented elsewhere:
@@ -13941,7 +13940,7 @@ The top-level fields are `id`, `name`, `description`, `kind`, `inputs`, `partici
 - **`inputs`**: An object schema with `required` and `properties`; each property supports `type`, `description`, and `enum`.
 - **`participants`**: Up to 8 entries with `kind` set to `subagent` (the default) or `room_agent`.
   - A `subagent` is an [authored subagent](#authored-subagents) of the caller: it declares `id`, an optional `description`, and either `profile`, naming a `subagents/<name>.md` profile in the caller's workspace, or an inline `system_prompt` with optional `tools`, `skills`, `model`, and `mode`.
-    Its `tools` must be the caller's own toolkits or `toolkit.function` entries, never `memory`, `delegate`, `self_config`, `personal_agent_manager`, `skill_manage`, `compact_context`, `dynamic_workflow`, `dynamic_tools`, `invite_router`, or `thread_model`, and a participant that names no tools, inline or in its profile, gets none.
+    Its `tools` must be the caller's own toolkits or `toolkit.function` entries, never `memory`, `delegate`, `self_config`, `agent_manager`, `skill_manage`, `compact_context`, `dynamic_workflow`, `dynamic_tools`, `invite_router`, or `thread_model`, and a participant that names no tools, inline or in its profile, gets none.
     Its `skills` must be the caller's own skills, and a participant that names no skills gets none; it reads its skills whenever the caller could without approval, but reads a skill's scripts only when an operator `auto_approve` rule allows `get_skill_script`.
     It searches no knowledge bases, even when its profile lists `knowledge`.
     Its `model` is any alias or model ID in `models:` and defaults to the caller's current model; when `permissions.models` is set, it must also list it.
@@ -14195,9 +14194,9 @@ update_own_config(
 )
 ```
 
-## [`personal_agent_manager`]
+## [`agent_manager`]
 
-`personal_agent_manager` lets a [personal agent](https://docs.mindroom.chat/personal-agents/) change its own settings for its owner, so a person can retune their agent in chat without asking an administrator.
+`agent_manager` lets a [personal agent](https://docs.mindroom.chat/personal-agents/) change its own settings for its owner, so a person can retune their agent in chat without asking an administrator.
 Set `owner_edits: true` on the [`personal_agents`](https://docs.mindroom.chat/personal-agents/#owner-edits) template; MindRoom then adds the tool automatically to each generated agent of that template.
 Listing it on any other agent does nothing, because both functions refuse an agent that is not a generated personal agent.
 
@@ -14211,8 +14210,8 @@ A template tool with its own settings cannot be removed; removing any other tool
 
 Only the agent's owner can read or change it, with no administrator bypass, and the change is stored in the roster and applied after a short configuration reload.
 The tool runs in the primary runtime even when `worker_tools` lists it, and it is never available to scripts, [workflow participants](#spec-shape), or deferral.
-Its calls ask for no confirmation, because every edit stays inside the template's grant and only the owner can make it.
-An administrator who wants one can add a [`tool_approval`](https://docs.mindroom.chat/tool-approval/) rule for `update_agent`, but approval cards need the router in the room, and personal rooms do not have it by default.
+Every `update_agent()` call shows the owner an approval card, even when `tool_approval.default` is `auto_approve`, because the model issuing it also reads untrusted content.
+In a personal room the agent first invites the router with its built-in [`invite_router`](https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing) tool, which the router accepts when `router.accept_invites` allows it (the default), and the owner then approves with ✅.
 
 ```python
 list_my_agents()
@@ -19172,7 +19171,7 @@ agents:
 The tools that default to workers when no list is set are `browser_mcp`, `coding`, `docker`, `file`, `python`, and `shell`.
 Any other registered tool can be listed in `worker_tools`, except tools that need the primary runtime or room context, which stay in the primary runtime even when listed.
 These include the Matrix, scheduling, todo, attachment, and thread tools, `gmail` and the other Google tools, `github`, `atlassian`, `slack`, `spotify`, `homeassistant`, `reasoning`, `daytona`, `e2b`, `mem0`, `claude_agent`, `config_manager`, `oauth_connections`, and `agent_vault_access`, plus `browserbase`, `composio`, `duckdb`, `pandas`, `sql`, and `zep`, which keep a session, connection, or other state between calls.
-The built-in `memory`, `delegate`, `self_config`, and `personal_agent_manager` tools also always run in the primary runtime.
+The built-in `memory`, `delegate`, `self_config`, and `agent_manager` tools also always run in the primary runtime.
 The `browser` tool chooses per call: `target: desktop` stays in the primary runtime, while `target: host` follows the worker routing.
 
 ### Execution modes

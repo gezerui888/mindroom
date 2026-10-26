@@ -245,7 +245,7 @@ def test_config_rejects_lazy_flags_inside_named_tool_overrides(tmp_path: Path, l
 
 @pytest.mark.parametrize(
     "tool_name",
-    ["delegate", "dynamic_tools", "invite_router", "personal_agent_manager", "self_config", "skill_manage"],
+    ["agent_manager", "delegate", "dynamic_tools", "invite_router", "self_config", "skill_manage"],
 )
 def test_config_rejects_deferred_control_plane_tools(tmp_path: Path, tool_name: str) -> None:
     """Control-plane tools are injected by runtime policy and cannot be lazy-loading units."""
@@ -2081,7 +2081,7 @@ def test_search_toolkit_results_are_never_redirected_to_output_files(
 
 
 def test_tool_is_offered_only_with_owner_edits(tmp_path: Path) -> None:
-    """A generated agent gets personal_agent_manager when its template grants owner edits; no other agent does."""
+    """A generated agent gets agent_manager when its template grants owner edits; no other agent does."""
     raw = _base_config_data()
     raw["personal_agents"] = {
         "editable": {"owner_edits": True, "agent": {"display_name": "Editable", "model": "default"}},
@@ -2104,7 +2104,7 @@ def test_tool_is_offered_only_with_owner_edits(tmp_path: Path) -> None:
             knowledge=None,
             active_model_name=None,
         )
-        return "personal_agent_manager" in _toolkit_names(build)
+        return "agent_manager" in _toolkit_names(build)
 
     assert offered("editable_alice")
     assert not offered("fixed_alice")

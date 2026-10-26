@@ -13,7 +13,7 @@ These built-in tools let an agent hand tasks to other agents, build and run reus
 - [`report_publishing`](#report_publishing) - Publish workflow reports or workspace static sites through revocable public links.
 - [`config_manager`](#config_manager) - Inspect and patch the full configuration, and create, update, or validate agents and teams.
 - [`self_config`](#self_config) - Let an agent read and update only its own configuration.
-- [`personal_agent_manager`](#personal_agent_manager) - Let a personal agent change its own settings for its owner, within its template's grant.
+- [`agent_manager`](#agent_manager) - Let a personal agent change its own settings for its owner, within its template's grant.
 - [`claude_agent`](#claude_agent) - Run persistent Claude Agent SDK coding sessions.
 
 Related tools documented elsewhere:
@@ -360,7 +360,7 @@ The top-level fields are `id`, `name`, `description`, `kind`, `inputs`, `partici
 - **`inputs`**: An object schema with `required` and `properties`; each property supports `type`, `description`, and `enum`.
 - **`participants`**: Up to 8 entries with `kind` set to `subagent` (the default) or `room_agent`.
   - A `subagent` is an [authored subagent](#authored-subagents) of the caller: it declares `id`, an optional `description`, and either `profile`, naming a `subagents/<name>.md` profile in the caller's workspace, or an inline `system_prompt` with optional `tools`, `skills`, `model`, and `mode`.
-    Its `tools` must be the caller's own toolkits or `toolkit.function` entries, never `memory`, `delegate`, `self_config`, `personal_agent_manager`, `skill_manage`, `compact_context`, `dynamic_workflow`, `dynamic_tools`, `invite_router`, or `thread_model`, and a participant that names no tools, inline or in its profile, gets none.
+    Its `tools` must be the caller's own toolkits or `toolkit.function` entries, never `memory`, `delegate`, `self_config`, `agent_manager`, `skill_manage`, `compact_context`, `dynamic_workflow`, `dynamic_tools`, `invite_router`, or `thread_model`, and a participant that names no tools, inline or in its profile, gets none.
     Its `skills` must be the caller's own skills, and a participant that names no skills gets none; it reads its skills whenever the caller could without approval, but reads a skill's scripts only when an operator `auto_approve` rule allows `get_skill_script`.
     It searches no knowledge bases, even when its profile lists `knowledge`.
     Its `model` is any alias or model ID in `models:` and defaults to the caller's current model; when `permissions.models` is set, it must also list it.
@@ -614,9 +614,9 @@ update_own_config(
 )
 ```
 
-## [`personal_agent_manager`]
+## [`agent_manager`]
 
-`personal_agent_manager` lets a [personal agent](../personal-agents.md) change its own settings for its owner, so a person can retune their agent in chat without asking an administrator.
+`agent_manager` lets a [personal agent](../personal-agents.md) change its own settings for its owner, so a person can retune their agent in chat without asking an administrator.
 Set `owner_edits: true` on the [`personal_agents`](../personal-agents.md#owner-edits) template; MindRoom then adds the tool automatically to each generated agent of that template.
 Listing it on any other agent does nothing, because both functions refuse an agent that is not a generated personal agent.
 
@@ -630,8 +630,8 @@ A template tool with its own settings cannot be removed; removing any other tool
 
 Only the agent's owner can read or change it, with no administrator bypass, and the change is stored in the roster and applied after a short configuration reload.
 The tool runs in the primary runtime even when `worker_tools` lists it, and it is never available to scripts, [workflow participants](#spec-shape), or deferral.
-Its calls ask for no confirmation, because every edit stays inside the template's grant and only the owner can make it.
-An administrator who wants one can add a [`tool_approval`](../tool-approval.md) rule for `update_agent`, but approval cards need the router in the room, and personal rooms do not have it by default.
+Every `update_agent()` call shows the owner an approval card, even when `tool_approval.default` is `auto_approve`, because the model issuing it also reads untrusted content.
+In a personal room the agent first invites the router with its built-in [`invite_router`](../tool-approval.md#when-the-router-is-missing) tool, which the router accepts when `router.accept_invites` allows it (the default), and the owner then approves with ✅.
 
 ```python
 list_my_agents()

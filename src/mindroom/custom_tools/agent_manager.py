@@ -1,4 +1,4 @@
-"""Personal agent manager tool: lets a personal agent change itself for its owner."""
+"""Agent manager tool: lets a personal agent change itself for its owner."""
 
 from __future__ import annotations
 
@@ -17,15 +17,17 @@ _ChangeValue = str | int | bool | list[str] | None
 _NO_CONTEXT_ERROR = "Error: This tool only works while answering a request, and there is none."
 
 
-class PersonalAgentManagerTools(Toolkit):
+class AgentManagerTools(Toolkit):
     """Tools that let a personal agent read and change its own owner-editable settings."""
 
     def __init__(self, agent_name: str) -> None:
         self.agent_name = agent_name
         super().__init__(
-            name="personal_agent_manager",
+            name="agent_manager",
             tools=[self.list_my_agents, self.update_agent],
         )
+        # The owner confirms every change, because the model issuing the call also reads untrusted content.
+        self.async_functions["update_agent"].requires_confirmation = True
 
     async def list_my_agents(self) -> str:
         """List what the owner may change about this agent: its key, its current editable values and the allowed names.
@@ -71,7 +73,9 @@ class PersonalAgentManagerTools(Toolkit):
         or an automatic feature stays available, so do not tell the owner it is gone while you still have it.
         Only this agent's owner may ask; anyone else gets an error.
         A request for a name outside the template's grant is refused whole, with the allowed names in the error.
-        No confirmation is asked, because every edit stays within the template's grant and only the owner can make it.
+        The owner confirms each change on an approval card. If the call fails with
+        "Tool approval needs the router in this room", call `invite_router`, wait for the router to join,
+        then call `update_agent` again.
         The change applies after a short configuration reload.
 
         Args:

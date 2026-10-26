@@ -134,11 +134,11 @@ if TYPE_CHECKING:
 
 _DEFER_PROHIBITED_CONTROL_TOOLS = frozenset(
     {
+        "agent_manager",
         "delegate",
         "dynamic_tools",
         "external_trigger_manager",
         "invite_router",
-        "personal_agent_manager",
         "self_config",
         "skill_manage",
     },

@@ -73,9 +73,9 @@ class AgentManagerTools(Toolkit):
         or an automatic feature stays available, so do not tell the owner it is gone while you still have it.
         Only this agent's owner may ask; anyone else gets an error.
         A request for a name outside the template's grant is refused whole, with the allowed names in the error.
-        The owner confirms each change on an approval card. If the call fails with
-        "Tool approval needs the router in this room", call `invite_router`, wait for the router to join,
-        then call `update_agent` again.
+        The owner confirms each change on an approval card, unless their own !auto_approve window is open.
+        If the call fails with "Tool approval needs the router in this room", call `invite_router`,
+        wait for the router to join, then call `update_agent` again.
         The change applies after a short configuration reload.
 
         Args:

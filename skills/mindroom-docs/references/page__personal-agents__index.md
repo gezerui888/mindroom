@@ -145,15 +145,15 @@ An agent changes only itself, never another personal agent.
 
 A generated agent whose template has `owner_edits: true` gets the [`agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#agent_manager) tool automatically.
 `list_my_agents()` returns the agent's key, its editable values, and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
-The owner confirms each change on an approval card, even when `tool_approval.default` is `auto_approve`, because the agent also reads content the owner did not write.
-Approval cards need the router, so in a personal room the agent first invites it with its built-in [`invite_router`](https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing) tool, which the router accepts when `router.accept_invites` allows it (the default), and the owner then approves with ✅.
+The owner confirms each change on an approval card, even when `tool_approval.default` is `auto_approve`, because the agent also reads content the owner did not write; only the owner's own [`!auto_approve`](https://docs.mindroom.chat/tool-approval/#auto-approval-for-a-few-minutes) window skips the card.
+Approval cards need the router, so in a personal room without it the agent first invites the router (see [When the Router Is Missing](https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing)), and the owner then approves with ✅.
 
 ```text
 Alice: Call yourself Sage and stop using web_search.
 Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}); Alice approves with ✅)
 Agent: Done. I'm Sage from the next reload, and I no longer have web search.
 Alice: Now give yourself shell.
-Agent: (calls update_agent(changes={"tools": ["calculator", "shell"]}))
+Agent: (calls update_agent(changes={"tools": ["calculator", "shell"]}); Alice approves with ✅)
 Agent: That is not available: tools cannot include shell; allowed: calculator, web_search.
 ```
 

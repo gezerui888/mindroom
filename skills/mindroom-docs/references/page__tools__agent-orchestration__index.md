@@ -626,8 +626,8 @@ A template tool with its own settings cannot be removed; removing any other tool
 
 Only the agent's owner can read or change it, with no administrator bypass, and the change is stored in the roster and applied after a short configuration reload.
 The tool runs in the primary runtime even when `worker_tools` lists it, and it is never available to scripts, [workflow participants](#spec-shape), or deferral.
-Every `update_agent()` call shows the owner an approval card, even when `tool_approval.default` is `auto_approve`, because the model issuing it also reads untrusted content.
-In a personal room the agent first invites the router with its built-in [`invite_router`](https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing) tool, which the router accepts when `router.accept_invites` allows it (the default), and the owner then approves with ✅.
+Every `update_agent()` call shows the owner an approval card, even when `tool_approval.default` is `auto_approve`, because the model issuing it also reads untrusted content; only the owner's own [`!auto_approve`](https://docs.mindroom.chat/tool-approval/#auto-approval-for-a-few-minutes) window skips it.
+In a room without the router, such as a personal room, the router is invited first (see [When the Router Is Missing](https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing)), and the owner then approves with ✅.
 
 ```python
 list_my_agents()

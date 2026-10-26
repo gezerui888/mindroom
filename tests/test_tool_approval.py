@@ -446,6 +446,58 @@ async def test_action_delivery_resolver_retries_an_unreadable_exact_card() -> No
         await transport.resolve_approval_action_delivery("!room:localhost", "$approval")
 
 
+def _router_and_agent(*, joins: bool) -> tuple[MagicMock, MagicMock]:
+    router = MagicMock(
+        agent_name="router",
+        running=True,
+        client=MagicMock(user_id="@mindroom_router:localhost"),
+        approval_room_ids=frozenset(),
+    )
+
+    async def invite(room_id: str, _user_id: str) -> nio.RoomInviteResponse:
+        if joins:
+            router.approval_room_ids = frozenset({room_id})
+        return nio.RoomInviteResponse()
+
+    agent = MagicMock(
+        agent_name="mind_alice",
+        running=True,
+        client=MagicMock(user_id="@mindroom_mind_alice:localhost", room_invite=AsyncMock(side_effect=invite)),
+    )
+    return router, agent
+
+
+@pytest.mark.asyncio
+async def test_prepare_invites_a_missing_router_and_continues_once_it_joins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A personal room the agent created has no router, so the requesting agent invites it before the card."""
+    router, agent = _router_and_agent(joins=True)
+    transport = approval_transport.ApprovalMatrixTransport(
+        bot_provider={"router": router, "mind_alice": agent}.get,
+    )
+    monkeypatch.setattr(approval_transport, "can_send_to_encrypted_room", lambda *_args, **_kwargs: True)
+
+    prepared = await transport.prepare_approval_event("!personal:localhost", None, {"agent_name": "mind_alice"})
+
+    assert prepared is not None
+    assert prepared["agent_name"] == "mind_alice"
+    agent.client.room_invite.assert_awaited_once_with("!personal:localhost", "@mindroom_router:localhost")
+
+
+@pytest.mark.asyncio
+async def test_prepare_reports_the_missing_router_when_it_does_not_join(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A router that declines the invite, such as under router.accept_invites, leaves the original error."""
+    router, agent = _router_and_agent(joins=False)
+    transport = approval_transport.ApprovalMatrixTransport(
+        bot_provider={"router": router, "mind_alice": agent}.get,
+    )
+    monkeypatch.setattr(approval_transport, "_ROUTER_JOIN_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(approval_transport.ToolApprovalTransportError, match="needs the router in this room"):
+        await transport.prepare_approval_event("!personal:localhost", None, {"agent_name": "mind_alice"})
+
+    agent.client.room_invite.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_legacy_action_without_router_transport_is_ignored(tmp_path: Path) -> None:
     """An unverifiable pre-registry card cannot retain an event-journal lane forever."""

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 _UNAVAILABLE_NOTICE_APPROVAL_ID_KEY = "io.mindroom.approval_unavailable_id"
+_ROUTER_JOIN_POLL_SECONDS = 0.25
+_ROUTER_JOIN_TIMEOUT_SECONDS = 10.0
 
 
 def _approval_delivery_content(claimed: MatrixDelivery) -> dict[str, object]:
@@ -237,7 +240,11 @@ class ApprovalMatrixTransport:
         bot = self.bot_provider(ROUTER_AGENT_NAME)
         if bot is None or not bot.running or bot.client is None:
             return None
-        if not self._bot_has_approval_room(bot, room_id):
+        if not self._bot_has_approval_room(bot, room_id) and not await self._invite_router(
+            bot,
+            room_id,
+            content.get("agent_name"),
+        ):
             raise ToolApprovalTransportError(DEFAULT_ROUTER_MANAGED_ROOM_REASON)
         if not can_send_to_encrypted_room(bot.client, room_id, operation="send_approval_event"):
             return None
@@ -329,6 +336,27 @@ class ApprovalMatrixTransport:
             return None
         approval_id = content.get("approval_id")
         return approval_id if isinstance(approval_id, str) and approval_id else None
+
+    async def _invite_router(self, router: _ApprovalTransportBot, room_id: str, agent_name: object) -> bool:
+        """Have the requesting agent invite the router, such as into a personal room it created, and wait for it."""
+        agent = self.bot_provider(agent_name) if isinstance(agent_name, str) else None
+        if agent is None or not agent.running or agent.client is None or router.client is None:
+            return False
+        # The router joins only when its router.accept_invites admits this agent; otherwise the wait runs out.
+        response = await agent.client.room_invite(room_id, router.client.user_id)
+        logger.info(
+            "approval_router_invited",
+            room_id=room_id,
+            agent=agent_name,
+            sent=isinstance(response, nio.RoomInviteResponse),
+        )
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _ROUTER_JOIN_TIMEOUT_SECONDS
+        while not self._bot_has_approval_room(router, room_id):
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(_ROUTER_JOIN_POLL_SECONDS)
+        return True
 
     def _bot_has_approval_room(self, bot: _ApprovalTransportBot, room_id: str) -> bool:
         """Return whether one bot can safely post into an approval room."""

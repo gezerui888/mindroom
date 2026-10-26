@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from hashlib import sha256
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
 from mindroom.background_tasks import run_blocking_until_complete
 from mindroom.config.agent import AgentConfig
 from mindroom.config.personal_agents import (
+    OWNER_FREE_FIELDS,
+    OWNER_SUBSET_FIELDS,
     PersonalAgentRosterEntry,
+    apply_owner_overrides,
+    ceiling_names,
     personal_agent_data,
     personal_agent_display_name,
     personal_agent_roster_lock_path,
@@ -30,7 +35,7 @@ from mindroom.matrix.users import (
     preflight_managed_account_provisioning,
 )
 from mindroom.matrix_identifiers import agent_username_localpart, namespaced_username_localpart
-from mindroom.requester_identity import runtime_matrix_domain
+from mindroom.requester_identity import resolve_human_requester_alias, runtime_matrix_domain
 from mindroom.startup_errors import PermanentStartupError
 
 if TYPE_CHECKING:
@@ -39,6 +44,10 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.matrix.state import MatrixAccount
+
+
+class _PersonalAgentEditError(ValueError):
+    """Why an owner's edit to their personal agent was refused; the message is shown to the owner as is."""
 
 
 def _write_personal_agent_roster(runtime_paths: RuntimePaths, roster: list[PersonalAgentRosterEntry]) -> None:
@@ -257,3 +266,87 @@ async def provision_personal_agent(
     )
     await run_blocking_until_complete(_activate_personal_agent_roster_entry, runtime_paths, entry)
     return entry.agent_name, True
+
+
+def _owner_edit_target(
+    config: Config,
+    roster: list[PersonalAgentRosterEntry],
+    agent_name: str,
+) -> tuple[PersonalAgentRosterEntry, dict[str, Any]]:
+    """Return the roster entry of one personal agent and the agent its template grants, or refuse."""
+    instance = config.personal_agent_instance(agent_name)
+    entry = next((other for other in roster if other.agent_name == agent_name), None)
+    if instance is None or entry is None:
+        msg = f"{agent_name} is not a personal agent"
+        raise _PersonalAgentEditError(msg)
+    template = config.personal_agents[instance.template]
+    if not template.owner_edits:
+        msg = "Owner edits are off for this agent's template"
+        raise _PersonalAgentEditError(msg)
+    return entry, personal_agent_data(template.model_dump(exclude_unset=True), entry)
+
+
+def _owner_agent_summary(config: Config, runtime_paths: RuntimePaths, agent_name: str) -> dict[str, Any]:
+    """Return what the owner of a personal agent may change: the current values and the names the template grants."""
+    entry, ceiling = _owner_edit_target(config, read_personal_agent_roster(runtime_paths), agent_name)
+    clamped, _ = apply_owner_overrides(ceiling, entry.overrides)
+    agent = AgentConfig.model_validate(clamped)
+    editable = {field: getattr(agent, field) for field in sorted(OWNER_FREE_FIELDS | OWNER_SUBSET_FIELDS)}
+    editable["tools"] = agent.tool_names
+    return {
+        "agent_name": agent_name,
+        "editable": editable,
+        "allowed": {field: ceiling_names(ceiling, field) for field in sorted(OWNER_SUBSET_FIELDS)},
+    }
+
+
+def _refusals(ceiling: Mapping[str, Any], overrides: Mapping[str, Any], changes: Mapping[str, Any]) -> list[str]:
+    """Say why each requested change would not stick: the fields expansion would drop, and those never editable."""
+    _, dropped = apply_owner_overrides(ceiling, overrides)
+    editable = OWNER_FREE_FIELDS | OWNER_SUBSET_FIELDS
+    refusals: list[str] = []
+    for field in changes:
+        if field not in editable:
+            refusals.append(f"{field} is not editable")
+        elif field in dropped and field in OWNER_SUBSET_FIELDS:
+            allowed = ", ".join(ceiling_names(ceiling, field)) or "none"
+            rejected = dropped[field]
+            if isinstance(rejected, list):
+                refusals.append(f"{field} cannot include {', '.join(map(str, rejected))}; allowed: {allowed}")
+            else:
+                refusals.append(f"{field} must be a list of names; allowed: {allowed}")
+        elif field in dropped:
+            refusals.append(f"{field} has an invalid value, or conflicts with another setting")
+    return refusals
+
+
+def _update_owner_overrides(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    *,
+    agent_name: str,
+    requester_id: str,
+    changes: Mapping[str, Any],
+) -> PersonalAgentRosterEntry:
+    """Store the owner's changes to their personal agent, a None value giving that field back to the template.
+
+    Refuses whatever the agent's next load would drop, so a stored edit always takes effect.
+    Synchronous and blocking: the roster lock covers the read, the validation, and the write, so run it in a worker thread.
+    """
+    with advisory_file_lock(personal_agent_roster_lock_path(runtime_paths)):
+        roster = read_personal_agent_roster(runtime_paths)
+        entry, ceiling = _owner_edit_target(config, roster, agent_name)
+        if resolve_human_requester_alias(requester_id, config, runtime_paths) != entry.user_id:
+            msg = f"Only {entry.user_id} can change this agent"
+            raise _PersonalAgentEditError(msg)
+        overrides = dict(entry.overrides)
+        for field, value in changes.items():
+            if value is None:
+                overrides.pop(field, None)
+            else:
+                overrides[field] = deepcopy(value)
+        if refusals := _refusals(ceiling, overrides, changes):
+            raise _PersonalAgentEditError("; ".join(refusals))
+        updated = entry.model_copy(update={"overrides": overrides})
+        _write_personal_agent_roster(runtime_paths, [updated if other is entry else other for other in roster])
+        return updated

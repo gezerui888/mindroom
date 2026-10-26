@@ -59,7 +59,7 @@ from mindroom.api.usage_export import close_usage_export_runner
 from mindroom.api.validation_errors import validation_error_response
 from mindroom.api.workers import router as workers_router
 from mindroom.background_tasks import run_blocking_until_complete
-from mindroom.config.personal_agents import personal_agent_data
+from mindroom.config.personal_agents import owner_edited_agent_data
 from mindroom.credentials.legacy_tool_credentials import migrate_tool_credential_defaults
 from mindroom.credentials.sync import sync_env_to_credentials
 from mindroom.embeddings.embedder_health import get_embedder_failure
@@ -955,7 +955,7 @@ async def get_personal_agents(
             agent_name=entry.agent_name,
             matrix_user_id=matrix_user_id,
             display_name=(
-                personal_agent_data(templates[entry.template], entry).get("display_name")
+                owner_edited_agent_data(templates[entry.template], entry)[0].get("display_name")
                 if entry.template in templates
                 else None
             ),

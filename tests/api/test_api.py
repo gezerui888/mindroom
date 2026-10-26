@@ -1479,6 +1479,7 @@ def test_get_personal_agents_lists_active_pending_and_removed_template_entries(
 
     Dave is onboarded after the config was loaded, so the loaded config has no agent for him yet.
     Alice's account was registered under an earlier namespace on the real server name, which the listing keeps.
+    The template lets owners edit, so Dave's listed name is the one he gave his agent.
     """
     runtime_paths = main._app_runtime_paths(main.app)
     for entry in (
@@ -1494,12 +1495,19 @@ def test_get_personal_agents_lists_active_pending_and_removed_template_entries(
     ):
         _append_personal_agent_roster_entry(runtime_paths, entry)
     config_data = yaml.safe_load(temp_config_file.read_text())
-    config_data["personal_agents"] = {"mind": {"agent": {"display_name": "{user_display_name}'s Mind"}}}
+    config_data["personal_agents"] = {
+        "mind": {"owner_edits": True, "agent": {"display_name": "{user_display_name}'s Mind"}},
+    }
     temp_config_file.write_text(yaml.dump(config_data))
     assert config_lifecycle.load_config_into_app(runtime_paths, main.app)
     _append_personal_agent_roster_entry(
         runtime_paths,
-        personal_agent_entry("@dave:localhost", agent_name="mind_dave", user_display_name="Dave"),
+        personal_agent_entry(
+            "@dave:localhost",
+            agent_name="mind_dave",
+            user_display_name="Dave",
+            overrides={"display_name": "Dee"},
+        ),
     )
     matrix_state = MatrixState.load(runtime_paths=runtime_paths)
     matrix_state.add_account("agent_mind_alice_smith", "mindroom_mind_alice_smith_old", None, domain="example.org")
@@ -1541,7 +1549,7 @@ def test_get_personal_agents_lists_active_pending_and_removed_template_entries(
             "user_id": "@dave:localhost",
             "agent_name": "mind_dave",
             "matrix_user_id": "@mindroom_mind_dave:localhost",
-            "display_name": "Dave's Mind",
+            "display_name": "Dee",
             "pending": False,
             "template_exists": True,
         },

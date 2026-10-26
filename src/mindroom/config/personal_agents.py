@@ -32,7 +32,7 @@ _MAX_DISPLAY_NAME_LENGTH = 100
 _PROBE_USER_ID = "@personal_agent_probe:example.invalid"
 
 # The fields an owner may edit; every other field keeps the template's value.
-_OWNER_FREE_FIELDS = frozenset(
+OWNER_FREE_FIELDS = frozenset(
     {
         "display_name",
         "role",
@@ -45,7 +45,7 @@ _OWNER_FREE_FIELDS = frozenset(
     },
 )
 # These take names only: an owner may pick among the template's entries but never add or change one.
-_OWNER_SUBSET_FIELDS = frozenset({"tools", "skills", "knowledge_bases", "delegate_to"})
+OWNER_SUBSET_FIELDS = frozenset({"tools", "skills", "knowledge_bases", "delegate_to"})
 
 logger = get_logger(__name__)
 
@@ -276,7 +276,7 @@ def _entries(agent: Mapping[str, Any], field: str) -> list[Any]:
     return values if isinstance(values, list) else []
 
 
-def _ceiling_names(ceiling: Mapping[str, Any], field: str) -> list[str]:
+def ceiling_names(ceiling: Mapping[str, Any], field: str) -> list[str]:
     """Return the names the ceiling grants for one subset field."""
     entries = _entries(ceiling, field)
     if field == "tools":
@@ -284,7 +284,7 @@ def _ceiling_names(ceiling: Mapping[str, Any], field: str) -> list[str]:
     return [entry for entry in entries if isinstance(entry, str)]
 
 
-def _apply_owner_overrides(
+def apply_owner_overrides(
     ceiling: Mapping[str, Any],
     overrides: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, object]]:
@@ -297,7 +297,7 @@ def _apply_owner_overrides(
     agent = deepcopy(dict(ceiling))
     dropped: dict[str, object] = {}
     for field, value in overrides.items():
-        if field in _OWNER_FREE_FIELDS:
+        if field in OWNER_FREE_FIELDS:
             candidate = {**agent, field: deepcopy(value)}
             try:
                 AgentConfig.model_validate(candidate)
@@ -305,8 +305,8 @@ def _apply_owner_overrides(
                 dropped[field] = value
             else:
                 agent = candidate
-        elif field in _OWNER_SUBSET_FIELDS and isinstance(value, list):
-            granted = _ceiling_names(ceiling, field)
+        elif field in OWNER_SUBSET_FIELDS and isinstance(value, list):
+            granted = ceiling_names(ceiling, field)
             kept = [name for name in value if isinstance(name, str) and name in granted]
             if rejected := [name for name in value if name not in kept]:
                 dropped[field] = rejected
@@ -319,12 +319,15 @@ def _apply_owner_overrides(
     return agent, dropped
 
 
-def _generated_agent(template: Mapping[str, Any], entry: PersonalAgentRosterEntry) -> tuple[dict[str, Any], bool]:
+def owner_edited_agent_data(
+    template: Mapping[str, Any],
+    entry: PersonalAgentRosterEntry,
+) -> tuple[dict[str, Any], bool]:
     """Build one generated agent, and say whether the owner's edits were applied to it."""
     agent = personal_agent_data(template, entry)
     if template.get("owner_edits") is not True or not entry.overrides:
         return agent, False
-    agent, dropped = _apply_owner_overrides(agent, entry.overrides)
+    agent, dropped = apply_owner_overrides(agent, entry.overrides)
     if dropped:
         logger.warning("personal_agent_override_clamped", agent_name=entry.agent_name, dropped=dropped)
     return agent, True
@@ -407,7 +410,7 @@ def expand_personal_agents(data: object, roster: Sequence[PersonalAgentRosterEnt
                 raise ValueError(msg)
         if entry.pending:
             continue
-        agent, edited = _generated_agent(template, entry)
+        agent, edited = owner_edited_agent_data(template, entry)
         agents[entry.agent_name] = agent
         instances[entry.agent_name] = PersonalAgentInstance(entry.template, entry.user_id, entry.matrix_username)
         # An edited agent no longer shows that the template's own default generates a valid agent.

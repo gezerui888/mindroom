@@ -67,6 +67,8 @@ class PersonalAgentManagerTools(Toolkit):
         Send only the fields you change, because each value replaces the whole field,
         and a field set to null goes back to the template's value.
         To remove a tool, send `tools` with only the names to keep.
+        That drops only the template's entry: a tool you also get from the defaults, a preset or an automatic feature
+        stays available, so do not tell the owner it is gone while you still have it.
         Only this agent's owner may ask; anyone else gets an error.
         A request for a name outside the template's grant is refused whole, with the allowed names in the error.
         No confirmation is asked, because every edit stays within the template's grant and only the owner can make it.

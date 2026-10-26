@@ -132,7 +132,8 @@ The read-only Agents list shows the edited display name, and `config_manager`'s 
 Each load clamps them to the current ceiling.
 A name the template no longer grants, or a value that would make the agent invalid, is ignored, and MindRoom logs `personal_agent_override_clamped` with the agent's name and the `dropped` values.
 Loading never fails because of an edit, and the stored edit stays, so granting the name again makes it take effect again.
-After the first owner edit, older MindRoom releases cannot read `tracking/personal_agents.json`, so roll back together with a roster backup from before the first edit.
+A tool the owner removed comes back if the administrator later gives its template entry its own settings, because such entries cannot be removed.
+After the first owner edit, older MindRoom releases cannot read `tracking/personal_agents.json`, so before rolling back, stop MindRoom and delete the `overrides` key from every entry in the current file; a backup from before the first edit would drop everyone onboarded since.
 
 ### Who can edit
 
@@ -164,6 +165,7 @@ A refused request changes nothing, and the tool returns one of these reasons as 
 | `Only @alice:example.org can change this agent` | The requester is not the owner. |
 | `Owner edits are off for this agent's template` | The template has `owner_edits: false`. |
 | `tools cannot include shell; allowed: calculator, web_search` | A name is outside the ceiling; the same wording applies to `skills`, `knowledge_bases`, and `delegate_to`. |
+| `` `knowledge_graph` keeps its template settings and cannot be removed `` | `tools` leaves out a template tool that has its own settings. |
 | `model is not editable` | The field is fixed or unknown. |
 | `role has an invalid value, or conflicts with another setting` | The value would make the agent invalid. |
 | `you can only change yourself (mind_alice); omit agent_name to change yourself` | `agent_name` is given and is not the calling agent's key, for example its display name; the error names the key. |

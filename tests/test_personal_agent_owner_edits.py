@@ -57,14 +57,15 @@ def _setup(
     return Config.validate_with_runtime(data, paths), paths
 
 
-def _edit(config: Config, paths: RuntimePaths, changes: dict[str, Any], **kwargs: Any) -> PersonalAgentRosterEntry:  # noqa: ANN401
-    return _update_owner_overrides(
-        config,
-        paths,
-        agent_name=kwargs.pop("agent_name", _AGENT),
-        requester_id=kwargs.pop("requester_id", _OWNER),
-        changes=changes,
-    )
+def _edit(
+    config: Config,
+    paths: RuntimePaths,
+    changes: dict[str, Any],
+    *,
+    agent_name: str = _AGENT,
+    requester_id: str = _OWNER,
+) -> PersonalAgentRosterEntry:
+    return _update_owner_overrides(config, paths, agent_name=agent_name, requester_id=requester_id, changes=changes)
 
 
 def _overrides(paths: RuntimePaths) -> dict[str, Any]:
@@ -257,9 +258,9 @@ def test_the_roster_is_written_under_its_lock(tmp_path: Path) -> None:
     config, paths = _setup(tmp_path)
     held: list[bool] = []
 
-    def write(*args: Any, **kwargs: Any) -> None:  # noqa: ANN401
-        held.append(file_lock_is_held(personal_agent_roster_lock_path(paths)))
-        _write_personal_agent_roster(*args, **kwargs)
+    def write(runtime_paths: RuntimePaths, roster: list[PersonalAgentRosterEntry]) -> None:
+        held.append(file_lock_is_held(personal_agent_roster_lock_path(runtime_paths)))
+        _write_personal_agent_roster(runtime_paths, roster)
 
     with patch("mindroom.personal_agents._write_personal_agent_roster", new=write):
         _edit(config, paths, {"role": "Mine"})

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import re
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from mindroom.config.main import Config
 from mindroom.config.personal_agents import (
     PersonalAgentRosterEntry,
     personal_agent_roster_lock_path,
+    personal_agent_roster_path,
     read_personal_agent_roster,
 )
 from mindroom.file_locks import file_lock_is_held
@@ -42,9 +45,12 @@ def _setup(
     owner_edits: bool = True,
     entry: PersonalAgentRosterEntry | None = None,
     aliases: dict[str, list[str]] | None = None,
+    default_tools: list[str] | None = None,
     **agent: object,
 ) -> tuple[Config, RuntimePaths]:
     data = deepcopy(BASE)
+    if default_tools is not None:
+        data["defaults"] = {"tools": default_tools}
     data["personal_agents"]["mind"] = {
         "owner_edits": owner_edits,
         "agent": {"display_name": "Mind", "role": "R", "model": "default", "tools": ["calculator", "shell"], **agent},
@@ -344,3 +350,73 @@ def test_edit_is_refused_when_the_roster_moved_the_agent_to_another_template(tmp
         owner_agent_summary(config, paths, _AGENT, requester_id=_OWNER)
 
     assert read_personal_agent_roster(paths) == before
+
+
+_LIMIT = {"exclude_tools": ["x"]}
+
+
+@pytest.mark.parametrize(
+    ("tools", "default_tools", "kept", "limited", "reason"),
+    [
+        (["calculator", {"file": _LIMIT}], ["file"], ["calculator"], "file", "defaults.tools also provides it"),
+        (
+            ["openclaw_compat", {"scheduler": _LIMIT}],
+            [],
+            ["openclaw_compat"],
+            "scheduler",
+            "the preset `openclaw_compat` provides it",
+        ),
+        (
+            ["matrix_message", {"attachments": _LIMIT}],
+            [],
+            ["matrix_message"],
+            "attachments",
+            "`matrix_message` implies it",
+        ),
+    ],
+)
+def test_a_tool_that_arrives_another_way_keeps_the_template_entry(
+    tmp_path: Path,
+    tools: list[object],
+    default_tools: list[str],
+    kept: list[str],
+    limited: str,
+    reason: str,
+) -> None:
+    """Dropping a tool that defaults.tools, a preset or an implied tool still gives would strip the template's settings.
+
+    So the agent keeps the template's entry, and a request to drop it is refused with the reason.
+    """
+    entry = _entry(_OWNER, overrides={"tools": kept})
+    config, paths = _setup(tmp_path, entry=entry, default_tools=default_tools, tools=tools)
+
+    assert {tool.name: tool.overrides for tool in config.agents[_AGENT].tools}.get(limited) == _LIMIT
+    assert limited in owner_agent_summary(config, paths, _AGENT, requester_id=_OWNER)["editable"]["tools"]
+    with pytest.raises(PersonalAgentEditError) as raised:
+        _edit(config, paths, {"tools": kept})
+    assert str(raised.value) == f"`{limited}` cannot be removed: {reason}"
+
+
+def test_an_accepted_edit_loads_unclamped(tmp_path: Path) -> None:
+    """What an edit stores is what the next load builds, including a tool defaults.tools also gives."""
+    config, paths = _setup(tmp_path, default_tools=["file"], tools=["calculator", "shell", {"file": _LIMIT}])
+    _edit(config, paths, {"role": "Mine", "tools": ["file", "calculator"]})
+
+    with capture_logs() as logs:
+        reloaded = Config.validate_with_runtime(config.authored_model_dump(), paths)
+
+    agent = reloaded.agents[_AGENT]
+    assert agent.role == "Mine"
+    assert {tool.name: tool.overrides for tool in agent.tools} == {"calculator": {}, "file": _LIMIT}
+    assert [log for log in logs if log["event"] == "personal_agent_override_clamped"] == []
+
+
+def test_an_unedited_entry_is_written_as_older_releases_read_it(tmp_path: Path) -> None:
+    """An entry without edits is written without overrides, so a rollback to a release that forbids the key loads."""
+    paths = test_runtime_paths(tmp_path)
+    _write_personal_agent_roster(paths, [_entry(_OWNER), _entry("@bob:example.org", overrides={"role": "Mine"})])
+
+    written = json.loads(personal_agent_roster_path(paths).read_text(encoding="utf-8"))["entries"]
+
+    assert ["overrides" in entry for entry in written] == [False, True]
+    assert [entry.overrides for entry in read_personal_agent_roster(paths)] == [{}, {"role": "Mine"}]

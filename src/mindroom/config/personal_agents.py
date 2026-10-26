@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, 
 
 from mindroom.config.access import validate_concrete_matrix_user_ids
 from mindroom.config.agent import AgentConfig
-from mindroom.config.models import ToolConfigEntry
+from mindroom.config.models import DefaultsConfig, ToolConfigEntry
 from mindroom.config.schema_hints import dashboard_hint
 from mindroom.constants import AGENT_NAME_PATTERN, tracking_dir
 from mindroom.logging_config import get_logger
@@ -287,11 +287,15 @@ def ceiling_names(ceiling: Mapping[str, Any], field: str) -> list[str]:
 def apply_owner_overrides(
     ceiling: Mapping[str, Any],
     overrides: Mapping[str, Any],
+    *,
+    default_tools: Sequence[str],
 ) -> tuple[dict[str, Any], dict[str, object]]:
     """Apply an owner's edits on top of the agent the template grants, clamping instead of raising.
 
     A free field keeps the ceiling's value when the new one would make the agent invalid.
     A subset field keeps only the names the ceiling has, and a selected tool keeps the ceiling's whole entry.
+    A tool entry also stays while `default_tools`, a preset or an implied tool still gives the agent that tool,
+    because the tool would otherwise arrive without the ceiling's settings.
     Every other field keeps the ceiling's value. Returns the agent data and the dropped values keyed by field.
     """
     agent = deepcopy(dict(ceiling))
@@ -311,7 +315,11 @@ def apply_owner_overrides(
             if rejected := [name for name in value if name not in kept]:
                 dropped[field] = rejected
             if field == "tools":
-                agent[field] = [raw for raw in _entries(agent, field) if _tool_name(raw) in kept]
+                from mindroom.config.main import Config  # noqa: PLC0415 - config.main imports this module
+
+                included = [] if ceiling.get("include_default_tools") is False else list(default_tools)
+                reachable = Config.expand_tool_names([*kept, *included])
+                agent[field] = [raw for raw in _entries(agent, field) if _tool_name(raw) in reachable]
             else:
                 agent[field] = list(dict.fromkeys(kept))
         else:
@@ -322,12 +330,14 @@ def apply_owner_overrides(
 def owner_edited_agent_data(
     template: Mapping[str, Any],
     entry: PersonalAgentRosterEntry,
+    *,
+    default_tools: Sequence[str],
 ) -> tuple[dict[str, Any], bool]:
     """Build one generated agent, and say whether the owner's edits were applied to it."""
     agent = personal_agent_data(template, entry)
     if template.get("owner_edits") is not True or not entry.overrides:
         return agent, False
-    agent, dropped = apply_owner_overrides(agent, entry.overrides)
+    agent, dropped = apply_owner_overrides(agent, entry.overrides, default_tools=default_tools)
     if dropped:
         logger.warning("personal_agent_override_clamped", agent_name=entry.agent_name, dropped=dropped)
     return agent, True
@@ -394,6 +404,12 @@ def expand_personal_agents(data: object, roster: Sequence[PersonalAgentRosterEnt
         "personal_agents": raw_templates,
     }
 
+    defaults = config.get("defaults")
+    if isinstance(defaults, dict) and "tools" in defaults:
+        default_tools = ceiling_names(defaults, "tools")
+    else:
+        default_tools = DefaultsConfig().tool_names
+
     agents: dict[str, Any] = dict(authored_agents)
     instances: dict[str, PersonalAgentInstance] = {}
     owners: dict[str, set[str]] = {}
@@ -410,7 +426,7 @@ def expand_personal_agents(data: object, roster: Sequence[PersonalAgentRosterEnt
                 raise ValueError(msg)
         if entry.pending:
             continue
-        agent, edited = owner_edited_agent_data(template, entry)
+        agent, edited = owner_edited_agent_data(template, entry, default_tools=default_tools)
         agents[entry.agent_name] = agent
         instances[entry.agent_name] = PersonalAgentInstance(entry.template, entry.user_id, entry.matrix_username)
         # An edited agent no longer shows that the template's own default generates a valid agent.

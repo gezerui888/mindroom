@@ -26,6 +26,8 @@ class PersonalAgentManagerTools(Toolkit):
             name="personal_agent_manager",
             tools=[self.list_my_agents, self.update_agent],
         )
+        # The owner confirms every change, because the model issuing the call also reads untrusted content.
+        self.async_functions["update_agent"].requires_confirmation = True
 
     async def list_my_agents(self) -> str:
         """List what the owner may change about this agent: its key, its current editable values and the allowed names.
@@ -66,10 +68,10 @@ class PersonalAgentManagerTools(Toolkit):
         `list_my_agents` result; for tools these are toolkit names such as `todo`, never function names such as `add_todo`.
         Send only the fields you change, because each value replaces the whole field,
         and a field set to null goes back to the template's value.
+        To remove a tool, send `tools` with only the names to keep.
         Only this agent's owner may ask; anyone else gets an error.
         A request for a name outside the template's grant is refused whole, with the allowed names in the error.
-        No confirmation is requested, because every edit stays within what the template grants;
-        an administrator who wants one can add a `tool_approval` rule for this tool.
+        The owner confirms each change before it is stored.
         The change applies after a short configuration reload.
 
         Args:

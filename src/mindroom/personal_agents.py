@@ -51,8 +51,9 @@ class PersonalAgentEditError(ValueError):
 
 
 def _write_personal_agent_roster(runtime_paths: RuntimePaths, roster: list[PersonalAgentRosterEntry]) -> None:
-    payload = {"entries": [entry.model_dump(mode="json") for entry in roster]}
-    write_json_file_durable(personal_agent_roster_path(runtime_paths), payload, strict_atomic_replace=True)
+    # Unedited entries omit overrides, so a rollback to a release that forbids the key still loads them.
+    entries = [entry.model_dump(mode="json", exclude=None if entry.overrides else {"overrides"}) for entry in roster]
+    write_json_file_durable(personal_agent_roster_path(runtime_paths), {"entries": entries}, strict_atomic_replace=True)
 
 
 def _append_personal_agent_roster_entry(runtime_paths: RuntimePaths, entry: PersonalAgentRosterEntry) -> None:
@@ -316,7 +317,7 @@ def owner_agent_summary(
         agent_name,
         requester_id,
     )
-    clamped, _ = apply_owner_overrides(ceiling, entry.overrides)
+    clamped, _ = apply_owner_overrides(ceiling, entry.overrides, default_tools=config.defaults.tool_names)
     agent = AgentConfig.model_validate(clamped)
     editable = {field: getattr(agent, field) for field in sorted(OWNER_FREE_FIELDS | OWNER_SUBSET_FIELDS)}
     editable["tools"] = agent.tool_names
@@ -327,9 +328,22 @@ def owner_agent_summary(
     }
 
 
-def _refusals(ceiling: Mapping[str, Any], overrides: Mapping[str, Any], changes: Mapping[str, Any]) -> list[str]:
+def _tool_source(config: Config, tool: str, chosen: list[str]) -> str:
+    """Say what still gives the agent a tool the owner removed: a chosen preset or tool, else defaults.tools."""
+    source = next((other for other in chosen if tool in config.expand_tool_names([other])), None)
+    if source is None:
+        return "defaults.tools also provides it"
+    return f"the preset `{source}` provides it" if config.is_tool_preset(source) else f"`{source}` implies it"
+
+
+def _refusals(
+    config: Config,
+    ceiling: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+    changes: Mapping[str, Any],
+) -> list[str]:
     """Say why each requested change would not stick: the fields expansion would drop, and those never editable."""
-    _, dropped = apply_owner_overrides(ceiling, overrides)
+    agent, dropped = apply_owner_overrides(ceiling, overrides, default_tools=config.defaults.tool_names)
     editable = OWNER_FREE_FIELDS | OWNER_SUBSET_FIELDS
     refusals: list[str] = []
     for field in changes:
@@ -344,6 +358,12 @@ def _refusals(ceiling: Mapping[str, Any], overrides: Mapping[str, Any], changes:
                 refusals.append(f"{field} must be a list of names; allowed: {allowed}")
         elif field in dropped:
             refusals.append(f"{field} has an invalid value, or conflicts with another setting")
+        elif field == "tools" and isinstance(chosen := overrides.get(field), list):
+            refusals.extend(
+                f"`{tool}` cannot be removed: {_tool_source(config, tool, chosen)}"
+                for tool in ceiling_names(agent, field)
+                if tool not in chosen
+            )
     return refusals
 
 
@@ -369,7 +389,7 @@ def update_owner_overrides(
                 overrides.pop(field, None)
             else:
                 overrides[field] = deepcopy(value)
-        if refusals := _refusals(ceiling, overrides, changes):
+        if refusals := _refusals(config, ceiling, overrides, changes):
             raise PersonalAgentEditError("; ".join(refusals))
         updated = entry.model_copy(update={"overrides": overrides})
         _write_personal_agent_roster(runtime_paths, [updated if other is entry else other for other in roster])

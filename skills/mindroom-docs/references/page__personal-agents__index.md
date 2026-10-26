@@ -119,7 +119,7 @@ A field the owner has edited keeps the owner's value when the template's value c
 | Class | Fields | What the owner can set |
 | --- | --- | --- |
 | Free | `display_name`, `role`, `instructions`, `markdown`, `thread_mode`, `num_history_runs`, `num_history_messages`, `show_tool_calls` | Any value that still makes a valid agent. Placeholders such as `{user}` are not replaced in an edit. |
-| Subset | `tools`, `skills`, `knowledge_bases`, `delegate_to` | A list of names, each of them in the ceiling's list. A selected tool keeps the ceiling's whole entry, so its per-tool settings cannot change. Tools that come from `defaults.tools` are not in the agent's own `tools` list, so an owner cannot remove them. |
+| Subset | `tools`, `skills`, `knowledge_bases`, `delegate_to` | A list of names, each of them in the ceiling's list. A selected tool keeps the ceiling's whole entry, so its per-tool settings cannot change. A tool the agent would still get another way cannot be removed: one in `defaults.tools`, one in a kept preset such as `openclaw_compat`, or one a kept tool implies, such as `attachments` for `matrix_message`. Such a removal is refused, so the tool never loses the template's settings. |
 | Fixed | Every other field | Nothing; the ceiling's value stays. |
 
 The fixed fields include `model`, `worker_tools`, `worker_scope`, `file_access`, `access`, `credential_managers`, `private`, and `allow_self_config`.
@@ -135,7 +135,7 @@ Loading never fails because of an edit, and the stored edit stays, so granting t
 
 ### Who can edit
 
-Only the owner can view or change the agent's settings.
+Only the owner can view or change the agent's settings through `personal_agent_manager`.
 The requester must be the owner's Matrix ID, or a [bridge alias](https://docs.mindroom.chat/authorization/#bridge-aliases) of it, and an administrator or anyone else the template's `access` admits is refused, so a person admitted to work with the agent cannot reshape it.
 An administrator changes someone's agent through the template or `users`.
 An agent changes only itself, never another personal agent.
@@ -144,11 +144,11 @@ An agent changes only itself, never another personal agent.
 
 A generated agent whose template has `owner_edits: true` gets the [`personal_agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#personal_agent_manager) tool automatically.
 `list_my_agents()` returns the agent's key, its editable values, and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
-The tool asks for no confirmation, because every edit stays within the template's grant; to add one, put a [`tool_approval`](https://docs.mindroom.chat/tool-approval/) rule on `update_agent`.
+The owner confirms each change on an approval card, even when `tool_approval.default` is `auto_approve`, because the agent also reads content the owner did not write and that content could try to rewrite it.
 
 ```text
 Alice: Call yourself Sage and stop using web_search.
-Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}))
+Agent: (calls list_my_agents, then update_agent(changes={"display_name": "Sage", "tools": ["calculator"]}), and Alice approves)
 Agent: Done. I'm Sage from the next reload, and I no longer have web search.
 Alice: Now give yourself shell.
 Agent: (calls update_agent(changes={"tools": ["calculator", "shell"]}))

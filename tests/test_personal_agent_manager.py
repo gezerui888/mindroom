@@ -9,13 +9,17 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
+from mindroom.agents import create_agent
+from mindroom.approval.tool_approval import POLICY_CONFIRMATION_APPROVAL_TYPE
 from mindroom.config.personal_agents import personal_agent_roster_path, read_personal_agent_roster
 from mindroom.custom_tools.personal_agent_manager import PersonalAgentManagerTools
 from mindroom.message_target import MessageTarget
 from mindroom.tool_system.agno_toolkits import adapt_toolkit
 from mindroom.tool_system.runtime_context import tool_runtime_context
+from tests.agent_tool_helpers import offered_function
 from tests.authorization_helpers import make_test_tool_runtime_context
 from tests.conftest import make_conversation_reader_mock, make_relation_lookup
+from tests.identity_helpers import persist_entity_accounts
 from tests.test_personal_agent_owner_edits import _AGENT, _OWNER, _setup
 
 if TYPE_CHECKING:
@@ -53,6 +57,26 @@ def _as_requester(
 
 def _orchestrator() -> Any:  # noqa: ANN401 - a stub for the orchestrator runtime the context carries
     return MagicMock()
+
+
+def test_built_agent_requires_confirmation_for_updates_only(tmp_path: Path) -> None:
+    """The owner confirms each change, because the model making it also reads untrusted content."""
+    config, paths = _setup(tmp_path)
+    persist_entity_accounts(config, paths)
+    build = create_agent(
+        _AGENT,
+        config,
+        paths,
+        execution_identity=None,
+        knowledge=None,
+        active_model_name=None,
+        supports_native_tool_approval=True,
+    )
+
+    update = offered_function(build, "update_agent")
+    assert update.requires_confirmation is True
+    assert update.approval_type != POLICY_CONFIRMATION_APPROVAL_TYPE
+    assert offered_function(build, "list_my_agents").requires_confirmation is not True
 
 
 def test_update_agent_schema_lets_a_model_send_text_and_name_lists() -> None:

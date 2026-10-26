@@ -356,6 +356,7 @@ oxylabs = [
 pandas = [
   "pandas>=2.2",
 ]
+personal_agent_manager = []
 postgres = [
   "psycopg[binary]",
 ]

@@ -29,6 +29,7 @@ from mindroom.desktop.credentials import (
 )
 from mindroom.history.prompt_tokens import build_static_token_estimator
 from mindroom.mcp.toolkit import MindRoomMCPToolkit
+from mindroom.personal_agents import _append_personal_agent_roster_entry
 from mindroom.providers.gemini import wire as gemini_wire
 from mindroom.response_runner import _agent_has_matrix_messaging_tool
 from mindroom.tool_system.agno_toolkits import adapt_function, adapt_toolkit, offered_refusal
@@ -41,6 +42,7 @@ from mindroom.tool_system.metadata import TOOL_METADATA
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.agent_tool_helpers import call_entrypoint, offered_function, source_toolkit
 from tests.identity_helpers import persist_entity_accounts
+from tests.test_personal_agents_config import _entry
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -2073,3 +2075,34 @@ def test_search_toolkit_results_are_never_redirected_to_output_files(
 
     assert "dynamic_tools" in _toolkit_names(agent)
     assert "dynamic_tools" not in wrapped
+
+
+def test_tool_is_offered_only_with_owner_edits(tmp_path: Path) -> None:
+    """A generated agent gets personal_agent_manager when its template grants owner edits; no other agent does."""
+    raw = _base_config_data()
+    raw["personal_agents"] = {
+        "editable": {"owner_edits": True, "agent": {"display_name": "Editable", "model": "default"}},
+        "fixed": {"agent": {"display_name": "Fixed", "model": "default"}},
+    }
+    paths = _runtime_paths(tmp_path)
+    for template in ("editable", "fixed"):
+        _append_personal_agent_roster_entry(
+            paths,
+            _entry("@alice:example.org", template=template, agent_name=f"{template}_alice"),
+        )
+    config = _validated_config(tmp_path, raw)
+
+    def offered(agent_name: str) -> bool:
+        build = create_agent(
+            agent_name,
+            config,
+            paths,
+            execution_identity=None,
+            knowledge=None,
+            active_model_name=None,
+        )
+        return "personal_agent_manager" in _toolkit_names(build)
+
+    assert offered("editable_alice")
+    assert not offered("fixed_alice")
+    assert not offered("code")

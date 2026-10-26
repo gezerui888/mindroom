@@ -17,11 +17,11 @@ from mindroom.config.personal_agents import (
 )
 from mindroom.file_locks import file_lock_is_held
 from mindroom.personal_agents import (
+    PersonalAgentEditError,
     _append_personal_agent_roster_entry,
-    _owner_agent_summary,
-    _PersonalAgentEditError,
-    _update_owner_overrides,
     _write_personal_agent_roster,
+    owner_agent_summary,
+    update_owner_overrides,
 )
 from tests.conftest import test_runtime_paths
 from tests.test_personal_agents_config import BASE, _entry
@@ -65,7 +65,7 @@ def _edit(
     agent_name: str = _AGENT,
     requester_id: str = _OWNER,
 ) -> PersonalAgentRosterEntry:
-    return _update_owner_overrides(config, paths, agent_name=agent_name, requester_id=requester_id, changes=changes)
+    return update_owner_overrides(config, paths, agent_name=agent_name, requester_id=requester_id, changes=changes)
 
 
 def _overrides(paths: RuntimePaths) -> dict[str, Any]:
@@ -89,7 +89,7 @@ def test_non_owner_is_refused(tmp_path: Path) -> None:
     config, paths = _setup(tmp_path)
     before = read_personal_agent_roster(paths)
 
-    with pytest.raises(_PersonalAgentEditError, match=re.escape("Only @alice:example.org can change this agent")):
+    with pytest.raises(PersonalAgentEditError, match=re.escape("Only @alice:example.org can change this agent")):
         _edit(config, paths, {"role": "Mine"}, requester_id="@bob:example.org")
 
     assert read_personal_agent_roster(paths) == before
@@ -108,7 +108,7 @@ def test_out_of_ceiling_tool_is_refused(tmp_path: Path) -> None:
     """A tool outside the template's grant is named, with the names the owner may choose from."""
     config, paths = _setup(tmp_path)
 
-    with pytest.raises(_PersonalAgentEditError) as raised:
+    with pytest.raises(PersonalAgentEditError) as raised:
         _edit(config, paths, {"tools": ["calculator", "browser"]})
 
     assert str(raised.value) == "tools cannot include browser; allowed: calculator, shell"
@@ -120,7 +120,7 @@ def test_out_of_ceiling_names_are_refused_for_every_subset_field(tmp_path: Path,
     """A subset field names what is disallowed and says when the template grants nothing."""
     config, paths = _setup(tmp_path)
 
-    with pytest.raises(_PersonalAgentEditError) as raised:
+    with pytest.raises(PersonalAgentEditError) as raised:
         _edit(config, paths, {field: ["x", "y"]})
 
     assert str(raised.value) == f"{field} cannot include x, y; allowed: none"
@@ -130,7 +130,7 @@ def test_non_list_subset_value_is_refused(tmp_path: Path) -> None:
     """A subset field must be a list of names, so a bare string is refused with the allowed names."""
     config, paths = _setup(tmp_path)
 
-    with pytest.raises(_PersonalAgentEditError) as raised:
+    with pytest.raises(PersonalAgentEditError) as raised:
         _edit(config, paths, {"tools": "shell"})
 
     assert str(raised.value) == "tools must be a list of names; allowed: calculator, shell"
@@ -141,7 +141,7 @@ def test_fixed_field_is_refused(tmp_path: Path) -> None:
     config, paths = _setup(tmp_path)
 
     for changes in ({"model": "x"}, {"model": None}, {"access": {"users": ["@bob:example.org"]}}):
-        with pytest.raises(_PersonalAgentEditError) as raised:
+        with pytest.raises(PersonalAgentEditError) as raised:
             _edit(config, paths, changes)
         assert str(raised.value) == f"{next(iter(changes))} is not editable"
 
@@ -152,7 +152,7 @@ def test_invalid_free_value_is_refused(tmp_path: Path) -> None:
     """A free field value the agent could not load with is refused by field name."""
     config, paths = _setup(tmp_path)
 
-    with pytest.raises(_PersonalAgentEditError, match="thread_mode has an invalid value"):
+    with pytest.raises(PersonalAgentEditError, match="thread_mode has an invalid value"):
         _edit(config, paths, {"thread_mode": "nonsense", "role": "Mine"})
 
     assert _overrides(paths) == {}
@@ -162,7 +162,7 @@ def test_free_value_that_conflicts_with_a_stored_edit_is_refused(tmp_path: Path)
     """Two history limits that exclude each other cannot both be stored, so the later one is refused."""
     config, paths = _setup(tmp_path, entry=_entry(_OWNER, overrides={"num_history_runs": 3}))
 
-    with pytest.raises(_PersonalAgentEditError, match="num_history_messages has an invalid value"):
+    with pytest.raises(PersonalAgentEditError, match="num_history_messages has an invalid value"):
         _edit(config, paths, {"num_history_messages": 10})
 
     assert _overrides(paths) == {"num_history_runs": 3}
@@ -172,7 +172,7 @@ def test_every_refusal_is_reported_and_none_is_stored(tmp_path: Path) -> None:
     """One bad field refuses the whole request, and the message names each one."""
     config, paths = _setup(tmp_path)
 
-    with pytest.raises(_PersonalAgentEditError) as raised:
+    with pytest.raises(PersonalAgentEditError) as raised:
         _edit(config, paths, {"role": "Mine", "model": "x", "tools": ["browser"]})
 
     assert str(raised.value) == "model is not editable; tools cannot include browser; allowed: calculator, shell"
@@ -192,7 +192,7 @@ def test_edits_refused_while_owner_edits_is_off(tmp_path: Path) -> None:
     """Without the template's switch the owner may not edit, and nothing is stored."""
     config, paths = _setup(tmp_path, owner_edits=False)
 
-    with pytest.raises(_PersonalAgentEditError, match=re.escape("Owner edits are off for this agent's template")):
+    with pytest.raises(PersonalAgentEditError, match=re.escape("Owner edits are off for this agent's template")):
         _edit(config, paths, {"role": "Mine"})
 
     assert _overrides(paths) == {}
@@ -202,9 +202,9 @@ def test_authored_agent_is_refused(tmp_path: Path) -> None:
     """An agent written in the config belongs to no owner, so it cannot be edited this way."""
     config, paths = _setup(tmp_path)
 
-    with pytest.raises(_PersonalAgentEditError, match="helper is not a personal agent"):
+    with pytest.raises(PersonalAgentEditError, match="helper is not a personal agent"):
         _edit(config, paths, {"role": "Mine"}, agent_name="helper")
-    with pytest.raises(_PersonalAgentEditError, match="missing is not a personal agent"):
+    with pytest.raises(PersonalAgentEditError, match="missing is not a personal agent"):
         _edit(config, paths, {"role": "Mine"}, agent_name="missing")
 
 
@@ -213,7 +213,7 @@ def test_agent_missing_from_the_roster_is_refused(tmp_path: Path) -> None:
     config, paths = _setup(tmp_path)
     _write_personal_agent_roster(paths, [])
 
-    with pytest.raises(_PersonalAgentEditError, match="mind_alice is not a personal agent"):
+    with pytest.raises(PersonalAgentEditError, match="mind_alice is not a personal agent"):
         _edit(config, paths, {"role": "Mine"})
 
 
@@ -274,7 +274,7 @@ def test_owner_agent_summary_lists_allowed_names(tmp_path: Path) -> None:
     entry = _entry(_OWNER, overrides={"role": "Mine", "tools": ["calculator", "gone"], "model": "x"})
     config, paths = _setup(tmp_path, entry=entry, skills=["review"], instructions=["Be brief"])
 
-    summary = _owner_agent_summary(config, paths, _AGENT)
+    summary = owner_agent_summary(config, paths, _AGENT, requester_id=_OWNER)
 
     assert summary["agent_name"] == _AGENT
     assert summary["allowed"] == {
@@ -302,9 +302,45 @@ def test_owner_agent_summary_lists_allowed_names(tmp_path: Path) -> None:
 def test_owner_agent_summary_refuses_what_an_edit_would(tmp_path: Path) -> None:
     """The summary refuses an authored agent and a template without owner edits, as an edit does."""
     config, paths = _setup(tmp_path)
-    with pytest.raises(_PersonalAgentEditError, match="helper is not a personal agent"):
-        _owner_agent_summary(config, paths, "helper")
+    with pytest.raises(PersonalAgentEditError, match="helper is not a personal agent"):
+        owner_agent_summary(config, paths, "helper", requester_id=_OWNER)
 
     config, paths = _setup(tmp_path / "off", owner_edits=False)
-    with pytest.raises(_PersonalAgentEditError, match=re.escape("Owner edits are off for this agent's template")):
-        _owner_agent_summary(config, paths, _AGENT)
+    with pytest.raises(PersonalAgentEditError, match=re.escape("Owner edits are off for this agent's template")):
+        owner_agent_summary(config, paths, _AGENT, requester_id=_OWNER)
+
+
+def test_owner_agent_summary_refuses_a_non_owner(tmp_path: Path) -> None:
+    """Only the owner may read the agent's settings, so the summary is refused to anyone else."""
+    config, paths = _setup(tmp_path)
+
+    with pytest.raises(PersonalAgentEditError) as raised:
+        owner_agent_summary(config, paths, _AGENT, requester_id="@bob:example.org")
+
+    assert str(raised.value) == f"Only {_OWNER} can change this agent"
+
+
+def test_a_non_owner_learns_nothing_about_the_template(tmp_path: Path) -> None:
+    """The owner check comes before the owner-edits-off refusal, so a stranger cannot tell whether the switch is on."""
+    config, paths = _setup(tmp_path, owner_edits=False)
+
+    with pytest.raises(PersonalAgentEditError) as edit:
+        _edit(config, paths, {"role": "Mine"}, requester_id="@bob:example.org")
+    with pytest.raises(PersonalAgentEditError) as summary:
+        owner_agent_summary(config, paths, _AGENT, requester_id="@bob:example.org")
+
+    assert str(edit.value) == str(summary.value) == f"Only {_OWNER} can change this agent"
+
+
+def test_edit_is_refused_when_the_roster_moved_the_agent_to_another_template(tmp_path: Path) -> None:
+    """The roster is read again under the lock, so a template change since the config loaded refuses the edit."""
+    config, paths = _setup(tmp_path)
+    _write_personal_agent_roster(paths, [_entry(_OWNER, template="other")])
+    before = read_personal_agent_roster(paths)
+
+    with pytest.raises(PersonalAgentEditError, match="changed template since the configuration loaded"):
+        _edit(config, paths, {"role": "Mine"})
+    with pytest.raises(PersonalAgentEditError, match="changed template since the configuration loaded"):
+        owner_agent_summary(config, paths, _AGENT, requester_id=_OWNER)
+
+    assert read_personal_agent_roster(paths) == before

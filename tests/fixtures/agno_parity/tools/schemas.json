@@ -22069,6 +22069,100 @@
       }
     ]
   },
+  "personal_agent_manager": {
+    "instructions": null,
+    "guidance": null,
+    "functions": [
+      {
+        "name": "list_my_agents",
+        "description": "List what the owner may change about this agent: its current values and the names its template grants.\nThe template's grant is the ceiling: tools, skills, knowledge_bases and delegate_to can only be chosen from\nthe `allowed` names, and display_name, role, instructions and similar fields are free text.\nOnly this agent's owner may ask; anyone else gets an error.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mindroom_output_path": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional MindRoom-managed workspace-relative path. If set, the full supported tool output is written to this file in your workspace and the tool returns only a compact receipt. Use this for large output you plan to inspect later with file, coding, python, or shell tools."
+            }
+          },
+          "required": []
+        },
+        "strict": false,
+        "requires_confirmation": false,
+        "external_execution": false,
+        "approval_type": null,
+        "stop_after_tool_call": false
+      },
+      {
+        "name": "update_agent",
+        "description": "Change this agent's settings for its owner. Only the fields in `changes` are touched.\n`agent_name` must be this agent's own name, because an agent can only change itself.\n`changes` maps field names to new values, such as {\"role\": \"Concise reviewer\", \"tools\": [\"calculator\"]};\na field set to null goes back to the template's value.\nOnly this agent's owner may ask; anyone else gets an error.\nA request for a name outside the template's grant is refused whole, with the allowed names in the error;\ncall `list_my_agents` first to see them.\nNo confirmation is requested, because every edit stays within what the template grants;\nan administrator who wants one can add a `tool_approval` rule for this tool.\nThe change applies after a short configuration reload.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "agent_name": {
+              "type": "string"
+            },
+            "changes": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "mindroom_output_path": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Optional MindRoom-managed workspace-relative path. If set, the full supported tool output is written to this file in your workspace and the tool returns only a compact receipt. Use this for large output you plan to inspect later with file, coding, python, or shell tools."
+            }
+          },
+          "required": [
+            "agent_name",
+            "changes"
+          ]
+        },
+        "strict": false,
+        "requires_confirmation": false,
+        "external_execution": false,
+        "approval_type": null,
+        "stop_after_tool_call": false
+      }
+    ]
+  },
   "postgres": {
     "instructions": null,
     "guidance": null,

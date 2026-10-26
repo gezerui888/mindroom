@@ -816,6 +816,11 @@ def build_agent_toolkit(  # noqa: C901, PLR0911, PLR0912
             SelfConfigTools(agent_name=agent_name, runtime_paths=runtime_paths),
         )
 
+    if tool_name == "personal_agent_manager":
+        from mindroom.custom_tools.personal_agent_manager import PersonalAgentManagerTools  # noqa: PLC0415
+
+        return wrap_direct(PersonalAgentManagerTools(agent_name=agent_name))
+
     if tool_name == "skill_manage":
         from mindroom.custom_tools.skill_manage import SkillManageTools  # noqa: PLC0415
 

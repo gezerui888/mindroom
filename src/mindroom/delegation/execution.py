@@ -73,8 +73,9 @@ from mindroom.redaction import redact_sensitive_text
 from mindroom.response_turn import (
     ResponsePausedForApproval,
     apply_exact_approval_decisions,
-    local_approval_requirements,
+    own_approved_calls,
     paused_attempt_from_response,
+    pending_approval_requirements,
 )
 from mindroom.run_storage import RunStorage, TerminalRecord
 from mindroom.runtime_resolution import resolve_agent_runtime, resolve_agent_storage
@@ -328,9 +329,7 @@ async def _execute_child(
     if persisted.status != RunStatus.paused or decisions is None:
         # A retained pause must never acquire ownership from a later reconstruction.
         return _ChildOutcome(persisted, {})
-    child_state = DelegationState.from_metadata(persisted.metadata)
-    local_calls = () if child_state.pending_child_id is not None else approval_calls
-    approved_calls = tuple(call for call in local_calls if decisions.get(call.tool_call_id))
+    approved_calls = own_approved_calls(persisted, approval_calls, decisions)
     required_tool_names = await required_approval_tool_names(
         child.child_agent_name,
         approved_calls,
@@ -383,7 +382,7 @@ async def _execute_child(
         msg = "Delegated run's session is no longer available"
         raise RuntimeError(msg)
     toolkit_owners = tool_owners_by_agent(build)
-    validate_approval_tool_owners(toolkit_owners, approved_calls, local_approval_requirements(persisted))
+    validate_approval_tool_owners(toolkit_owners, approved_calls, pending_approval_requirements(persisted))
     runner = ResumeRunner(
         build=build,
         config=config,
@@ -448,12 +447,10 @@ async def _start_child_envelope(
             config=config,
             runtime_paths=runtime_paths,
             refresh_scheduler=refresh_scheduler,
-            supports_native_tool_approval=True,
         )
     except ResponsePausedForApproval as suspension:
+        # The paused attempt published its run id and model when it started, through ``run_child``.
         toolkit_owners = suspension.paused.toolkit_owners
-        if suspension.paused.runtime_model_name is not None:
-            note_child_run_id(child, child.run_id, runtime_paths, model_name=suspension.paused.runtime_model_name)
     response = await read_child_run(child, config, runtime_paths)
     if response is None:
         msg = result or "Delegated execution did not retain its exact run outcome"
@@ -469,6 +466,22 @@ async def _observed_child_events(events: AsyncIterator[RunEvent]) -> AsyncIterat
             yield event
 
 
+@dataclass(frozen=True)
+class _ObservedChildResume:
+    """A delegated child's resume under ``runner``, its events passed through the child's observers."""
+
+    runner: ResumeRunner
+
+    @property
+    def storage(self) -> RunStorage:
+        """Where the child's row lives."""
+        return self.runner.storage
+
+    def events(self, paused: RunRecord, decisions: ResumeDecisions) -> AsyncIterator[RunEvent]:
+        """Resume ``paused`` with ``decisions``, its events observed as this context's own."""
+        return _observed_child_events(self.runner.events(paused, decisions))
+
+
 async def _continue_child(
     runner: ResumeRunner,
     run_child: ChildResponseRunner,
@@ -482,24 +495,20 @@ async def _continue_child(
     approval_calls: Sequence[ApprovalCall],
 ) -> RunRecord:
     """Apply child decisions and drive any further nested delegations under the config ``runner`` resumes with."""
-
-    async def continue_run(paused: RunRecord, resume: ResumeDecisions, _on_event: ResumeEvents | None) -> RunRecord:
-        return await forward_resume(_observed_child_events(runner.events(paused, resume)), None, paused=paused)
-
+    resume = _ObservedChildResume(runner)
     driver_decisions: dict[str, bool] | None = decisions
     if not has_delegation_state(persisted):
-        persisted = await continue_run(
-            persisted,
-            approval_decisions(approval_calls, decisions, denial_reasons or {}),
+        persisted = await forward_resume(
+            resume.events(persisted, approval_decisions(approval_calls, decisions, denial_reasons or {})),
             None,
+            paused=persisted,
         )
         driver_decisions = None
         denial_reasons = None
         approval_calls = ()
     return await _drive_delegations(
         persisted,
-        storage=runner.storage,
-        continue_parent=continue_run,
+        continue_parent=resume,
         agent_name=child.child_agent_name,
         run_child=run_child,
         config=runner.config,
@@ -1014,10 +1023,9 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
     that saves the real parent without adding a provider requirement or message.
     A managed `background` runtime owns children this call starts or continues.
     The call's own started and completed events reach `on_event` through `tag_call_event`.
+    ``execution_identity`` is a Matrix owner's: the driver refuses any other, and a hidden CLI call's is built from
+    its Matrix runtime context.
     """
-    if execution_identity.channel != "matrix":
-        msg = "Native delegation requires a Matrix execution owner"
-        raise RuntimeError(msg)
     # Bind this exact parent call and its presentation before resolving the target.
     tool = requirement.tool_execution
     tool_name = tool.tool_name
@@ -1381,7 +1389,6 @@ def prepare_delegation_state(
 async def _drive_delegations[R: AnyRunRecord](
     response: R,
     *,
-    storage: RunStorage,
     continue_parent: ContinueRun[R],
     agent_name: str,
     run_child: ChildResponseRunner,
@@ -1399,9 +1406,10 @@ async def _drive_delegations[R: AnyRunRecord](
     """Advance one durable parent; sequential children preserve completed sibling results.
 
     ``continue_parent`` resumes the parent with the decisions on its own calls and its children's results, and
-    returns its new terminal record; the loop behind it refuses anything but exact coverage of the calls the parent
-    waits for. ``storage`` is where the parent's row lives.
+    holds where the parent's row lives; the loop behind it refuses anything but exact coverage of the calls the parent
+    waits for. The continuation's events reach ``on_event``.
     """
+    storage = continue_parent.storage
     if not has_delegation_state(response):
         return response
     if execution_identity is None or execution_identity.channel != "matrix":
@@ -1471,10 +1479,11 @@ async def _drive_delegations[R: AnyRunRecord](
             await persist(state)
             return response
         await persist(state)
-        response = await continue_parent(
-            _awaiting_answers(response),
-            replace(own, external_results=answered_delegation_calls(response)),
+        awaiting = _awaiting_answers(response)
+        response = await forward_resume(
+            continue_parent.events(awaiting, replace(own, external_results=answered_delegation_calls(response))),
             on_event,
+            paused=awaiting,
         )
         own = ResumeDecisions()
         state.clear_pending()
@@ -1486,7 +1495,6 @@ async def drive_delegation_stream[R: AnyRunRecord](
     events: AsyncIterator[RunEvent],
     *,
     record_type: type[R],
-    storage: RunStorage,
     continue_parent: ContinueRun[R],
     **options: Unpack[_DelegationOptions],
 ) -> AsyncIterator[RunEvent]:
@@ -1508,7 +1516,6 @@ async def drive_delegation_stream[R: AnyRunRecord](
     async def drive(on_event: Callable[[object], None]) -> R:
         return await _drive_delegations(
             record,
-            storage=storage,
             continue_parent=continue_parent,
             on_event=on_event,
             **options,

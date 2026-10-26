@@ -48,6 +48,7 @@ from mindroom.response_sources import ResponseSources
 from mindroom.response_turn import CompletedApprovalRun, PausedAttempt, ResponsePausedForApproval
 from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.teams import envelope
+from mindroom.teams import leader as leader_module
 from mindroom.teams.members import _as_member
 from mindroom.teams.spec import TeamMode
 from mindroom.tool_jobs.instances import pin_background_tool_jobs
@@ -661,7 +662,7 @@ async def test_the_leader_runs_with_compaction_bound_to_the_team_scope(
     captured: dict[str, Any] = {}
     # Every member's hooks come from the same builder; the leader's compaction is the one built for the team.
     compactions: list[dict[str, Any]] = []
-    real_run_team = envelope.run_team
+    real_run_team = leader_module.run_team
     real_compaction_hook = loop_hooks.mid_turn_compaction_hook
 
     def capture_run_team(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
@@ -672,7 +673,7 @@ async def test_the_leader_runs_with_compaction_bound_to_the_team_scope(
         compactions.append(kwargs)
         return real_compaction_hook(**kwargs)
 
-    monkeypatch.setattr(envelope, "run_team", capture_run_team)
+    monkeypatch.setattr(leader_module, "run_team", capture_run_team)
     monkeypatch.setattr(loop_hooks, "mid_turn_compaction_hook", capture_compaction_hook)
 
     await team.stream()
@@ -835,6 +836,86 @@ async def test_an_approved_member_call_resumes_the_stored_team_run_and_renders_t
     assert team.models["default"].requests[-1].messages[-1].content == (
         "Member results after human-in-the-loop resolution:\n[Checker]: Touched."
     )
+
+
+class _HandOffProbe(ProbeToolkit):
+    """The squad's probe toolkit plus ``hand_off``, a call executed outside the agent loop, which nothing answers."""
+
+    def __init__(self) -> None:
+        Toolkit.__init__(
+            self,
+            name="probe",
+            tools=[self.touch, self.scope, self.dig, self.model, self.hand_off],
+            external_execution_required_tools=["hand_off"],
+        )
+
+    async def hand_off(self) -> str:
+        """Hand the work to an external executor."""
+        return "handed off"
+
+
+@pytest.mark.asyncio
+async def test_a_team_approval_resume_that_pauses_on_a_call_nothing_answers_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member that pauses again on an externally executed call no approval asks about fails the team's resume."""
+    with registered_toolkit(PROBE_TOOL, _HandOffProbe):
+        team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
+        team.models["checker-model"] = ScriptedModel([calls(tool_call("hand_off", "call-hand"))])
+
+        # The failure names the call the team waits for, not the generic note it gave before.
+        with pytest.raises(RuntimeError, match=r"team run 'run-1' paused on \['hand_off'\] without an approval"):
+            await team.resume(
+                raised.paused,
+                approved=True,
+                approvals=(member_approval("call-touch", "dangerous"),),
+            )
+
+    assert ProbeToolkit.calls == ["dangerous"]
+    record, _members = team.stored_runs()
+    assert record.status is RunStatus.paused
+
+
+@pytest.mark.asyncio
+async def test_a_member_resumed_by_an_approval_stores_to_the_team_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member's calls after its approved call address the team's history, as its calls before the pause did."""
+    team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
+    team.models["default"] = ScriptedModel([answer("Done.")])
+    team.models["checker-model"] = ScriptedModel([calls(tool_call("scope", "call-scope")), answer("Touched.")])
+
+    result = await team.resume(
+        raised.paused,
+        approved=True,
+        approvals=(member_approval("call-touch", "dangerous"),),
+    )
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert ProbeToolkit.scopes == ["team:squad"]
+
+
+@pytest.mark.asyncio
+async def test_a_saved_team_approval_resumes_the_run_in_the_scope_its_approval_retained(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A team no longer configured resumes from the storage its approval retained, not the scope it resolves to now."""
+    team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
+    team.models["default"] = ScriptedModel([answer("The checker touched it.")])
+    team.models["checker-model"] = ScriptedModel([answer("Touched.")])
+    del team.config.teams["squad"]
+
+    result = await team.resume(
+        raised.paused,
+        approved=True,
+        approvals=(member_approval("call-touch", "dangerous"),),
+    )
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert ProbeToolkit.calls == ["dangerous"]
 
 
 @pytest.mark.asyncio

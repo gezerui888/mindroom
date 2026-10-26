@@ -762,19 +762,13 @@ async def test_the_stored_team_run_carries_the_turn_s_run_session_and_requester(
     stream: bool,
 ) -> None:
     team = _team(tmp_path, monkeypatch, leader=[answer("General response")])
-    run_ids: list[str] = []
 
-    await team.reply(
-        stream=stream,
-        ctx=team.ctx(run_id="run-123"),
-        user_id="@alice:localhost",
-        run_id_callback=run_ids.append,
-    )
+    await team.reply(stream=stream, ctx=team.ctx(run_id="run-123"), user_id="@alice:localhost")
 
     record, members = team.stored_runs()
     assert (record.run_id, record.session_id, record.user_id) == ("run-123", SESSION_ID, "@alice:localhost")
     assert members == []
-    assert run_ids == ["run-123"]
+    assert team.recorder.run_id == "run-123"
 
 
 @pytest.mark.asyncio
@@ -911,6 +905,7 @@ async def test_preparing_a_team_turn_directly_recovers_an_earlier_reply_s_notice
         list(team.member_names),
         team.orchestrator,
         team.identity,
+        config=team.config,
         configured_team_name=None,
         reason_prefix="Team request",
         active_model_names=dict.fromkeys(team.member_names, "default"),
@@ -962,6 +957,7 @@ def test_a_member_build_without_a_role_is_refused_not_rostered_with_an_empty_one
         list(team.member_names),
         team.orchestrator,
         team.identity,
+        config=team.config,
         configured_team_name=None,
         reason_prefix="Team request",
         active_model_names=dict.fromkeys(team.member_names, "default"),

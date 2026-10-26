@@ -21,7 +21,7 @@ register_builtin_tool_metadata(
         file_access=ToolFileAccess.NONE,
         display_name="Personal Agent Manager",
         description="Let a personal agent change its own editable settings for its owner, within its template's grant",
-        docs_url="https://docs.mindroom.chat/personal-agents/",
+        docs_url="https://docs.mindroom.chat/personal-agents/#owner-edits",
         category=ToolCategory.DEVELOPMENT,
         status=ToolStatus.AVAILABLE,
         setup_type=SetupType.NONE,

@@ -5646,7 +5646,7 @@
       "dependencies": [],
       "description": "Let a personal agent change its own editable settings for its owner, within its template's grant",
       "display_name": "Personal Agent Manager",
-      "docs_url": "https://docs.mindroom.chat/personal-agents/",
+      "docs_url": "https://docs.mindroom.chat/personal-agents/#owner-edits",
       "executes_code": false,
       "file_access": "none",
       "function_names": [

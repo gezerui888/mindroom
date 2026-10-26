@@ -45,6 +45,7 @@ A key follows the [agent naming rules](configuration/agents.md#naming-rules) and
 | `matrix_username` | string | `mindroom_<agent key>` | Matrix localpart pattern; it contains `{username}` exactly once plus at least one other character, so no agent takes a person's bare localpart, and renders to `[a-z0-9._=/-]`. `_<MINDROOM_NAMESPACE>` is appended when a namespace is set, and the default account carries the same suffix. |
 | `agent` | object | Required | Any [agent](configuration/agents.md#configuration-options) fields; the defaults for every user's agent. |
 | `users` | object | `{}` | Per-user overrides keyed by concrete Matrix user ID, with no patterns. Each override is an agent field that replaces the template's value whole, so a list or object is not merged. |
+| `owner_edits` | boolean | `false` | Let each owner change their own agent by asking it in chat, within what this template grants; see [Owner Edits](#owner-edits). A quoted `"true"` fails validation. |
 
 Placeholders are replaced as exact tokens, so other braces in prompts stay literal and a replaced value is never replaced again.
 
@@ -64,6 +65,7 @@ Every generated agent also gets these settings, whatever the template says:
 - The owner is added to `access.users` and `credential_managers` when missing.
 - `access.members_of_rooms` is `[]` when missing or null, so membership of the agent's rooms grants nothing unless you list rooms yourself.
 - `allow_self_config` is `false`, even when `defaults.allow_self_config` is true, because `self_config` edits `agents.<name>`, which a generated agent does not have.
+- The [`personal_agent_manager`](tools/agent-orchestration.md#personal_agent_manager) tool is added when the template sets `owner_edits: true`.
 
 Config validation rejects `private` and `allow_self_config: true` in the template's `agent` and in any `users` override, because a personal agent already belongs to one user.
 A template or override that would produce an invalid agent fails validation as soon as you save or load it, even before anyone has onboarded, with `personal_agents would generate an invalid agent for a new user:` and the reason.
@@ -91,6 +93,82 @@ With `members_of_rooms: [lobby]` and the lobby as the onboarding room, every onb
 > Anyone the template's `access` admits can work with the owner's agent, including its memory, its files, and its shared credentials.
 > That includes the admitted person's own agent acting for them, because an agent mentioned in a reply acts for the person who requested that reply (see [Agents mentioning other agents](authorization.md#agents-mentioning-other-agents)).
 > Admit only people you would trust with everything an owner gives their agent.
+
+## Owner Edits
+
+A generated agent follows its template, so a person who wants another tone or fewer tools has to ask an administrator to edit `users`.
+Set `owner_edits: true` on a template and each owner can change their own agent by asking it in chat, within what the template grants.
+
+```yaml
+personal_agents:
+  mind:
+    owner_edits: true
+    agent:
+      display_name: "{user_display_name}'s Mind"
+      role: Personal assistant for {user}.
+      model: sonnet
+      tools: [calculator, web_search]
+      memory_backend: file
+```
+
+The switch defaults to `false`.
+Turning it off ignores every stored edit but keeps them, so turning it on again brings them back, and the agent no longer gets the tool.
+
+### The ceiling
+
+The ceiling is the agent the template describes for that user: the template's `agent` plus the administrator's `users` override for that user, with placeholders replaced.
+An owner can never go beyond it, and an administrator who edits the template or `users` moves the ceiling at the next reload.
+A field the owner has edited keeps the owner's value when the template's value changes; setting the field to `null` gives it back to the template.
+
+| Class | Fields | What the owner can set |
+| --- | --- | --- |
+| Free | `display_name`, `role`, `instructions`, `markdown`, `thread_mode`, `num_history_runs`, `num_history_messages`, `show_tool_calls` | Any value that still makes a valid agent. Placeholders such as `{user}` are not replaced in an edit. |
+| Subset | `tools`, `skills`, `knowledge_bases`, `delegate_to` | A list of names, each of them in the ceiling's list. A selected tool keeps the ceiling's whole entry, so its per-tool settings cannot change. Tools that come from `defaults.tools` are not in the agent's own `tools` list, so an owner cannot remove them. |
+| Fixed | Every other field | Nothing; the ceiling's value stays. |
+
+The fixed fields include `model`, `worker_tools`, `worker_scope`, `file_access`, `access`, `credential_managers`, `private`, and `allow_self_config`.
+So an owner cannot pick a dearer model, move a tool between a worker and the main process, widen who may use the agent, or reach files the template does not grant.
+
+### Where edits live
+
+Edits are stored as `overrides` on the agent's entry in `tracking/personal_agents.json`, never in `config.yaml`, so they appear neither in the dashboard nor in `config_manager`, and they are backed up with the storage.
+Each load clamps them to the current ceiling.
+A name the template no longer grants, or a value that would make the agent invalid, is ignored, and MindRoom logs `personal_agent_override_clamped` with the agent's name and the `dropped` values.
+Loading never fails because of an edit, and the stored edit stays, so granting the name again makes it take effect again.
+
+### Who can edit
+
+Only the owner can view or change the agent's settings.
+The requester must be the owner's Matrix ID, or a [bridge alias](authorization.md#bridge-aliases) of it, and an administrator or anyone else the template's `access` admits is refused, so a person admitted to work with the agent cannot reshape it.
+An administrator changes someone's agent through the template or `users`.
+An agent changes only itself, never another personal agent.
+
+### The tool
+
+A generated agent whose template has `owner_edits: true` gets the [`personal_agent_manager`](tools/agent-orchestration.md#personal_agent_manager) tool automatically.
+`list_my_agents()` returns the agent's editable values and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
+The tool asks for no confirmation, because every edit stays within the template's grant; to add one, put a [`tool_approval`](tool-approval.md) rule on `update_agent`.
+
+```text
+Alice: Call yourself Sage and stop using web_search.
+Agent: (calls list_my_agents, then update_agent("mind_alice", {"display_name": "Sage", "tools": ["calculator"]}))
+Agent: Done. I'm Sage from the next reload, and I no longer have web search.
+Alice: Now give yourself shell.
+Agent: (calls update_agent("mind_alice", {"tools": ["calculator", "shell"]}))
+Agent: That is not available: tools cannot include shell; allowed: calculator, web_search.
+```
+
+A refused request changes nothing, and the tool returns one of these reasons as `Error: <reason>`.
+
+| Reason | Meaning |
+| --- | --- |
+| `Only @alice:example.org can change this agent` | The requester is not the owner. |
+| `Owner edits are off for this agent's template` | The template has `owner_edits: false`. |
+| `tools cannot include shell; allowed: calculator, web_search` | A name is outside the ceiling; the same wording applies to `skills`, `knowledge_bases`, and `delegate_to`. |
+| `model is not editable` | The field is fixed or unknown. |
+| `role has an invalid value, or conflicts with another setting` | The value would make the agent invalid. |
+| `you can only change yourself` | `agent_name` is not the calling agent. |
+| `no changes given` | `changes` is empty. |
 
 ## Onboarding Behavior
 

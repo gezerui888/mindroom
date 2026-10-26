@@ -582,6 +582,7 @@ depends_on = [
     "mindroom.response_sources",
     "mindroom.stop",
     "mindroom.streaming",
+    "mindroom.tool_system.agno_toolkits",
     "mindroom.tool_system.call_record",
     "mindroom.tool_system.events",
     "mindroom.tool_system.tool_function",
@@ -7762,6 +7763,7 @@ depends_on = [
     "mindroom.tool_jobs.settings",
     "mindroom.tool_jobs.background_after",
     "mindroom.tool_system.runtime_context",
+    "mindroom.tool_system.tool_function",
     "mindroom.tool_system.worker_routing",
 ]
 

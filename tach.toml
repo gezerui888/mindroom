@@ -1196,9 +1196,10 @@ depends_on = []
 
 [[modules]]
 path = "mindroom.providers.google_adc"
-depends_on = ["mindroom.startup_errors"]
+depends_on = ["mindroom.constants", "mindroom.startup_errors"]
 visibility = [
     "mindroom.providers.anthropic.messages",
+    "mindroom.providers.gemini",
 ]
 
 [[modules]]
@@ -6452,7 +6453,14 @@ expose = [
 from = ["mindroom.ai"]
 
 [[interfaces]]
-expose = ["dashboard_api_key", "missing_model_api_key_provider", "model_uses_own_credential", "uses_alternative_auth"]
+expose = [
+    "dashboard_api_key",
+    "gemini_uses_vertexai",
+    "missing_model_api_key_provider",
+    "model_api_key",
+    "model_uses_own_credential",
+    "uses_alternative_auth",
+]
 from = ["mindroom.providers.credentials"]
 
 [[interfaces]]
@@ -8002,7 +8010,6 @@ depends_on = ["mindroom.bounded_bytes", "mindroom.llm", "mindroom.logging_config
 [[modules]]
 path = "mindroom.providers.gemini"
 depends_on = [
-    "mindroom.credentials.sync",
     "mindroom.llm",
     "mindroom.logging_config",
     "mindroom.model_defaults",
@@ -8010,6 +8017,7 @@ depends_on = [
     "mindroom.providers.credentials",
     "mindroom.providers.errors",
     "mindroom.providers.extra_kwargs",
+    "mindroom.providers.google_adc",
     "mindroom.providers.remote_media",
     "mindroom.providers.tool_policy",
 ]

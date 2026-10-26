@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, field_validator, model_validator
 
 from mindroom.config.access import validate_concrete_matrix_user_ids
 from mindroom.config.agent import AgentConfig
@@ -95,7 +95,8 @@ class PersonalAgentTemplateConfig(BaseModel):
         ),
         json_schema_extra=dashboard_hint(key_placeholder="@alice:example.org"),
     )
-    owner_edits: bool = Field(
+    # Strict, so a string such as "true" is refused instead of silently leaving owner edits off.
+    owner_edits: StrictBool = Field(
         default=False,
         description="Let each owner change their agent's editable fields through it, within this template's grant",
     )
@@ -318,6 +319,17 @@ def _apply_owner_overrides(
     return agent, dropped
 
 
+def _generated_agent(template: Mapping[str, Any], entry: PersonalAgentRosterEntry) -> tuple[dict[str, Any], bool]:
+    """Build one generated agent, and say whether the owner's edits were applied to it."""
+    agent = personal_agent_data(template, entry)
+    if template.get("owner_edits") is not True or not entry.overrides:
+        return agent, False
+    agent, dropped = _apply_owner_overrides(agent, entry.overrides)
+    if dropped:
+        logger.warning("personal_agent_override_clamped", agent_name=entry.agent_name, dropped=dropped)
+    return agent, True
+
+
 def _expandable_templates(templates: dict[Any, Any]) -> dict[str, dict[str, Any]]:
     """Keep templates whose shape expansion can read; the schema reports the rest."""
     return {
@@ -395,14 +407,12 @@ def expand_personal_agents(data: object, roster: Sequence[PersonalAgentRosterEnt
                 raise ValueError(msg)
         if entry.pending:
             continue
-        agent = personal_agent_data(template, entry)
-        if template.get("owner_edits") is True and entry.overrides:
-            agent, dropped = _apply_owner_overrides(agent, entry.overrides)
-            if dropped:
-                logger.warning("personal_agent_override_clamped", agent_name=entry.agent_name, dropped=dropped)
+        agent, edited = _generated_agent(template, entry)
         agents[entry.agent_name] = agent
         instances[entry.agent_name] = PersonalAgentInstance(entry.template, entry.user_id, entry.matrix_username)
-        owners.setdefault(entry.template, set()).add(entry.user_id)
+        # An edited agent no longer shows that the template's own default generates a valid agent.
+        if not edited:
+            owners.setdefault(entry.template, set()).add(entry.user_id)
 
     probes = _probe_agents(templates, owners)
     return _PersonalAgentExpansion(

@@ -491,3 +491,24 @@ def test_old_roster_entries_load_without_overrides(tmp_path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"entries": [entry]}), encoding="utf-8")
     assert [loaded.overrides for loaded in read_personal_agent_roster(paths)] == [{}]
+
+
+def test_owner_edits_do_not_mask_a_broken_template_default(tmp_path: Path) -> None:
+    """An owner who edited away a broken template field must not hide it from the check for the next user."""
+    data = deepcopy(BASE)
+    data["personal_agents"]["mind"] = _owner_template(model="default", knowledge_bases=["missing"])
+    entry = _entry(overrides={"knowledge_bases": []})
+    with pytest.raises(
+        ConfigRuntimeValidationError,
+        match="personal_agents would generate an invalid agent for a new user:",
+    ):
+        _runtime_config(tmp_path, data, roster=(entry,))
+
+
+def test_owner_edits_rejects_a_quoted_boolean() -> None:
+    """A quoted "true" fails validation instead of silently leaving owner edits off."""
+    agent = {"display_name": "Mind"}
+    assert PersonalAgentTemplateConfig.model_validate({"agent": agent, "owner_edits": True}).owner_edits is True
+    for value in ("true", 1):
+        with pytest.raises(ValidationError, match="owner_edits"):
+            PersonalAgentTemplateConfig.model_validate({"agent": agent, "owner_edits": value})

@@ -22075,7 +22075,7 @@
     "functions": [
       {
         "name": "list_my_agents",
-        "description": "List what the owner may change about this agent: its current values and the names its template grants.\nThe template's grant is the ceiling: tools, skills, knowledge_bases and delegate_to can only be chosen from\nthe `allowed` names, and display_name, role, instructions and similar fields are free text.\nOnly this agent's owner may ask; anyone else gets an error.",
+        "description": "List what the owner may change about this agent: its key, its current editable values and the allowed names.\nCall this before `update_agent`.\nThe result has `agent_name` (this agent's own key), `editable` (the current values) and `allowed`\n(the names the template grants for tools, skills, knowledge_bases and delegate_to).\ndisplay_name, role, instructions and similar fields are free text.\nOnly this agent's owner may ask; anyone else gets an error.",
         "parameters": {
           "type": "object",
           "properties": {
@@ -22102,12 +22102,19 @@
       },
       {
         "name": "update_agent",
-        "description": "Change this agent's settings for its owner. Only the fields in `changes` are touched.\n`agent_name` must be this agent's own name, because an agent can only change itself.\n`changes` maps field names to new values, such as {\"role\": \"Concise reviewer\", \"tools\": [\"calculator\"]};\na field set to null goes back to the template's value.\nOnly this agent's owner may ask; anyone else gets an error.\nA request for a name outside the template's grant is refused whole, with the allowed names in the error;\ncall `list_my_agents` first to see them.\nNo confirmation is requested, because every edit stays within what the template grants;\nan administrator who wants one can add a `tool_approval` rule for this tool.\nThe change applies after a short configuration reload.",
+        "description": "Change this agent's settings for its owner. Only the fields in `changes` are touched.\nCall `list_my_agents` first. Omit `agent_name`: an agent can only change itself.\n`changes` maps field names to new values, such as {\"role\": \"Concise reviewer\", \"tools\": [\"calculator\"]}.\nSend `tools`, `skills`, `knowledge_bases` and `delegate_to` as names taken from `allowed` in the\n`list_my_agents` result; for tools these are toolkit names such as `todo`, never function names such as `add_todo`.\nSend only the fields you change, because each value replaces the whole field,\nand a field set to null goes back to the template's value.\nOnly this agent's owner may ask; anyone else gets an error.\nA request for a name outside the template's grant is refused whole, with the allowed names in the error.\nNo confirmation is requested, because every edit stays within what the template grants;\nan administrator who wants one can add a `tool_approval` rule for this tool.\nThe change applies after a short configuration reload.",
         "parameters": {
           "type": "object",
           "properties": {
             "agent_name": {
-              "type": "string"
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "changes": {
               "type": "object",
@@ -22151,7 +22158,6 @@
             }
           },
           "required": [
-            "agent_name",
             "changes"
           ]
         },

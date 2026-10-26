@@ -28,14 +28,16 @@ class PersonalAgentManagerTools(Toolkit):
         )
 
     async def list_my_agents(self) -> str:
-        """List what the owner may change about this agent: its current values and the names its template grants.
+        """List what the owner may change about this agent: its key, its current editable values and the allowed names.
 
-        The template's grant is the ceiling: tools, skills, knowledge_bases and delegate_to can only be chosen from
-        the `allowed` names, and display_name, role, instructions and similar fields are free text.
+        Call this before `update_agent`.
+        The result has `agent_name` (this agent's own key), `editable` (the current values) and `allowed`
+        (the names the template grants for tools, skills, knowledge_bases and delegate_to).
+        display_name, role, instructions and similar fields are free text.
         Only this agent's owner may ask; anyone else gets an error.
 
         Returns:
-            The agent's editable settings and the allowed names as YAML, or an error message.
+            The agent's key, editable settings and allowed names as YAML, or an error message.
 
         """
         context = get_tool_runtime_context()
@@ -55,21 +57,23 @@ class PersonalAgentManagerTools(Toolkit):
             return f"Error: {exc}"
         return yaml.safe_dump(summary, default_flow_style=False, sort_keys=False)
 
-    async def update_agent(self, agent_name: str, changes: dict[str, _ChangeValue]) -> str:
+    async def update_agent(self, agent_name: str | None = None, *, changes: dict[str, _ChangeValue]) -> str:
         """Change this agent's settings for its owner. Only the fields in `changes` are touched.
 
-        `agent_name` must be this agent's own name, because an agent can only change itself.
-        `changes` maps field names to new values, such as {"role": "Concise reviewer", "tools": ["calculator"]};
-        a field set to null goes back to the template's value.
+        Call `list_my_agents` first. Omit `agent_name`: an agent can only change itself.
+        `changes` maps field names to new values, such as {"role": "Concise reviewer", "tools": ["calculator"]}.
+        Send `tools`, `skills`, `knowledge_bases` and `delegate_to` as names taken from `allowed` in the
+        `list_my_agents` result; for tools these are toolkit names such as `todo`, never function names such as `add_todo`.
+        Send only the fields you change, because each value replaces the whole field,
+        and a field set to null goes back to the template's value.
         Only this agent's owner may ask; anyone else gets an error.
-        A request for a name outside the template's grant is refused whole, with the allowed names in the error;
-        call `list_my_agents` first to see them.
+        A request for a name outside the template's grant is refused whole, with the allowed names in the error.
         No confirmation is requested, because every edit stays within what the template grants;
         an administrator who wants one can add a `tool_approval` rule for this tool.
         The change applies after a short configuration reload.
 
         Args:
-            agent_name: This agent's own name.
+            agent_name: Leave out to change this agent; a different name is refused.
             changes: Field names mapped to their new values, or to null to restore the template's value.
 
         Returns:
@@ -79,8 +83,8 @@ class PersonalAgentManagerTools(Toolkit):
         context = get_tool_runtime_context()
         if context is None:
             return _NO_CONTEXT_ERROR
-        if agent_name != self.agent_name:
-            return "Error: you can only change yourself"
+        if agent_name not in (None, self.agent_name):
+            return f"Error: you can only change yourself ({self.agent_name}); omit agent_name to change yourself"
         if not changes:
             return "Error: no changes given"
         try:

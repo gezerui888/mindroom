@@ -63,6 +63,7 @@ def test_update_agent_schema_lets_a_model_send_text_and_name_lists() -> None:
         if function.name == "update_agent"
     )
 
+    assert function.parameters["required"] == ["changes"]
     value_types = function.parameters["properties"]["changes"]["additionalProperties"]["anyOf"]
 
     assert {"type": "string"} in value_types
@@ -78,7 +79,7 @@ async def test_update_agent_writes_and_requests_reload(tmp_path: Path) -> None:
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, orchestrator=orchestrator):
-        result = await tool.update_agent(_AGENT, {"role": "Mine", "tools": ["calculator"]})
+        result = await tool.update_agent(_AGENT, changes={"role": "Mine", "tools": ["calculator"]})
 
     assert result == f"Updated {_AGENT}: role, tools."
     (entry,) = read_personal_agent_roster(paths)
@@ -93,7 +94,7 @@ async def test_update_agent_without_an_orchestrator_still_writes(tmp_path: Path)
     tool = PersonalAgentManagerTools(agent_name=_AGENT)
 
     with _as_requester(tool, config, paths):
-        result = await tool.update_agent(_AGENT, {"role": "Mine"})
+        result = await tool.update_agent(_AGENT, changes={"role": "Mine"})
 
     assert not result.startswith("Error")
     assert read_personal_agent_roster(paths)[0].overrides == {"role": "Mine"}
@@ -107,7 +108,7 @@ async def test_update_agent_refusal_is_returned_and_requests_no_reload(tmp_path:
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, orchestrator=orchestrator):
-        result = await tool.update_agent(_AGENT, {"tools": ["browser"]})
+        result = await tool.update_agent(_AGENT, changes={"tools": ["browser"]})
 
     assert result == "Error: tools cannot include browser; allowed: calculator, shell"
     assert read_personal_agent_roster(paths)[0].overrides == {}
@@ -123,11 +124,26 @@ async def test_update_agent_with_no_changes_does_nothing(tmp_path: Path) -> None
     roster_before = personal_agent_roster_path(paths).read_bytes()
 
     with _as_requester(tool, config, paths, orchestrator=orchestrator):
-        result = await tool.update_agent(_AGENT, {})
+        result = await tool.update_agent(_AGENT, changes={})
 
     assert result == "Error: no changes given"
     assert personal_agent_roster_path(paths).read_bytes() == roster_before
     orchestrator.config_reload.request_reload.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_update_agent_defaults_to_itself(tmp_path: Path) -> None:
+    """Leaving agent_name out changes the calling agent's own entry."""
+    config, paths = _setup(tmp_path)
+    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    orchestrator = _orchestrator()
+
+    with _as_requester(tool, config, paths, orchestrator=orchestrator):
+        result = await tool.update_agent(changes={"role": "Mine"})
+
+    assert result == f"Updated {_AGENT}: role."
+    assert read_personal_agent_roster(paths)[0].overrides == {"role": "Mine"}
+    orchestrator.config_reload.request_reload.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -138,7 +154,7 @@ async def test_update_agent_refuses_a_non_owner(tmp_path: Path) -> None:
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, requester_id="@bob:example.org", orchestrator=orchestrator):
-        result = await tool.update_agent(_AGENT, {"role": "Bob's"})
+        result = await tool.update_agent(_AGENT, changes={"role": "Bob's"})
 
     assert result == f"Error: Only {_OWNER} can change this agent"
     assert read_personal_agent_roster(paths)[0].overrides == {}
@@ -146,16 +162,17 @@ async def test_update_agent_refuses_a_non_owner(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_agent_refuses_another_agent(tmp_path: Path) -> None:
-    """An agent changes only itself, even for its owner, so another agent's name is refused."""
+@pytest.mark.parametrize("wrong_name", ["helper", "Alice's Mind"])
+async def test_update_agent_refuses_another_agent(tmp_path: Path, wrong_name: str) -> None:
+    """An agent changes only itself, so another agent's name or its own display name is refused, naming its key."""
     config, paths = _setup(tmp_path)
     tool = PersonalAgentManagerTools(agent_name=_AGENT)
     orchestrator = _orchestrator()
 
     with _as_requester(tool, config, paths, orchestrator=orchestrator):
-        result = await tool.update_agent("helper", {"role": "Mine"})
+        result = await tool.update_agent(wrong_name, changes={"role": "Mine"})
 
-    assert result == "Error: you can only change yourself"
+    assert result == f"Error: you can only change yourself ({_AGENT}); omit agent_name to change yourself"
     assert read_personal_agent_roster(paths)[0].overrides == {}
     orchestrator.config_reload.request_reload.assert_not_called()
 
@@ -170,7 +187,7 @@ async def test_manager_refuses_an_authored_agent(tmp_path: Path) -> None:
 
     with _as_requester(tool, config, paths):
         listed = await tool.list_my_agents()
-        updated = await tool.update_agent("helper", {"role": "Mine"})
+        updated = await tool.update_agent("helper", changes={"role": "Mine"})
 
     assert listed == "Error: helper is not a personal agent"
     assert updated == "Error: helper is not a personal agent"
@@ -183,7 +200,7 @@ async def test_update_agent_without_runtime_context_fails_closed(tmp_path: Path)
     _, paths = _setup(tmp_path)
     tool = PersonalAgentManagerTools(agent_name=_AGENT)
 
-    result = await tool.update_agent(_AGENT, {"role": "Mine"})
+    result = await tool.update_agent(_AGENT, changes={"role": "Mine"})
 
     assert result.startswith("Error")
     assert read_personal_agent_roster(paths)[0].overrides == {}

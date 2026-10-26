@@ -222,62 +222,32 @@ def drive_team_delegations(
     return cast("AsyncIterator[TeamRunEvent]", driven)
 
 
-def _waiting_slot(presentation: TeamStreamPresentation, requirement: RunRequirement) -> tuple[str, str]:
-    """Return the slot that shows the call ``requirement`` waits on and the call's id there, by ``pending_call_slot``."""
-    member_id, call_id = pending_call_slot(requirement, presentation.config_names_by_id.values())
-    if member_id is None:
-        return "team", call_id
-    return f"agent:{presentation.resolve_member_id(member_id, requirement.member_display_name)}", call_id
-
-
 def continued_team_pause(presentation: TeamStreamPresentation, paused: PausedAttempt) -> PausedAttempt:
     """Render the pending calls into their slots and freeze the document the pause shows.
 
-    The approval card of a member's own delegation call adds no marker: the member's slot already shows that call
-    pending under its own id, and the resume finishes it there.
+    Each call waits in the slot ``pending_call_slot`` names, the rule the approval card anchors by too. The approval
+    card of a member's own delegation call adds no marker: the member's slot already shows that call pending under
+    its own id, and the resume finishes it there. Every other call waits under its own id.
     """
     member_names = presentation.config_names_by_id.values()
     for requirement in paused.requirements:
         if member_delegation_card(requirement, member_names):
             continue
-        scope, _ = _waiting_slot(presentation, requirement)
-        presentation.start_tool(scope, requirement.tool_execution.call)
+        member_id, _ = pending_call_slot(requirement, member_names)
+        call = requirement.tool_execution.call
+        if member_id is None:
+            presentation.start_tool("team", call)
+        else:
+            presentation.start_member_tool(
+                presentation.resolve_member_id(member_id, requirement.member_display_name),
+                call,
+            )
     return replace(
         paused,
         response_text=presentation.render_body(),
         tool_trace=tuple(presentation.tool_trace),
         response_presentation_state=presentation.to_state(),
     )
-
-
-def blocking_team_pause(
-    paused: PausedAttempt,
-    record: TeamRunRecord,
-    *,
-    config_names: Sequence[str],
-    display_names: Sequence[str],
-    show_tool_calls: bool,
-) -> PausedAttempt:
-    """Render a blocking team pause from its runs' records into the document the resume continues.
-
-    Each run's text fills its slot first, paused notices included: the leader's is the consensus, and each
-    member run that ended (``ended_member_runs``) adds its own to its member's slot. Every run's tool calls follow
-    in their slots, still pending where the pause waits on them; a member's own delegation card waits on that
-    member's call.
-    """
-    presentation = TeamStreamPresentation.new(config_names, display_names, show_tool_calls=show_tool_calls)
-    waiting = {_waiting_slot(presentation, requirement) for requirement in paused.requirements}
-    presentation.append_consensus(finished_run_text(record))
-    calls = [("team", tool) for tool in record.tools or ()]
-    for member in record.ended_member_runs:
-        member_id = presentation.resolve_member_id(member.agent_id, member.agent_display_name)
-        presentation.append_member(member_id, finished_run_text(member))
-        calls.extend((f"agent:{member_id}", tool) for tool in member.tools or ())
-    for scope, tool in calls:
-        presentation.start_tool(scope, tool.call)
-        if (scope, tool.tool_call_id) not in waiting:
-            presentation.complete_tool(scope, tool.call)
-    return continued_team_pause(presentation, paused)
 
 
 async def _finished(record: TeamRunRecord) -> AsyncIterator[TeamRunEvent]:
@@ -453,7 +423,7 @@ async def continue_paused_team_run(
                         await publish_team_presentation(progress, presentation)
         continued = attempt.terminal_record()
         # Each resumed run's slot shows what the run hands over beyond what it carried over from the pause and its
-        # events did not show: a paused notice, or a failed member run's reason.
+        # events did not show, such as a failed member run's reason; a run that paused again shows no paused notice.
         for run in (continued, *continued.ended_member_runs):
             attempt.show_unshown_handover(run)
         paused = paused_attempt_from_response(
@@ -491,7 +461,6 @@ async def continue_paused_team_run(
 
 __all__ = [
     "TeamResume",
-    "blocking_team_pause",
     "continue_paused_team_run",
     "continued_team_pause",
     "drive_team_delegations",

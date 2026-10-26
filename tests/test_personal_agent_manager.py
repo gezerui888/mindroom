@@ -115,6 +115,22 @@ async def test_update_agent_refusal_is_returned_and_requests_no_reload(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_update_agent_with_no_changes_does_nothing(tmp_path: Path) -> None:
+    """An empty change set is an error, and neither rewrites the roster nor asks for a reload."""
+    config, paths = _setup(tmp_path)
+    tool = PersonalAgentManagerTools(agent_name=_AGENT)
+    orchestrator = _orchestrator()
+    roster_before = personal_agent_roster_path(paths).read_bytes()
+
+    with _as_requester(tool, config, paths, orchestrator=orchestrator):
+        result = await tool.update_agent(_AGENT, {})
+
+    assert result == "Error: no changes given"
+    assert personal_agent_roster_path(paths).read_bytes() == roster_before
+    orchestrator.config_reload.request_reload.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_update_agent_refuses_a_non_owner(tmp_path: Path) -> None:
     """Someone else in the room cannot change the owner's agent through it."""
     config, paths = _setup(tmp_path)

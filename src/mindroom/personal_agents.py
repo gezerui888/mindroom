@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
 
 class PersonalAgentEditError(ValueError):
-    """Why an owner's edit to their personal agent was refused; the message is shown to the owner as is."""
+    """Why an owner's edit to their personal agent was refused; the message is shown to the requester as is."""
 
 
 def _write_personal_agent_roster(runtime_paths: RuntimePaths, roster: list[PersonalAgentRosterEntry]) -> None:

@@ -81,6 +81,8 @@ class PersonalAgentManagerTools(Toolkit):
             return _NO_CONTEXT_ERROR
         if agent_name != self.agent_name:
             return "Error: you can only change yourself"
+        if not changes:
+            return "Error: no changes given"
         try:
             await run_blocking_until_complete(
                 partial(

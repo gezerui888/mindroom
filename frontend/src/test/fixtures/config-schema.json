@@ -3736,6 +3736,12 @@
           "x-mindroom": {
             "key_placeholder": "@alice:example.org"
           }
+        },
+        "owner_edits": {
+          "default": false,
+          "description": "Let each owner change their agent's editable fields through it, within this template's grant",
+          "title": "Owner Edits",
+          "type": "boolean"
         }
       },
       "required": [

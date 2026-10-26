@@ -9,12 +9,14 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from mindroom.config.access import validate_concrete_matrix_user_ids
 from mindroom.config.agent import AgentConfig
+from mindroom.config.models import ToolConfigEntry
 from mindroom.config.schema_hints import dashboard_hint
 from mindroom.constants import AGENT_NAME_PATTERN, tracking_dir
+from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -28,6 +30,24 @@ _MATRIX_LOCALPART_PATTERN = re.compile(r"[a-z0-9._=/-]+")
 _MAX_USERNAME_LENGTH = 40
 _MAX_DISPLAY_NAME_LENGTH = 100
 _PROBE_USER_ID = "@personal_agent_probe:example.invalid"
+
+# The fields an owner may edit; every other field keeps the template's value.
+_OWNER_FREE_FIELDS = frozenset(
+    {
+        "display_name",
+        "role",
+        "instructions",
+        "markdown",
+        "thread_mode",
+        "num_history_runs",
+        "num_history_messages",
+        "show_tool_calls",
+    },
+)
+# These take names only: an owner may pick among the template's entries but never add or change one.
+_OWNER_SUBSET_FIELDS = frozenset({"tools", "skills", "knowledge_bases", "delegate_to"})
+
+logger = get_logger(__name__)
 
 
 def _name_pattern(name: str | None, key: str) -> str:
@@ -74,6 +94,10 @@ class PersonalAgentTemplateConfig(BaseModel):
             "each replaces the template field whole, so a list or object is not merged"
         ),
         json_schema_extra=dashboard_hint(key_placeholder="@alice:example.org"),
+    )
+    owner_edits: bool = Field(
+        default=False,
+        description="Let each owner change their agent's editable fields through it, within this template's grant",
     )
 
     def agent_name(self, key: str, username: str) -> str:
@@ -153,6 +177,8 @@ class PersonalAgentRosterEntry(BaseModel):
     source_user_id: str | None = None
     # Recorded before the account is registered, so an interrupted registration resumes under these names.
     pending: bool = False
+    # The owner's edits to their own agent; they apply only while the template allows owner_edits, and clamp to its grant.
+    overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -237,6 +263,61 @@ def personal_agent_data(template: Mapping[str, Any], entry: PersonalAgentRosterE
     return agent
 
 
+def _tool_name(raw: object) -> str | None:
+    try:
+        return ToolConfigEntry.model_validate(raw).name
+    except ValidationError:
+        return None
+
+
+def _entries(agent: Mapping[str, Any], field: str) -> list[Any]:
+    values = agent.get(field)
+    return values if isinstance(values, list) else []
+
+
+def _ceiling_names(ceiling: Mapping[str, Any], field: str) -> list[str]:
+    """Return the names the ceiling grants for one subset field."""
+    entries = _entries(ceiling, field)
+    if field == "tools":
+        return [name for raw in entries if (name := _tool_name(raw)) is not None]
+    return [entry for entry in entries if isinstance(entry, str)]
+
+
+def _apply_owner_overrides(
+    ceiling: Mapping[str, Any],
+    overrides: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, object]]:
+    """Apply an owner's edits on top of the agent the template grants, clamping instead of raising.
+
+    A free field keeps the ceiling's value when the new one would make the agent invalid.
+    A subset field keeps only the names the ceiling has, and a selected tool keeps the ceiling's whole entry.
+    Every other field keeps the ceiling's value. Returns the agent data and the dropped values keyed by field.
+    """
+    agent = deepcopy(dict(ceiling))
+    dropped: dict[str, object] = {}
+    for field, value in overrides.items():
+        if field in _OWNER_FREE_FIELDS:
+            candidate = {**agent, field: deepcopy(value)}
+            try:
+                AgentConfig.model_validate(candidate)
+            except ValidationError:
+                dropped[field] = value
+            else:
+                agent = candidate
+        elif field in _OWNER_SUBSET_FIELDS and isinstance(value, list):
+            granted = _ceiling_names(ceiling, field)
+            kept = [name for name in value if isinstance(name, str) and name in granted]
+            if rejected := [name for name in value if name not in kept]:
+                dropped[field] = rejected
+            if field == "tools":
+                agent[field] = [raw for raw in _entries(agent, field) if _tool_name(raw) in kept]
+            else:
+                agent[field] = list(dict.fromkeys(kept))
+        else:
+            dropped[field] = value
+    return agent, dropped
+
+
 def _expandable_templates(templates: dict[Any, Any]) -> dict[str, dict[str, Any]]:
     """Keep templates whose shape expansion can read; the schema reports the rest."""
     return {
@@ -314,7 +395,12 @@ def expand_personal_agents(data: object, roster: Sequence[PersonalAgentRosterEnt
                 raise ValueError(msg)
         if entry.pending:
             continue
-        agents[entry.agent_name] = personal_agent_data(template, entry)
+        agent = personal_agent_data(template, entry)
+        if template.get("owner_edits") is True and entry.overrides:
+            agent, dropped = _apply_owner_overrides(agent, entry.overrides)
+            if dropped:
+                logger.warning("personal_agent_override_clamped", agent_name=entry.agent_name, dropped=dropped)
+        agents[entry.agent_name] = agent
         instances[entry.agent_name] = PersonalAgentInstance(entry.template, entry.user_id, entry.matrix_username)
         owners.setdefault(entry.template, set()).add(entry.user_id)
 

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import ValidationError
+from structlog.testing import capture_logs
 
 from mindroom.config.knowledge import KnowledgeBaseConfig
 from mindroom.config.main import Config, ConfigRuntimeValidationError
@@ -15,6 +17,7 @@ from mindroom.config.personal_agents import (
     PersonalAgentInstance,
     PersonalAgentRosterEntry,
     PersonalAgentTemplateConfig,
+    _apply_owner_overrides,
     expand_personal_agents,
     personal_agent_data,
     personal_agent_display_name,
@@ -369,3 +372,122 @@ def test_invalid_roster_error_names_the_file(tmp_path: Path, content: str) -> No
         read_personal_agent_roster(paths)
     with pytest.raises(ConfigRuntimeValidationError, match=r"Personal agent roster .* is invalid"):
         Config.validate_with_runtime(deepcopy(BASE), paths)
+
+
+_SHELL_ENTRY = {"shell": {"extra_env_passthrough": "FOO"}}
+
+
+def _owner_template(**agent: object) -> dict[str, Any]:
+    return {"owner_edits": True, "agent": {"display_name": "Mind", "role": "R", **agent}}
+
+
+def _expanded_agent(template: dict[str, Any], entry: PersonalAgentRosterEntry) -> dict[str, Any]:
+    expansion = expand_personal_agents({"personal_agents": {"mind": template}}, [entry])
+    return expansion.data["agents"][entry.agent_name]
+
+
+def test_owner_overrides_apply_within_the_ceiling() -> None:
+    """An owner's free fields and tool selection replace the template's when the template grants them."""
+    template = _owner_template(tools=["web_search", "calculator"])
+    agent = _expanded_agent(template, _entry(overrides={"role": "Mine", "tools": ["calculator"]}))
+    assert agent["role"] == "Mine"
+    assert agent["tools"] == ["calculator"]
+    assert "owner_edits" not in agent
+
+
+def test_owner_overrides_are_clamped_to_a_narrowed_template(tmp_path: Path) -> None:
+    """A tool the admin removed after the owner chose it disappears, is reported, and never breaks loading."""
+    data = deepcopy(BASE)
+    data["personal_agents"]["mind"] = _owner_template(tools=["calculator"], model="default")
+    entry = _entry(overrides={"tools": ["shell", "calculator"]})
+    ceiling = personal_agent_data(data["personal_agents"]["mind"], entry)
+    agent, dropped = _apply_owner_overrides(ceiling, entry.overrides)
+    assert agent["tools"] == ["calculator"]
+    assert dropped == {"tools": ["shell"]}
+
+    with capture_logs() as logs:
+        config = _runtime_config(tmp_path, data, roster=(entry,))
+    assert config.agents["mind_alice_smith"].tool_names == ["calculator"]
+    clamped = [log for log in logs if log["event"] == "personal_agent_override_clamped"]
+    assert [(log["agent_name"], log["dropped"]) for log in clamped] == [("mind_alice_smith", {"tools": ["shell"]})]
+
+
+def test_selected_tools_keep_the_ceiling_entry() -> None:
+    """A selected tool keeps the template's whole entry, and an owner-supplied entry is not a name."""
+    ceiling = personal_agent_data(_owner_template(tools=[_SHELL_ENTRY, "calculator"]), _entry())
+    agent, dropped = _apply_owner_overrides(ceiling, {"tools": ["shell"]})
+    assert agent["tools"] == [_SHELL_ENTRY]
+    assert dropped == {}
+
+    forged = {"shell": {"extra_env_passthrough": "BAR"}}
+    agent, dropped = _apply_owner_overrides(ceiling, {"tools": [forged]})
+    assert agent["tools"] == []
+    assert dropped == {"tools": [forged]}
+
+
+def test_fixed_fields_in_overrides_are_dropped() -> None:
+    """Fields outside the editable set keep the template's value however the owner sets them."""
+    template = _owner_template(model="default", worker_tools=["shell"])
+    overrides = {"model": "big", "worker_tools": [], "access": {"users": ["@x:y"]}}
+    entry = _entry(overrides=overrides)
+    ceiling = personal_agent_data(template, entry)
+    agent = _expanded_agent(template, entry)
+    assert (agent["model"], agent["worker_tools"], agent["access"]) == (
+        ceiling["model"],
+        ceiling["worker_tools"],
+        ceiling["access"],
+    )
+    assert _apply_owner_overrides(ceiling, overrides)[1] == overrides
+
+
+def test_invalid_free_override_falls_back() -> None:
+    """A free field that would make the agent invalid keeps the template's value, and the rest still apply."""
+    ceiling = personal_agent_data(_owner_template(thread_mode="room"), _entry())
+    agent, dropped = _apply_owner_overrides(ceiling, {"thread_mode": "nonsense", "role": "Mine"})
+    assert agent["thread_mode"] == "room"
+    assert agent["role"] == "Mine"
+    assert dropped == {"thread_mode": "nonsense"}
+
+
+def test_free_overrides_that_only_conflict_together_keep_the_first() -> None:
+    """Two free fields that are each valid but exclusive cannot both apply, so loading stays valid."""
+    ceiling = personal_agent_data(_owner_template(), _entry())
+    agent, dropped = _apply_owner_overrides(ceiling, {"num_history_runs": 3, "num_history_messages": 10})
+    assert (agent["num_history_runs"], "num_history_messages" in agent) == (3, False)
+    assert dropped == {"num_history_messages": 10}
+
+
+@pytest.mark.parametrize("field", ["tools", "skills", "knowledge_bases", "delegate_to"])
+def test_subset_overrides_keep_owner_order_and_drop_what_is_not_a_granted_name(field: str) -> None:
+    """A subset field keeps the granted names once each, and malformed values never raise."""
+    granted = ["calculator", "shell"] if field == "tools" else ["a", "b", "c"]
+    ceiling = personal_agent_data(_owner_template(**{field: granted}), _entry())
+    chosen = ["calculator", "calculator"] if field == "tools" else ["c", "a", "c", "x", 7]
+    agent, dropped = _apply_owner_overrides(ceiling, {field: chosen})
+    assert agent[field] == (["calculator"] if field == "tools" else ["c", "a"])
+    assert dropped == ({} if field == "tools" else {field: ["x", 7]})
+
+    agent, dropped = _apply_owner_overrides(ceiling, {field: "everything"})
+    assert agent[field] == granted
+    assert dropped == {field: "everything"}
+
+
+def test_owner_overrides_ignored_while_owner_edits_is_off() -> None:
+    """Stored edits are kept but not applied while the template's switch is off, and apply again once it is on."""
+    template = _owner_template(tools=["web_search", "calculator"])
+    entry = _entry(overrides={"role": "Mine", "tools": ["calculator"]})
+    template["owner_edits"] = False
+    assert _expanded_agent(template, entry) == personal_agent_data(template, entry)
+    template["owner_edits"] = True
+    assert _expanded_agent(template, entry)["role"] == "Mine"
+
+
+def test_old_roster_entries_load_without_overrides(tmp_path: Path) -> None:
+    """A roster written before owner edits existed has no overrides key and still loads."""
+    paths = test_runtime_paths(tmp_path)
+    entry = _entry().model_dump(exclude={"overrides"})
+    assert "overrides" not in entry
+    path = personal_agent_roster_path(paths)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"entries": [entry]}), encoding="utf-8")
+    assert [loaded.overrides for loaded in read_personal_agent_roster(paths)] == [{}]

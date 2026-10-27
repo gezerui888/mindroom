@@ -136,6 +136,34 @@ Returns JSON {"value": <rendered>} so scalars survive fromJson.
 {{- end -}}
 
 {{/*
+Forward one location to an origin proxy upstream, given as the context.
+The upstream sees the browser's Host header; other request headers, such as an
+identity gateway's signed assertion and its X-Forwarded-Proto, pass through unchanged.
+*/}}
+{{- define "mindroom-client.originProxy" -}}
+proxy_pass {{ . | trimSuffix "/" }};
+proxy_http_version 1.1;
+proxy_set_header Host $http_host;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+{{- end -}}
+
+{{/*
+Forward one location to the MindRoom runtime, given as the context.
+nginx picks the location from the normalized path but forwards the raw one, so
+a raw path the runtime would route elsewhere (dot segments, encoded dots or
+slashes, empty segments) gets a 404 instead. The runtime ends its own requests,
+and a worker computer stream stays open for up to its one-hour session.
+*/}}
+{{- define "mindroom-client.runtimeProxy" -}}
+if ($request_uri ~* "^[^?]*(?://|/\.\.?(?:/|\?|$)|%2e|%2f)") {
+  return 404;
+}
+{{ include "mindroom-client.originProxy" . }}
+proxy_read_timeout 1h;
+proxy_send_timeout 1h;
+{{- end -}}
+
+{{/*
 The nginx server config serving the client under basePath.
 The image entrypoint normally writes runtime-config.js into the app directory,
 which an unprivileged read-only container forbids, so the chart serves
@@ -144,8 +172,15 @@ runtime-config.js straight from nginx and the Deployment bypasses the entrypoint
 {{- define "mindroom-client.defaultNginxConf" -}}
 {{- $base := include "mindroom-client.basePath" . -}}
 {{- $prefix := include "mindroom-client.pathPrefix" . -}}
-{{- $navigationFallbackExcludePaths := default (list) .Values.serviceWorker.navigationFallbackExcludePaths | toJson -}}
-{{- $runtimeConfig := printf "window.__APP_BASE_PATH__ = \"%s\"; window.__ENABLE_SERVICE_WORKER__ = %t; window.__SERVICE_WORKER_NAVIGATION_FALLBACK_EXCLUDE_PATHS__ = %s;" $base .Values.serviceWorker.enabled $navigationFallbackExcludePaths -}}
+{{- $navigationFallbackExcludePaths := default (list) .Values.serviceWorker.navigationFallbackExcludePaths -}}
+{{- /* Browser pages the proxies below serve must reach the network, not the client's cached app shell. */ -}}
+{{- if .Values.proxy.homeserverUpstream -}}
+{{- $navigationFallbackExcludePaths = prepend $navigationFallbackExcludePaths "/_tuwunel" -}}
+{{- end -}}
+{{- if .Values.proxy.runtimeUpstream -}}
+{{- $navigationFallbackExcludePaths = concat (list "/connections" "/mcp" "/reports") $navigationFallbackExcludePaths -}}
+{{- end -}}
+{{- $runtimeConfig := printf "window.__APP_BASE_PATH__ = \"%s\"; window.__ENABLE_SERVICE_WORKER__ = %t; window.__SERVICE_WORKER_NAVIGATION_FALLBACK_EXCLUDE_PATHS__ = %s;" $base .Values.serviceWorker.enabled ($navigationFallbackExcludePaths | toJson) -}}
 {{- if .Values.authenticationRecovery.enabled -}}
 {{- $authenticationRecoveryConfig := dict "probeUrl" .Values.authenticationRecovery.probeUrl "navigationUrl" .Values.authenticationRecovery.navigationUrl "timeoutMs" (int .Values.authenticationRecovery.timeoutMs) | toJson -}}
 {{- $authenticationRecoveryLoader := "if (!window.__AUTHENTICATION_RECOVERY_READY__) { const script = document.createElement(\"script\"); script.src = new URL(\"authentication-recovery.js\", document.currentScript.src).href; script.async = false; window.__AUTHENTICATION_RECOVERY_READY__ = new Promise((resolve) => { script.onload = resolve; script.onerror = resolve; }); document.head.appendChild(script); }" -}}
@@ -239,6 +274,65 @@ server {
     proxy_send_timeout 120s;
     proxy_read_timeout 120s;
     proxy_buffering off;
+  }
+{{- end }}
+{{- with .Values.proxy.homeserverUpstream }}
+
+  # Matrix homeserver APIs. The homeserver alone limits upload sizes, media
+  # streams to the browser without spooling onto the pod's disk, and the read
+  # timeout outlasts the longest sync long poll (90 seconds by default on Tuwunel).
+  location ~ ^/(?:_matrix|_synapse|_tuwunel)/ {
+    {{- include "mindroom-client.originProxy" . | nindent 4 }}
+    client_max_body_size 0;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_read_timeout 120s;
+  }
+
+  location = /.well-known/matrix/server {
+    {{- include "mindroom-client.originProxy" . | nindent 4 }}
+  }
+{{- if not (or $.Values.matrixRTC.enabled $.Values.bugReports.admins) }}
+
+  location = /.well-known/matrix/client {
+    {{- include "mindroom-client.originProxy" . | nindent 4 }}
+  }
+{{- end }}
+{{- end }}
+{{- with .Values.proxy.runtimeUpstream }}
+
+  # MindRoom runtime routes that belong on the public host. Every other path,
+  # including the dashboard and the rest of its API, stays with the client.
+  # Connections portal, its API, and OAuth account links and callbacks.
+  location ~ ^/(?:connections|api/connections|api/oauth)(?:/|$) {
+    {{- include "mindroom-client.runtimeProxy" . | nindent 4 }}
+  }
+
+  # MCP gateway, its OAuth server, and SCIM account provisioning.
+  location ~ ^/mcp(?:/oauth/(?:authorize|register|token|revoke|\.well-known/oauth-authorization-server)|/scim/v2/.*)?$ {
+    {{- include "mindroom-client.runtimeProxy" . | nindent 4 }}
+  }
+
+  # MCP client discovery.
+  location ~ ^/\.well-known/oauth-(?:authorization-server/mcp/oauth|protected-resource/mcp)$ {
+    {{- include "mindroom-client.runtimeProxy" . | nindent 4 }}
+  }
+
+  # Worker computer viewers and their WebSocket streams.
+  location ~ ^/api/computers/ {
+    {{- include "mindroom-client.runtimeProxy" . | nindent 4 }}
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+  }
+
+  # External triggers and the usage export and budget services.
+  location ~ ^/api/(?:triggers/|usage/export$|budgets/service(?:/|$)) {
+    {{- include "mindroom-client.runtimeProxy" . | nindent 4 }}
+  }
+
+  # Published reports and private workflow reports.
+  location ~ ^/reports/(?:public/[^/]+(?:/.*)?|private/[^/]+(?:/[^/]+/[^/]+/[^/]+)?)$ {
+    {{- include "mindroom-client.runtimeProxy" . | nindent 4 }}
   }
 {{- end }}
 {{- with .Values.nginx.serverSnippet }}

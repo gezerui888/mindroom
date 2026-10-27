@@ -86,3 +86,14 @@
 {{- if and .Values.matrixRTC.proxy.enabled (not .Values.matrixRTC.proxy.sfuUpstream) -}}
 {{- fail "matrixRTC.proxy.sfuUpstream is required when matrixRTC.proxy.enabled=true" -}}
 {{- end -}}
+{{- range $name, $upstream := dict "homeserverUpstream" .Values.proxy.homeserverUpstream "runtimeUpstream" .Values.proxy.runtimeUpstream -}}
+{{- if $upstream -}}
+{{- if or (not $.Values.nginx.create) $.Values.nginx.existingConfigMap -}}
+{{- fail (printf "proxy.%s requires the chart-managed nginx config" $name) -}}
+{{- end -}}
+{{- /* A path would make nginx rewrite or reject the forwarded URI, and $ would expand as an nginx variable. */ -}}
+{{- if not (regexMatch `^https?://[^/?#\s$;{}'"\\]+/?$` (toString $upstream)) -}}
+{{- fail (printf "proxy.%s must be an http:// or https:// URL without a path, such as http://service:8080; got %q" $name (toString $upstream)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

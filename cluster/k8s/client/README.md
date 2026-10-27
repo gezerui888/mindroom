@@ -79,6 +79,53 @@ The optional proxy strips `/livekit/jwt/` and `/livekit/sfu/` before forwarding 
 This chart does not deploy either backend, expose LiveKit media ports, configure TURN, issue TLS certificates, or manage backend credentials.
 See [Voice Calls](../../../docs/voice-calls.md) for the MindRoom agent configuration and complete backend requirements.
 
+## Single Origin
+
+Set the `proxy` upstreams to make this chart the only origin of its host: the ingress or tunnel then sends every path on that host to this Service, and nginx forwards the homeserver and runtime routes.
+
+```yaml
+matrix:
+  homeserverUrl: https://chat.example.com
+
+proxy:
+  homeserverUpstream: http://matrix-mindroom-tuwunel:8008
+  runtimeUpstream: http://mindroom-runtime:8765
+```
+
+The upstreams name the Services of a Tuwunel chart release called `matrix` and a runtime chart release called `mindroom-runtime` in the same namespace; each must be an `http://` or `https://` URL without a path, and the proxies require the chart-managed nginx config.
+Set either one alone to forward only its routes.
+
+With `homeserverUpstream`, nginx forwards `/_matrix/`, `/_synapse/`, `/_tuwunel/`, and `/.well-known/matrix/server` to the homeserver, and `/.well-known/matrix/client` too unless the chart serves it for [MatrixRTC](#matrixrtc-calls) or [bug reports](#bug-reports).
+The homeserver's own limit, such as Tuwunel's `max_request_size`, is the only limit on uploads, and sync requests may wait up to 120 seconds.
+
+With `runtimeUpstream`, nginx forwards only the runtime routes that belong on the public host:
+
+| Paths | Feature |
+| --- | --- |
+| `/connections`, `/api/connections`, and their sub-paths; `/api/oauth/*` | [Connections portal](../../../docs/connections-portal.md) and OAuth account links |
+| `/mcp`, `/mcp/oauth/authorize`, `/mcp/oauth/register`, `/mcp/oauth/token`, `/mcp/oauth/revoke`, `/mcp/oauth/.well-known/oauth-authorization-server`, `/mcp/scim/v2/*`, `/.well-known/oauth-authorization-server/mcp/oauth`, `/.well-known/oauth-protected-resource/mcp` | [MCP gateway](../../../docs/deployment/mcp-gateway.md) |
+| `/api/computers/*`, including WebSocket streams | [Worker computers](../../../docs/tools/worker-computer.md) |
+| `/api/triggers/<id>` | [External triggers](../../../docs/external-triggers.md) |
+| `/api/usage/export`, `/api/budgets/service`, `/api/budgets/service/users/<id>` | [Usage export](../../../docs/usage.md#usage-export-service) and budget services |
+| `/reports/public/<slug>` and its files, `/reports/private/...` | Published and private [workflow reports](../../../docs/tools/agent-orchestration.md) |
+
+Every other path, including the dashboard and the rest of the runtime API, stays with the client, so this list is the runtime's boundary on the public host.
+Serve the dashboard on [its own host](../../../docs/deployment/trusted-upstream-auth.md#dashboard-on-its-own-host), routed straight to the runtime.
+The upstreams receive the browser's `Host` header and an appended `X-Forwarded-For`; other request headers, such as an identity gateway's signed assertion and its `X-Forwarded-Proto`, reach them unchanged.
+The chart adds `/connections`, `/mcp`, and `/reports` with the runtime, and `/_tuwunel` with the homeserver, before the [navigation fallback exclusions](#service-worker-hygiene), where they count toward the eight the client honors.
+
+When the runtime chart creates its NetworkPolicy with `networkPolicy.apiIngressFrom`, admit the client pods:
+
+```yaml
+networkPolicy:
+  create: true
+  apiIngressFrom:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: mindroom-client
+          app.kubernetes.io/component: client
+```
+
 ## Bug Reports
 
 The client's **Report a bug** message-menu item sends a JSON report to the deployment's administrators in a private room shared with them.

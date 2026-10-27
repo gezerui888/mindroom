@@ -79,6 +79,18 @@ matrixRTC:
     # Internal LiveKit SFU URL, for example http://matrixrtc-mindroom-matrixrtc-livekit:7880.
     sfuUpstream: ""
 
+# Optional same-origin proxies that make this chart the single origin for its host:
+# route every path of the host to this Service and nginx forwards these routes.
+# Each upstream is an http:// or https:// URL without a path.
+proxy:
+  # Internal Matrix homeserver URL, for example http://matrix-mindroom-tuwunel:8008.
+  # Forwards /_matrix/, /_synapse/, /_tuwunel/ and /.well-known/matrix/server, and
+  # /.well-known/matrix/client unless the chart serves it for MatrixRTC or bug reports.
+  homeserverUpstream: ""
+  # Internal MindRoom runtime API URL, for example http://mindroom-runtime:8765.
+  # Forwards only the runtime routes that belong on the public host, listed in the README.
+  runtimeUpstream: ""
+
 # One-click bug reports from the client's message menu go to a private room shared with these administrators.
 bugReports:
   # Matrix user IDs published in /.well-known/matrix/client as io.mindroom.bug_reports.

@@ -94,6 +94,7 @@ Optional features:
 - [Agent Vault server NetworkPolicy](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#agent-vault-server-networkpolicy) restricts the chart-managed vault, and [`jobNaming: contentHash`](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#agent-vault-access-grants) reruns its Jobs under `kubectl apply` workflows.
 - Tuwunel [structured settings](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/tuwunel/README.md#structured-settings) (`tuwunel.settings`) merge across values files, and [upgrades and database migrations](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/tuwunel/README.md#upgrades-and-database-migrations) explains how to upgrade the homeserver without corrupting its database.
 - The client chart's [`matrixRTC` values](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/client/README.md#matrixrtc-calls) announce and proxy the MatrixRTC chart's call backend.
+- The client chart's [`proxy` values](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/client/README.md#single-origin) make it the single origin of its host, forwarding the homeserver and the runtime's public routes so the ingress sends the whole host to one Service.
 - [Operational log events](operational-log-events.md) feed log-based metrics and alerts once `MINDROOM_LOG_FORMAT=json` is set through `env.extra`.
 
 ## Worker Backends

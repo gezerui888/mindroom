@@ -496,16 +496,6 @@ def test_client_chart_keeps_serving_its_own_matrix_client_discovery_with_a_homes
     assert "proxy_pass" not in discovery
 
 
-def test_client_chart_keeps_proxied_browser_pages_out_of_the_cached_app_shell() -> None:
-    """The client's service worker answers navigations with its cached shell unless a path is excluded."""
-    nginx_conf = _origin_proxy_conf("serviceWorker.navigationFallbackExcludePaths[0]=/other-app")
-
-    assert (
-        'window.__SERVICE_WORKER_NAVIGATION_FALLBACK_EXCLUDE_PATHS__ = [\\"/connections\\",\\"/mcp\\",\\"/reports\\",'
-        '\\"/_tuwunel\\",\\"/other-app\\"];'
-    ) in nginx_conf
-
-
 @pytest.mark.parametrize(
     ("values", "error"),
     [

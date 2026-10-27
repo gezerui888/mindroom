@@ -112,7 +112,6 @@ With `runtimeUpstream`, nginx forwards only the runtime routes that belong on th
 Every other path, including the dashboard and the rest of the runtime API, stays with the client, so this list is the runtime's boundary on the public host.
 Serve the dashboard on [its own host](../../../docs/deployment/trusted-upstream-auth.md#dashboard-on-its-own-host), routed straight to the runtime.
 The upstreams receive the browser's `Host` header and an appended `X-Forwarded-For`; other request headers, such as an identity gateway's signed assertion and its `X-Forwarded-Proto`, reach them unchanged.
-The chart adds `/connections`, `/mcp`, and `/reports` with the runtime, and `/_tuwunel` with the homeserver, before the [navigation fallback exclusions](#service-worker-hygiene), where they count toward the eight the client honors.
 
 When the runtime chart creates its NetworkPolicy with `networkPolicy.apiIngressFrom`, admit the client pods:
 

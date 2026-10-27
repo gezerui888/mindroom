@@ -172,15 +172,8 @@ runtime-config.js straight from nginx and the Deployment bypasses the entrypoint
 {{- define "mindroom-client.defaultNginxConf" -}}
 {{- $base := include "mindroom-client.basePath" . -}}
 {{- $prefix := include "mindroom-client.pathPrefix" . -}}
-{{- $navigationFallbackExcludePaths := default (list) .Values.serviceWorker.navigationFallbackExcludePaths -}}
-{{- /* Browser pages the proxies below serve must reach the network, not the client's cached app shell. */ -}}
-{{- if .Values.proxy.homeserverUpstream -}}
-{{- $navigationFallbackExcludePaths = prepend $navigationFallbackExcludePaths "/_tuwunel" -}}
-{{- end -}}
-{{- if .Values.proxy.runtimeUpstream -}}
-{{- $navigationFallbackExcludePaths = concat (list "/connections" "/mcp" "/reports") $navigationFallbackExcludePaths -}}
-{{- end -}}
-{{- $runtimeConfig := printf "window.__APP_BASE_PATH__ = \"%s\"; window.__ENABLE_SERVICE_WORKER__ = %t; window.__SERVICE_WORKER_NAVIGATION_FALLBACK_EXCLUDE_PATHS__ = %s;" $base .Values.serviceWorker.enabled ($navigationFallbackExcludePaths | toJson) -}}
+{{- $navigationFallbackExcludePaths := default (list) .Values.serviceWorker.navigationFallbackExcludePaths | toJson -}}
+{{- $runtimeConfig := printf "window.__APP_BASE_PATH__ = \"%s\"; window.__ENABLE_SERVICE_WORKER__ = %t; window.__SERVICE_WORKER_NAVIGATION_FALLBACK_EXCLUDE_PATHS__ = %s;" $base .Values.serviceWorker.enabled $navigationFallbackExcludePaths -}}
 {{- if .Values.authenticationRecovery.enabled -}}
 {{- $authenticationRecoveryConfig := dict "probeUrl" .Values.authenticationRecovery.probeUrl "navigationUrl" .Values.authenticationRecovery.navigationUrl "timeoutMs" (int .Values.authenticationRecovery.timeoutMs) | toJson -}}
 {{- $authenticationRecoveryLoader := "if (!window.__AUTHENTICATION_RECOVERY_READY__) { const script = document.createElement(\"script\"); script.src = new URL(\"authentication-recovery.js\", document.currentScript.src).href; script.async = false; window.__AUTHENTICATION_RECOVERY_READY__ = new Promise((resolve) => { script.onload = resolve; script.onerror = resolve; }); document.head.appendChild(script); }" -}}

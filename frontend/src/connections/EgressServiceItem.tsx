@@ -2,6 +2,7 @@ import { type FormEvent, useEffect, useRef, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import {
   accountReuseDescription,
@@ -40,7 +41,7 @@ import {
 } from "./request";
 import { SharedAccountDialog } from "./SharedAccountDialog";
 import { ItemName } from "./ToolRow";
-import type { EgressCredentialService } from "./types";
+import type { EgressCredentialService, EgressLabelledAccount } from "./types";
 
 /** The endpoints one service row talks to. */
 export interface ServicePaths {
@@ -49,12 +50,23 @@ export interface ServicePaths {
   disconnect: string;
   /** Where Agent Keys' use of the account is allowed (PUT) or stopped (DELETE). */
   reuse: string;
-  /** Whether the service's account is connected now, read again from the listing the row came from. */
-  accountConnected: (signal: AbortSignal) => Promise<boolean>;
+  /**
+   * Whether the service's account, or its labelled `account`, is connected
+   * now, read again from the listing the row came from.
+   */
+  accountConnected: (signal: AbortSignal, account?: string) => Promise<boolean>;
 }
 
 // What the server needs before Agent Keys may use an account: the user saw that commands skip the tools' approvals.
 const REUSE_BODY = { acknowledge_approval_bypass: true };
+// The server's account label rule.
+const ACCOUNT_LABEL = /^[a-z0-9][a-z0-9-]{0,30}$/;
+const ACCOUNT_LABEL_HINT =
+  "Use 1 to 31 lowercase letters, digits, or hyphens, starting with a letter or digit.";
+
+/** Where Agent Keys' use of a labelled account is stopped: the reuse path with the label as `account`. */
+const withAccount = (path: string, account: string) =>
+  `${path}${path.includes("?") ? "&" : "?"}account=${encodeURIComponent(account)}`;
 
 /** Asked before Agent Keys may use an account; a second click while it closes goes on only once. */
 function AccountReuseDialog({
@@ -119,6 +131,13 @@ export function EgressServiceItem({
   const [confirm, setConfirm] = useState<
     "key" | "account" | "service" | "shared" | "reuse" | null
   >(null);
+  // The label typed for another account of the provider, while its form is open.
+  const [newAccount, setNewAccount] = useState<string | null>(null);
+  // The labelled account a dialog asks about, and whether it allows or disconnects it.
+  const [accountConfirm, setAccountConfirm] = useState<{
+    action: "reuse" | "disconnect";
+    account: EgressLabelledAccount;
+  } | null>(null);
   const operation = useRef<AbortController | null>(null);
   const keyLabel = `${service.display_name} API key`;
   const oauth = service.oauth;
@@ -143,6 +162,13 @@ export function EgressServiceItem({
     oauth.unavailable_reason === null &&
     (service.can_manage || oauth.can_connect);
   const reuseEnabled = oauth?.reuse_enabled === true;
+  // Only the personal listing sends labelled accounts, and only Agent Keys connects them.
+  const accounts = service.accounts;
+  const canAddAccount =
+    accounts !== undefined &&
+    canChangeReuse &&
+    oauth.can_connect &&
+    !oauth.reset_required;
 
   // A limit of the viewer's that narrows this administrator's service.
   const limit = limitOf(service, agent.services);
@@ -193,6 +219,7 @@ export function EgressServiceItem({
     action: (signal: AbortSignal) => Promise<unknown>,
   ) => {
     setConfirm(null);
+    setAccountConfirm(null);
     const controller = new AbortController();
     operation.current = controller;
     setBusy(kind);
@@ -266,6 +293,29 @@ export function EgressServiceItem({
     );
   };
 
+  const connectAccount = (event: FormEvent) => {
+    event.preventDefault();
+    if (!oauth || busy !== null || newAccount === null) return;
+    const account = newAccount;
+    if (!ACCOUNT_LABEL.test(account)) return;
+    void run("connect", "Could not connect. Try again.", async (signal) => {
+      await connectWithPopup(
+        oauth.provider,
+        () =>
+          requestConnection<OAuthAuthorization>(
+            paths.connect,
+            signal,
+            "POST",
+            { account },
+            errorMessages,
+          ),
+        signal,
+        () => paths.accountConnected(signal, account),
+      );
+      setNewAccount(null);
+    });
+  };
+
   const name = service.display_name;
   // Connecting reads the saved connection first, so an unreadable one needs a reset before.
   const canConnect =
@@ -306,6 +356,18 @@ export function EgressServiceItem({
             label: "Replace key",
             ariaLabel: `Replace key for ${name}`,
             onSelect: openKeyForm,
+          },
+        ]
+      : []),
+    ...(oauth && canAddAccount
+      ? [
+          {
+            label: "Add another account",
+            ariaLabel: `Add another ${oauth.display_name} account for ${name}`,
+            onSelect: () => {
+              setError(null);
+              setNewAccount("");
+            },
           },
         ]
       : []),
@@ -428,6 +490,62 @@ export function EgressServiceItem({
           {unsetText && (
             <span className="text-xs text-muted-foreground">{unsetText}</span>
           )}
+          {oauth && accounts && accounts.length > 0 && (
+            <ul
+              aria-label={`Other ${oauth.display_name} accounts`}
+              className="flex flex-col gap-1 text-xs"
+            >
+              {accounts.map((account) => (
+                <li
+                  key={account.label}
+                  className="flex flex-wrap items-center gap-2"
+                >
+                  <span className="font-medium">{account.label}</span>
+                  {account.account_label && (
+                    <span className="text-muted-foreground">
+                      {account.account_label}
+                    </span>
+                  )}
+                  {canChangeReuse && (
+                    <>
+                      <label className="flex items-center gap-1">
+                        <Checkbox
+                          checked={account.reuse_enabled}
+                          disabled={busy !== null}
+                          aria-label={`Agent Keys may use ${account.label} for ${name}`}
+                          onCheckedChange={() =>
+                            account.reuse_enabled
+                              ? void run(
+                                  "reuse",
+                                  "Could not stop using the account. Try again.",
+                                  write(
+                                    withAccount(paths.reuse, account.label),
+                                    "DELETE",
+                                  ),
+                                )
+                              : setAccountConfirm({ action: "reuse", account })
+                          }
+                        />
+                        Agent Keys
+                      </label>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="h-6 px-2 text-xs"
+                        disabled={busy !== null}
+                        aria-label={`Disconnect ${account.label} for ${name}`}
+                        onClick={() =>
+                          setAccountConfirm({ action: "disconnect", account })
+                        }
+                      >
+                        Disconnect
+                      </Button>
+                    </>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       </td>
       <td className={SERVICE_CELL.actions}>
@@ -503,6 +621,47 @@ export function EgressServiceItem({
             disabled={busy !== null || limitActions.busy}
           />
         </div>
+        {oauth && newAccount !== null && (
+          <form
+            className="mt-2 flex flex-wrap items-center gap-2 sm:justify-end"
+            onSubmit={connectAccount}
+          >
+            <Input
+              aria-label={`Label of the other ${oauth.display_name} account`}
+              placeholder="Label, such as work"
+              autoFocus
+              className="h-9 min-w-0 basis-full"
+              value={newAccount}
+              disabled={busy !== null}
+              onChange={(event) => setNewAccount(event.target.value)}
+            />
+            {newAccount !== "" && !ACCOUNT_LABEL.test(newAccount) && (
+              <p className="basis-full text-xs text-destructive">
+                {ACCOUNT_LABEL_HINT}
+              </p>
+            )}
+            <Button
+              type="submit"
+              size="sm"
+              aria-label={`Connect the other ${oauth.display_name} account for ${name}`}
+              disabled={busy !== null || !ACCOUNT_LABEL.test(newAccount)}
+            >
+              {busy === "connect" ? "Connecting…" : "Connect"}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                operation.current?.abort();
+                setBusy(null);
+                setNewAccount(null);
+              }}
+            >
+              Cancel
+            </Button>
+          </form>
+        )}
         {canManageKey && editing && (
           <form
             className="mt-2 flex flex-wrap items-center gap-2 sm:justify-end"
@@ -613,6 +772,53 @@ export function EgressServiceItem({
                     write(paths.reuse, "PUT", REUSE_BODY),
                   )
                 : connect()
+            }
+          />
+        )}
+        {oauth && (
+          <AccountReuseDialog
+            open={accountConfirm?.action === "reuse"}
+            provider={oauth.display_name}
+            description={accountReuseDescription({
+              provider: oauth.display_name,
+              account:
+                accountConfirm?.account.account_label ??
+                `the ${accountConfirm?.account.label} account`,
+              service: name,
+              sharedAgent: asksAboutSharedAccount ? agent.displayName : null,
+              unscoped: agent.scope === "unscoped",
+            })}
+            confirmLabel="Use account"
+            onCancel={() => setAccountConfirm(null)}
+            onContinue={() =>
+              accountConfirm &&
+              void run(
+                "reuse",
+                "Could not allow the account. Try again.",
+                write(paths.reuse, "PUT", {
+                  ...REUSE_BODY,
+                  account: accountConfirm.account.label,
+                }),
+              )
+            }
+          />
+        )}
+        {oauth && (
+          <ConfirmDialog
+            open={accountConfirm?.action === "disconnect"}
+            title={`Disconnect ${accountConfirm?.account.label}?`}
+            description={`This removes the ${oauth.display_name} account saved as ${accountConfirm?.account.label} for ${agent.displayName}, and Agent Keys stops using it.`}
+            confirmLabel="Disconnect"
+            onCancel={() => setAccountConfirm(null)}
+            onConfirm={() =>
+              accountConfirm &&
+              void run(
+                "disconnect",
+                "Could not disconnect. Try again.",
+                write(paths.disconnect, "POST", {
+                  account: accountConfirm.account.label,
+                }),
+              )
             }
           />
         )}

@@ -105,6 +105,18 @@ export interface EgressOAuthStatus {
   reuse_enabled: boolean;
 }
 
+/**
+ * A further account of a service's provider that only Agent Keys uses; a
+ * request picks it with the `X-Agent-Keys-Account: <label>` header.
+ */
+export interface EgressLabelledAccount {
+  label: string;
+  /** The account's email, or its login where the provider has none. */
+  account_label: string | null;
+  /** Agent Keys may use this account for the service. */
+  reuse_enabled: boolean;
+}
+
 /** Who defined a service: the administrator in config.yaml or the caller's own scope. */
 export type EgressServiceSource = "config" | "user";
 
@@ -158,6 +170,8 @@ export interface EgressCredentialService {
   key_configured: boolean;
   key_updated_at: string | null;
   oauth: EgressOAuthStatus | null;
+  /** The provider's connected labelled accounts, by label. Sent in the personal listing; absent on the dashboard. */
+  accounts?: EgressLabelledAccount[];
 }
 
 /** Why one of the caller's own stored services is not in use. */

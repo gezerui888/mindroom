@@ -2195,3 +2195,122 @@ describe("a popup that closes without answering", () => {
     expect(onChanged).not.toHaveBeenCalled();
   });
 });
+
+describe("labelled accounts", () => {
+  beforeEach(fakePopup);
+
+  const withLabelled = (accounts: EgressCredentialService["accounts"]) =>
+    withAccount(
+      { connected: true, account_label: "octocat" },
+      { configured: true, active_source: "oauth", accounts },
+    );
+  const call = (index: number) => vi.mocked(fetch).mock.calls[index];
+
+  it("adds another account under a valid label through the connect flow", async () => {
+    vi.mocked(fetch).mockImplementation(async () => json(authorization));
+    const onChanged = vi.fn();
+    renderRows([withLabelled([])], { onChanged });
+
+    fireEvent.click(await rowAction("Add another GitHub account for GitHub"));
+    const label = screen.getByLabelText("Label of the other GitHub account");
+    const connect = screen.getByRole("button", {
+      name: "Connect the other GitHub account for GitHub",
+    });
+    for (const invalid of ["Work", "a_b", "../x", "-x", "x".repeat(32)]) {
+      fireEvent.change(label, { target: { value: invalid } });
+      expect(connect).toBeDisabled();
+    }
+    expect(
+      screen.getByText(/1 to 31 lowercase letters, digits, or hyphens/),
+    ).toBeVisible();
+    fireEvent.change(label, { target: { value: "work" } });
+    fireEvent.click(connect);
+
+    await waitFor(() =>
+      expect(popup.location.href).toBe(authorization.auth_url),
+    );
+    expect(call(0)[0]).toBe(
+      "/api/connections/egress/agents/personal/github/connect",
+    );
+    expect(call(0)[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ account: "work" }),
+      }),
+    );
+    answer("connected");
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+  });
+
+  it("shows each account with its account, allow toggle, and Disconnect", async () => {
+    const onChanged = vi.fn();
+    renderRows(
+      [
+        withLabelled([
+          { label: "home", account_label: "octo-home", reuse_enabled: true },
+          { label: "work", account_label: "octo-work", reuse_enabled: false },
+        ]),
+      ],
+      { onChanged },
+    );
+    const github = row("GitHub");
+    expect(within(github).getByText("work")).toBeVisible();
+    expect(within(github).getByText("octo-work")).toBeVisible();
+
+    fireEvent.click(
+      within(github).getByRole("checkbox", {
+        name: "Agent Keys may use work for GitHub",
+      }),
+    );
+    await pressInDialog("Use account");
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+    expect(call(0)[0]).toBe(
+      "/api/connections/egress/agents/personal/github/oauth-reuse",
+    );
+    expect(call(0)[1]).toEqual(
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          acknowledge_approval_bypass: true,
+          account: "work",
+        }),
+      }),
+    );
+
+    fireEvent.click(
+      within(github).getByRole("checkbox", {
+        name: "Agent Keys may use home for GitHub",
+      }),
+    );
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(2));
+    expect(call(1)[0]).toBe(
+      "/api/connections/egress/agents/personal/github/oauth-reuse?account=home",
+    );
+    expect(call(1)[1]).toEqual(expect.objectContaining({ method: "DELETE" }));
+
+    fireEvent.click(
+      within(github).getByRole("button", {
+        name: "Disconnect work for GitHub",
+      }),
+    );
+    await pressInDialog("Disconnect");
+    await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(3));
+    expect(call(2)[0]).toBe(
+      "/api/connections/egress/agents/personal/github/disconnect",
+    );
+    expect(call(2)[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ account: "work" }),
+      }),
+    );
+  });
+
+  it("offers no other accounts where the listing sends none, as on the dashboard", async () => {
+    renderRows([withLabelled(undefined)]);
+    await expectNoAction(
+      "Add another GitHub account for GitHub",
+      row("GitHub"),
+    );
+  });
+});

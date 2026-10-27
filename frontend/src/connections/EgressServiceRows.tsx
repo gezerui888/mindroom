@@ -37,9 +37,13 @@ export const servicePath = (agentName: string, serviceName: string) =>
 const accountConnectedIn = (
   services: readonly EgressCredentialService[] | undefined,
   serviceName: string,
-) =>
-  services?.find((service) => service.name === serviceName)?.oauth
-    ?.connected === true;
+  account?: string,
+) => {
+  const service = services?.find((item) => item.name === serviceName);
+  return account === undefined
+    ? service?.oauth?.connected === true
+    : service?.accounts?.some((item) => item.label === account) === true;
+};
 
 // The egress listings say whether each service's account is connected, for any
 // agent and provider; a provider's own status route only knows the agent's tools.
@@ -54,7 +58,7 @@ function servicePathsFor(
       connect: target.accountPath(serviceName, "connect"),
       disconnect: target.accountPath(serviceName, "disconnect"),
       reuse: target.accountPath(serviceName, "oauth-reuse"),
-      accountConnected: async (signal) =>
+      accountConnected: async (signal, account) =>
         accountConnectedIn(
           (
             await requestConnection<{ services: EgressCredentialService[] }>(
@@ -63,6 +67,7 @@ function servicePathsFor(
             )
           ).services,
           serviceName,
+          account,
         ),
     };
   }
@@ -73,7 +78,7 @@ function servicePathsFor(
     connect: `${base}/connect`,
     disconnect: `${base}/disconnect`,
     reuse: `${base}/oauth-reuse`,
-    accountConnected: async (signal) =>
+    accountConnected: async (signal, account) =>
       accountConnectedIn(
         (
           await requestConnection<EgressCredentialList>(
@@ -82,6 +87,7 @@ function servicePathsFor(
           )
         ).agents.find((agent) => agent.agent_name === agentName)?.services,
         serviceName,
+        account,
       ),
   };
 }

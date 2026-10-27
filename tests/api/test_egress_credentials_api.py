@@ -49,6 +49,7 @@ from mindroom.egress_broker.user_services import (
 from mindroom.oauth import credential_store as oauth_credential_store
 from mindroom.oauth import github as github_oauth
 from mindroom.oauth import registry as oauth_registry
+from mindroom.oauth.accounts import provider_for_account
 from mindroom.oauth.github import LOGIN_LOOKUP_TIMEOUT_SECONDS, github_oauth_provider
 from mindroom.oauth.providers import OAuthProvider
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
@@ -1057,7 +1058,7 @@ def test_connect_and_disconnect_mask_an_internal_oauth_error(
 ) -> None:
     """A refusal from the OAuth flow keeps its status, but the route says only its own text and never the detail."""
     portal = oauth_egress_portal
-    monkeypatch.setattr(oauth, action, AsyncMock(side_effect=HTTPException(503, "internal-client-secret")))
+    monkeypatch.setattr(oauth, f"{action}_account", AsyncMock(side_effect=HTTPException(503, "internal-client-secret")))
     response = _account_action(portal, "alice", "personal", "drive", action)
     assert response.status_code == 503
     assert response.json() == {"detail": masked}
@@ -1125,6 +1126,111 @@ def test_disconnect_clears_only_the_callers_connection(oauth_egress_portal: dict
     assert _egress_row(portal, "alice", "personal", "drive")["oauth"]["connected"] is False
     assert _egress_row(portal, "alice", "personal", "drive")["active_source"] is None
     assert _egress_row(portal, "bob", "personal", "drive")["oauth"]["connected"] is True
+
+
+def _account_body_action(
+    portal: dict[str, Any],
+    user: str,
+    agent: str,
+    service: str,
+    action: str,
+    account: str,
+) -> Any:  # noqa: ANN401
+    """POST the `connect` or `disconnect` action of a service's labelled account `account`, as `user`."""
+    return portal["client"].post(
+        f"{_key_url(agent, service)}/{action}",
+        headers=portal["headers"][user],
+        json={"account": account},
+    )
+
+
+def _connect_labelled_account(
+    portal: dict[str, Any],
+    user: str,
+    agent: str,
+    service: str,
+    provider: str,
+    account: str,
+) -> None:
+    """Run the whole OAuth flow of a labelled account through the egress connect route and the shared callback."""
+    connect = _account_body_action(portal, user, agent, service, "connect", account)
+    _finish_oauth(portal["client"], connect, provider, portal["headers"][user])
+
+
+def _stored_account(
+    portal: dict[str, Any],
+    requester_id: str,
+    agent: str,
+    provider: str,
+    account: str | None,
+) -> tuple[bool, str | None]:
+    """Return whether the broker's store for a tool call by `requester_id` holds `account`, and its label."""
+    config = Config.model_validate(portal["payload"], context={"runtime_paths": portal["paths"]})
+    context = oauth_source.broker_credential_context(
+        provider_for_account(portal["providers"][provider], account),
+        config,
+        portal["paths"],
+        get_runtime_credentials_manager(portal["paths"]),
+        _broker_target(portal, requester_id, agent),
+    )
+    return oauth_source.oauth_connection_for_display(context)
+
+
+@pytest.mark.parametrize(("service", "provider"), [("drive", "google_drive"), ("gh", "github")])
+def test_connect_with_account_stores_labelled_connection(
+    oauth_egress_portal: dict[str, Any],
+    service: str,
+    provider: str,
+) -> None:
+    """The callback stores a labelled account beside the provider's own connection, which stays as it was.
+
+    A requester-scoped provider keeps it in the requester's own store, like its own connection.
+    """
+    portal = oauth_egress_portal
+    _connect_labelled_account(portal, "alice", "personal", service, provider, "work")
+
+    assert _stored_account(portal, "@alice:example.org", "personal", provider, "work") == (True, "alice@example.com")
+    assert _stored_account(portal, "@alice:example.org", "personal", provider, None) == (False, None)
+    assert _stored_account(portal, "@bob:example.org", "personal", provider, "work") == (False, None)
+    assert _egress_row(portal, "alice", "personal", service)["oauth"]["connected"] is False
+
+
+def test_disconnect_with_account_removes_only_that_account(oauth_egress_portal: dict[str, Any]) -> None:
+    """Disconnecting a labelled account leaves the provider's own connection and other labels, and the reverse."""
+    portal = oauth_egress_portal
+    alice = "@alice:example.org"
+    _connect_account(portal, "alice", "personal", "drive", "google_drive")
+    _connect_labelled_account(portal, "alice", "personal", "drive", "google_drive", "work")
+    _connect_labelled_account(portal, "alice", "personal", "drive", "google_drive", "home")
+
+    response = _account_body_action(portal, "alice", "personal", "drive", "disconnect", "work")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "disconnected", "provider": "google_drive"}
+    assert _stored_account(portal, alice, "personal", "google_drive", "work") == (False, None)
+    assert _stored_account(portal, alice, "personal", "google_drive", "home")[0] is True
+    assert _stored_account(portal, alice, "personal", "google_drive", None)[0] is True
+
+    assert _account_action(portal, "alice", "personal", "drive", "disconnect").status_code == 200
+    assert _stored_account(portal, alice, "personal", "google_drive", None) == (False, None)
+    assert _stored_account(portal, alice, "personal", "google_drive", "home")[0] is True
+
+
+@pytest.mark.parametrize("action", ["connect", "disconnect"])
+@pytest.mark.parametrize("account", ["", "Work", "a_b", "a/b", "..", "../x", "-x", "x" * 32])
+def test_invalid_account_label_is_422(oauth_egress_portal: dict[str, Any], action: str, account: str) -> None:
+    """A label that is not lowercase letters, digits, and inner hyphens up to 31 characters never reaches a store."""
+    portal = oauth_egress_portal
+    response = _account_body_action(portal, "alice", "personal", "drive", action, account)
+    assert response.status_code == 422, response.text
+
+
+def test_generic_oauth_routes_take_no_account() -> None:
+    """Only Agent Keys connects labelled accounts: the tools' connect and disconnect routes have no `account`."""
+    routes = {route.path: route for route in main.app.routes if isinstance(route, APIRoute)}
+    for action in ("connect", "disconnect"):
+        route = routes[f"/api/oauth/{{provider_id}}/{action}"]
+        assert "account" not in {param.name for param in route.dependant.query_params}
 
 
 def test_shared_agent_connection_is_managed_but_visible_to_users(oauth_egress_portal: dict[str, Any]) -> None:

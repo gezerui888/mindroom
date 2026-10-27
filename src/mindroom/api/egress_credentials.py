@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError
 
 from mindroom.api import config_lifecycle, oauth
 from mindroom.api.auth import require_connections_user
@@ -63,6 +63,7 @@ from mindroom.egress_broker.user_services import (
     service_source,
     user_service_hosts_not_allowed,
 )
+from mindroom.oauth.accounts import validate_account_label
 from mindroom.oauth.registry import load_oauth_providers, load_oauth_providers_for_snapshot
 from mindroom.requester_identity import resolve_human_requester_alias
 
@@ -591,8 +592,12 @@ def delete_user_service_route(
 # Accounts
 
 
-class _EmptyMutation(BaseModel):
+class _AccountMutation(BaseModel):
+    """Body of the account routes: `account` names a labelled account of the provider, none its own connection."""
+
     model_config = ConfigDict(extra="forbid")
+
+    account: Annotated[str, AfterValidator(validate_account_label)] | None = None
 
 
 async def _account_provider(
@@ -635,12 +640,12 @@ async def connect_egress_account(
     agent_name: str,
     service: str,
     requester_id: _EgressUser,
-    _body: _EmptyMutation,
+    body: _AccountMutation,
 ) -> oauth.OAuthConnectResponse:
-    """Start the OAuth flow of a service's provider for one agent's credential scope."""
+    """Start the OAuth flow of a service's provider, or of its labelled `account`, for one agent's credential scope."""
     _agent, provider = await _account_provider(request, requester_id, agent_name, service, connecting=True)
     return await masked_oauth_call(
-        oauth.connect(provider.id, request, agent_name=agent_name),
+        oauth.connect_account(provider.id, request, agent_name=agent_name, account=body.account),
         "Could not start account connection",
     )
 
@@ -651,12 +656,15 @@ async def disconnect_egress_account(
     agent_name: str,
     service: str,
     requester_id: _EgressUser,
-    _body: _EmptyMutation,
+    body: _AccountMutation,
 ) -> dict[str, str]:
-    """Reset the OAuth connection of a service's provider for one agent's credential scope; its opt-in stays."""
+    """Reset the OAuth connection of a service's provider, or only its labelled `account`, for one agent's scope.
+
+    The opt-in of the provider's own connection stays.
+    """
     _agent, provider = await _account_provider(request, requester_id, agent_name, service, connecting=False)
     return await masked_oauth_call(
-        oauth.disconnect(provider.id, request, agent_name=agent_name),
+        oauth.disconnect_account(provider.id, request, agent_name=agent_name, account=body.account),
         "Could not disconnect account",
     )
 

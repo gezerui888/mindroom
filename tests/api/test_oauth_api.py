@@ -3577,6 +3577,7 @@ async def test_callback_maps_locked_connection_generation_race_to_conflict(
         payload={"connection_generation": "generation-1"},
         code_verifier=None,
         token_url=provider.token_url,
+        account=None,
     )
     conflict = OAuthCredentialConflictError("OAuth connection state is stale because this credential changed")
     monkeypatch.setattr(oauth_api, "_require_oauth_api_user", AsyncMock())
@@ -3630,6 +3631,7 @@ async def test_callback_hides_provider_controlled_exchange_error(
         payload={"connection_generation": "generation-1"},
         code_verifier=None,
         token_url=provider.token_url,
+        account=None,
     )
     provider_error = OAuthProviderError("provider-controlled-callback-secret")
     monkeypatch.setattr(oauth_api, "_require_oauth_api_user", AsyncMock())
@@ -4462,6 +4464,7 @@ async def test_callback_saves_exchanged_credentials_before_propagating_cancellat
         payload=await oauth_api._target_binding_payload(provider, target),
         code_verifier=None,
         token_url=provider.token_url,
+        account=None,
     )
 
     async def allow_request(_request: StarletteRequest) -> None:
@@ -4543,6 +4546,7 @@ async def test_callback_finishes_target_verification_after_state_consumption_bef
         payload={"connection_generation": "generation-1"},
         code_verifier=None,
         token_url=provider.token_url,
+        account=None,
     )
     verification_started = asyncio.Event()
     release_verification = asyncio.Event()

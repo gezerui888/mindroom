@@ -51,6 +51,7 @@ from mindroom.oauth import (
     is_oauth_loopback_hostname,
     is_valid_hosted_oauth_callback_for_request,
 )
+from mindroom.oauth.accounts import provider_for_account
 from mindroom.oauth.credential_binding import (
     OAuthCredentialBinding,
     OAuthCredentialBindingParseError,
@@ -295,6 +296,7 @@ async def _issue_authorization_url(
     *,
     agent_name: str | None,
     connect_target: OAuthConnectTarget | None = None,
+    account: str | None = None,
 ) -> OAuthConnectResponse:
     conversation_context = None
     if connect_target is not None:
@@ -324,6 +326,7 @@ async def _issue_authorization_url(
             browser_user_required=connect_target is None or connect_target.binding.worker_scope != "shared",
             # The page that started the flow, so the popup's last page can tell it how the flow ended.
             opener_origin=_validated_opener_origin(request.headers.get("origin"), provider, runtime_paths),
+            account=account,
         )
         auth_url = await provider.authorization_uri_async(
             runtime_paths,
@@ -793,9 +796,26 @@ def _oauth_success_origin(provider: OAuthProvider, runtime_paths: RuntimePaths) 
 @router.post("/{provider_id}/connect")
 async def connect(provider_id: str, request: Request, agent_name: str | None = None) -> OAuthConnectResponse:
     """Start a provider OAuth flow and return the external authorization URL."""
+    return await connect_account(provider_id, request, agent_name=agent_name, account=None)
+
+
+async def connect_account(
+    provider_id: str,
+    request: Request,
+    *,
+    agent_name: str | None,
+    account: str | None,
+) -> OAuthConnectResponse:
+    """Start the OAuth flow of the provider's own connection (None) or of its labelled `account`, for Agent Keys."""
     await _require_oauth_api_user(request)
     provider, runtime_paths = _load_provider(request, provider_id)
-    return await _issue_authorization_url(request, provider, runtime_paths, agent_name=agent_name)
+    return await _issue_authorization_url(
+        request,
+        provider_for_account(provider, account),
+        runtime_paths,
+        agent_name=agent_name,
+        account=account,
+    )
 
 
 @router.get("/{provider_id}/authorize")
@@ -1021,6 +1041,7 @@ async def _store_callback_credentials(
 ) -> bool:
     """Resolve and store one callback's exact credential target."""
     pending = consume_pending_oauth_request(request, provider.id, state)
+    provider = provider_for_account(provider, pending.account)
     token_url = pending.token_url
     # LEGACY_COMPAT: Pending OAuth connect state without a bound token endpoint.
     # Legacy format: pending `dashboard_oauth_state` records whose data has no `token_url`.
@@ -1320,8 +1341,20 @@ async def agent_connection_status(
 @router.post("/{provider_id}/disconnect")
 async def disconnect(provider_id: str, request: Request, agent_name: str | None = None) -> dict[str, str]:
     """Remove scoped OAuth credentials for one provider while preserving tool settings."""
+    return await disconnect_account(provider_id, request, agent_name=agent_name, account=None)
+
+
+async def disconnect_account(
+    provider_id: str,
+    request: Request,
+    *,
+    agent_name: str | None,
+    account: str | None,
+) -> dict[str, str]:
+    """Remove the provider's own connection (None) or only its labelled `account`, for Agent Keys."""
     await _require_oauth_api_user(request)
     provider, runtime_paths = _load_provider(request, provider_id)
+    provider = provider_for_account(provider, account)
     target = _resolve_oauth_credentials_target(
         request,
         provider,

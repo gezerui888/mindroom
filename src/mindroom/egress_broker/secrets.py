@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 __all__ = [
     "PERSONAL_WORKER_SCOPES",
     "EgressServiceStatus",
+    "OAuthAccount",
     "OAuthStatus",
     "OAuthStatusReader",
     "Secret",
@@ -291,6 +292,19 @@ class OAuthStatus:
     unavailable_reason: Literal["shared_sandbox"] | None = None
     shared_worker_opt_in: bool = False
     reuse_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class OAuthAccount:
+    """A labelled account of a service's provider in one scope; never holds a token.
+
+    `account_label` shows which account it is (its email, or a login where the provider has none), and
+    `reuse_enabled` whether Agent Keys may use it for the service.
+    """
+
+    label: str
+    account_label: str | None
+    reuse_enabled: bool
 
 
 type OAuthStatusReader = Callable[[str, ResolvedWorkerTarget | None], OAuthStatus | None]

@@ -49,8 +49,8 @@ from mindroom.config.egress_broker import EgressService
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.env import EgressAgentScope, egress_agent_scope
 from mindroom.egress_broker.oauth_reuse import set_oauth_reuse, stop_account_reuse, stop_service_reuse
-from mindroom.egress_broker.oauth_source import broker_credential_context
-from mindroom.egress_broker.secrets import delete_secret, save_secret
+from mindroom.egress_broker.oauth_source import broker_credential_context, labelled_accounts
+from mindroom.egress_broker.secrets import OAuthAccount, delete_secret, save_secret
 from mindroom.egress_broker.service import active_audit_log
 from mindroom.egress_broker.user_services import (
     MAX_SERVICE_BYTES,
@@ -64,6 +64,7 @@ from mindroom.egress_broker.user_services import (
     service_source,
     user_service_hosts_not_allowed,
 )
+from mindroom.logging_config import get_logger
 from mindroom.oauth.registry import load_oauth_providers, load_oauth_providers_for_snapshot
 from mindroom.requester_identity import resolve_human_requester_alias
 
@@ -75,10 +76,12 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
+    from mindroom.egress_broker.secrets import OAuthStatus
     from mindroom.oauth import OAuthProvider
     from mindroom.oauth.credential_lifecycle import OAuthCredentialContext
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
+logger = get_logger(__name__)
 router = APIRouter(
     prefix="/api/connections/egress",
     tags=["egress-credentials"],
@@ -239,7 +242,9 @@ class EgressCredentialService(EgressSourceStatus):
     can tell which services overlap, and how each rule sends the key (`auth_type` and `auth_name`, never the key).
     `placeholder_names` lists the variables the service sets in the sandbox (a preset's included), names only, so the
     editor can warn when a service of one's own sets the same one. `restrict_only` marks a service that only limits
-    the paths of the other services on its hosts and never has a key or account of its own.
+    the paths of the other services on its hosts and never has a key or account of its own. `accounts` lists the
+    connected labelled accounts of the service's provider in this scope, by label, with whether Agent Keys may use
+    each for this service; a request picks one with the `X-Agent-Keys-Account` header.
     """
 
     name: str
@@ -251,6 +256,7 @@ class EgressCredentialService(EgressSourceStatus):
     rules: list[EgressRuleSummary]
     placeholder_names: list[str]
     restrict_only: bool
+    accounts: list[OAuthAccount]
 
 
 class EgressCredentialAgent(BaseModel):
@@ -335,6 +341,7 @@ async def egress_services_for_agent(
             reuse_target=lambda _provider: target,
         )
         sources = await egress_service_status(manager, target, service, name, oauth_part)
+        accounts = await _labelled_accounts(request, name, service, target, oauth_part, config=config, manager=manager)
         return EgressCredentialService(
             name=name,
             display_name=service.display_name or name.replace("_", " ").title(),
@@ -345,6 +352,7 @@ async def egress_services_for_agent(
             rules=rule_summaries(service),
             placeholder_names=list(service.placeholder_env),
             restrict_only=service.restrict_only,
+            accounts=accounts,
             **asdict(sources),
         )
 
@@ -352,6 +360,33 @@ async def egress_services_for_agent(
         (functools.partial(row, name, service) for name, service in services.items()),
         limited=True,
     )
+
+
+async def _labelled_accounts(
+    request: Request,
+    name: str,
+    service: EgressService,
+    target: ResolvedWorkerTarget,
+    oauth_part: OAuthStatus | None,
+    *,
+    config: Config,
+    manager: CredentialsManager,
+) -> list[OAuthAccount]:
+    """List the labelled accounts of a service's provider for its row; none where its status shows no usable provider.
+
+    A failure to read them lists none, like a provider whose status cannot be read, instead of failing the page.
+    """
+    provider = service_oauth_provider(config_lifecycle.bind_current_request_snapshot(request), service)
+    if provider is None or oauth_part is None or oauth_part.unavailable_reason is not None:
+        return []
+    snapshot = config_lifecycle.bind_current_request_snapshot(request)
+    context = broker_credential_context(provider, config, snapshot.runtime_paths, manager, target)
+    try:
+        return await asyncio.to_thread(labelled_accounts, context, name, allowed_only=False)
+    except Exception as exc:
+        # OAuth provider code, plugin providers included, can raise anything.
+        logger.warning("egress_labelled_accounts_unavailable", service=name, error_type=type(exc).__name__)
+        return []
 
 
 async def _load_egress_agents(request: Request, requester_id: str) -> list[EgressCredentialAgent]:

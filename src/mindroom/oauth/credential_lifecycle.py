@@ -23,6 +23,7 @@ from mindroom.oauth.credential_store import (
     OAuthCredentialUnreadableError,
     oauth_credential_reader,
     oauth_credential_store_exists,
+    oauth_credential_store_services,
     oauth_credential_transaction,
 )
 from mindroom.oauth.providers import (
@@ -991,6 +992,14 @@ def oauth_verified_claim(credentials: dict[str, Any], key: str) -> str | None:
         return None
     value = claims.get(key)
     return value if isinstance(value, str) and value else None
+
+
+def oauth_credential_services_beside(context: OAuthCredentialContext) -> list[str]:
+    """Return the credential services stored beside the context's in its scope, such as a provider's labelled accounts.
+
+    Listing opens and creates no store; it blocks on the filesystem.
+    """
+    return oauth_credential_store_services(context)
 
 
 def oauth_account_label(credentials: dict[str, Any]) -> str | None:

@@ -350,6 +350,16 @@ def oauth_credential_store_exists(context: OAuthCredentialStoreContext) -> bool:
     return _oauth_credential_database_path(context).exists()
 
 
+def oauth_credential_store_services(context: OAuthCredentialStoreContext) -> list[str]:
+    """Return the credential services with a store in the directory of the scope's, sorted; blocks on the filesystem.
+
+    Listing opens and creates nothing.
+    """
+    database_path = _oauth_credential_database_path(context)
+    suffix = database_path.name.removeprefix(context.provider.credential_service)
+    return sorted(path.name.removesuffix(suffix) for path in database_path.parent.glob(f"*{suffix}"))
+
+
 @asynccontextmanager
 async def oauth_credential_transaction(
     context: OAuthCredentialStoreContext,

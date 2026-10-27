@@ -12,9 +12,11 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from mindroom.oauth.providers import OAuthProvider
 
-__all__ = ["account_credential_service", "provider_for_account", "validate_account_label"]
+__all__ = ["account_credential_service", "account_labels", "provider_for_account", "validate_account_label"]
 
 _ACCOUNT_LABEL = re.compile(r"[a-z0-9][a-z0-9-]{0,30}")
 _SERVICE_SUFFIX = "_oauth"
@@ -41,3 +43,14 @@ def provider_for_account(provider: OAuthProvider, account: str | None) -> OAuthP
     if account is None:
         return provider
     return replace(provider, credential_service=account_credential_service(provider, account))
+
+
+def account_labels(provider: OAuthProvider, credential_services: Iterable[str]) -> list[str]:
+    """Return the labels of the provider's labelled accounts among `credential_services`, in their order."""
+    prefix = f"{provider.credential_service.removesuffix(_SERVICE_SUFFIX)}__"
+    labels = (
+        service.removeprefix(prefix).removesuffix(_SERVICE_SUFFIX)
+        for service in credential_services
+        if service.startswith(prefix) and service.endswith(_SERVICE_SUFFIX)
+    )
+    return [label for label in labels if _ACCOUNT_LABEL.fullmatch(label)]

@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from mindroom.egress_broker.oauth_reuse import oauth_reuse_enabled
 from mindroom.egress_broker.secrets import (
+    OAuthAccount,
     OAuthStatus,
     Secret,
     SecretAccountNotAllowed,
@@ -29,11 +30,12 @@ from mindroom.egress_broker.secrets import (
     is_personal_target,
 )
 from mindroom.logging_config import get_logger
-from mindroom.oauth.accounts import provider_for_account
+from mindroom.oauth.accounts import account_labels, provider_for_account
 from mindroom.oauth.credential_lifecycle import (
     OAuthCredentialUnreadableError,
     load_oauth_credentials_snapshot_sync,
     oauth_account_label,
+    oauth_credential_services_beside,
     oauth_credential_store_exists,
     oauth_credentials_usable,
     refresh_oauth_credentials_blocking,
@@ -59,6 +61,7 @@ if TYPE_CHECKING:
 __all__ = [
     "SharedWorkerOAuth",
     "broker_credential_context",
+    "labelled_accounts",
     "oauth_connection_for_display",
     "oauth_status",
     "resolve_oauth_token",
@@ -222,6 +225,29 @@ def oauth_connection_for_display(context: OAuthCredentialContext) -> tuple[bool,
             credentials = load_oauth_credentials_snapshot_sync(context).credentials
     connected = oauth_credentials_usable(context.provider, context.runtime_paths, credentials)
     return connected, oauth_account_label(credentials) if connected and credentials else None
+
+
+def labelled_accounts(context: OAuthCredentialContext, service: str, *, allowed_only: bool) -> list[OAuthAccount]:
+    """Return the scope's connected labelled accounts of the context's provider, by label, with their opt-ins for `service`.
+
+    The agent tool passes `allowed_only`, which reads no account nobody allowed for `service`; the egress pages list
+    every one, read whatever its opt-in, as `oauth_connection_for_display` reads the provider's own connection.
+    Blocks on the store, so async callers run it in a thread.
+    """
+    provider = context.provider
+    if provider.requester_scoped_credentials and context.worker_target is None:
+        return []
+    accounts = []
+    for label in account_labels(provider, oauth_credential_services_beside(context)):
+        reuse_enabled = oauth_reuse_enabled(context, service, provider.id, label)
+        if allowed_only and not reuse_enabled:
+            continue
+        connected, account_label = oauth_connection_for_display(
+            replace(context, provider=provider_for_account(provider, label)),
+        )
+        if connected:
+            accounts.append(OAuthAccount(label=label, account_label=account_label, reuse_enabled=reuse_enabled))
+    return accounts
 
 
 def shared_worker_oauth(

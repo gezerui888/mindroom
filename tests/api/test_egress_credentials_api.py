@@ -1303,6 +1303,31 @@ def test_deleting_a_service_of_ones_own_removes_its_labelled_opt_ins(oauth_egres
     assert _labelled_reuse(portal, "@alice:example.org", "personal", "mygh", "github", "work") is False
 
 
+def test_status_lists_labelled_accounts(oauth_egress_portal: dict[str, Any]) -> None:
+    """A service row lists its provider's labelled accounts with their accounts and opt-ins, whatever the opt-in."""
+    portal = oauth_egress_portal
+    client, headers, url = portal["client"], portal["headers"]["alice"], _reuse_url("personal", "drive")
+    _connect_and_allow(portal, "alice", "personal", "drive", "google_drive")
+    for account in ("work", "home"):
+        _connect_labelled_account(portal, "alice", "personal", "drive", "google_drive", account)
+    assert (
+        client.put(url, headers=headers, json={"acknowledge_approval_bypass": True, "account": "work"}).status_code
+        == 204
+    )
+
+    row = _egress_row(portal, "alice", "personal", "drive")
+
+    assert row["accounts"] == [
+        {"label": "home", "account_label": "alice@example.com", "reuse_enabled": False},
+        {"label": "work", "account_label": "alice@example.com", "reuse_enabled": True},
+    ]
+    assert row["oauth"]["account_label"] == "alice@example.com"
+    assert _egress_row(portal, "bob", "personal", "drive")["accounts"] == []
+    assert _egress_row(portal, "alice", "personal", "github")["accounts"] == []
+    assert _account_body_action(portal, "alice", "personal", "drive", "disconnect", "home").status_code == 200
+    assert [account["label"] for account in _egress_row(portal, "alice", "personal", "drive")["accounts"]] == ["work"]
+
+
 def test_generic_oauth_routes_take_no_account() -> None:
     """Only Agent Keys connects labelled accounts: the tools' connect and disconnect routes have no `account`."""
     routes = {route.path: route for route in main.app.routes if isinstance(route, APIRoute)}

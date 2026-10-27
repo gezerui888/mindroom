@@ -21,11 +21,12 @@ from agno.tools import Toolkit
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.env import personal_page_served
 from mindroom.egress_broker.messages import CONNECTIONS_PAGE_NOT_SERVED
-from mindroom.egress_broker.oauth_source import oauth_status
+from mindroom.egress_broker.oauth_source import broker_credential_context, labelled_accounts, oauth_status
 from mindroom.egress_broker.secrets import is_personal_target, service_status
 from mindroom.egress_broker.service import manage_url
 from mindroom.egress_broker.user_services import effective_config, service_source
 from mindroom.logging_config import get_logger
+from mindroom.oauth.registry import load_oauth_providers
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
 
 if TYPE_CHECKING:
@@ -71,7 +72,9 @@ class EgressCredentialsTools(Toolkit):
         `oauth_reuse` says whether Agent Keys may use the service's account (null without one). A service with
         nothing configured also says whether the user can connect an account instead of adding a key
         (`can_connect_account`), with the account's
-        `provider` when it can or when the account still needs allowing. The result carries the link
+        `provider` when it can or when the account still needs allowing. `accounts` lists further labelled
+        accounts of the provider Agent Keys may use for the service; a request picks one with the header
+        `X-Agent-Keys-Account: <label>`. The result carries the link
         where the user connects and allows accounts and adds or replaces keys. Never ask the user to paste a key
         into the chat; send them to the link instead.
         """
@@ -104,13 +107,13 @@ class EgressCredentialsTools(Toolkit):
         config: Config,
         name: str,
         service: EgressService,
-    ) -> dict[str, str | bool | None]:
+    ) -> dict[str, object]:
         """Describe one service's credential sources in this agent's scope, as the broker would use them.
 
         A service whose status cannot be read is reported as not configured and not connectable, so one failing
         provider or unreadable secret does not fail the listing of the others. Only the error type is logged.
         """
-        entry: dict[str, str | bool | None] = {
+        entry: dict[str, object] = {
             "name": name,
             "display_name": service.display_name or name,
             "source": service_source(config.egress_broker, name),
@@ -147,6 +150,12 @@ class EgressCredentialsTools(Toolkit):
             "active_source": status.active_source,
             "oauth_reuse": reuse,
         }
+        if (
+            oauth is not None
+            and reuse is not None
+            and (accounts := self._accounts(manager, config, name, oauth.provider))
+        ):
+            entry["accounts"] = accounts
         if not status.configured:
             # An unreadable stored connection must be reset before a new one can be stored, so it is not connectable.
             # Like the broker's 403 body, name the provider only when the user can connect or allow it.
@@ -154,6 +163,23 @@ class EgressCredentialsTools(Toolkit):
             entry["can_connect_account"] = connectable
             entry["provider"] = oauth.provider if oauth is not None and (connectable or reuse is False) else None
         return entry
+
+    def _accounts(
+        self,
+        manager: CredentialsManager,
+        config: Config,
+        name: str,
+        provider_id: str,
+    ) -> list[dict[str, str | None]]:
+        """List the labelled accounts of `provider_id` that Agent Keys may use for the service, reading no other."""
+        provider = load_oauth_providers(config, self._runtime_paths).get(provider_id)
+        if provider is None:
+            return []
+        context = broker_credential_context(provider, config, self._runtime_paths, manager, self._worker_target)
+        return [
+            {"label": account.label, "account_label": account.account_label}
+            for account in labelled_accounts(context, name, allowed_only=True)
+        ]
 
     @staticmethod
     def _note(link: str | None, *, settable: bool, shared: bool) -> str:
@@ -194,12 +220,14 @@ class EgressCredentialsTools(Toolkit):
             "this agent's scope, so brokered requests to them fail with `credential_not_configured`. "
             "`active_source` names what a configured service uses; an API key wins over a connected account. "
             "`source` is `config` for a service the administrator defined and `user` for one the user added themselves. "
+            "`accounts` lists further accounts of a service's provider that Agent Keys may use; to use one instead of "
+            "the default, send the header `X-Agent-Keys-Account: <label>` with the request. "
             f"{fix}"
             "Never ask the user to paste a key into the chat."
         )
 
     @staticmethod
-    def _payload(services: list[dict[str, str | bool | None]], link: str | None, note: str) -> str:
+    def _payload(services: list[dict[str, object]], link: str | None, note: str) -> str:
         return json.dumps(
             {"tool": "egress_credentials", "services": services, "manage_url": link, "note": note},
             sort_keys=True,

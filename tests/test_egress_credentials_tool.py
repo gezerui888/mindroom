@@ -20,6 +20,7 @@ from mindroom.custom_tools.egress_credentials import EgressCredentialsTools
 from mindroom.egress_broker.secrets import save_secret
 from mindroom.egress_broker.user_services import save_user_service
 from mindroom.message_target import MessageTarget
+from mindroom.oauth.accounts import provider_for_account
 from mindroom.oauth.credential_lifecycle import resolve_oauth_credential_context
 from mindroom.oauth.credential_store import _oauth_credential_database_path
 from mindroom.oauth.github import github_oauth_provider
@@ -786,3 +787,36 @@ def test_note_on_a_shared_agent_says_who_can_allow_an_account(tmp_path: Path, wo
         "On this shared agent only its credential managers or an administrator can allow its accounts, "
         "except a per-user account such as GitHub, which each user allows for themselves."
     ) in str(payload["note"])
+
+
+def test_tool_lists_accounts_and_header(tmp_path: Path) -> None:
+    """A service lists the labelled accounts Agent Keys may use for it, and the note says how to pick one.
+
+    A labelled account nobody allowed for the service is neither listed nor read.
+    """
+    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
+    manager = get_runtime_credentials_manager(runtime_paths)
+    _configure_github_client(manager)
+    _connect_github(manager)
+    _allow_github(runtime_paths)
+    github = github_oauth_provider()
+    for account in ("work", "home"):
+        connect_account(
+            manager,
+            account_store(_ALICE),
+            f"{account}-token",
+            provider=provider_for_account(github, account),
+            _oauth_claims={"login": f"{account}-login"},
+            _oauth_claims_verified=True,
+        )
+    allow_oauth_reuse(manager, runtime_paths, account_store(_ALICE), account="work")
+    context = _context(runtime_paths, _PRESET_SERVICES)
+
+    alice = _list(_tool(runtime_paths), context)
+    bob = _list(_tool(runtime_paths, _BOB), context)
+
+    assert _entry(alice, "github")["accounts"] == [{"label": "work", "account_label": "work-login"}]
+    assert "accounts" not in _entry(alice, "openai")
+    assert "accounts" not in _entry(bob, "github")
+    assert "X-Agent-Keys-Account: <label>" in str(alice["note"])
+    assert "work-token" not in json.dumps(alice)

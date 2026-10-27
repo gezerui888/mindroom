@@ -10,7 +10,8 @@ Nothing in Agent Keys can express that, so a migration had to drop those logins 
 
 ## Decisions
 
-- **An extra account is a labelled connection of an existing provider.** A label matches `^[a-z0-9][a-z0-9-]{0,30}$`; the account is stored in the same scope store as the provider's own connection, under the credential service `f"{provider.credential_service}__{label}"`.
+- **An extra account is a labelled connection of an existing provider.** A label matches `^[a-z0-9][a-z0-9-]{0,30}$`; the account is stored in the same scope store as the provider's own connection, under the credential service `f"{base}__{label}_oauth"`, where `base` is the provider's credential service without its `_oauth` suffix (`google_drive__work_oauth`).
+  The label goes before the suffix because provider validation and credential placement treat only `*_oauth` names as OAuth tokens; any other name would fail validation, and placement would treat it as a worker-grantable setting.
   Every OAuth mechanism already works per credential service (the connect flow, the callback, refresh, the credential lifecycle), so a labelled account is the provider with that one field replaced (`dataclasses.replace`), and needs no new storage.
   The provider's own connection keeps its name and stays the one the tools use; tools never see labelled accounts.
 - **Connecting an extra account goes through Agent Keys.** The Agent Keys connect endpoint takes an optional `account` label, the OAuth pending state records it, and the callback stores the result under the labelled credential service.

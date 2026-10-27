@@ -293,11 +293,17 @@ export function EgressServiceItem({
     );
   };
 
-  const connectAccount = (event: FormEvent) => {
-    event.preventDefault();
-    if (!oauth || busy !== null || newAccount === null) return;
-    const account = newAccount;
-    if (!ACCOUNT_LABEL.test(account)) return;
+  // Why the typed label cannot be connected, if it cannot.
+  const newAccountProblem =
+    newAccount === null || newAccount === ""
+      ? null
+      : !ACCOUNT_LABEL.test(newAccount)
+        ? ACCOUNT_LABEL_HINT
+        : accounts?.some((account) => account.label === newAccount)
+          ? `${newAccount} already has an account. Reconnect or disconnect it instead.`
+          : null;
+  const connectAccount = (account: string) => {
+    if (!oauth || busy !== null) return;
     void run("connect", "Could not connect. Try again.", async (signal) => {
       await connectWithPopup(
         oauth.provider,
@@ -501,10 +507,26 @@ export function EgressServiceItem({
                   className="flex flex-wrap items-center gap-2"
                 >
                   <span className="font-medium">{account.label}</span>
-                  {account.account_label && (
-                    <span className="text-muted-foreground">
-                      {account.account_label}
-                    </span>
+                  {account.connected ? (
+                    account.account_label && (
+                      <span className="text-muted-foreground">
+                        {account.account_label}
+                      </span>
+                    )
+                  ) : (
+                    <span className="text-muted-foreground">Not connected</span>
+                  )}
+                  {!account.connected && canAddAccount && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-6 px-2 text-xs"
+                      disabled={busy !== null}
+                      aria-label={`Reconnect ${account.label} for ${name}`}
+                      onClick={() => connectAccount(account.label)}
+                    >
+                      Reconnect
+                    </Button>
                   )}
                   {canChangeReuse && (
                     <>
@@ -624,7 +646,11 @@ export function EgressServiceItem({
         {oauth && newAccount !== null && (
           <form
             className="mt-2 flex flex-wrap items-center gap-2 sm:justify-end"
-            onSubmit={connectAccount}
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (newAccount && newAccountProblem === null)
+                connectAccount(newAccount);
+            }}
           >
             <Input
               aria-label={`Label of the other ${oauth.display_name} account`}
@@ -635,16 +661,18 @@ export function EgressServiceItem({
               disabled={busy !== null}
               onChange={(event) => setNewAccount(event.target.value)}
             />
-            {newAccount !== "" && !ACCOUNT_LABEL.test(newAccount) && (
+            {newAccountProblem && (
               <p className="basis-full text-xs text-destructive">
-                {ACCOUNT_LABEL_HINT}
+                {newAccountProblem}
               </p>
             )}
             <Button
               type="submit"
               size="sm"
               aria-label={`Connect the other ${oauth.display_name} account for ${name}`}
-              disabled={busy !== null || !ACCOUNT_LABEL.test(newAccount)}
+              disabled={
+                busy !== null || newAccount === "" || newAccountProblem !== null
+              }
             >
               {busy === "connect" ? "Connecting…" : "Connect"}
             </Button>

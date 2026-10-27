@@ -17,7 +17,7 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
-from mindroom.egress_broker.oauth_reuse import oauth_reuse_enabled
+from mindroom.egress_broker.oauth_reuse import oauth_reuse_accounts, oauth_reuse_enabled
 from mindroom.egress_broker.secrets import (
     OAuthAccount,
     OAuthStatus,
@@ -153,7 +153,7 @@ def resolve_oauth_token(  # noqa: PLR0911 - checks in order
         )
     # The opt-in lives with the provider's own connection; a labelled account's token is in the same store.
     context = replace(context, provider=provider_for_account(provider, account))
-    credentials = _refreshed_credentials(service, context, linked=account is None)
+    credentials = _refreshed_credentials(service, context, account=account)
     if isinstance(credentials, SecretNeedsReconnect | SecretUnavailable):
         return credentials
     token = (credentials or {}).get("token") or (credentials or {}).get("access_token")
@@ -228,25 +228,33 @@ def oauth_connection_for_display(context: OAuthCredentialContext) -> tuple[bool,
 
 
 def labelled_accounts(context: OAuthCredentialContext, service: str, *, allowed_only: bool) -> list[OAuthAccount]:
-    """Return the scope's connected labelled accounts of the context's provider, by label, with their opt-ins for `service`.
+    """Return the scope's labelled accounts of the context's provider, by label, with their opt-ins for `service`.
 
-    The agent tool passes `allowed_only`, which reads no account nobody allowed for `service`; the egress pages list
-    every one, read whatever its opt-in, as `oauth_connection_for_display` reads the provider's own connection.
-    Blocks on the store, so async callers run it in a thread.
+    The egress pages list each connected account, read whatever its opt-in, as `oauth_connection_for_display` reads
+    the provider's own connection, and each allowed one even while it cannot be used, so its opt-in stays in sight
+    until someone reconnects, stops, or disconnects it. The agent tool passes `allowed_only`: only allowed accounts
+    it can use, reading no other. Blocks on the store, so async callers run it in a thread.
     """
     provider = context.provider
     if provider.requester_scoped_credentials and context.worker_target is None:
         return []
+    allowed = set(oauth_reuse_accounts(context, service, provider.id))
+    stored = [] if allowed_only else account_labels(provider, oauth_credential_services_beside(context))
     accounts = []
-    for label in account_labels(provider, oauth_credential_services_beside(context)):
-        reuse_enabled = oauth_reuse_enabled(context, service, provider.id, label)
-        if allowed_only and not reuse_enabled:
-            continue
+    for label in sorted(allowed.union(stored)):
         connected, account_label = oauth_connection_for_display(
             replace(context, provider=provider_for_account(provider, label)),
         )
-        if connected:
-            accounts.append(OAuthAccount(label=label, account_label=account_label, reuse_enabled=reuse_enabled))
+        reuse_enabled = label in allowed
+        if connected or (reuse_enabled and not allowed_only):
+            accounts.append(
+                OAuthAccount(
+                    label=label,
+                    account_label=account_label,
+                    connected=connected,
+                    reuse_enabled=reuse_enabled,
+                ),
+            )
     return accounts
 
 
@@ -317,11 +325,12 @@ def _refreshed_credentials(
     service: str,
     context: OAuthCredentialContext,
     *,
-    linked: bool,
+    account: str | None,
 ) -> dict[str, Any] | SecretNeedsReconnect | SecretUnavailable | None:
     """Refresh the scope's credentials through its gate; a failed refresh becomes the result to return.
 
-    A rejected grant carries a reconnect link only when `linked`.
+    A reconnect names the labelled `account` the context stores, and carries a link only for the provider's own
+    connection.
     """
     gate = _refresh_gate(context)
     with gate.lock:
@@ -342,10 +351,11 @@ def _refreshed_credentials(
     _log_token_unavailable(service, context.provider, terminal)
     if isinstance(terminal, OAuthCredentialUnreadableError):
         # Unreadable state must be reset from the dashboard before a new connection can be stored.
-        return SecretNeedsReconnect(provider=context.provider.id, reset_required=True)
+        return SecretNeedsReconnect(provider=context.provider.id, reset_required=True, account=account)
     return SecretNeedsReconnect(
         provider=context.provider.id,
-        connect_url=_connect_url(context, OAUTH_REFRESH_REJECTED_REASON) if linked else None,
+        connect_url=_connect_url(context, OAUTH_REFRESH_REJECTED_REASON) if account is None else None,
+        account=account,
     )
 
 

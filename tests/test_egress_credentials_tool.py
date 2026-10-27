@@ -820,3 +820,29 @@ def test_tool_lists_accounts_and_header(tmp_path: Path) -> None:
     assert "accounts" not in _entry(bob, "github")
     assert "X-Agent-Keys-Account: <label>" in str(alice["note"])
     assert "work-token" not in json.dumps(alice)
+
+
+def test_a_failing_account_listing_leaves_the_service_listed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Labelled accounts that cannot be read leave the service's own entry, like a status that cannot be read."""
+    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
+    manager = get_runtime_credentials_manager(runtime_paths)
+    _configure_github_client(manager)
+    _connect_github(manager)
+    _allow_github(runtime_paths)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        msg = "store unavailable"
+        raise OSError(msg)
+
+    monkeypatch.setattr(egress_credentials_module, "labelled_accounts", fail)
+    with capture_logs() as logs:
+        payload = _list(_tool(runtime_paths), _context(runtime_paths, _PRESET_SERVICES))
+
+    assert _entry(payload, "github")["active_source"] == "oauth"
+    assert "accounts" not in _entry(payload, "github")
+    assert {
+        "event": "egress_credentials_accounts_failed",
+        "log_level": "warning",
+        "service": "github",
+        "error_type": "OSError",
+    } in logs

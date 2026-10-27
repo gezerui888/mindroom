@@ -234,12 +234,14 @@ class SecretMissing:
 class SecretNeedsReconnect:
     """The scope's OAuth connection cannot supply a token until the user reconnects: its grant was revoked.
 
-    `reset_required` means the stored credential is unreadable and must be reset before reconnecting.
+    `reset_required` means the stored credential is unreadable and must be reset before reconnecting. `account` is
+    the label of the provider's account the request named, None for its own connection.
     """
 
     provider: str
     connect_url: str | None = field(default=None, repr=False)
     reset_required: bool = False
+    account: str | None = None
 
 
 @dataclass(frozen=True)
@@ -298,12 +300,13 @@ class OAuthStatus:
 class OAuthAccount:
     """A labelled account of a service's provider in one scope; never holds a token.
 
-    `account_label` shows which account it is (its email, or a login where the provider has none), and
-    `reuse_enabled` whether Agent Keys may use it for the service.
+    `account_label` shows which account it is (its email, or a login where the provider has none), `connected`
+    whether its stored connection can be used, and `reuse_enabled` whether Agent Keys may use it for the service.
     """
 
     label: str
     account_label: str | None
+    connected: bool
     reuse_enabled: bool
 
 

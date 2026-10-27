@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "OAUTH_REUSE_CREDENTIAL_SERVICE",
+    "oauth_reuse_accounts",
     "oauth_reuse_enabled",
     "set_oauth_reuse",
     "stop_account_reuse",
@@ -56,6 +57,22 @@ def oauth_reuse_enabled(
             return True
         case _:
             return False
+
+
+def oauth_reuse_accounts(context: OAuthCredentialContext, service: str, provider_id: str) -> list[str]:
+    """Return the labels of the accounts Agent Keys may use for `service`, given for `provider_id`.
+
+    Reads the credential store, so async callers run it in a thread.
+    """
+    if context.provider.requester_scoped_credentials and context.worker_target is None:
+        return []
+    labels = []
+    for key, entry in _stored(context).items():
+        name, _, label = key.partition("@")
+        match entry:
+            case {"provider": provider} if provider == provider_id and name == service and label:
+                labels.append(label)
+    return labels
 
 
 def set_oauth_reuse(

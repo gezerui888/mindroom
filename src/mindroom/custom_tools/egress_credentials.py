@@ -150,12 +150,15 @@ class EgressCredentialsTools(Toolkit):
             "active_source": status.active_source,
             "oauth_reuse": reuse,
         }
-        if (
-            oauth is not None
-            and reuse is not None
-            and (accounts := self._accounts(manager, config, name, oauth.provider))
-        ):
-            entry["accounts"] = accounts
+        if oauth is not None and reuse is not None:
+            try:
+                accounts = self._accounts(manager, config, name, oauth.provider)
+            except Exception as exc:
+                # The service's own entry stays right without its further accounts.
+                logger.warning("egress_credentials_accounts_failed", service=name, error_type=type(exc).__name__)
+                accounts = []
+            if accounts:
+                entry["accounts"] = accounts
         if not status.configured:
             # An unreadable stored connection must be reset before a new one can be stored, so it is not connectable.
             # Like the broker's 403 body, name the provider only when the user can connect or allow it.

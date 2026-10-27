@@ -113,6 +113,8 @@ export interface EgressLabelledAccount {
   label: string;
   /** The account's email, or its login where the provider has none. */
   account_label: string | null;
+  /** Its stored connection can be used; an allowed account stays listed without one until it is reconnected or removed. */
+  connected: boolean;
   /** Agent Keys may use this account for the service. */
   reuse_enabled: boolean;
 }

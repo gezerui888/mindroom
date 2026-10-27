@@ -709,6 +709,18 @@ async def test_missing_secret_on_a_shared_agent_names_its_credential_managers(
                 "message": RECONNECT_MESSAGE,
             },
         ),
+        (
+            SecretNeedsReconnect(provider="github", account="work"),
+            {
+                "error": "oauth_connection_required",
+                "service": "svc",
+                "provider": "github",
+                "account": "work",
+                "connect_url": None,
+                "manage_url": MANAGE_URL,
+                "message": RECONNECT_MESSAGE,
+            },
+        ),
     ],
 )
 async def test_oauth_reconnect_required_gets_403_without_reaching_upstream(

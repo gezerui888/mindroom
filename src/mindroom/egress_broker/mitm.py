@@ -298,6 +298,7 @@ class TlsInterceptor:
                 connectable=result.connect_url is not None,
                 connect_url=result.connect_url,
                 manage_url=manage_url,
+                account=result.account,
             )
             if result.reset_required:
                 reconnect["reset_required"] = True

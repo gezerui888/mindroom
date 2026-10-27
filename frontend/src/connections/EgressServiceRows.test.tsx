@@ -2247,8 +2247,18 @@ describe("labelled accounts", () => {
     renderRows(
       [
         withLabelled([
-          { label: "home", account_label: "octo-home", reuse_enabled: true },
-          { label: "work", account_label: "octo-work", reuse_enabled: false },
+          {
+            label: "home",
+            account_label: "octo-home",
+            connected: true,
+            reuse_enabled: true,
+          },
+          {
+            label: "work",
+            account_label: "octo-work",
+            connected: true,
+            reuse_enabled: false,
+          },
         ]),
       ],
       { onChanged },
@@ -2304,6 +2314,64 @@ describe("labelled accounts", () => {
         body: JSON.stringify({ account: "work" }),
       }),
     );
+  });
+
+  it("keeps an allowed account that stopped working, offering Reconnect", async () => {
+    vi.mocked(fetch).mockImplementation(async () => json(authorization));
+    renderRows([
+      withLabelled([
+        {
+          label: "work",
+          account_label: null,
+          connected: false,
+          reuse_enabled: true,
+        },
+      ]),
+    ]);
+    const github = row("GitHub");
+    expect(within(github).getByText("Not connected")).toBeVisible();
+
+    fireEvent.click(
+      within(github).getByRole("button", { name: "Reconnect work for GitHub" }),
+    );
+
+    await waitFor(() =>
+      expect(popup.location.href).toBe(authorization.auth_url),
+    );
+    expect(call(0)[1]).toEqual(
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ account: "work" }),
+      }),
+    );
+  });
+
+  it("refuses a label another account already has", async () => {
+    renderRows([
+      withLabelled([
+        {
+          label: "work",
+          account_label: "octo-work",
+          connected: true,
+          reuse_enabled: true,
+        },
+      ]),
+    ]);
+
+    fireEvent.click(await rowAction("Add another GitHub account for GitHub"));
+    fireEvent.change(
+      screen.getByLabelText("Label of the other GitHub account"),
+      {
+        target: { value: "work" },
+      },
+    );
+
+    expect(
+      screen.getByRole("button", {
+        name: "Connect the other GitHub account for GitHub",
+      }),
+    ).toBeDisabled();
+    expect(screen.getByText(/already has an account/)).toBeVisible();
   });
 
   it("offers no other accounts where the listing sends none, as on the dashboard", async () => {

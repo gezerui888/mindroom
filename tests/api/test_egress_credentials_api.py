@@ -1318,14 +1318,44 @@ def test_status_lists_labelled_accounts(oauth_egress_portal: dict[str, Any]) -> 
     row = _egress_row(portal, "alice", "personal", "drive")
 
     assert row["accounts"] == [
-        {"label": "home", "account_label": "alice@example.com", "reuse_enabled": False},
-        {"label": "work", "account_label": "alice@example.com", "reuse_enabled": True},
+        {"label": "home", "account_label": "alice@example.com", "connected": True, "reuse_enabled": False},
+        {"label": "work", "account_label": "alice@example.com", "connected": True, "reuse_enabled": True},
     ]
     assert row["oauth"]["account_label"] == "alice@example.com"
     assert _egress_row(portal, "bob", "personal", "drive")["accounts"] == []
     assert _egress_row(portal, "alice", "personal", "github")["accounts"] == []
     assert _account_body_action(portal, "alice", "personal", "drive", "disconnect", "home").status_code == 200
     assert [account["label"] for account in _egress_row(portal, "alice", "personal", "drive")["accounts"]] == ["work"]
+
+
+def test_an_allowed_account_that_stopped_working_stays_listed_until_disconnected(
+    oauth_egress_portal: dict[str, Any],
+) -> None:
+    """A labelled account Agent Keys may use stays on the row once unusable, so someone can reconnect or remove it.
+
+    Disconnecting it resets even an unreadable store and drops its opt-ins, so the row goes with it.
+    """
+    portal = oauth_egress_portal
+    client, headers, url = portal["client"], portal["headers"]["alice"], _reuse_url("personal", "drive")
+    _connect_labelled_account(portal, "alice", "personal", "drive", "google_drive", "work")
+    assert (
+        client.put(url, headers=headers, json={"acknowledge_approval_bypass": True, "account": "work"}).status_code
+        == 204
+    )
+    context = _oauth_credential_context(
+        provider_for_account(portal["providers"]["google_drive"], "work"),
+        portal["paths"],
+        requester_id="@alice:example.org",
+        agent_name="personal",
+    )
+    corrupt_oauth_credential_payload(oauth_credential_store._oauth_credential_database_path(context), b"unreadable")
+
+    broken = _egress_row(portal, "alice", "personal", "drive")["accounts"]
+    disconnected = _account_body_action(portal, "alice", "personal", "drive", "disconnect", "work")
+
+    assert broken == [{"label": "work", "account_label": None, "connected": False, "reuse_enabled": True}]
+    assert disconnected.status_code == 200, disconnected.text
+    assert _egress_row(portal, "alice", "personal", "drive")["accounts"] == []
 
 
 def test_generic_oauth_routes_take_no_account() -> None:

@@ -1133,4 +1133,4 @@ def test_a_labelled_accounts_refresh_is_its_own(
 
     assert outage == SecretUnavailable(provider="github")
     assert own == Secret("alice-own")
-    assert revoked == SecretNeedsReconnect(provider="github")
+    assert revoked == SecretNeedsReconnect(provider="github", account="work")

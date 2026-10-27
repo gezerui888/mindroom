@@ -630,7 +630,7 @@ A template tool with its own settings cannot be removed; removing any other tool
 
 Only the agent's owner can read or change it, with no administrator bypass, and the change is stored in the roster and applied after a short configuration reload.
 The tool runs in the primary runtime even when `worker_tools` lists it, and it is never available to scripts, [workflow participants](#spec-shape), or deferral.
-Every `update_agent()` call shows the owner an approval card, even when `tool_approval.default` is `auto_approve`, because the model issuing it also reads untrusted content; only the owner's own [`!auto_approve`](../tool-approval.md#auto-approval-for-a-few-minutes) window skips it.
+Every `update_agent()` call shows the owner an approval card, even when `tool_approval.default` is `auto_approve`, because the model issuing it also reads untrusted content; only the owner's own [`!auto_approve`](../tool-approval.md#auto-approve-everything) window skips it.
 In a room without the router, such as a personal room, the router is invited first (see [When the Router Is Missing](../tool-approval.md#when-the-router-is-missing)), and the owner then approves with ✅.
 
 ```python

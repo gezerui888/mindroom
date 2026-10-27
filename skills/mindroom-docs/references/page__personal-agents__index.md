@@ -145,7 +145,7 @@ An agent changes only itself, never another personal agent.
 
 A generated agent whose template has `owner_edits: true` gets the [`agent_manager`](https://docs.mindroom.chat/tools/agent-orchestration/#agent_manager) tool automatically.
 `list_my_agents()` returns the agent's key, its editable values, and the names the template allows, and `update_agent()` stores a change and requests a short configuration reload that applies it.
-The owner confirms each change on an approval card, even when `tool_approval.default` is `auto_approve`, because the agent also reads content the owner did not write; only the owner's own [`!auto_approve`](https://docs.mindroom.chat/tool-approval/#auto-approval-for-a-few-minutes) window skips the card.
+The owner confirms each change on an approval card, even when `tool_approval.default` is `auto_approve`, because the agent also reads content the owner did not write; only the owner's own [`!auto_approve`](https://docs.mindroom.chat/tool-approval/#auto-approve-everything) window skips the card.
 Approval cards need the router, so in a personal room without it the agent first invites the router (see [When the Router Is Missing](https://docs.mindroom.chat/tool-approval/#when-the-router-is-missing)), and the owner then approves with ✅.
 
 ```text

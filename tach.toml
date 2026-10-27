@@ -1572,7 +1572,9 @@ depends_on = ["mindroom.config.agent"]
 path = "mindroom.custom_tools.memory"
 depends_on = [
     "mindroom.embeddings.errors",
+    "mindroom.failure_text",
     "mindroom.memory",
+    "mindroom.redaction",
 ]
 
 [[modules]]
@@ -3627,17 +3629,11 @@ depends_on = [
     "mindroom.embeddings.factory",
     "mindroom.embeddings.signatures",
     "mindroom.logging_config",
-    "mindroom.memory._mem0_openai",
     "mindroom.memory._mem0_usage",
     "mindroom.timing",
     "mindroom.tool_system.dependencies",
 ]
 visibility = ["mindroom.memory._backend"]
-
-[[modules]]
-path = "mindroom.memory._mem0_openai"
-depends_on = ["mindroom.model_defaults"]
-visibility = ["mindroom.memory.config"]
 
 [[modules]]
 path = "mindroom.memory._mem0_usage"
@@ -8470,6 +8466,19 @@ visibility = ["mindroom.tools.visualization"]
 [[interfaces]]
 from = ["mindroom.tools.agno_compat_visualization"]
 expose = ["WorkspaceVisualizationTools"]
+
+[[modules]]
+path = "mindroom.tools.mem0"
+depends_on = ["mindroom.tool_system.declarations", "mindroom.tool_system.registration", "mindroom.tools.agno_compat_mem0"]
+
+[[modules]]
+path = "mindroom.tools.agno_compat_mem0"
+depends_on = ["mindroom.failure_text", "mindroom.redaction"]
+visibility = ["mindroom.tools.mem0"]
+
+[[interfaces]]
+from = ["mindroom.tools.agno_compat_mem0"]
+expose = ["UserFilterMem0Tools"]
 
 [[modules]]
 path = "mindroom.tools.newspaper4k"

@@ -17,7 +17,13 @@ from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker import oauth_source
-from mindroom.egress_broker.oauth_reuse import OAUTH_REUSE_CREDENTIAL_SERVICE, set_oauth_reuse
+from mindroom.egress_broker.oauth_reuse import (
+    OAUTH_REUSE_CREDENTIAL_SERVICE,
+    oauth_reuse_enabled,
+    set_oauth_reuse,
+    stop_account_reuse,
+    stop_service_reuse,
+)
 from mindroom.egress_broker.oauth_source import broker_credential_context, oauth_status, resolve_oauth_token
 from mindroom.egress_broker.secrets import (
     OAuthStatus,
@@ -27,6 +33,7 @@ from mindroom.egress_broker.secrets import (
     SecretResult,
     SecretUnavailable,
     load_egress_document,
+    save_egress_document,
 )
 from mindroom.egress_broker.tokens import WorkerClaims
 from mindroom.oauth.credential_lifecycle import load_oauth_credentials_snapshot_sync, resolve_oauth_credential_context
@@ -979,3 +986,87 @@ def test_status_says_whether_agent_keys_may_use_the_connection_and_revoking_stop
     assert allowed[1] == Secret("alice-access")
     assert revoked == SecretMissing(provider="github", reuse_off=True, requester_owned=True)
     assert load_egress_document(manager, account_store("@alice:example.org"), OAUTH_REUSE_CREDENTIAL_SERVICE) is None
+
+
+def _allowed(context: OAuthCredentialContext, service: str, account: str | None) -> bool:
+    return oauth_reuse_enabled(context, service, "github", account)
+
+
+def test_account_opt_ins_toggle_independently(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    manager: CredentialsManager,
+) -> None:
+    """The provider's own connection and each labelled account are allowed and stopped per service, one at a time."""
+    context = broker_credential_context(
+        github_oauth_provider(),
+        config,
+        runtime_paths,
+        manager,
+        _broker_target("@alice:example.org"),
+    )
+    for account in (None, "work", "home"):
+        set_oauth_reuse(context, "github", "github", enabled=True, by="@alice:example.org", account=account)
+
+    set_oauth_reuse(context, "github", "github", enabled=False, by="@alice:example.org", account="work")
+    after_work = [_allowed(context, "github", account) for account in (None, "work", "home")]
+    set_oauth_reuse(context, "github", "github", enabled=False, by="@alice:example.org")
+    after_own = [_allowed(context, "github", account) for account in (None, "work", "home")]
+
+    assert after_work == [True, False, True]
+    assert after_own == [False, False, True]
+    assert _allowed(context, "gist", "home") is False
+    document = load_egress_document(manager, account_store("@alice:example.org"), OAUTH_REUSE_CREDENTIAL_SERVICE)
+    assert document is not None
+    assert set(document["services"]) == {"github@home"}
+    assert document["services"]["github@home"]["provider"] == "github"
+
+
+def test_existing_documents_read_unchanged(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    manager: CredentialsManager,
+) -> None:
+    """A document holding only entries named after services keeps allowing the provider's own connection, only."""
+    store = account_store("@alice:example.org")
+    entry = {"provider": "github", "enabled_by": "@alice:example.org", "enabled_at": "2026-10-01T00:00:00Z"}
+    save_egress_document(manager, store, OAUTH_REUSE_CREDENTIAL_SERVICE, {"services": {"github": entry}})
+    context = broker_credential_context(
+        github_oauth_provider(),
+        config,
+        runtime_paths,
+        manager,
+        _broker_target("@alice:example.org"),
+    )
+
+    assert _allowed(context, "github", None) is True
+    assert _allowed(context, "github", "github") is False
+
+
+def test_stopping_an_account_or_a_service_drops_each_of_its_opt_ins(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    manager: CredentialsManager,
+) -> None:
+    """A disconnected label loses its opt-in for every service; a deleted service loses all of its own."""
+    context = broker_credential_context(
+        github_oauth_provider(),
+        config,
+        runtime_paths,
+        manager,
+        _broker_target("@alice:example.org"),
+    )
+    for service in ("github", "gist"):
+        for account in (None, "work", "home"):
+            set_oauth_reuse(context, service, "github", enabled=True, by="@alice:example.org", account=account)
+    set_oauth_reuse(context, "other", "other_provider", enabled=True, by="@alice:example.org", account="work")
+
+    stop_account_reuse(context, "github", "work")
+    after_account = {(service, account) for service in ("github", "gist") for account in (None, "work", "home")}
+    after_account = {pair for pair in after_account if _allowed(context, *pair)}
+    stop_service_reuse(context, "gist")
+
+    assert after_account == {("github", None), ("github", "home"), ("gist", None), ("gist", "home")}
+    assert [_allowed(context, "gist", account) for account in (None, "home")] == [False, False]
+    assert [_allowed(context, "github", account) for account in (None, "home")] == [True, True]
+    assert oauth_reuse_enabled(context, "other", "other_provider", "work") is True

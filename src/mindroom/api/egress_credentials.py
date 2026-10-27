@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response
-from pydantic import AfterValidator, BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from mindroom.api import config_lifecycle, oauth
 from mindroom.api.auth import require_connections_user
@@ -26,6 +26,7 @@ from mindroom.api.connection_agents import (
 )
 from mindroom.api.egress_status import (
     RESTRICT_ONLY_KEY_REFUSAL,
+    AccountLabel,
     AuditLogsResponse,
     EgressRuleSummary,
     EgressSourceStatus,
@@ -47,7 +48,7 @@ from mindroom.authorization import is_sender_allowed_for_agent_credential_manage
 from mindroom.config.egress_broker import EgressService
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.egress_broker.env import EgressAgentScope, egress_agent_scope
-from mindroom.egress_broker.oauth_reuse import set_oauth_reuse
+from mindroom.egress_broker.oauth_reuse import set_oauth_reuse, stop_account_reuse, stop_service_reuse
 from mindroom.egress_broker.oauth_source import broker_credential_context
 from mindroom.egress_broker.secrets import delete_secret, save_secret
 from mindroom.egress_broker.service import active_audit_log
@@ -63,7 +64,6 @@ from mindroom.egress_broker.user_services import (
     service_source,
     user_service_hosts_not_allowed,
 )
-from mindroom.oauth.accounts import validate_account_label
 from mindroom.oauth.registry import load_oauth_providers, load_oauth_providers_for_snapshot
 from mindroom.requester_identity import resolve_human_requester_alias
 
@@ -76,6 +76,7 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
     from mindroom.oauth import OAuthProvider
+    from mindroom.oauth.credential_lifecycle import OAuthCredentialContext
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 router = APIRouter(
@@ -567,7 +568,7 @@ def delete_user_service_route(
     name: str,
     requester_id: _EgressUser,
 ) -> None:
-    """Delete one of the scope's own services together with its stored key and its account's opt-in.
+    """Delete one of the scope's own services together with its stored key and its accounts' opt-ins.
 
     Returns 404 when the scope has no such service. A config service cannot be deleted, so its name is a 409. An
     inactive entry (see `InactiveUserService`) can still be removed: one stored under a name that a config service
@@ -581,7 +582,7 @@ def delete_user_service_route(
     if delete_user_service(agent.manager, agent.target, name, config_services=operator.services):
         provider = service_oauth_provider(config_lifecycle.bind_current_request_snapshot(request), own)
         if provider is not None:
-            _set_account_reuse(agent, provider, name, enabled=False, by=requester_id)
+            stop_service_reuse(_reuse_context(agent, provider), name)
         return
     if name in operator.services:
         detail = f"Service '{name}' is configured by your administrator and cannot be deleted here"
@@ -597,7 +598,7 @@ class _AccountMutation(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    account: Annotated[str, AfterValidator(validate_account_label)] | None = None
+    account: AccountLabel | None = None
 
 
 async def _account_provider(
@@ -628,10 +629,22 @@ async def _account_provider(
     return agent, provider
 
 
-def _set_account_reuse(agent: _ResolvedAgent, provider: OAuthProvider, service: str, *, enabled: bool, by: str) -> None:
-    """Allow or stop Agent Keys using the service's account, in the store the broker reads it from for this agent."""
-    context = broker_credential_context(provider, agent.config, agent.runtime_paths, agent.manager, agent.target)
-    set_oauth_reuse(context, service, provider.id, enabled=enabled, by=by)
+def _reuse_context(agent: _ResolvedAgent, provider: OAuthProvider) -> OAuthCredentialContext:
+    """Return the context whose store holds this agent's opt-ins for the provider, where the broker reads them."""
+    return broker_credential_context(provider, agent.config, agent.runtime_paths, agent.manager, agent.target)
+
+
+def _set_account_reuse(
+    agent: _ResolvedAgent,
+    provider: OAuthProvider,
+    service: str,
+    *,
+    enabled: bool,
+    by: str,
+    account: str | None,
+) -> None:
+    """Allow or stop Agent Keys using the service's account, or its labelled `account`, for this agent."""
+    set_oauth_reuse(_reuse_context(agent, provider), service, provider.id, enabled=enabled, by=by, account=account)
 
 
 @router.post("/agents/{agent_name}/{service}/connect")
@@ -660,13 +673,17 @@ async def disconnect_egress_account(
 ) -> dict[str, str]:
     """Reset the OAuth connection of a service's provider, or only its labelled `account`, for one agent's scope.
 
-    The opt-in of the provider's own connection stays.
+    The opt-in of the provider's own connection stays; a labelled account's opt-ins go with it.
     """
-    _agent, provider = await _account_provider(request, requester_id, agent_name, service, connecting=False)
-    return await masked_oauth_call(
+    agent, provider = await _account_provider(request, requester_id, agent_name, service, connecting=False)
+    result = await masked_oauth_call(
         oauth.disconnect_account(provider.id, request, agent_name=agent_name, account=body.account),
         "Could not disconnect account",
     )
+    if body.account is not None:
+        # The account's row and toggles go with it, so its opt-ins must not wait for a later account under its label.
+        await asyncio.to_thread(stop_account_reuse, _reuse_context(agent, provider), provider.id, body.account)
+    return result
 
 
 @router.put("/agents/{agent_name}/{service}/oauth-reuse", status_code=204)
@@ -675,15 +692,24 @@ async def allow_egress_account_reuse(
     agent_name: str,
     service: str,
     requester_id: _EgressUser,
-    _body: OAuthReuseRequest,
+    body: OAuthReuseRequest,
 ) -> None:
     """Let Agent Keys use the service's connected account for this agent; the body must confirm the approval bypass.
 
-    The account's own connection, connected now or later, is then injected for the agent's shell and python. Who may
-    do this, and the 403, 404, and 409 answers, follow the connect route; a body without the confirmation is a 422.
+    The account's own connection, connected now or later, is then injected for the agent's shell and python; with
+    `account`, that labelled account instead. Who may do this, and the 403, 404, and 409 answers, follow the connect
+    route; a body without the confirmation or with an invalid label is a 422.
     """
     agent, provider = await _account_provider(request, requester_id, agent_name, service, connecting=False)
-    await asyncio.to_thread(_set_account_reuse, agent, provider, service, enabled=True, by=requester_id)
+    await asyncio.to_thread(
+        _set_account_reuse,
+        agent,
+        provider,
+        service,
+        enabled=True,
+        by=requester_id,
+        account=body.account,
+    )
 
 
 @router.delete("/agents/{agent_name}/{service}/oauth-reuse", status_code=204)
@@ -691,11 +717,23 @@ async def stop_egress_account_reuse(
     request: Request,
     agent_name: str,
     service: str,
-    requester_id: _EgressUser,
+    requester_id: Annotated[str, Depends(_egress_user_accepting("account"))],
+    account: Annotated[AccountLabel | None, Query()] = None,
 ) -> None:
-    """Stop Agent Keys using the service's connected account for this agent; the connection stays for its tools."""
+    """Stop Agent Keys using the service's connected account, or its labelled `account`, for this agent.
+
+    The connection stays for its tools.
+    """
     agent, provider = await _account_provider(request, requester_id, agent_name, service, connecting=False)
-    await asyncio.to_thread(_set_account_reuse, agent, provider, service, enabled=False, by=requester_id)
+    await asyncio.to_thread(
+        _set_account_reuse,
+        agent,
+        provider,
+        service,
+        enabled=False,
+        by=requester_id,
+        account=account,
+    )
 
 
 # Request log

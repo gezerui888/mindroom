@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import weakref
 from dataclasses import asdict, replace
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 from fastapi import HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import AfterValidator, BaseModel, ConfigDict
 
 from mindroom.api import config_lifecycle, oauth
 from mindroom.api.connection_agents import CONNECTIONS_HEADERS
@@ -35,6 +35,7 @@ from mindroom.egress_broker.user_services import (
     effective_config,
 )
 from mindroom.logging_config import get_logger
+from mindroom.oauth.accounts import validate_account_label
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
 from mindroom.oauth.service import oauth_provider_service_account_configured
 from mindroom.workers.backend import WorkerBackendError
@@ -322,8 +323,11 @@ class PutSecretRequest(BaseModel):
     secret: str
 
 
+AccountLabel = Annotated[str, AfterValidator(validate_account_label)]
+
+
 class OAuthReuseRequest(BaseModel):
-    """Body that lets Agent Keys use a service's connected account.
+    """Body that lets Agent Keys use a service's connected account, or its labelled `account`.
 
     The account's tools ask for approval before they write, but the agent's shell and python then act as the account
     with its full access and no prompts, so the caller must confirm that (`acknowledge_approval_bypass`).
@@ -332,6 +336,7 @@ class OAuthReuseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     acknowledge_approval_bypass: Literal[True]
+    account: AccountLabel | None = None
 
 
 class EgressSourceStatus(BaseModel):

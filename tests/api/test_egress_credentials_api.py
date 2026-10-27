@@ -31,6 +31,7 @@ from mindroom.credentials.manager import CredentialsManager, get_runtime_credent
 from mindroom.egress_broker import oauth_source, secrets
 from mindroom.egress_broker.audit import AuditLog, AuditRecord
 from mindroom.egress_broker.env import egress_agent_scope
+from mindroom.egress_broker.oauth_reuse import oauth_reuse_enabled
 from mindroom.egress_broker.oauth_source import resolve_oauth_token
 from mindroom.egress_broker.presets import EGRESS_PRESETS
 from mindroom.egress_broker.rules import EgressRules, route_request
@@ -1223,6 +1224,83 @@ def test_invalid_account_label_is_422(oauth_egress_portal: dict[str, Any], actio
     portal = oauth_egress_portal
     response = _account_body_action(portal, "alice", "personal", "drive", action, account)
     assert response.status_code == 422, response.text
+
+
+def _labelled_reuse(
+    portal: dict[str, Any],
+    requester_id: str,
+    agent: str,
+    service: str,
+    provider: str,
+    account: str | None,
+) -> bool:
+    """Return whether the broker may use `account` of the service's provider for a tool call by `requester_id`."""
+    config = Config.model_validate(portal["payload"], context={"runtime_paths": portal["paths"]})
+    context = oauth_source.broker_credential_context(
+        portal["providers"][provider],
+        config,
+        portal["paths"],
+        get_runtime_credentials_manager(portal["paths"]),
+        _broker_target(portal, requester_id, agent),
+    )
+    return oauth_reuse_enabled(context, service, provider, account)
+
+
+def test_allow_reuse_for_labelled_account(oauth_egress_portal: dict[str, Any]) -> None:
+    """Allowing or stopping a labelled account changes its opt-in alone, and an invalid label is refused."""
+    portal = oauth_egress_portal
+    client, headers, url = portal["client"], portal["headers"]["alice"], _reuse_url("personal", "drive")
+    _connect_labelled_account(portal, "alice", "personal", "drive", "google_drive", "work")
+    body = {"acknowledge_approval_bypass": True, "account": "work"}
+
+    allowed = client.put(url, headers=headers, json=body)
+    states = [
+        _labelled_reuse(portal, "@alice:example.org", "personal", "drive", "google_drive", a) for a in (None, "work")
+    ]
+    own = _allow_reuse(portal, "alice", "personal", "drive")
+    stopped = client.delete(url, headers=headers, params={"account": "work"})
+    after = [
+        _labelled_reuse(portal, "@alice:example.org", "personal", "drive", "google_drive", a) for a in (None, "work")
+    ]
+
+    assert (allowed.status_code, own.status_code, stopped.status_code) == (204, 204, 204)
+    assert states == [False, True]
+    assert after == [True, False]
+    assert client.put(url, headers=headers, json={**body, "account": "../x"}).status_code == 422
+    assert client.delete(url, headers=headers, params={"account": "Work"}).status_code == 422
+
+
+def test_disconnecting_a_labelled_account_stops_its_opt_ins(oauth_egress_portal: dict[str, Any]) -> None:
+    """A label connected again later starts without Agent Keys allowed; the provider's own opt-in stays."""
+    portal = oauth_egress_portal
+    client, headers, url = portal["client"], portal["headers"]["alice"], _reuse_url("personal", "drive")
+    _connect_and_allow(portal, "alice", "personal", "drive", "google_drive")
+    _connect_labelled_account(portal, "alice", "personal", "drive", "google_drive", "work")
+    assert (
+        client.put(url, headers=headers, json={"acknowledge_approval_bypass": True, "account": "work"}).status_code
+        == 204
+    )
+
+    assert _account_body_action(portal, "alice", "personal", "drive", "disconnect", "work").status_code == 200
+    _connect_labelled_account(portal, "alice", "personal", "drive", "google_drive", "work")
+
+    assert _labelled_reuse(portal, "@alice:example.org", "personal", "drive", "google_drive", "work") is False
+    assert _labelled_reuse(portal, "@alice:example.org", "personal", "drive", "google_drive", None) is True
+
+
+def test_deleting_a_service_of_ones_own_removes_its_labelled_opt_ins(oauth_egress_portal: dict[str, Any]) -> None:
+    """A service saved again under the same name starts without any of its accounts allowed."""
+    portal = oauth_egress_portal
+    client, headers = portal["client"], portal["headers"]["alice"]
+    assert _put_service(portal, "alice", "personal", "mygh", _MY_GITHUB).status_code == 204
+    _connect_labelled_account(portal, "alice", "personal", "mygh", "github", "work")
+    allow = {"acknowledge_approval_bypass": True, "account": "work"}
+    assert client.put(_reuse_url("personal", "mygh"), headers=headers, json=allow).status_code == 204
+
+    assert _delete_service(portal, "alice", "personal", "mygh").status_code == 204
+    assert _put_service(portal, "alice", "personal", "mygh", _MY_GITHUB).status_code == 204
+
+    assert _labelled_reuse(portal, "@alice:example.org", "personal", "mygh", "github", "work") is False
 
 
 def test_generic_oauth_routes_take_no_account() -> None:

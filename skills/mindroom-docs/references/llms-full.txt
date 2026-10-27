@@ -6762,7 +6762,7 @@ Changing `matrix_sync` through config reload restarts running agents.
 If a large initial sync exceeds the response limit, raise `max_response_bytes` enough to fit it.
 If processing received events exceeds the pending limit, raise `max_pending_bytes`; stored events can take more space than the HTTP response, so raising the response limit may also require raising the pending limit.
 Each bot has its own sync session, so allow enough memory and disk space when raising these limits.
-Large initial syncs may also need more startup time: `MINDROOM_MATRIX_SYNC_STARTUP_TIMEOUT_SECONDS` sets the first-sync allowance, and the runtime Helm chart's `probes.startup` values set the Kubernetes startup probe allowance.
+Large initial syncs may also need more startup time: `MINDROOM_MATRIX_SYNC_STARTUP_TIMEOUT_SECONDS` sets the first-sync allowance.
 
 # Rooms & Spaces
 
@@ -15538,6 +15538,8 @@ The config sent to runners with each request, and the config file projected into
 
 Of the agents' data, dedicated Docker and Kubernetes workers mount only workspaces and shared directories, never the agent state roots around them, so sessions, memory, Mem0 data, and private-instance identity records stay out of every worker.
 The Kubernetes `static_runner` sidecar still mounts `agents`, `private_instances`, and `shared_directories` read-write, so records the primary treats as authority live below the primary-only `tracking/` directory instead: the invited-room and pending-invite ledgers, personal-room records, conversation modes, auto-approve windows, the shared-directory membership ledger, and the primary's copy of each private-instance owner record, together with their locks.
+Agent and private-instance conversation databases stay in those directories, so opening a conversation store refuses a `sessions` directory or database file that is a link; the store's later operations do not check again (see [Known gaps](#known-gaps)).
+The one-time conversion of a database from an earlier release reads its rows as untrusted input and writes its `.pre-storage-v2` backup without following links, so a database worker code changed fails only its own agent's or team's history.
 The thread exporter writes into a private instance only for the requester that the primary's owner record names, so an owner record planted in `private_instances` gets no export.
 Automations likewise run for a private instance only as the requester that record names, and post only in that requester's personal room, so their replies quoting private files never reach another room.
 The knowledge graph database lives in the primary-only `knowledge_graph/` storage directory, and its embedded server opens no TCP port and listens on a Unix socket in a private temporary directory of the primary, so no worker can reach it.
@@ -15711,6 +15713,10 @@ These are tracked gaps, not intentional behaviors; fix them rather than document
   By default these tools run in a worker, where they see only what the worker already mounts.
 - Knowledge Git commands refuse a worktree whose path goes through a link, but Git then reopens that worktree by path.
   For a Git-backed knowledge base inside a workspace a worker writes, swapping the knowledge folder for a link between that check and the Git command can make that one sync check out or update files at the link target with the primary's permissions; the next sync refuses the link.
+- Opening a conversation store checks for links only once, because Python's `sqlite3` cannot open a database without following links.
+  A `sessions` directory swapped for a link inside SQLite's own resolve-then-open window at that open opens the link's target under the expected name: a file there already in the current layout opens as the store, a file in an older layout stops at the conversion's backup, which follows no link, and a missing or empty one gets the storage v2 tables.
+  An open store then reconnects by path for each operation for the rest of the turn, so a swap made after the open is followed: that operation fails on the missing tables, and it can leave an empty `<name>.db` at the link's target.
+  Only code in the Kubernetes `static_runner` sidecar can write a `sessions` directory.
 
 ## Intentional behaviors
 
@@ -18536,7 +18542,7 @@ curl http://localhost:8765/api/health
 curl http://localhost:8765/api/ready
 ```
 
-Use `/api/health` for liveness and `/api/ready` for readiness; responses are described in [Health & Readiness](https://docs.mindroom.chat/deployment/operational-log-events/#health-readiness).
+[Health & Readiness](https://docs.mindroom.chat/deployment/operational-log-events/#health-readiness) says which endpoint each probe should ask and what each answers.
 A hosted container waiting for pairing approval is live but not ready; find the approval link with `docker logs mindroom`.
 
 ## Building from Source
@@ -20622,6 +20628,7 @@ Set `MINDROOM_SESSION_STORAGE_PATH` to move agent and team session databases to 
 
 Back up the whole storage directory, and keep `tracking/` on persistent storage.
 When `MINDROOM_SESSION_STORAGE_PATH` is set in a container, mount that path on persistent storage and back it up too.
+The [conversation storage v2 upgrade notes](https://docs.mindroom.chat/deployment/upgrades/#upgrading-to-conversation-storage-v2) cover the `<name>.db.pre-storage-v2` backups it leaves beside each conversation database and what a database restored from a backup taken before that upgrade needs when it converts again.
 
 `tracking/` keeps a small record of every handled event so restarts and resyncs never answer the same message twice.
 These records are never pruned automatically, so size and monitor the volume for growth over the install's lifetime.
@@ -20900,7 +20907,9 @@ See also [Routing & Responder Selection](https://docs.mindroom.chat/configuratio
 | GET | `/api/health` | Liveness. Returns `200` with `{"status": "healthy", ...}`, or `503` with `"status": "unhealthy"` once startup is ready and an agent, team, or router has stopped syncing with Matrix |
 | GET | `/api/ready` | Readiness. Returns `{"status": "ready"}` when startup has finished, otherwise `503` with `{"status": "<phase>", "detail": "..."}` |
 
-Use `/api/health` for liveness probes and `/api/ready` for readiness probes in container orchestrators.
+Use `/api/health` for startup and liveness probes and `/api/ready` for readiness probes in container orchestrators.
+Never point a startup probe at `/api/ready`: the one-time conversion after [upgrading to conversation storage v2](https://docs.mindroom.chat/deployment/upgrades/#upgrading-to-conversation-storage-v2) keeps the process not ready for as long as it takes, a probe restart rolls back the database being converted, and a database larger than the probe allows never finishes converting.
+A startup probe on `/api/health` passes as soon as the process answers, as the bundled Helm charts configure it.
 
 The `/api/health` body also contains:
 
@@ -20918,7 +20927,7 @@ The `/api/ready` phases are:
 | `ready` | Startup finished and requests are being served |
 | `failed` | Startup or runtime failure; `detail` gives the cause |
 
-While `mindroom run` waits for hosted pairing approval, only these two endpoints answer: `/api/health` returns `200` and `/api/ready` returns `503` with phase `starting` and detail `Waiting for local pairing approval`.
+While `mindroom run` waits for hosted pairing approval, or converts conversation storage on the first start after an upgrade, only these two endpoints answer: `/api/health` returns `200` and `/api/ready` returns `503` with phase `starting` and detail `Waiting for local pairing approval` or `Converting conversation storage`.
 
 When an agent, team, or router receives no Matrix sync for 120 seconds, MindRoom restarts that entity's sync loop on its own.
 After 180 seconds without a sync, `/api/health` returns `503` and lists the entity in `stale_sync_entities`.
@@ -21052,6 +21061,21 @@ Every agent in the room that receives the message logs it, and a burst of failur
 
 Count it grouped by `agent` and alert on a sustained rate.
 Failures from one `sender_device_id` point at that client, while failures across many senders for one agent point at that agent's device.
+
+### `conversation_converted`
+
+Logged once for each conversation database the first start after [upgrading to conversation storage v2](https://docs.mindroom.chat/deployment/upgrades/#upgrading-to-conversation-storage-v2) converts, or that converts at its first use later, such as a restored backup.
+
+| Field | Meaning |
+|-------|---------|
+| `path` | The converted database file |
+| `runs` | Runs in the converted database |
+| `messages` | Stored messages in the converted database |
+| `compacted` | Whether the file was compacted to return the space its old tables used |
+| `duration_seconds` | Time the conversion and compaction took |
+
+`compacted` is `false` when compacting would return little or the directory lacked the space the [upgrade notes](https://docs.mindroom.chat/deployment/upgrades/#upgrading-to-conversation-storage-v2) give for it; a `conversation_compaction_failed` warning names the database when compacting failed, and the conversion still stands.
+A database that could not convert at startup logs `conversation_conversion_skipped_store` instead.
 
 ### `tool_call_limit_reached`
 
@@ -21203,6 +21227,40 @@ Unset or `0` disables the probe (the default), and any other value below `60` fa
 Use this page when upgrading an existing deployment across a release that needs operator action.
 Each section names the change, what to do before or after the upgrade, and what does not carry over.
 Always back up configuration and persistent storage before replacing the running version, and never run two backend versions against the same storage at once.
+
+## Upgrading to conversation storage v2
+
+The first start after this upgrade converts the conversation database of every agent and team, private instances included, and the internal usage database under `system/`, to a new layout before any agent comes online.
+Each converted database logs one `conversation_converted` record (see [Events](https://docs.mindroom.chat/deployment/operational-log-events/#conversation_converted)).
+The process stays live but becomes ready only after the conversion and the rest of startup finish; [Health & Readiness](https://docs.mindroom.chat/deployment/operational-log-events/#health-readiness) says what each endpoint answers meanwhile.
+The conversion is one-way, and downgrading afterwards is not supported.
+
+### Before upgrading
+
+Check that every startup probe asks `/api/health`, as the bundled Helm charts do and [Health & Readiness](https://docs.mindroom.chat/deployment/operational-log-events/#health-readiness) requires.
+A deploy that rolls back when readiness times out, such as `helm upgrade --atomic` with its default 5-minute timeout, can roll back mid-conversion and start the older release on converted databases (see [Downgrading](#downgrading)), so raise the timeout or drop `--atomic` for this upgrade.
+Make sure each disk that holds conversation databases, under the storage directory or `MINDROOM_SESSION_STORAGE_PATH`, has free space of about two and a half times the total size of their `.db` files.
+A database that no release since v2026.10.341 has opened can still hold Agno 2 run blobs or the compaction archive, which the conversion copies first, so it needs up to about three and a half times its size.
+A database whose directory lacks the space it needs is not converted: startup logs `conversation_conversion_skipped_store` for it, and every use of it fails with an error naming the database and the bytes it needs until you free the space, after which its next use converts it.
+
+### What carries over
+
+Conversation history, compaction summaries, pending tool approvals, and usage records carry over.
+Before converting a database, MindRoom copies it byte for byte to `<name>.db.pre-storage-v2` beside it and never deletes that copy.
+A stored run whose data cannot be read is left out of the converted database, logged as `conversation_run_left_out` with its run ID, and kept in the backup.
+A crash or restart during the upgrade leaves the database being converted unchanged, and the next start converts it.
+Right after converting a database, MindRoom compacts it to return the space its old tables used, when its directory has free space of about twice the converted data.
+Without that space the file keeps it until later writes reuse it; with MindRoom stopped, `sqlite3 <name>.db VACUUM` returns it.
+
+### Downgrading
+
+The only way back is to stop MindRoom, replace each `<name>.db` with its `<name>.db.pre-storage-v2` backup, delete any `<name>.db-journal` beside it, and start the older release.
+Everything written since the upgrade is lost: replies, summaries, session state, approvals requested since then, and usage records for that period.
+The older release drops messages redacted since the upgrade from the restored history before it next replies in that conversation, but edits made since the upgrade are not applied again, so the earlier reply to an edited message can return to the agent's history.
+An older release started on converted databases without restoring the backups archives each agent's or team's `sessions/` directory, backups included, as [Incompatible session databases](https://docs.mindroom.chat/deployment/storage/#incompatible-session-databases) describes; move the backups back out of that archive and restore them as above.
+Upgrading again converts each restored database again and writes a new backup.
+
+Once you are sure you will not downgrade, delete the `.pre-storage-v2` backups.
 
 ## Upgrading to OpenAI SDK 3
 

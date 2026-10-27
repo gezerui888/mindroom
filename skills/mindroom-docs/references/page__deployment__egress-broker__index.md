@@ -371,6 +371,18 @@ An allowance covers that provider's account for that scope until someone stops i
 It does not apply while the service's `oauth_provider` names another provider.
 A script can allow an account with `PUT /api/connections/egress/agents/<agent>/<service>/oauth-reuse`, or `PUT /api/egress-broker/services/<name>/oauth-reuse?agent_name=<agent>` on the dashboard, and the body `{"acknowledge_approval_bypass": true}`, and stop it with `DELETE` on the same URL.
 
+### Several accounts of one provider
+
+A service can use more accounts of its provider than the one its tools use, such as a second Google account for a shared mailbox.
+On the personal egress page, **Add another account** asks for a label (1 to 31 lowercase letters, digits, or hyphens, starting with a letter or digit, such as `work`) and connects an account under it; the row then lists each such account with its email or login, a toggle that allows or stops Agent Keys using it for the service, and **Disconnect**.
+These accounts are only for Agent Keys: the provider's tools keep using the account connected for them, and each account is allowed per service on its own, with the same confirmation.
+Who may add, allow, or disconnect one follows **Who may connect and set keys** above.
+Disconnecting one also stops its allowances, so an account connected later under the same label must be allowed again.
+A request uses one by sending the header `X-Agent-Keys-Account: <label>`, for example `curl -H 'X-Agent-Keys-Account: work' https://gmail.googleapis.com/gmail/v1/users/me/profile`; the broker removes the header before forwarding.
+Without the header a request uses the account connected for the tools, or the service's API key when one is set; with it, the labelled account's token is sent even when a key is set.
+A label that is not connected or not allowed for the service is refused with 403 `account_not_allowed`, and a repeated, empty, or invalid header with 400 `bad_request`.
+A script connects one with `POST /api/connections/egress/agents/<agent>/<service>/connect` and the body `{"account": "<label>"}`, disconnects it with the same body on `.../disconnect`, allows it with `{"acknowledge_approval_bypass": true, "account": "<label>"}` on `.../oauth-reuse`, and stops it with `DELETE .../oauth-reuse?account=<label>`.
+
 ## User services
 
 A user service is a service the user defines for their own scope instead of an administrator defining it in `config.yaml`.
@@ -499,6 +511,7 @@ Its one function, `list_egress_credentials`, takes no arguments and returns JSON
 - `configured` is true when the calling agent's scope has either source for the service, and `active_source` says which one the broker uses: `key`, `oauth`, or `null`.
   The tool reports the scope the broker uses, so each requester sees only their own keys and, for GitHub and Atlassian, their own account, and an agent with no worker scope reads the global store.
 - `oauth_reuse` says whether Agent Keys may use the service's account (see [Using a connected account](#using-a-connected-account)); it is `null` for a service without an account provider or whose GitHub or Atlassian account the broker never uses in a [shared sandbox](#personal-accounts-and-shared-sandboxes).
+- `accounts`, present only when there are any, lists the [further accounts](#several-accounts-of-one-provider) Agent Keys may use for the service as `{"label", "account_label"}`, with the account's email or login, and the note tells the agent to send `X-Agent-Keys-Account: <label>` to use one.
   When it is `false`, `provider` names the account to allow, and the note tells the agent that allowing it lets its commands act as the account without the approval prompts the account's tools ask for, and who may allow it.
 - A service with nothing configured also reports `can_connect_account`.
   When it is `true`, the user can connect an account Agent Keys may use instead of adding a key, and `provider` names the OAuth provider id.
@@ -607,6 +620,8 @@ The broker returns these errors to worker code:
 | Unmatched host under `deny` policy | 403 JSON `{"error": "host_not_allowed", "services": [...], "message": "..."}` with the operator's service names as a hint |
 | Matched service, no key, and an account provider nobody allowed Agent Keys to use | 403 JSON `{"error": "credential_not_configured", "service": "<name>", "provider": "<id>", "oauth_reuse": "off", "manage_url": "<link>", "message": "..."}` with no `connect_url`; add a key or allow the account at `manage_url` |
 | Matched service, no key and no connected account in scope | 403 JSON `{"error": "credential_not_configured", "service": "<name>", "manage_url": "<link>", "message": "..."}`, plus `"provider": "<id>"` and `"connect_url": "<link>"` when the user can connect an account that is not shared by everyone using the agent |
+| `X-Agent-Keys-Account` names a label that is not connected, or not allowed for the matched service (see [Several accounts of one provider](#several-accounts-of-one-provider)) | 403 JSON `{"error": "account_not_allowed", "service": "<name>", "account": "<label>", "manage_url": "<link>", "message": "..."}` |
+| `X-Agent-Keys-Account` repeated, empty, or not a valid label | 400 JSON `{"error": "bad_request", "message": "..."}` with the header's rules |
 | Connected account revoked, rejected by the provider, or unreadable | 403 JSON `{"error": "oauth_connection_required", "service": "<name>", "provider": "<id>", "connect_url": "<link>", "manage_url": "<link>", "message": "..."}`; `connect_url` is `null` for a shared connection, and an unreadable stored credential adds `"reset_required": true` and has a `null` `connect_url` until it is reset |
 | Provider outage, timeout, or network failure while refreshing the account's token | 503 JSON `{"error": "oauth_refresh_failed", "service": "<name>", "provider": "<id>", "manage_url": "<link>", "message": "..."}`; retry later, do not reconnect |
 | Unresolvable destination, or upstream connect or TLS failure | 502 JSON `{"error": "upstream_unreachable", "message": "..."}` |

@@ -82,6 +82,14 @@ Requester-scoped providers get one opt-in per requester and service name, coveri
 It names the provider, not the account: it covers whatever account of that provider the scope connects, a later connection made for the tools included, until someone stops it, and it does not apply while the service's `oauth_provider` names another provider.
 Rejected: keeping connections already in use working after the upgrade, because that would silently keep the bypass this removes.
 
+**Further accounts of a provider are labelled connections that only Agent Keys uses, picked per request by a header.**
+Agent Vault let a vault hold several logins of one provider, such as a second Google account for a shared mailbox, and a scope's one connection per provider could not express that.
+A labelled account is the provider with its credential service renamed to `<base>__<label>_oauth` in the same scope store, so the connect flow, refresh, and storage serve it unchanged; the label goes before the `_oauth` suffix because placement and validation treat only `*_oauth` names as OAuth tokens, and any other name could land in a worker-writable store.
+The tools keep the provider's own connection, so connecting a further account never changes what an approval-gated tool acts as.
+Each (service, account) pair has its own opt-in, keyed `service@label`, so existing documents read unchanged, and disconnecting a labelled account drops its opt-ins, because its row and toggle go with it and an opt-in left behind would silently cover a later account under the same label.
+The worker picks an account with `X-Agent-Keys-Account` rather than a host or path, since routing already decides the service; the broker strips the header on every intercepted request, refuses a repeated or invalid one instead of picking, and with the header skips a stored key, which would otherwise silently answer for the wrong account.
+Rejected: choosing the account by path, which tools that cannot set headers would need; and a refusal with a connect link for a labelled account, which would connect the provider's own connection.
+
 **Requester-scoped accounts (GitHub, Atlassian) are used only in a requester's own sandbox.**
 In a shared sandbox, every requester's commands run together, so one user's code could act with another's account.
 A shared sandbox can opt in with `oauth_on_shared_workers`, which only administrators can set.

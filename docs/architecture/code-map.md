@@ -106,6 +106,7 @@ Matrix sync callback
 | `approval/response.py` | Response-side native approval continuation persistence, card publication, and terminal settlement |
 | `approval/manager.py` | Matrix-backed tool approval runtime state |
 | `approval/auto_approve_windows.py` | Durable per-conversation `!auto_approve` windows that approve one requester's gated calls without cards |
+| `oauth/accounts.py` | Labelled accounts of an OAuth provider that only Agent Keys uses: the label rule and the credential service each is stored under |
 | `oauth/credential_binding.py` | Canonical OAuth provider and worker-target bindings for browser workflows |
 | `oauth/credential_lifecycle.py` | Single transaction owner for scoped OAuth load, refresh, callback publication, invalidation, and reset state |
 | `oauth/credential_store.py` | Per-scope SQLite OAuth credential storage, revisions, and reset receipts |

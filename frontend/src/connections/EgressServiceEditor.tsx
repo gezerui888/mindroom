@@ -390,7 +390,7 @@ export function EgressServiceEditor({
   // The services this form would send a key to the same website as, for this agent.
   const overlaps = limiting
     ? []
-    : overlapWarnings(form, preset, agentServices, name, form.separateAccount);
+    : overlapWarnings(form, preset, agentServices, name);
   // Another service of the user's with rules on the hosts a limit, or the
   // repositories applied to this service, cover.
   const overlapHosts = !limiting
@@ -414,7 +414,8 @@ export function EgressServiceEditor({
   });
 
   // Another preset has its own defaults, so what the loaded service emptied on
-  // purpose no longer applies to it.
+  // purpose no longer applies to it. Back on the loaded preset, its own login
+  // applies again, as the save writes it.
   const choosePreset = (value: string) => {
     // The rules the helper wrote are gone with the preset's own, so typed
     // repositories are to be applied again when the form is saved.
@@ -423,7 +424,13 @@ export function EgressServiceEditor({
       preset: value,
       replacePresetRules: false,
       rules: form.rules.length > 0 ? form.rules : [emptyRule()],
-      explicitlyEmpty: NOT_EXPLICITLY_EMPTY,
+      explicitlyEmpty: {
+        ...NOT_EXPLICITLY_EMPTY,
+        presetLogin:
+          value !== "" &&
+          value === service?.preset &&
+          service.oauth_provider !== undefined,
+      },
     });
   };
 
@@ -701,6 +708,7 @@ export function EgressServiceEditor({
               configPlaceholders={configPlaceholders}
               ruleEditing={ruleEditing}
               newService={service === null}
+              focusDisplayName={!editing && service !== null}
             />
           )}
         </section>

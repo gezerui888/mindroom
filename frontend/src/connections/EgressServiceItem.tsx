@@ -26,6 +26,7 @@ import { BusyNote, useLimitActions } from "./EgressLimitRows";
 import { ServiceStatus } from "./EgressServiceStatus";
 import {
   AgentSees,
+  Code,
   type RowAction,
   RowActionsMenu,
   SERVICE_CELL,
@@ -327,6 +328,7 @@ export function EgressServiceItem({
     !editing &&
     (!oauth || (!canConnect && !oauth.connected && !oauth.reset_required));
   const editable = canEdit(serviceEditing, service);
+  const addAccount = serviceEditing.addAccount?.(service);
   // Everything but the action that makes the service work, which is a button of its own.
   const actions: RowAction[] = [
     ...(oauth && canManageKey && !showKeyControls && !setKeyFirst
@@ -421,6 +423,16 @@ export function EgressServiceItem({
           },
         ]
       : []),
+    ...(addAccount
+      ? [
+          {
+            label: "Add another account",
+            ariaLabel: `Add another account for ${name}`,
+            disabled: serviceEditing.disabled || serviceEditing.limitDisabled,
+            onSelect: addAccount,
+          },
+        ]
+      : []),
     ...(oauth?.connected && canResetAccount
       ? [
           {
@@ -468,6 +480,12 @@ export function EgressServiceItem({
           description={service.description}
         >
           <AgentSees service={service} />
+          {service.separate_account && (
+            <p className="text-xs text-muted-foreground">
+              Agents choose it with{" "}
+              <Code>X-Agent-Keys-Service: {service.name}</Code>
+            </p>
+          )}
           {limitedText && (
             <p className="text-xs text-muted-foreground">{limitedText}</p>
           )}

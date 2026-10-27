@@ -865,6 +865,19 @@ describe("connected accounts", () => {
       expect(screen.queryByText("Connected for tools only")).toBeNull();
     });
 
+    it("names the header agents choose a service's own account with", () => {
+      const header = wholeText(
+        "Agents choose it with X-Agent-Keys-Service: team_calendar",
+      );
+      renderRows([
+        { ...toolsOnly, name: "team_calendar", separate_account: true },
+      ]);
+      expect(within(row("GitHub")).getByText(header)).toBeVisible();
+      cleanup();
+      renderRows([toolsOnly]);
+      expect(screen.queryByText(/X-Agent-Keys-Service/)).toBeNull();
+    });
+
     it("leaves the account alone when the confirmation is cancelled", async () => {
       renderRows([toolsOnly]);
       fireEvent.click(
@@ -1170,6 +1183,27 @@ describe("connected accounts", () => {
           }),
         ],
       ]);
+    });
+
+    it("says requests are refused for an account allowed only to read where the service no longer offers read only", () => {
+      renderRows([
+        drive(
+          { reuse_access: "read" },
+          {
+            read_only_supported: false,
+            configured: true,
+            active_source: "oauth",
+          },
+        ),
+      ]);
+      const drives = row("Drive");
+      expect(within(drives).getByText("Needs read and write")).toBeVisible();
+      expect(
+        within(drives).getByText(
+          "Requests are refused until this account is changed to read and write.",
+        ),
+      ).toBeVisible();
+      expect(within(drives).queryByText("Using connected account")).toBeNull();
     });
 
     it("changes an account allowed only to read to read and write where the service no longer offers read only", async () => {

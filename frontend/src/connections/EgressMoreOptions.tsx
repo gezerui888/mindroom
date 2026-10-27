@@ -163,6 +163,7 @@ export function MoreOptions({
   configPlaceholders,
   ruleEditing,
   newService,
+  focusDisplayName,
 }: {
   /** The id of the section, which the toggle controls. */
   id: string;
@@ -187,6 +188,8 @@ export function MoreOptions({
   ruleEditing: (index: number, rule: RuleForm) => RuleEditing;
   /** The service is being added, so an empty display name is saved as its host; an edited one keeps none. */
   newService: boolean;
+  /** Focus the display name when the section opens, for a new service that starts from another, such as another account. */
+  focusDisplayName: boolean;
 }) {
   const primaryHost = (form.rules[0]?.host ?? "").trim().toLowerCase();
   const displayNameHint = preset
@@ -206,7 +209,7 @@ export function MoreOptions({
     <p className="text-xs text-muted-foreground">
       {sharedTarget
         ? "Accounts cannot be connected on a shared agent, so this service uses an API key."
-        : `Users can connect an account (${preset.oauth_provider}) instead of an API key.`}
+        : `Users can connect an account (${providers.find((provider) => provider.id === preset.oauth_provider)?.display_name ?? preset.oauth_provider}) instead of an API key.`}
     </p>
   ) : (
     !preset && (
@@ -254,6 +257,7 @@ export function MoreOptions({
           {(control) => (
             <Input
               {...control}
+              autoFocus={focusDisplayName}
               className={inputClass}
               value={form.displayName}
               disabled={disabled}

@@ -41,6 +41,8 @@ from mindroom.egress_broker.user_services import (
     delete_user_service,
     save_user_service,
 )
+from mindroom.oauth.accounts import provider_for_account
+from mindroom.oauth.github import github_oauth_provider
 from mindroom.oauth.google_drive import google_drive_oauth_provider
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, resolve_worker_target
 from tests.oauth_test_utils import (
@@ -74,7 +76,7 @@ if TYPE_CHECKING:
 
     from .conftest import RawResponse, Upstream, UpstreamCA
 
-type GetThrough = Callable[[dict[str, str]], Awaitable[httpx.Response]]
+type GetThrough = Callable[..., Awaitable[httpx.Response]]
 
 _THREAD_NAME = "mindroom-egress-broker"
 _PLACEHOLDER = "mindroom-brokered"
@@ -172,14 +174,14 @@ def get_through(
     tls_upstream: Upstream,
     tmp_path: Path,
 ) -> GetThrough:
-    """Return ``get(env)``: ``GET /echo`` on the fake TLS upstream, sent as a worker's tool would with `env`.
+    """Return ``get(env, headers=None)``: ``GET /echo`` on the fake TLS upstream, sent as a worker's tool would with `env`.
 
     The request uses the env's proxy and the runner's trust bundle, so the service's broker has to intercept it.
     """
 
-    async def get(env: dict[str, str]) -> httpx.Response:
+    async def get(env: dict[str, str], headers: dict[str, str] | None = None) -> httpx.Response:
         async with _worker_client(env, tmp_path / "runner") as client:
-            return await client.get(tls_upstream.url("/echo"))
+            return await client.get(tls_upstream.url("/echo"), headers=headers)
 
     return get
 
@@ -1633,3 +1635,97 @@ async def test_config_placeholders_win_over_user_placeholders(
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=target)
     assert env["GH_TOKEN"] == _PLACEHOLDER
     assert env["MINE_TOKEN"] == "mine-placeholder"  # noqa: S105 - a placeholder value, not a secret
+
+
+_WORK_HEADER = {"X-Agent-Keys-Account": "work"}
+
+
+def _connect_own_and_work(manager: CredentialsManager, runtime_paths: RuntimePaths, *, allow_work: bool) -> None:
+    """Connect Alice's own GitHub account and her `work` one, allowing her own and, with `allow_work`, `work`."""
+    store = account_store("@alice:example.org")
+    connect_account(manager, store, "alice-own")
+    connect_account(manager, store, "alice-work", provider=provider_for_account(github_oauth_provider(), "work"))
+    allow_oauth_reuse(manager, runtime_paths, store)
+    if allow_work:
+        allow_oauth_reuse(manager, runtime_paths, store, account="work")
+
+
+@pytest.mark.usefixtures("github_oauth_client")
+@pytest.mark.asyncio
+async def test_header_uses_allowed_labelled_account(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    get_through: GetThrough,
+) -> None:
+    """The header injects the labelled account's token and never reaches the upstream; without it, the own one."""
+    runtime_paths = _oauth_runtime(tmp_runtime_paths)
+    config = _config(github=_GITHUB_OAUTH)
+    _connect_own_and_work(manager, runtime_paths, allow_work=True)
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
+        own = await get_through(env)
+        work = await get_through(env, _WORK_HEADER)
+    assert own.json()["headers"]["authorization"] == ["Bearer alice-own"]
+    assert work.json()["headers"]["authorization"] == ["Bearer alice-work"]
+    assert "x-agent-keys-account" not in work.json()["headers"]
+
+
+@pytest.mark.usefixtures("github_oauth_client")
+@pytest.mark.asyncio
+async def test_stored_key_wins_only_without_header(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    get_through: GetThrough,
+) -> None:
+    """A stored key replaces the provider's own connection, never a labelled account the request names."""
+    runtime_paths = _oauth_runtime(tmp_runtime_paths)
+    config = _config(github=_GITHUB_OAUTH)
+    _connect_own_and_work(manager, runtime_paths, allow_work=True)
+    save_secret(manager, _routable_target(), "github", "s3cret")
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
+        keyed = await get_through(env)
+        work = await get_through(env, _WORK_HEADER)
+    assert keyed.json()["headers"]["authorization"] == ["Bearer s3cret"]
+    assert work.json()["headers"]["authorization"] == ["Bearer alice-work"]
+
+
+@pytest.mark.usefixtures("github_oauth_client")
+@pytest.mark.asyncio
+async def test_unknown_or_not_allowed_label_refused_without_reading(
+    tmp_runtime_paths: Callable[..., RuntimePaths],
+    manager: CredentialsManager,
+    tls_upstream: Upstream,
+    get_through: GetThrough,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A label not allowed for the service, connected or not, is a 403 naming it; no connection is read or refreshed.
+
+    A service without an OAuth provider has no labelled accounts, so its key is not used for one either.
+    """
+    runtime_paths = _oauth_runtime(tmp_runtime_paths)
+    config = _config(github=_GITHUB_OAUTH)
+    _connect_own_and_work(manager, runtime_paths, allow_work=False)
+    reads: list[str] = []
+    real_refresh = oauth_source.refresh_oauth_credentials_blocking
+
+    def recording_refresh(context: OAuthCredentialContext) -> dict[str, Any] | None:
+        reads.append(context.provider.credential_service)
+        return real_refresh(context)
+
+    monkeypatch.setattr(oauth_source, "refresh_oauth_credentials_blocking", recording_refresh)
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=config, worker_target=_routable_target())
+        not_allowed = await get_through(env, _WORK_HEADER)
+        unknown = await get_through(env, {"X-Agent-Keys-Account": "home"})
+    plain = _config(github=_GITHUB)
+    save_secret(manager, _routable_target(), "github", "s3cret")
+    async with serve_egress_broker(runtime_paths, config_provider=lambda: plain, credentials_manager=manager):
+        env = execution_env_for_worker(runtime_paths, config=plain, worker_target=_routable_target())
+        without_oauth = await get_through(env, _WORK_HEADER)
+    for response, account in ((not_allowed, "work"), (unknown, "home"), (without_oauth, "work")):
+        assert response.status_code == 403
+        assert (response.json()["error"], response.json()["account"]) == ("account_not_allowed", account)
+        assert "alice-" not in response.text
+    assert reads == []
+    assert tls_upstream.hits == []

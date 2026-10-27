@@ -22,8 +22,10 @@ __all__ = [
     "OAuthStatus",
     "OAuthStatusReader",
     "Secret",
+    "SecretAccountNotAllowed",
     "SecretMissing",
     "SecretNeedsReconnect",
+    "SecretRequest",
     "SecretResult",
     "SecretServiceChanged",
     "SecretUnavailable",
@@ -194,6 +196,17 @@ def delete_secret(
 
 
 @dataclass(frozen=True)
+class SecretRequest:
+    """What a request asks of the secret lookup beyond its service.
+
+    `account` is the label of the provider's account the request names (`X-Agent-Keys-Account`), None for the
+    provider's own connection.
+    """
+
+    account: str | None = None
+
+
+@dataclass(frozen=True)
 class Secret:
     """The secret the broker injects for one request; its value never appears in a repr."""
 
@@ -243,7 +256,16 @@ class SecretServiceChanged:
     """
 
 
-type SecretResult = Secret | SecretMissing | SecretNeedsReconnect | SecretUnavailable | SecretServiceChanged
+@dataclass(frozen=True)
+class SecretAccountNotAllowed:
+    """The request named a labelled account that is not connected, or not allowed for the service, in its scope."""
+
+    account: str
+
+
+type SecretResult = (
+    Secret | SecretMissing | SecretNeedsReconnect | SecretUnavailable | SecretServiceChanged | SecretAccountNotAllowed
+)
 
 
 @dataclass(frozen=True)

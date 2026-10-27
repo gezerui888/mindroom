@@ -393,3 +393,29 @@ def test_unknown_code_or_missing_value_is_a_programming_error() -> None:
         refusal_body("no_such_code")
     with pytest.raises(KeyError, match="host"):
         refusal_body("upstream_unreachable")
+
+
+def test_an_account_agent_keys_may_not_use_names_its_label() -> None:
+    """A labelled account that is not connected or allowed for the service is named, with where to fix it."""
+    body = refusal_body("account_not_allowed", service="gmail", account="work", manage_url=MANAGE_URL)
+
+    assert body == {
+        "error": "account_not_allowed",
+        "service": "gmail",
+        "account": "work",
+        "manage_url": MANAGE_URL,
+        "message": "Agent Keys may not use an account labelled work for gmail here. "
+        "Ask the user to connect or allow it at manage_url, then retry.",
+    }
+    assert len(str(body["message"])) <= 200
+    without_page = refusal_body("account_not_allowed", service="gmail", account="work", personal_page=False)
+    assert "manage_url" not in str(without_page["message"])
+
+
+def test_an_unusable_account_header_says_how_to_send_it() -> None:
+    """A repeated, empty, or invalid `X-Agent-Keys-Account` header is a `bad_request` naming the header's rules."""
+    assert refusal_body("bad_request", account_header=True) == {
+        "error": "bad_request",
+        "message": "Send the X-Agent-Keys-Account header at most once, with an account label: "
+        "1 to 31 lowercase letters, digits, or hyphens.",
+    }

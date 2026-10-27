@@ -31,6 +31,7 @@ from mindroom.egress_broker.rules import EgressRules
 from mindroom.egress_broker.secrets import (
     PERSONAL_WORKER_SCOPES,
     Secret,
+    SecretAccountNotAllowed,
     SecretMissing,
     SecretResult,
     SecretServiceChanged,
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.credentials.manager import CredentialsManager
+    from mindroom.egress_broker.secrets import SecretRequest
     from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
     from mindroom.worker_computer.browser_proxy import BrowserEgress
 
@@ -274,6 +276,7 @@ async def _resolve_secret(
     claims: WorkerClaims,
     name: str,
     routed: EgressService,
+    secret_request: SecretRequest,
     *,
     config: _LastGoodConfig,
     runtime_paths: RuntimePaths,
@@ -286,14 +289,16 @@ async def _resolve_secret(
     config's services plus the scope's own) must still define `name` as `routed`, or the result is
     `SecretServiceChanged`: a service saved since routing may be meant for other hosts. The key read and that check
     run in one call on the loop's default executor (`_routed_key`); the OAuth lookup, which may refresh, then
-    runs on `oauth_executor` with the provider of the checked definition.
+    runs on `oauth_executor` with the provider of the checked definition. A request naming a labelled account
+    (`secret_request.account`) gets that account of the provider, never the stored key.
     """
     target = claims.to_worker_target()
+    account = secret_request.account
     stored = await asyncio.to_thread(_routed_key, config, credentials_manager, target, name, routed)
-    if stored is not None:
+    if isinstance(stored, SecretServiceChanged) or (stored is not None and account is None):
         return stored
     if routed.oauth_provider is None:
-        return SecretMissing()
+        return SecretMissing() if account is None else SecretAccountNotAllowed(account=account)
     current = config.current()
     if current is None:
         # Without a config nothing defines `name`, so `routed` is not its definition.
@@ -306,6 +311,7 @@ async def _resolve_secret(
         runtime_paths=runtime_paths,
         credentials_manager=credentials_manager,
         worker_target=target,
+        account=account,
     )
     return await asyncio.get_running_loop().run_in_executor(oauth_executor, lookup)
 

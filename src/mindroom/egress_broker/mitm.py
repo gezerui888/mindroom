@@ -13,6 +13,7 @@ import certifi
 import h11
 
 from mindroom.egress_broker._relay import (
+    ACCOUNT_HEADER,
     AuditEntry,
     Peer,
     send_json,
@@ -25,12 +26,15 @@ from mindroom.egress_broker.messages import refusal_body
 from mindroom.egress_broker.rules import EgressRules, RuleMatch, inject_credentials
 from mindroom.egress_broker.secrets import (
     Secret,
+    SecretAccountNotAllowed,
     SecretMissing,
     SecretNeedsReconnect,
+    SecretRequest,
     SecretServiceChanged,
     SecretUnavailable,
 )
 from mindroom.logging_config import get_logger
+from mindroom.oauth.accounts import validate_account_label
 
 if TYPE_CHECKING:
     from mindroom.egress_broker._relay import Relay
@@ -76,6 +80,15 @@ def _injected_request(
     except h11.LocalProtocolError:
         # The error message can quote the offending header value, which may be the secret, so it is dropped here.
         return None
+
+
+def _requested_account(headers: list[tuple[bytes, bytes]]) -> str | None:
+    """Return the label `X-Agent-Keys-Account` names, None without it; ValueError when it repeats or names no label."""
+    values = [value for name, value in headers if name == ACCOUNT_HEADER]
+    if len(values) > 1:
+        msg = "X-Agent-Keys-Account is repeated"
+        raise ValueError(msg)
+    return validate_account_label(values[0].decode("latin-1")) if values else None
 
 
 def _host_header_name(value: bytes) -> str | None:
@@ -185,6 +198,13 @@ class TlsInterceptor:
             # Forwarding another Host to the same address is domain fronting: it could carry the secret elsewhere.
             await self._relay.deny(client, entry, refusal_body("host_mismatch"))
             return False
+        try:
+            account = _requested_account(list(request.headers))
+        except ValueError:
+            # Picking one of several labels, or reading an invalid one, could hand the request an account it did
+            # not mean.
+            await self._relay.deny(client, entry, refusal_body("bad_request", account_header=True), status=400)
+            return False
         routed = await self._relay.route(client, entry, tunnel.port)
         if routed is None:
             return False
@@ -200,7 +220,7 @@ class TlsInterceptor:
             upstream_request = h11.Request(method=request.method, target=request.target, headers=headers)
         else:
             entry.service = match.service
-            if (secret := await self._secret(client, entry, match)) is None:
+            if (secret := await self._secret(client, entry, match, SecretRequest(account=account))) is None:
                 return False
             if (upstream_request := _injected_request(request, headers, match, secret)) is None:
                 logger.warning("egress_broker_secret_unusable", service=match.service)
@@ -208,13 +228,20 @@ class TlsInterceptor:
                 return False
         return await self._forward(client, entry, tunnel, upstream_request, rules, strip_cookies=route.host_has_rules)
 
-    async def _secret(self, client: Peer, entry: AuditEntry, match: RuleMatch) -> str | None:
+    async def _secret(
+        self,
+        client: Peer,
+        entry: AuditEntry,
+        match: RuleMatch,
+        secret_request: SecretRequest,
+    ) -> str | None:
         """Return the worker scope's secret for the matched service; otherwise answer the client, audit, and return None.
 
-        The resolver also gets the definition the match came from, and resolves nothing once the service has changed.
+        The resolver also gets the definition the match came from, and resolves nothing once the service has changed,
+        and what the request asks for, such as a labelled account.
         """
         try:
-            result = await self._resolve_secret(entry.claims, match.service, match.definition)
+            result = await self._resolve_secret(entry.claims, match.service, match.definition, secret_request)
             if isinstance(result, Secret) and result.value:
                 return result.value
             status, body = self._refusal(entry.claims, match.service, result)
@@ -242,6 +269,15 @@ class TlsInterceptor:
             return 502, refusal_body("broker_error")
         manage_url = self._relay.manage_url
         scope = self._relay.scope_info(claims)
+        if isinstance(result, SecretAccountNotAllowed):
+            return 403, refusal_body(
+                "account_not_allowed",
+                service=service,
+                account=result.account,
+                shared=scope.shared,
+                personal_page=scope.personal_page,
+                manage_url=manage_url,
+            )
         if isinstance(result, SecretUnavailable):
             # The provider may recover, so this is a retryable failure, not a prompt to reconnect.
             return 503, refusal_body(

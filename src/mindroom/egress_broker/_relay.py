@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from mindroom.egress_broker.tokens import WorkerClaims
 
 __all__ = [
+    "ACCOUNT_HEADER",
     "AuditEntry",
     "Peer",
     "Relay",
@@ -64,6 +65,8 @@ _GIT_DISCOVERY_SERVICES = frozenset({"git-upload-pack", "git-receive-pack"})
 _ECHO_METHODS = frozenset({"TRACE", "TRACK"})
 # Names a broker refusal's code; h11 lowercases header names, so upstream copies compare equal.
 _ERROR_HEADER = b"x-mindroom-error"
+# Names the labelled account a request uses; only the broker reads it, so it never reaches an upstream.
+ACCOUNT_HEADER = b"x-agent-keys-account"
 # One requester cannot hold more of the broker's destination lookups than this, even when its names never resolve.
 _MAX_CONCURRENT_LOOKUPS = 4
 
@@ -368,7 +371,7 @@ def split_authority(text: str) -> tuple[str, str]:
 
 
 def upstream_request_headers(received: list[tuple[bytes, bytes]], *, host: bytes) -> list[tuple[bytes, bytes]]:
-    """Return the headers to send upstream: Host set to `host`, hop-by-hop removed, framing rebuilt.
+    """Return the headers to send upstream: Host set to `host`, hop-by-hop and the account header removed, framing rebuilt.
 
     The broker answers ``Expect: 100-continue`` itself. Framing follows what h11 read, whatever the client's
     Connection header lists: a chunked body is re-chunked, so a client Content-Length beside it is dropped
@@ -380,7 +383,7 @@ def upstream_request_headers(received: list[tuple[bytes, bytes]], *, host: bytes
     headers += [
         (name, value)
         for name, value in strip_hop_by_hop(received, keep_upgrade=False)
-        if name not in {b"host", b"expect", b"content-length"}
+        if name not in {b"host", b"expect", b"content-length", ACCOUNT_HEADER}
     ]
     if chunked:
         headers.append((b"transfer-encoding", b"chunked"))

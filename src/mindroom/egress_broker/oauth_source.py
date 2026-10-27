@@ -21,6 +21,7 @@ from mindroom.egress_broker.oauth_reuse import oauth_reuse_enabled
 from mindroom.egress_broker.secrets import (
     OAuthStatus,
     Secret,
+    SecretAccountNotAllowed,
     SecretMissing,
     SecretNeedsReconnect,
     SecretResult,
@@ -28,6 +29,7 @@ from mindroom.egress_broker.secrets import (
     is_personal_target,
 )
 from mindroom.logging_config import get_logger
+from mindroom.oauth.accounts import provider_for_account
 from mindroom.oauth.credential_lifecycle import (
     OAuthCredentialUnreadableError,
     load_oauth_credentials_snapshot_sync,
@@ -106,6 +108,7 @@ def resolve_oauth_token(  # noqa: PLR0911 - checks in order
     runtime_paths: RuntimePaths,
     credentials_manager: CredentialsManager,
     worker_target: ResolvedWorkerTarget,
+    account: str | None = None,
 ) -> SecretResult:
     """Return a fresh access token from the scope's connection to `provider_id`, refreshing it when near expiry.
 
@@ -116,10 +119,14 @@ def resolve_oauth_token(  # noqa: PLR0911 - checks in order
     for `_TRANSIENT_FAILURE_BACKOFF_SECONDS`. `service` names the egress service in the one warning logged for a
     provider id the registry does not know. Blocks on the OAuth transaction owner, and on another lookup refreshing
     the same scope, so callers on an event loop run it in a thread.
+    With `account`, the token is the provider's labelled account in the same store. A label without an opt-in for
+    `service`, or one nothing is connected under, is `SecretAccountNotAllowed`, and neither offers a connect link,
+    which would connect the provider's own connection.
     """
+    unusable = SecretMissing() if account is None else SecretAccountNotAllowed(account=account)
     provider = _registered_provider(service, provider_id, config, runtime_paths)
     if provider is None:
-        return SecretMissing()
+        return unusable
     access = shared_worker_oauth(
         provider,
         worker_target,
@@ -128,23 +135,27 @@ def resolve_oauth_token(  # noqa: PLR0911 - checks in order
     )
     if access == "refused":
         # Connecting an account would not change that, so there is no link either.
-        return SecretMissing()
+        return unusable
     context = broker_credential_context(provider, config, runtime_paths, credentials_manager, worker_target)
     if provider.requester_scoped_credentials and context.worker_target is None:
         # No requester to bind the connection to, so there is no stored token to use or allow.
-        return SecretMissing()
-    if not oauth_reuse_enabled(context, service, provider.id):
+        return unusable
+    if not oauth_reuse_enabled(context, service, provider.id, account):
+        if account is not None:
+            return unusable
         return SecretMissing(
             provider=provider.id,
             reuse_off=True,
             requester_owned=provider.requester_scoped_credentials,
         )
-    credentials = _refreshed_credentials(service, context)
+    # The opt-in lives with the provider's own connection; a labelled account's token is in the same store.
+    context = replace(context, provider=provider_for_account(provider, account))
+    credentials = _refreshed_credentials(service, context, linked=account is None)
     if isinstance(credentials, SecretNeedsReconnect | SecretUnavailable):
         return credentials
     token = (credentials or {}).get("token") or (credentials or {}).get("access_token")
     if not oauth_credentials_usable(provider, runtime_paths, credentials) or not isinstance(token, str) or not token:
-        return _missing(context)
+        return _missing(context) if account is None else unusable
     return Secret(token)
 
 
@@ -279,8 +290,13 @@ def _registered_provider(
 def _refreshed_credentials(
     service: str,
     context: OAuthCredentialContext,
+    *,
+    linked: bool,
 ) -> dict[str, Any] | SecretNeedsReconnect | SecretUnavailable | None:
-    """Refresh the scope's credentials through its gate; a failed refresh becomes the result to return."""
+    """Refresh the scope's credentials through its gate; a failed refresh becomes the result to return.
+
+    A rejected grant carries a reconnect link only when `linked`.
+    """
     gate = _refresh_gate(context)
     with gate.lock:
         # Lookups queued behind a failed refresh answer here instead of each repeating the grant.
@@ -303,7 +319,7 @@ def _refreshed_credentials(
         return SecretNeedsReconnect(provider=context.provider.id, reset_required=True)
     return SecretNeedsReconnect(
         provider=context.provider.id,
-        connect_url=_connect_url(context, OAUTH_REFRESH_REJECTED_REASON),
+        connect_url=_connect_url(context, OAUTH_REFRESH_REJECTED_REASON) if linked else None,
     )
 
 
@@ -317,11 +333,11 @@ def _log_token_unavailable(service: str, provider: OAuthProvider, exc: OAuthProv
 
 
 def _refresh_gate(context: OAuthCredentialContext) -> _RefreshGate:
-    """Return the gate of the context's credential store: one per provider, worker scope, and worker key."""
+    """Return the gate of the context's credential store: one per stored connection, worker scope, and worker key."""
     target = context.worker_target
     key = (
         context.runtime_paths.storage_root,
-        context.provider.id,
+        context.provider.credential_service,
         None if target is None else (target.worker_scope, target.worker_key),
     )
     with _refresh_gates_lock:

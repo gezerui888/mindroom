@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from mindroom.egress_broker.dial import DialPolicy
     from mindroom.egress_broker.messages import ScopeInfo
     from mindroom.egress_broker.rules import EgressRules
-    from mindroom.egress_broker.secrets import SecretResult
+    from mindroom.egress_broker.secrets import SecretRequest, SecretResult
     from mindroom.egress_broker.tokens import TokenSigner, WorkerClaims
 
 __all__ = ["EgressBroker", "RulesProvider", "ScopeInfoProvider", "SecretResolver"]
@@ -45,7 +45,7 @@ __all__ = ["EgressBroker", "RulesProvider", "ScopeInfoProvider", "SecretResolver
 type RulesProvider = Callable[[WorkerClaims], EgressRules]
 # Awaited on the broker's loop with the matched service's name and the definition its rule came from: the resolver
 # chooses which executor each blocking lookup runs on.
-type SecretResolver = Callable[[WorkerClaims, str, EgressService], Awaitable[SecretResult]]
+type SecretResolver = Callable[[WorkerClaims, str, EgressService, SecretRequest], Awaitable[SecretResult]]
 # Called on the broker's loop when a refusal says who can add a missing key or change a path limit.
 type ScopeInfoProvider = Callable[[WorkerClaims], ScopeInfo]
 

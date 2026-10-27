@@ -43,7 +43,15 @@ _MESSAGES = {
     "upstream_timeout": "{host} did not answer in time.",
     "broker_error": "The credential broker hit an internal error. Retry; if it keeps failing, tell an administrator.",
     "proxy_authentication_required": "The sandbox's proxy credentials are missing or expired. Start a new tool call.",
+    "account_not_allowed": (
+        "Agent Keys may not use an account labelled {account} for {service} here. "
+        "Ask the user to connect or allow it at manage_url, then retry."
+    ),
 }
+_BAD_ACCOUNT_HEADER = (
+    "Send the X-Agent-Keys-Account header at most once, with an account label: "
+    "1 to 31 lowercase letters, digits, or hyphens."
+)
 _CONNECTABLE = (
     "No {service} credential is set for this agent. "
     "Ask the user to connect it at connect_url or add a key at manage_url, then retry."
@@ -92,6 +100,9 @@ _WITHOUT_PAGE = {
         "{provider} did not refresh the account token. Retry in a minute; if it keeps failing, tell an administrator."
     ),
     "path_not_allowed": _PATH_OUTSIDE + "Each user sets this agent's services " + CONNECTIONS_PAGE_NOT_SERVED,
+    "account_not_allowed": (
+        "No allowed account labelled {account} for {service}: each user sets these " + CONNECTIONS_PAGE_NOT_SERVED
+    ),
 }
 _REUSE_OFF_WITHOUT_PAGE = (
     "No {service} key or allowed {provider} account: each user sets these " + CONNECTIONS_PAGE_NOT_SERVED
@@ -132,6 +143,7 @@ def _template(  # noqa: PLR0911 - one text per case, checked in order
     by_operator: bool,
     reuse_off: bool,
     requester_owned: bool,
+    account_header: bool,
 ) -> str:
     without_page = not (shared or personal_page)
     if code == "credential_not_configured" and reuse_off:
@@ -144,6 +156,8 @@ def _template(  # noqa: PLR0911 - one text per case, checked in order
         return _PATH_ADMINISTRATOR
     if code == "path_not_allowed" and shared:
         return _PATH_SHARED
+    if code == "bad_request" and account_header:
+        return _BAD_ACCOUNT_HEADER
     if code == "bad_request" and path is None:
         return _MALFORMED
     texts = _MESSAGES
@@ -181,6 +195,8 @@ def refusal_body(
     by_operator: bool = False,
     reuse_off: bool = False,
     requester_owned: bool = False,
+    account: str | None = None,
+    account_header: bool = False,
     **extra: object,
 ) -> dict[str, object]:
     """Return the JSON body for a refusal: its `error` code, `message`, `service` and `provider` when given, and `extra`.
@@ -197,7 +213,9 @@ def refusal_body(
     A personal scope without the personal page (`personal_page` false) has no page that sets its keys, accounts, or
     services: its texts say so and offer only a connect link, for `oauth_connection_required` too where `connectable`
     says the body carries one, and the body leaves out `manage_url`, which would be the dashboard.
-    A `bad_request` with a `path` is the ambiguous-path refusal; without one, the request itself was malformed.
+    A `bad_request` with a `path` is the ambiguous-path refusal; without one, the request itself was malformed, and
+    with `account_header` its `X-Agent-Keys-Account` header was repeated or named no valid label. `account` is the
+    label an `account_not_allowed` names, also in the body.
     Raises ValueError for a code without a text and KeyError when the text needs a value that was not given.
     """
     template = _template(
@@ -210,6 +228,7 @@ def refusal_body(
         by_operator=by_operator,
         reuse_off=reuse_off,
         requester_owned=requester_owned,
+        account_header=account_header,
     )
     if "manage_url" not in template:
         # A body carries the manage link only where its text names it.
@@ -220,6 +239,7 @@ def refusal_body(
         "service": service_label or service,
         "provider": provider,
         "managers": ", ".join(managers or ()),
+        "account": account,
     }
     message = template.format_map({name: value for name, value in values.items() if value is not None})
     body: dict[str, object] = {"error": code}
@@ -227,6 +247,8 @@ def refusal_body(
         body["service"] = service
     if provider is not None:
         body["provider"] = provider
+    if account is not None:
+        body["account"] = account
     if reuse_off:
         body["oauth_reuse"] = "off"
     return {**body, **extra, "message": message}

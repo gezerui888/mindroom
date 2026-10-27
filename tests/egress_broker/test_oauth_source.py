@@ -28,6 +28,7 @@ from mindroom.egress_broker.oauth_source import broker_credential_context, oauth
 from mindroom.egress_broker.secrets import (
     OAuthStatus,
     Secret,
+    SecretAccountNotAllowed,
     SecretMissing,
     SecretNeedsReconnect,
     SecretResult,
@@ -36,6 +37,7 @@ from mindroom.egress_broker.secrets import (
     save_egress_document,
 )
 from mindroom.egress_broker.tokens import WorkerClaims
+from mindroom.oauth.accounts import provider_for_account
 from mindroom.oauth.credential_lifecycle import load_oauth_credentials_snapshot_sync, resolve_oauth_credential_context
 from mindroom.oauth.credential_store import _oauth_credential_database_path
 from mindroom.oauth.github import github_oauth_provider
@@ -174,8 +176,9 @@ def _resolve(
     *,
     provider_id: str = "github",
     service: str | None = None,
+    account: str | None = None,
 ) -> SecretResult:
-    """Resolve the token of the service named `service`, by default after its provider."""
+    """Resolve the token of the service named `service`, by default after its provider, or of a labelled `account`."""
     return resolve_oauth_token(
         service=service or provider_id,
         provider_id=provider_id,
@@ -183,6 +186,7 @@ def _resolve(
         runtime_paths=runtime_paths,
         credentials_manager=manager,
         worker_target=target,
+        account=account,
     )
 
 
@@ -1070,3 +1074,63 @@ def test_stopping_an_account_or_a_service_drops_each_of_its_opt_ins(
     assert [_allowed(context, "gist", account) for account in (None, "home")] == [False, False]
     assert [_allowed(context, "github", account) for account in (None, "home")] == [True, True]
     assert oauth_reuse_enabled(context, "other", "other_provider", "work") is True
+
+
+_WORK = provider_for_account(github_oauth_provider(), "work")
+
+
+def test_a_labelled_account_yields_its_own_token(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    manager: CredentialsManager,
+) -> None:
+    """With an opt-in for the label, the lookup returns that account's token; without one it refuses the label."""
+    store = account_store("@alice:example.org")
+    connect_account(manager, store, "alice-own")
+    connect_account(manager, store, "alice-work", provider=_WORK)
+    target = _broker_target("@alice:example.org")
+    allow_oauth_reuse(manager, runtime_paths, store)
+
+    refused = _resolve(config, runtime_paths, manager, target, account="work")
+    allow_oauth_reuse(manager, runtime_paths, store, account="work")
+    allowed = _resolve(config, runtime_paths, manager, target, account="work")
+    missing = _resolve(config, runtime_paths, manager, target, account="home")
+
+    assert refused == SecretAccountNotAllowed(account="work")
+    assert allowed == Secret("alice-work")
+    assert missing == SecretAccountNotAllowed(account="home")
+    assert _resolve(config, runtime_paths, manager, target) == Secret("alice-own")
+
+
+def test_a_labelled_accounts_refresh_is_its_own(
+    config: Config,
+    runtime_paths: RuntimePaths,
+    manager: CredentialsManager,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A labelled account's outage never backs off the provider's own connection, and its revoked grant has no link.
+
+    A link would connect the provider's own connection, not the labelled account.
+    """
+    store = account_store("@alice:example.org")
+    connect_account(manager, store, "alice-own")
+    connect_account(manager, store, "stale-work", provider=_WORK, expires_at=1.0)
+    allow_oauth_reuse(manager, runtime_paths, store)
+    allow_oauth_reuse(manager, runtime_paths, store, account="work")
+    serve_token_endpoint(
+        monkeypatch,
+        [
+            httpx.Response(503, json={"error": "temporarily_unavailable"}),
+            httpx.Response(400, json={"error": "invalid_grant"}),
+        ],
+    )
+    target = _broker_target("@alice:example.org")
+
+    outage = _resolve(config, runtime_paths, manager, target, account="work")
+    own = _resolve(config, runtime_paths, manager, target)
+    monkeypatch.setattr(oauth_source, "_TRANSIENT_FAILURE_BACKOFF_SECONDS", 0.0)
+    revoked = _resolve(config, runtime_paths, manager, target, account="work")
+
+    assert outage == SecretUnavailable(provider="github")
+    assert own == Secret("alice-own")
+    assert revoked == SecretNeedsReconnect(provider="github")

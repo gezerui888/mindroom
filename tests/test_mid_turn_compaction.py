@@ -935,21 +935,21 @@ def test_replayed_queued_notice_is_folded() -> None:
     assert old_notice in layout.history
 
 
-def test_tool_results_after_an_interleaved_receipt_fold_with_their_call() -> None:
+def test_tool_results_after_an_interleaved_message_fold_with_their_call() -> None:
     prompt = Message(role="user", content="Do the task")
     call = Message(
         role="assistant",
         tool_calls=[{"id": "c1", "type": "function", "function": {"name": "probe", "arguments": "{}"}}],
     )
-    # An approval receipt sits between a paused call and its approved result.
-    receipt = Message(role="system", content="Approved.", add_to_agent_memory=False)
+    # Turn context no history keeps sits between a call and its result.
+    context = Message(role="user", content="Noted.", add_to_agent_memory=False)
     result = Message(role="tool", tool_call_id="c1", content="r")
-    messages = [Message(role="system", content="Be precise."), prompt, call, receipt, result]
+    messages = [Message(role="system", content="Be precise."), prompt, call, context, result]
 
     layout = mid_turn_compaction._layout(messages, prompt.id, scoped=False)
 
     assert layout.folded == (call, result)
-    assert layout.kept == (prompt, receipt)
+    assert layout.kept == (prompt, context)
 
 
 @pytest.mark.asyncio
@@ -1696,7 +1696,7 @@ def test_legacy_resume_then_mid_turn_compaction_leaves_one_summary() -> None:
     layout = mid_turn_compaction._layout(messages, prompt.id, scoped=True)
     mid_turn_compaction._rewrite(messages, layout, compaction_summary_message("NEW", run_local=False))
 
-    # The leading message is edited in place, so projections that track it by identity (approval receipts) still do.
+    # The leading message is edited in place.
     assert messages[0] is legacy_system
     assert messages[0].content == "Be precise.\n\nCurrent date: Monday"
     assert [is_compaction_summary(message) for message in messages] == [False, False, True]

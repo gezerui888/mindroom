@@ -148,7 +148,7 @@ def _mem0_llm_config(config: Config, runtime_paths: RuntimePaths) -> dict[str, A
 
 
 def _get_memory_config(storage_path: Path, config: Config, runtime_paths: RuntimePaths) -> dict:
-    """Get Mem0 configuration with ChromaDB backend.
+    """Get Mem0 configuration with a ChromaDB backend and history database under ``storage_path``.
 
     Args:
         storage_path: Base directory for memory storage
@@ -166,6 +166,10 @@ def _get_memory_config(storage_path: Path, config: Config, runtime_paths: Runtim
     # Ensure storage directories exist
     chroma_path = resolved_storage_path / "chroma"
     chroma_path.mkdir(parents=True, exist_ok=True)
+    # Mem0's history database keeps the text of changed and deleted memories, and the latest messages it adds to the
+    # next extraction prompt under keys that do not name the requester, so each storage root needs its own.
+    history_dir = resolved_storage_path / "mem0"
+    history_dir.mkdir(exist_ok=True)
     resolved_embedder = resolve_embedder_settings(app_config, runtime_paths)
     embedder_provider = resolved_embedder.provider
 
@@ -199,6 +203,7 @@ def _get_memory_config(storage_path: Path, config: Config, runtime_paths: Runtim
                 "path": str(chroma_path),
             },
         },
+        "history_db_path": str(history_dir / "history.db"),
     }
 
 
@@ -228,11 +233,10 @@ async def create_memory_instance(
     # Create AsyncMemory instance with dictionary config directly
     # Mem0 expects a dict for configuration, not config objects
     if config_dict["embedder"]["provider"] == "huggingface":
-        # Mem0's huggingface embedder builds its own SentenceTransformer, which imports optional local packages.
+        # Mem0's huggingface embedder, which both local providers load, imports sentence-transformers.
         # Install and wait for running installs in a worker thread so the event loop keeps serving other tasks.
         def from_config_with_local_embedder() -> AsyncMemory:
-            if config.memory.embedder.provider == "sentence_transformers":
-                ensure_sentence_transformers_dependencies(runtime_paths)
+            ensure_sentence_transformers_dependencies(runtime_paths)
             with optional_dependency_environment():
                 return AsyncMemory.from_config(config_dict)
 

@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 import jwt
 from fastapi import HTTPException
 
+from mindroom.cloudflare_access_team import cloudflare_access_defaults
 from mindroom.matrix.identity import (
     matrix_user_id_from_email,
     try_parse_historical_matrix_user_id,
@@ -115,12 +116,13 @@ class ExternalAuthSettings:
         def value(name: str, default: str | None = None) -> str | None:
             return paths.env_value(f"MINDROOM_MCP_EXTERNAL_{name}", default=default) or None
 
+        cloudflare = cloudflare_access_defaults(paths)
         return cls(
-            authorization_server=_text(value("AUTHORIZATION_SERVER")),
-            issuer=_text(value("ISSUER")),
+            authorization_server=_text(value("AUTHORIZATION_SERVER", cloudflare.issuer)),
+            issuer=_text(value("ISSUER", cloudflare.issuer)),
             audience=_text(value("AUDIENCE")),
-            jwks_url=_text(value("JWKS_URL")),
-            token_header=_text(value("TOKEN_HEADER", "authorization")).lower(),
+            jwks_url=_text(value("JWKS_URL", cloudflare.jwks_url)),
+            token_header=_text(value("TOKEN_HEADER", cloudflare.jwt_header or "authorization")).lower(),
             email_claim=_text(value("EMAIL_CLAIM", "email")),
             matrix_user_id_claim=value("MATRIX_USER_ID_CLAIM"),
             email_to_matrix_user_id_template=value("EMAIL_TO_MATRIX_USER_ID_TEMPLATE"),

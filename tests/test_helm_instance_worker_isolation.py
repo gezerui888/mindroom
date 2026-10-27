@@ -1522,6 +1522,37 @@ def test_chart_renders_trusted_upstream_jwt_env(chart: str, deployment_name: str
     assert env_values["MINDROOM_TRUSTED_UPSTREAM_JWT_MATRIX_USER_ID_CLAIM"] == "matrix_user_id"
 
 
+def test_runtime_chart_takes_trusted_upstream_jwt_settings_from_cloudflare_access_team() -> None:
+    """A Cloudflare Access team in env.extra leaves only the audience for the block to set."""
+    docs = _render_chart(
+        Path("cluster/k8s/runtime"),
+        "trustedUpstreamAuth.enabled=true",
+        "trustedUpstreamAuth.jwtAudience=mindroom-dashboard",
+        "env.extra.MINDROOM_CLOUDFLARE_ACCESS_TEAM=example",
+    )
+    container = _container(_resource(docs, "Deployment", "mindroom-demo-mindroom-runtime"), "mindroom")
+    env_values = {env["name"]: env.get("value") for env in container["env"]}
+
+    assert env_values["MINDROOM_CLOUDFLARE_ACCESS_TEAM"] == "example"
+    assert env_values["MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE"] == "mindroom-dashboard"
+    assert (
+        not {
+            "MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER",
+            "MINDROOM_TRUSTED_UPSTREAM_JWKS_URL",
+            "MINDROOM_TRUSTED_UPSTREAM_JWT_ISSUER",
+        }
+        & env_values.keys()
+    )
+
+    completed = _run_helm_template(
+        Path("cluster/k8s/runtime"),
+        "trustedUpstreamAuth.enabled=true",
+        "env.extra.MINDROOM_CLOUDFLARE_ACCESS_TEAM=example",
+    )
+    assert completed.returncode != 0
+    assert "trustedUpstreamAuth.jwtAudience is required when trustedUpstreamAuth.enabled=true" in completed.stderr
+
+
 def test_runtime_chart_renders_no_trusted_upstream_env_by_default() -> None:
     """Trusted upstream auth stays off unless the runtime chart's block enables it."""
     docs = _render_chart(Path("cluster/k8s/runtime"))

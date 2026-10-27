@@ -31,6 +31,7 @@ Matrix sync callback
 | `failure_text.py` | The text a caught exception reports: its text, or its type name when it has none |
 | `bounded_bytes.py` | Shared asynchronous and synchronous byte collection that rejects overflowing chunks before buffering them |
 | `origins.py` | Shared browser-origin normalization and allowlist validation for dashboard auth, CORS, Connections same-origin checks, the Computers and Connections MindRoom Chat allowlists, and MCP gateway origins |
+| `cloudflare_access_team.py` | The header, issuer, and JWKS URL that `MINDROOM_CLOUDFLARE_ACCESS_TEAM` supplies to trusted upstream browser auth and MCP external auth |
 | `matrix_openid.py` | Matrix OpenID verification at the configured homeserver and audience binding, shared by Computers and the Connections portal |
 | `atomic_file.py` | Shared atomic byte publication and cleanup relative to an opened directory |
 | `orchestrator.py` | MultiAgentOrchestrator - boots agents, manages sync loops, hot-reload |

@@ -326,6 +326,7 @@ apiAuth:
 # Dashboard sign-in through an identity gateway that signs a JWT for each request.
 # Each key sets the matching MINDROOM_TRUSTED_UPSTREAM_* variable; see docs/deployment/trusted-upstream-auth.md.
 # enabled requires jwtHeader, jwksUrl, jwtAudience, and jwtIssuer, and emailToMatrixUserIdTemplate requires emailDomain.
+# MINDROOM_CLOUDFLARE_ACCESS_TEAM in env.extra replaces jwtHeader, jwksUrl, and jwtIssuer.
 trustedUpstreamAuth:
   enabled: false
   emailToMatrixUserIdTemplate: ""

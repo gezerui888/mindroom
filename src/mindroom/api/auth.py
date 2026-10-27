@@ -25,6 +25,7 @@ from mindroom.api.config_lifecycle import store_request_snapshot as store_reques
 from mindroom.api.connections_session_cookie import connections_session_cookie, read_connections_session
 from mindroom.api.open_access import open_access_rejection
 from mindroom.authorization import is_platform_administrator
+from mindroom.cloudflare_access_team import cloudflare_access_defaults
 from mindroom.matrix.identity import (
     matrix_user_id_from_email,
     try_parse_historical_matrix_user_id,
@@ -210,12 +211,13 @@ def _env_text(runtime_paths: RuntimePaths, name: str) -> str | None:
 
 def _build_trusted_upstream_auth_settings(runtime_paths: RuntimePaths) -> _TrustedUpstreamAuthSettings:
     """Read trusted-upstream auth settings from one runtime context."""
+    cloudflare = cloudflare_access_defaults(runtime_paths)
     return _TrustedUpstreamAuthSettings(
         enabled=runtime_paths.env_flag("MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED"),
-        jwt_header=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER"),
-        jwks_url=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWKS_URL"),
+        jwt_header=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER") or cloudflare.jwt_header,
+        jwks_url=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWKS_URL") or cloudflare.jwks_url,
         audience=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE"),
-        issuer=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWT_ISSUER"),
+        issuer=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWT_ISSUER") or cloudflare.issuer,
         email_claim=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWT_EMAIL_CLAIM") or "email",
         user_id_claim=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWT_USER_ID_CLAIM"),
         matrix_user_id_claim=_env_text(runtime_paths, "MINDROOM_TRUSTED_UPSTREAM_JWT_MATRIX_USER_ID_CLAIM"),

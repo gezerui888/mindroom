@@ -166,6 +166,7 @@ MINDROOM_MCP_SCIM_TOKEN=<at least 32 random characters>
 | `MINDROOM_MCP_EXTERNAL_CLIENT_ID` | unset | Exact signed `client_id` claim to require |
 
 The authorization server, issuer, and JWKS URLs must be HTTPS without credentials, queries, or fragments.
+Behind Cloudflare Access, `MINDROOM_CLOUDFLARE_ACCESS_TEAM` supplies the authorization server, issuer, JWKS URL, and token header; see [Cloudflare Access](https://docs.mindroom.chat/deployment/trusted-upstream-auth/#cloudflare-access).
 Configure exactly one identity mapping: either the Matrix user ID claim, or the email template together with the email domain.
 With the email mapping, the complete signed email must match the SCIM `userName` exactly, including case.
 
@@ -190,7 +191,7 @@ Direct JumpCloud JWT authentication is unverified and not recommended.
 Put JumpCloud behind an OAuth-aware proxy that enforces the tenant's login policy and sends signed assertions instead.
 
 An OAuth-aware proxy can send a raw signed JWT in the header named by `MINDROOM_MCP_EXTERNAL_TOKEN_HEADER`.
-For example, [Cloudflare Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/) (beta) uses `Cf-Access-Jwt-Assertion`; configure that header, the assertion issuer and JWKS, the MCP Access application's audience, and the OAuth discovery issuer.
+For example, with [Cloudflare Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/) (beta), set `MINDROOM_CLOUDFLARE_ACCESS_TEAM` and the MCP Access application's audience.
 The edge must own OAuth, enforce the MCP policy, replace client-supplied assertions, and prevent origin bypass.
 Do not keep a bypass policy on `/mcp` or combine Managed OAuth with built-in mode.
 SCIM still needs its own authenticated route without interactive login redirects.

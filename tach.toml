@@ -48,6 +48,10 @@ path = "mindroom.origins"
 depends_on = ["mindroom.runtime_env_policy"]
 
 [[modules]]
+path = "mindroom.cloudflare_access_team"
+depends_on = []
+
+[[modules]]
 path = "mindroom.embeddings.factory"
 depends_on = [
     "mindroom.credentials.sync",
@@ -1670,6 +1674,7 @@ depends_on = []
 path = "mindroom.api.auth"
 depends_on = [
     "mindroom.authorization",
+    "mindroom.cloudflare_access_team",
     "mindroom.api.config_lifecycle",
     "mindroom.api.connections_session_cookie",
     "mindroom.api.open_access",
@@ -7391,7 +7396,7 @@ depends_on = []
 
 [[modules]]
 path = "mindroom.mcp_gateway.external_auth"
-depends_on = ["mindroom.matrix.identity"]
+depends_on = ["mindroom.cloudflare_access_team", "mindroom.matrix.identity"]
 
 [[modules]]
 path = "mindroom.mcp_gateway.lifecycle"

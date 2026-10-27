@@ -26,10 +26,10 @@ MINDROOM_TRUSTED_UPSTREAM_JWT_MATRIX_USER_ID_CLAIM=matrix_user_id
 | Variable | Meaning |
 | --- | --- |
 | `MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED` | Turns the mode on; default `false` |
-| `MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER` | Required; header carrying the JWT |
-| `MINDROOM_TRUSTED_UPSTREAM_JWKS_URL` | Required; the gateway's signing keys |
+| `MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER` | Required without a [Cloudflare Access team](#cloudflare-access); header carrying the JWT |
+| `MINDROOM_TRUSTED_UPSTREAM_JWKS_URL` | Required without a [Cloudflare Access team](#cloudflare-access); the gateway's signing keys |
 | `MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE` | Required; expected `aud` |
-| `MINDROOM_TRUSTED_UPSTREAM_JWT_ISSUER` | Required; expected `iss` |
+| `MINDROOM_TRUSTED_UPSTREAM_JWT_ISSUER` | Required without a [Cloudflare Access team](#cloudflare-access); expected `iss` |
 | `MINDROOM_TRUSTED_UPSTREAM_JWT_EMAIL_CLAIM` | Claim holding the verified email; default `email` |
 | `MINDROOM_TRUSTED_UPSTREAM_JWT_USER_ID_CLAIM` | Optional; claim holding a stable user ID distinct from the email, which is the user ID otherwise |
 | `MINDROOM_TRUSTED_UPSTREAM_JWT_MATRIX_USER_ID_CLAIM` | Optional; claim holding the user's Matrix ID |
@@ -37,6 +37,22 @@ MINDROOM_TRUSTED_UPSTREAM_JWT_MATRIX_USER_ID_CLAIM=matrix_user_id
 | `MINDROOM_TRUSTED_UPSTREAM_EMAIL_DOMAIN` | The single email domain allowed for template derivation; required with the template |
 
 MindRoom verifies the signature, expiry, issuer, audience, and every configured claim, and picks up gateway key rotation without a restart.
+
+## Cloudflare Access
+
+Behind Cloudflare Access, set `MINDROOM_CLOUDFLARE_ACCESS_TEAM` to the team name, such as `example` for the team domain `example.cloudflareaccess.com`, instead of the header, JWKS URL, and issuer:
+
+```bash
+MINDROOM_CLOUDFLARE_ACCESS_TEAM=example
+MINDROOM_TRUSTED_UPSTREAM_AUTH_ENABLED=true
+MINDROOM_TRUSTED_UPSTREAM_JWT_AUDIENCE=<AUD tag of the dashboard's Access application>
+```
+
+The team sets `MINDROOM_TRUSTED_UPSTREAM_JWT_HEADER` to `Cf-Access-Jwt-Assertion`, `MINDROOM_TRUSTED_UPSTREAM_JWKS_URL` to `https://example.cloudflareaccess.com/cdn-cgi/access/certs`, and `MINDROOM_TRUSTED_UPSTREAM_JWT_ISSUER` to `https://example.cloudflareaccess.com`.
+With [MCP external authorization](https://docs.mindroom.chat/deployment/mcp-gateway/#external-authorization) it also sets `MINDROOM_MCP_EXTERNAL_TOKEN_HEADER` to `Cf-Access-Jwt-Assertion`, `MINDROOM_MCP_EXTERNAL_JWKS_URL` to the same keys, and both `MINDROOM_MCP_EXTERNAL_ISSUER` and `MINDROOM_MCP_EXTERNAL_AUTHORIZATION_SERVER` to the same issuer.
+A variable you set yourself wins over the team's value.
+Audiences stay separate: set each feature's audience to the AUD tag of its own Access application.
+MindRoom refuses to start with `MINDROOM_CLOUDFLARE_ACCESS_TEAM must be a team name` when the value is a domain, a URL, or not a lowercase DNS label.
 
 ## Matrix Identity
 
@@ -67,6 +83,7 @@ trustedUpstreamAuth:
 Either chart sets the matching `MINDROOM_TRUSTED_UPSTREAM_*` environment variables, and with `enabled` true the runtime chart fails to render when `env.extra` also sets one of those variables.
 When instances come from the platform provisioner, put the same values under `provisioner.trustedUpstreamAuth` in the platform chart, which passes them to the provisioner as `INSTANCE_TRUSTED_UPSTREAM_*` variables.
 All three charts fail to render when `enabled` is true without `jwtHeader`, `jwksUrl`, `jwtAudience`, and `jwtIssuer`, or when `emailToMatrixUserIdTemplate` is set without `emailDomain`.
+In the runtime chart, a `MINDROOM_CLOUDFLARE_ACCESS_TEAM` entry in `env.extra` replaces `jwtHeader`, `jwksUrl`, and `jwtIssuer`.
 
 ## Dashboard On Its Own Host
 

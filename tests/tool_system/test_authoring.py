@@ -10,14 +10,23 @@ from unittest.mock import Mock
 
 import pytest
 
+from mindroom.constants import resolve_runtime_paths
 from mindroom.history.types import HistoryScope
 from mindroom.tool_system.agno_toolkits import Function, adapt_toolkit, agno_toolkit
 from mindroom.tool_system.agno_toolkits import Toolkit as AgnoToolkit
 from mindroom.tool_system.authoring import CurrentCall, Toolkit, current_call, tool, toolkit_functions
+from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
+from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
+from mindroom.tool_system.registration import register_tool_with_metadata
+from mindroom.tool_system.registry_state import capture_tool_registry_snapshot, restore_tool_registry_snapshot
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
+from tests.tool_system import agno_parity_support as support
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from mindroom.tool_system.tool_function import ToolFunction
 
 
@@ -237,3 +246,106 @@ def test_toolkit_functions_returns_one_callable_per_name() -> None:
     assert toolkit_functions(owned) == {"greet": owned.greet, "farewell": owned.bye, "shout": shout}
     assert toolkit_functions(agno) == {"lookup": alookup}
     assert toolkit_functions(agno_toolkit(owned)) == {"farewell": owned.bye, "shout": shout, "greet": owned.greet}
+
+
+def test_a_registered_owned_toolkit_builds_and_adapts_as_its_agno_twin(tmp_path: Path) -> None:
+    """``get_tool_by_name`` builds an owned toolkit with output files, and it adapts to its Agno twin's functions."""
+
+    class OwnedTwinTools(Toolkit):
+        name = "twin"
+        instructions = "Count and shout words."
+
+        @tool
+        def count_words(self, text: str, limit: int | None = None) -> str:
+            """Count the words of a text.
+
+            Args:
+                text: The text.
+                limit: The most words to count.
+
+            """
+            return str(len(text.split()[:limit]))
+
+        @tool
+        def shout_text(self, text: str) -> str:
+            """Shout a text.
+
+            Args:
+                text: The text.
+
+            """
+            return text.upper()
+
+    class AgnoTwinTools(AgnoToolkit):
+        def __init__(self) -> None:
+            super().__init__(
+                name="twin",
+                tools=[OwnedTwinTools().count_words, OwnedTwinTools().shout_text],
+                instructions="Count and shout words.",
+            )
+
+    snapshot = capture_tool_registry_snapshot()
+    for tool_name, toolkit_class in (("owned_twin", OwnedTwinTools), ("agno_twin", AgnoTwinTools)):
+        register_tool_with_metadata(
+            name=tool_name,
+            file_access=ToolFileAccess.NONE,
+            display_name=tool_name,
+            description="Test-only toolkit for owned authoring.",
+            category=ToolCategory.DEVELOPMENT,
+        )(lambda toolkit_class=toolkit_class: toolkit_class)
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "storage")
+    try:
+        owned, agno = (
+            adapt_toolkit(
+                get_tool_by_name(tool_name, runtime_paths, tool_output_workspace_root=tmp_path, worker_target=None),
+            )
+            for tool_name in ("owned_twin", "agno_twin")
+        )
+    finally:
+        restore_tool_registry_snapshot(snapshot)
+
+    assert support.golden_entry(owned) == support.golden_entry(agno)
+    assert OUTPUT_PATH_ARGUMENT in _by_name(owned.functions)["shout_text"].parameters["properties"]
+
+
+@pytest.mark.asyncio
+async def test_an_owned_function_writes_its_result_where_the_model_asks(tmp_path: Path) -> None:
+    """The output-file wrapper an owned function is built with saves its result under the workspace."""
+
+    class ShoutTools(Toolkit):
+        name = "shouter"
+
+        @tool
+        def shout_text(self, text: str) -> str:
+            """Shout a text."""
+            return text.upper()
+
+    snapshot = capture_tool_registry_snapshot()
+    register_tool_with_metadata(
+        name="owned_shouter",
+        file_access=ToolFileAccess.NONE,
+        display_name="Owned Shouter",
+        description="Test-only toolkit for owned output files.",
+        category=ToolCategory.DEVELOPMENT,
+    )(lambda: ShoutTools)
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "storage")
+    try:
+        toolkit = get_tool_by_name(
+            "owned_shouter",
+            runtime_paths,
+            tool_output_workspace_root=tmp_path,
+            worker_target=None,
+        )
+    finally:
+        restore_tool_registry_snapshot(snapshot)
+    [function] = adapt_toolkit(toolkit).functions
+
+    outcome = await execute_tool_call(
+        function,
+        {"text": "hi", OUTPUT_PATH_ARGUMENT: "out/shout.txt"},
+        _CONTEXT,
+        middleware=(),
+    )
+
+    assert not outcome.is_error
+    assert (tmp_path / "out" / "shout.txt").read_text(encoding="utf-8") == "HI"

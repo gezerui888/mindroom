@@ -5340,6 +5340,7 @@ visibility = [
 [[modules]]
 path = "mindroom.tool_system.metadata"
 depends_on = [
+    "mindroom.tool_system.agno_toolkits",
     "mindroom.tool_system.construction",
     "mindroom.constants",
     "mindroom.file_access",

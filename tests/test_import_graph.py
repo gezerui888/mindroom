@@ -131,6 +131,8 @@ _ALLOWED_THIRD_PARTY_ROOTS: dict[str, frozenset[str]] = {
     "mindroom.tool_system.declarations": frozenset({"dotenv"}),
     # The owned tool values import no Agno module; agno_toolkits builds them from Agno's tool objects.
     "mindroom.tool_system.tool_function": frozenset({"dotenv"}),
+    # Plugin code authors tools through the owned API without loading Agno: the runtime context's config footprint.
+    "mindroom.tool_system.authoring": _CONFIG_LAYER_ROOTS - {"cryptography"},
     # The owned schema generator reads annotations and docstrings and coerces arguments with pydantic.
     "mindroom.tool_system.tool_schema": frozenset(
         {"docstring_parser", "dotenv", "pydantic", "pydantic_core", "typing_extensions", "typing_inspection"},

@@ -48,6 +48,7 @@ _EXPORTS = [
     "CompactionHookContext",
     "ConfigField",
     "ConfigReloadedContext",
+    "CurrentCall",
     "CustomEventContext",
     "Done",
     "EnrichmentItem",
@@ -82,6 +83,8 @@ _EXPORTS = [
     "ToolRuntimeContext",
     "ToolRuntimeHookBindings",
     "ToolStatus",
+    "ToolValue",
+    "Toolkit",
     "TurnIntent",
     "TurnOrigin",
     "TurnTrust",
@@ -92,6 +95,7 @@ _EXPORTS = [
     "build_model_provider",
     "build_oauth_connect_instruction",
     "complete_prompt",
+    "current_call",
     "emit_custom_event",
     "get_logger",
     "get_tool_by_name",
@@ -109,6 +113,8 @@ _EXPORTS = [
     "resolve_agent_file",
     "resolve_config_relative_path",
     "resolve_tool_runtime_hook_bindings",
+    "tool",
+    "toolkit_functions",
     "write_file_within_root",
 ]
 
@@ -145,6 +151,7 @@ _SIGNATURES = {
     "ConfigReloadedContext": (
         f"({_HOOK}, changed_entities, added_entities, removed_entities, plugin_changes, *, {_HOOK_HELPERS})"
     ),
+    "CurrentCall": "(*, call_id, toolkit, session_id, session_state, history_scope, runtime)",
     "CustomEventContext": (
         f"({_HOOK}, payload, source_plugin, room_id, thread_id, sender_id, message_received_depth, *, {_HOOK_HELPERS})"
     ),
@@ -219,6 +226,8 @@ _SIGNATURES = {
     "ToolRuntimeHookBindings": (
         "(message_sender, matrix_admin, room_state_querier, room_state_putter, message_received_depth)"
     ),
+    "ToolValue": "(*, content, images, audios, videos, files)",
+    "Toolkit": "(*, name, tools, instructions)",
     "TurnOrigin": (
         "(transport_sender_id, requester_id, sender_entity_name, requester_entity_name, sender_kind, requester_kind, "
         "intent, source_kind, trust)"
@@ -230,6 +239,7 @@ _SIGNATURES = {
     "build_model_provider": "(config, runtime_paths, model_name, *, execution_identity)",
     "build_oauth_connect_instruction": "(provider, connect_url)",
     "complete_prompt": "(provider, prompt, *, instructions, schema, overrides, run_id)",
+    "current_call": "()",
     "emit_custom_event": "(plugin_name, event_name, payload)",
     "get_logger": "(name)",
     "get_tool_by_name": (
@@ -258,6 +268,8 @@ _SIGNATURES = {
     "resolve_agent_file": "(raw_path, *, workspace_root, file_access, field_name)",
     "resolve_config_relative_path": "(raw_path, runtime_paths)",
     "resolve_tool_runtime_hook_bindings": "(context)",
+    "tool": "(function, /, *, name, description)",
+    "toolkit_functions": "(toolkit)",
     "write_file_within_root": "(root, relative_path, payload, *, file_mode, dir_mode, exclusive)",
 }
 

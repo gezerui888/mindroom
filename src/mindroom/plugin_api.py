@@ -78,6 +78,7 @@ from mindroom.tool_system.atlassian_connections import (
     atlassian_connection_oauth_provider,
     register_atlassian_connection_tools,
 )
+from mindroom.tool_system.authoring import CurrentCall, Toolkit, current_call, tool, toolkit_functions
 from mindroom.tool_system.declarations import (
     ConfigField,
     SetupType,
@@ -102,6 +103,7 @@ from mindroom.tool_system.runtime_context import (
     get_tool_runtime_context,
     resolve_tool_runtime_hook_bindings,
 )
+from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 __all__ = [
@@ -140,6 +142,7 @@ __all__ = [
     "CompactionHookContext",
     "ConfigField",
     "ConfigReloadedContext",
+    "CurrentCall",
     "CustomEventContext",
     "Done",
     "EnrichmentItem",
@@ -174,6 +177,8 @@ __all__ = [
     "ToolRuntimeContext",
     "ToolRuntimeHookBindings",
     "ToolStatus",
+    "ToolValue",
+    "Toolkit",
     "TurnIntent",
     "TurnOrigin",
     "TurnTrust",
@@ -184,6 +189,7 @@ __all__ = [
     "build_model_provider",
     "build_oauth_connect_instruction",
     "complete_prompt",
+    "current_call",
     "emit_custom_event",
     "get_logger",
     "get_tool_by_name",
@@ -201,5 +207,7 @@ __all__ = [
     "resolve_agent_file",
     "resolve_config_relative_path",
     "resolve_tool_runtime_hook_bindings",
+    "tool",
+    "toolkit_functions",
     "write_file_within_root",
 ]

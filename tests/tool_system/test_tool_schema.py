@@ -2,7 +2,8 @@
 
 Every MindRoom-authored function whose schema Agno derives from its signature runs through both generators, for each
 registered tool as the goldens build it, and the two outputs must serialize to the same bytes. The annotation-kind
-cases do the same for each kind of annotation and docstring a tool may use.
+cases do the same for each kind of annotation and docstring a tool may use, and every argument golden whose probe
+takes no framework object runs through owned toolkit functions.
 """
 
 # The annotation-kind probes exist for their signatures, which no body reads.
@@ -26,9 +27,11 @@ from typing import (  # noqa: UP035 - The bare typing aliases are annotation-kin
 import pytest
 from pydantic import BaseModel
 
-from mindroom.tool_system.agno_toolkits import AGNO_EMPTY_PARAMETERS
+from mindroom.tool_system.agno_toolkits import AGNO_EMPTY_PARAMETERS, adapt_toolkit
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.declarations import tool_schema_source
 from mindroom.tool_system.tool_schema import tool_description, tool_parameters
+from tests.agno_parity import tool_argument_probes as probes
 from tests.tool_system import agno_parity_support as support
 
 if TYPE_CHECKING:
@@ -45,6 +48,7 @@ pytestmark = [
 
 SCHEMAS = json.loads(support.SCHEMAS_PATH.read_text(encoding="utf-8"))
 ALL_ENABLED_SCHEMAS = json.loads(support.ALL_ENABLED_SCHEMAS_PATH.read_text(encoding="utf-8"))
+ARGUMENTS = json.loads(support.ARGUMENTS_PATH.read_text(encoding="utf-8"))
 _BUILDS = [
     *((tool_name, False) for tool_name in sorted(SCHEMAS)),
     *((tool_name, True) for tool_name in sorted(ALL_ENABLED_SCHEMAS)),
@@ -383,3 +387,20 @@ def test_an_annotation_that_does_not_resolve_raises() -> None:
 
     with pytest.raises(NameError, match="Missing"):
         tool_parameters(broken)
+
+
+def owned_probe_functions() -> dict[str, Any]:
+    """Adapt the argument probes that take no framework object as one owned toolkit, keyed by function name."""
+    toolkit = Toolkit(name="probes", tools=[probe for probe in probes.PROBES if probe is not probes.probe_agent])
+    return {function.name: function for function in adapt_toolkit(toolkit).functions}
+
+
+_OWNED_CASES = sorted(case_id for case_id, case in ARGUMENTS.items() if case["function"] != "probe_agent")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case_id", _OWNED_CASES)
+async def test_argument_case_reaches_an_owned_function_as_the_golden_records(case_id: str) -> None:
+    """The owned coercion gives each probe body what Agno's coercion gave it, and fails with the same text."""
+    outcome = await support.argument_outcome(ARGUMENTS[case_id], owned_probe_functions())
+    assert json.loads(json.dumps(outcome)) == ARGUMENTS[case_id]

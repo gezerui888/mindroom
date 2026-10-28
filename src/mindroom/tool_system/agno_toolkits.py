@@ -1,7 +1,8 @@
-"""Adapt Agno toolkits to ``ToolFunction``, and give their entrypoints what they expect from Agno at call time.
+"""Adapt toolkits to ``ToolFunction``, and give Agno entrypoints what they expect from Agno at call time.
 
-Agno stays the tool authoring library: tools subclass ``agno.tools.Toolkit``, and Agno's public ``process_entrypoint``
-derives each schema and wraps each entrypoint in pydantic coercion.
+For an Agno toolkit, Agno's public ``process_entrypoint`` derives each schema and wraps each entrypoint in pydantic
+coercion. An owned toolkit (``authoring.Toolkit``) skips Agno: ``tool_schema`` derives its schemas and validates its
+calls' arguments, and its functions take no framework-supplied argument.
 At call time this module builds the Agno-shaped arguments an entrypoint declares, and ``read_tool_value`` reads the
 Agno ``ToolResult`` a vendor tool returns as the ``ToolValue`` MindRoom's own tools return. Those owned values live in
 ``tool_function``, so a module that only handles them imports no Agno module.
@@ -30,8 +31,10 @@ from agno.utils.schema import (
 
 from mindroom.llm.media import Audio, File, Image, Video
 from mindroom.logging_config import get_logger
+from mindroom.tool_system import authoring
 from mindroom.tool_system.declarations import finished_tool_schema
 from mindroom.tool_system.tool_function import AdaptedToolkit, InjectedValue, ToolFunction, ToolValue
+from mindroom.tool_system.tool_schema import tool_description, tool_parameters, validated_entrypoint
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Mapping
@@ -60,6 +63,37 @@ _RESERVED_NAMES: Mapping[str, InjectedValue] = {
 _UNBINDABLE_KINDS = frozenset(
     (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD, inspect.Parameter.POSITIONAL_ONLY),
 )
+# The parameters through which Agno hands a tool its agent, team, or run context, which an owned function reads through
+# ``current_call()`` instead.
+_FRAMEWORK_OBJECT_NAMES = frozenset(
+    name for name, value in _RESERVED_NAMES.items() if value in (InjectedValue.ACTOR, InjectedValue.RUN_CONTEXT)
+)
+
+
+class _OwnedFunction(Function):
+    """A function of an owned toolkit, carried in Agno's toolkit containers; adapting it uses no Agno code."""
+
+
+def agno_toolkit(toolkit: Toolkit | authoring.Toolkit) -> Toolkit:
+    """Return ``toolkit``, an owned one as an Agno toolkit holding its functions where Agno would register them.
+
+    ``get_tool_by_name`` edits Agno's function maps before adaptation (see its TODO), so an owned toolkit is carried
+    in them. Its functions stay owned: adapting one derives its schema with ``tool_schema``, not Agno.
+    """
+    if isinstance(toolkit, Toolkit):
+        return toolkit
+    container = Toolkit(name=toolkit.name, instructions=toolkit.instructions)
+    for name, entrypoint in toolkit.functions.items():
+        registered = container.async_functions if inspect.iscoroutinefunction(entrypoint) else container.functions
+        # The flags Agno's registration sets for a function no toolkit option asks anything of.
+        registered[name] = _OwnedFunction(
+            name=name,
+            description=authoring.authored_description(entrypoint),
+            entrypoint=entrypoint,
+            requires_confirmation=False,
+            external_execution=False,
+        )
+    return container
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,7 +223,12 @@ class FunctionScopedInstructions(Protocol):
         ...
 
 
-def adapt_toolkit(toolkit: Toolkit, *, key: str | None = None, registered: str | None = None) -> AdaptedToolkit:
+def adapt_toolkit(
+    toolkit: Toolkit | authoring.Toolkit,
+    *,
+    key: str | None = None,
+    registered: str | None = None,
+) -> AdaptedToolkit:
     """Adapt the functions of ``toolkit`` in Agno's async-run order, one per name; they share one ``actor_state``.
 
     ``key`` is the authored toolkit an agent is offered the functions from, which each one carries as its
@@ -200,6 +239,7 @@ def adapt_toolkit(toolkit: Toolkit, *, key: str | None = None, registered: str |
     other field MindRoom refuses is adapted without it and named in ``refused``, so whoever offers the toolkit
     refuses it only for a function it still offers.
     """
+    toolkit = agno_toolkit(toolkit)
     functions = toolkit.get_async_functions().values()
     actor_state: dict[str, Any] = {}
     adapted: list[ToolFunction] = []
@@ -295,35 +335,61 @@ def _refusal(function: Function) -> str | None:
 
 
 def _adapt(function: Function) -> ToolFunction:
-    """Process one Agno function once, on a copy, and return it as a ``ToolFunction`` with its finished schema.
+    """Derive one function once and return it as a ``ToolFunction`` with its finished schema and the loop's flags.
 
-    ``process_entrypoint`` rewrites a user-authored schema in place and replaces the entrypoint with its coercing
-    wrapper, so the shared ``Function`` stays untouched for whoever else holds it. A MindRoom wrapper that forges its
-    entrypoint's signature declares how the schema Agno derives from it is completed. A field MindRoom refuses is
-    left unread.
+    An Agno function is processed on a copy, because ``process_entrypoint`` rewrites a user-authored schema in place
+    and replaces the entrypoint with its coercing wrapper, so the shared ``Function`` stays untouched for whoever else
+    holds it; an owned one is derived by ``_owned_definition``. A MindRoom wrapper that forges its entrypoint's
+    signature declares how the schema derived from it is completed. A field MindRoom refuses is left unread.
     """
     if function.entrypoint is None:
         msg = f"Tool function {function.name!r} has no entrypoint"
         raise ValueError(msg)
-    prepared = function.model_copy(deep=False)
-    prepared.parameters = deepcopy(function.parameters)
-    # An explicit strict setting on the function wins; MindRoom never asks Agno for strict schemas otherwise.
-    prepared.process_entrypoint(strict=bool(function.strict))
-    assert prepared.entrypoint is not None
+    if isinstance(function, _OwnedFunction):
+        description, parameters, entrypoint = _owned_definition(function, function.entrypoint)
+        injected: dict[str, InjectedValue] = {}
+        processed = True
+    else:
+        prepared = function.model_copy(deep=False)
+        prepared.parameters = deepcopy(function.parameters)
+        # An explicit strict setting on the function wins; MindRoom never asks Agno for strict schemas otherwise.
+        prepared.process_entrypoint(strict=bool(function.strict))
+        assert prepared.entrypoint is not None
+        description, parameters, entrypoint = prepared.description, prepared.parameters, prepared.entrypoint
+        injected = injected_parameters(function.entrypoint)
+        processed = not function.skip_entrypoint_processing
     return ToolFunction(
-        name=prepared.name,
-        description=prepared.description,
-        parameters=finished_tool_schema(function.entrypoint, prepared.parameters),
-        strict=prepared.strict,
-        requires_confirmation=prepared.requires_confirmation,
-        approval_type=prepared.approval_type,
-        external_execution=prepared.external_execution,
-        external_execution_silent=prepared.external_execution_silent,
-        stop_after_call=prepared.stop_after_tool_call,
-        entrypoint=prepared.entrypoint,
-        injected_params=injected_parameters(function.entrypoint),
-        entrypoint_processed=not function.skip_entrypoint_processing,
+        name=function.name,
+        description=description,
+        parameters=finished_tool_schema(function.entrypoint, parameters),
+        strict=function.strict,
+        requires_confirmation=function.requires_confirmation,
+        approval_type=function.approval_type,
+        external_execution=function.external_execution,
+        external_execution_silent=function.external_execution_silent,
+        stop_after_call=function.stop_after_tool_call,
+        entrypoint=entrypoint,
+        injected_params=injected,
+        entrypoint_processed=processed,
     )
+
+
+def _owned_definition(
+    function: _OwnedFunction,
+    entrypoint: Callable[..., Any],
+) -> tuple[str, dict[str, Any], Callable[..., Any]]:
+    """Return an owned function's description, schema, and validating entrypoint, derived without Agno.
+
+    A parameter through which Agno would hand over a framework object is refused, because nothing fills it.
+    """
+    if taken := sorted(_FRAMEWORK_OBJECT_NAMES.intersection(inspect.signature(entrypoint).parameters)):
+        msg = (
+            f"Tool function {function.name!r} takes {', '.join(taken)}, which only Agno toolkits are handed;"
+            " read the call through current_call() instead"
+        )
+        raise ValueError(msg)
+    description = function.description or tool_description(entrypoint)
+    return description, tool_parameters(entrypoint), validated_entrypoint(entrypoint)
 
 
 def injected_parameters(entrypoint: Callable[..., Any]) -> dict[str, InjectedValue]:
@@ -571,6 +637,7 @@ __all__ = [
     "Toolkit",
     "adapt_function",
     "adapt_toolkit",
+    "agno_toolkit",
     "framework_arguments",
     "injected_parameters",
     "model_arguments",

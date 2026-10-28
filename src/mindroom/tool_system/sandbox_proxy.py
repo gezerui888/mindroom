@@ -11,6 +11,7 @@ import inspect
 import json
 import math
 import secrets
+import weakref
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -1020,19 +1021,22 @@ def _routed_entrypoint(
     execution_env: dict[str, str] | None = None,
     extra_env_passthrough: str | None = None,
     worker_target: ResolvedWorkerTarget | None = None,
-    primary_placement: SupportsPrimaryCallPlacement | None = None,
+    primary_placement: weakref.ref[SupportsPrimaryCallPlacement] | None = None,
 ) -> Callable[..., object]:
-    """Return ``local``'s stand-in sending each call to the worker, except a call ``primary_placement`` keeps here.
+    """Return ``local``'s stand-in sending each call to the worker, except one its toolkit keeps here.
 
-    It keeps ``local``'s signature, so the call's arguments are validated before they are sent. A synchronous function
-    keeps the completion ownership its own body has; an async one keeps prompt cancellation.
+    ``primary_placement`` refers to the toolkit, when it places calls. The stand-in keeps ``local``'s signature, so the
+    call's arguments are validated before they are sent. A synchronous function keeps the completion ownership its own
+    body has; an async one keeps prompt cancellation.
     """
+    # The toolkit being adapted, which the stand-in keeps for as long as its function lives.
+    placement = None if primary_placement is None else primary_placement()
     local_is_async = inspect.iscoroutinefunction(local)
     run_blocking = _run_in_worker_proxy_executor if local_is_async else _run_sync_tool_call
 
     @functools.wraps(local)
     async def proxy_entrypoint(*args: object, **kwargs: object) -> object:
-        if primary_placement is not None and primary_placement.runs_on_primary(
+        if placement is not None and placement.runs_on_primary(
             function_name,
             inspect.signature(local).bind(*args, **kwargs).arguments,
         ):
@@ -1105,5 +1109,6 @@ def worker_route(
         ),
         extra_env_passthrough=extra_env_passthrough,
         worker_target=worker_target,
-        primary_placement=toolkit if isinstance(toolkit, SupportsPrimaryCallPlacement) else None,
+        # Weak, because the toolkit keeps this route as long as it lives; a strong reference would keep it forever.
+        primary_placement=weakref.ref(toolkit) if isinstance(toolkit, SupportsPrimaryCallPlacement) else None,
     )

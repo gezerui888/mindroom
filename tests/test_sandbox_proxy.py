@@ -8,6 +8,7 @@ import base64
 import contextlib
 import contextvars
 import functools
+import gc
 import hashlib
 import inspect
 import json
@@ -17,6 +18,7 @@ import stat
 import sys
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import asdict, replace
@@ -64,7 +66,7 @@ from mindroom.tool_system.agno_toolkits import (
 )
 from mindroom.tool_system.authoring import Toolkit as OwnedToolkit
 from mindroom.tool_system.authoring import tool
-from mindroom.tool_system.declarations import ToolExecutionTarget, ToolFileAccess
+from mindroom.tool_system.declarations import SupportsPrimaryCallPlacement, ToolExecutionTarget, ToolFileAccess
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.media_transport import encode_media_result
 from mindroom.tool_system.metadata import (
@@ -2771,6 +2773,29 @@ def test_routed_browser_ignores_worker_planted_desktop_target(monkeypatch: pytes
     )
     assert tool._default_target == "host"
     assert tool._desktop_target is None
+
+
+def test_a_worker_routed_browser_toolkit_is_collected_once_its_functions_are_released(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A routed toolkit whose calls the primary may keep, as the browser's desktop calls stay, outlives no run."""
+    runtime_paths = _configure_proxy_runtime(monkeypatch, proxy_url="http://sandbox:8765", execution_mode="all")
+    tool = get_tool_by_name("browser", runtime_paths, worker_tools_override=["browser"], worker_target=None)
+    assert isinstance(tool, SupportsPrimaryCallPlacement)
+    functions = adapt_toolkit(tool).functions
+    assert sandbox_proxy_module.sandbox_proxy_enabled_for_tool(
+        "browser",
+        runtime_paths=runtime_paths,
+        worker_tools_override=["browser"],
+    )
+    released = weakref.ref(tool)
+    released_function = weakref.ref(functions[0].entrypoint)
+
+    del tool, functions
+    gc.collect()
+
+    assert released() is None
+    assert released_function() is None
 
 
 def test_get_tool_by_name_requires_explicit_clickup_config(tmp_path: Path) -> None:

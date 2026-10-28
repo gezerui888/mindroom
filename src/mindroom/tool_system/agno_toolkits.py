@@ -103,6 +103,7 @@ class _Finishing:
         return entrypoint, wrapped is not None
 
 
+# No value holds its toolkit, which would keep the toolkit, and whatever it holds, alive for the whole process.
 _FINISHING: WeakKeyDictionary[AnyToolkit, _Finishing] = WeakKeyDictionary()
 
 

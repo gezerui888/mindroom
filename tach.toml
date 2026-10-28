@@ -7902,6 +7902,7 @@ depends_on = [
     "mindroom.tool_jobs.runtime",
     "mindroom.tool_jobs.settings",
     "mindroom.tool_jobs.background_after",
+    "mindroom.tool_jobs.results",
     "mindroom.tool_system.runtime_context",
     "mindroom.tool_system.tool_function",
     "mindroom.tool_system.worker_routing",
@@ -7957,6 +7958,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.delegation.audit"
 depends_on = [
+    "mindroom.ai_run_metadata",
     "mindroom.delegation.records",
     "mindroom.delegation.state",
     "mindroom.llm",
@@ -8828,6 +8830,7 @@ path = "mindroom.tool_jobs.results"
 depends_on = ["mindroom.llm", "mindroom.tool_jobs.legacy_results", "mindroom.tool_system.tool_function"]
 visibility = [
     "mindroom.delegation.background",
+    "mindroom.delegation.execution",
     "mindroom.tool_jobs.execution",
     "mindroom.tool_jobs.consumption",
 ]

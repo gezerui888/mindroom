@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 from collections.abc import AsyncIterator  # noqa: TC003 - A tool's annotations resolve when its toolkit adapts.
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import Mock
 
 import pytest
@@ -40,7 +41,7 @@ from mindroom.tool_system.tool_schema import authored_parameters
 from tests.tool_system import agno_parity_support as support
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
@@ -152,6 +153,59 @@ def test_a_subclass_offers_its_bases_tool_methods_first() -> None:
     assert toolkit.functions["second"]() == "overridden"
 
 
+class StaticAndClassTools(Toolkit):
+    """Static and class methods marked with ``@tool`` in either decorator order."""
+
+    @staticmethod
+    @tool(name="static_marked_first", description="A static method marked before it became one.")
+    def _static_inside(text: str) -> str:
+        return f"static:{text}"
+
+    @tool(name="static_marked_last", description="A static method marked after it became one.")
+    @staticmethod
+    def _static_outside(text: str) -> str:
+        return f"static:{text}"
+
+    @classmethod
+    @tool(name="class_marked_first", description="A class method marked before it became one.")
+    def _class_inside(cls, text: str) -> str:
+        return f"{cls.__name__}:{text}"
+
+    @tool(name="class_marked_last", description="A class method marked after it became one.")
+    @classmethod
+    def _class_outside(cls, text: str) -> str:
+        return f"{cls.__name__}:{text}"
+
+
+@pytest.mark.asyncio
+async def test_static_and_class_methods_are_tool_functions_in_either_decorator_order() -> None:
+    """Each keeps the name and description ``@tool`` gave it, and the model fills only its own parameters."""
+    toolkit = StaticAndClassTools()
+    functions = _by_name(adapt_toolkit(toolkit).functions)
+    names = ["static_marked_first", "static_marked_last", "class_marked_first", "class_marked_last"]
+
+    outcomes = [await execute_tool_call(functions[name], {"text": "hi"}, _CONTEXT, middleware=()) for name in names]
+
+    assert list(toolkit.functions) == names
+    assert [functions[name].description for name in names] == [
+        "A static method marked before it became one.",
+        "A static method marked after it became one.",
+        "A class method marked before it became one.",
+        "A class method marked after it became one.",
+    ]
+    assert all(
+        functions[name].parameters
+        == {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}
+        for name in names
+    )
+    assert [outcome.content for outcome in outcomes] == [
+        "static:hi",
+        "static:hi",
+        "StaticAndClassTools:hi",
+        "StaticAndClassTools:hi",
+    ]
+
+
 def test_only_tool_marks_make_a_class_attribute_a_function() -> None:
     """An attribute that answers any attribute lookup, such as a lazy client proxy, is no tool function."""
 
@@ -167,6 +221,51 @@ def test_only_tool_marks_make_a_class_attribute_a_function() -> None:
             return "pong"
 
     assert list(ProxyHoldingTools().functions) == ["ping"]
+
+
+class _Callable:
+    """An object that is callable without being a function, which no schema can be derived from."""
+
+    def __call__(self, text: str) -> str:
+        return text
+
+
+@pytest.mark.parametrize("entry", [functools.partial(shout, "x"), _Callable()], ids=["partial", "callable_object"])
+def test_a_tool_that_is_no_function_or_method_is_refused_when_the_toolkit_is_built(entry: Callable[..., Any]) -> None:
+    """A schema and validation come from a function's own signature and annotations, so other callables cannot be tools."""
+    with pytest.raises(ValueError, match="takes functions and methods as tools"):
+        Toolkit(name="odd", tools=[entry])
+
+
+def test_a_tool_with_a_positional_only_parameter_is_refused_when_the_toolkit_is_built() -> None:
+    """The model passes every argument by name, so a parameter it could only pass by position is refused."""
+
+    class LookupTools(Toolkit):
+        @tool
+        def lookup(self, key: str, /) -> str:
+            return key
+
+    with pytest.raises(ValueError, match="'lookup' takes key only by position"):
+        LookupTools()
+
+
+def test_an_override_without_tool_stops_offering_the_inherited_function() -> None:
+    """A subclass stops offering an inherited function by overriding it without ``@tool``."""
+
+    class BaseTools(Toolkit):
+        @tool
+        def offered(self) -> str:
+            return "offered"
+
+        @tool
+        def withdrawn(self) -> str:
+            return "withdrawn"
+
+    class SubTools(BaseTools):
+        def withdrawn(self) -> str:
+            return "a helper now"
+
+    assert list(SubTools().functions) == ["offered"]
 
 
 def test_two_functions_under_one_name_raise() -> None:

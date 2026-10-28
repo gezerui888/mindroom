@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 
+from mindroom.tool_system.tool_function import ToolValue
 from mindroom.worker_computer.protocol import BrowserSession
 
 if TYPE_CHECKING:
@@ -95,10 +96,9 @@ def select_browser_provider(
             encode_media_result,
         )
     elif tool_name == "browser" and function_name == "browser_control":
-        from mindroom.tool_system.agno_toolkits import ToolResult  # noqa: PLC0415
 
         def encode_action_browser_result(result: object) -> object:
-            if isinstance(result, ToolResult):
+            if isinstance(result, ToolValue):
                 return encode_media_result(result)
             return encode_json(result)
 

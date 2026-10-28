@@ -329,9 +329,8 @@ def test_native_functions_reuse_one_guarded_session(  # noqa: PLR0915 - full HTT
     enabled: bool,
 ) -> None:
     """Current native names route through one retained toolkit; disabled mode fails closed."""
-    from agno.tools.function import ToolResult  # noqa: PLC0415
-
     from mindroom.tool_system.media_transport import decode_media_result  # noqa: PLC0415
+    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
     from mindroom.worker_computer.mcp_provider import WorkerBrowserMCP  # noqa: PLC0415
 
     identity = ToolExecutionIdentity(
@@ -369,9 +368,9 @@ def test_native_functions_reuse_one_guarded_session(  # noqa: PLR0915 - full HTT
     monkeypatch.setattr(sandbox_worker_prep, "prepare_worker_request", lambda **_kwargs: prepared)
     calls = []
 
-    async def execute(self: WorkerBrowserMCP, name: str, arguments: dict[str, object]) -> ToolResult:
+    async def execute(self: WorkerBrowserMCP, name: str, arguments: dict[str, object]) -> ToolValue:
         calls.append((id(self), name, arguments))
-        return ToolResult(content=name)
+        return ToolValue(content=name)
 
     monkeypatch.setattr(WorkerBrowserMCP, "execute", execute)
     payload = {

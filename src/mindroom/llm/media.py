@@ -224,6 +224,36 @@ def _is_text(mime_type: str | None) -> bool:
     return mime_type is not None and mime_type.startswith("text/")
 
 
+# The document types a tool may return a file as for the model to read; a model's provider adapter decides which of
+# them it sends.
+DOCUMENT_MIME_TYPES = frozenset(
+    {
+        "application/pdf",
+        "application/json",
+        "application/x-javascript",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/msword",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-outlook",
+        "application/zip",
+        "message/rfc822",
+        "text/javascript",
+        "application/x-python",
+        "text/x-python",
+        "text/plain",
+        "text/html",
+        "text/css",
+        "text/markdown",
+        "text/csv",
+        "text/xml",
+        "text/rtf",
+    },
+)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class File:
     """A document, usually given by ``url``, ``filepath``, or ``content``.
@@ -283,6 +313,7 @@ class File:
 
 
 __all__ = [
+    "DOCUMENT_MIME_TYPES",
     "IMAGE_HEADER_BYTES",
     "VIEWED_IMAGE_ID_PREFIX",
     "Audio",

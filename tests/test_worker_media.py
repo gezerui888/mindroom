@@ -14,29 +14,30 @@ from agno.tools.function import ToolResult
 from mindroom.api import sandbox_runner
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
+from mindroom.llm.media import Audio as OwnedAudio
 from mindroom.llm.messages import Message
 from mindroom.providers.gemini import wire as gemini_wire
 from mindroom.providers.openai.media import chat_audio_part, chat_file_part
 from mindroom.tool_system import media_transport
-from mindroom.tool_system.agno_toolkits import read_tool_value, tool_value
+from mindroom.tool_system.agno_toolkits import read_tool_value
 from mindroom.tool_system.media_transport import decode_media_result
+from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_media import serialize_worker_tool_result
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _openai_audio_format(result: ToolResult) -> str:
-    """Return the format the OpenAI chat wire sends for the first audio of a tool result."""
-    part = chat_audio_part(tool_value(result).audios[0])
+def _openai_audio_format(result: ToolValue) -> str:
+    """Return the format the OpenAI chat wire sends for the first audio of a tool value."""
+    part = chat_audio_part(result.audios[0])
     assert part is not None
     return part["input_audio"]["format"]
 
 
-def _gemini_mime_type(result: ToolResult) -> str:
-    """Return the MIME type the Gemini wire sends for the first audio or video of a tool result."""
-    value = tool_value(result)
-    message = Message(role="user", audio=value.audios, videos=value.videos)
+def _gemini_mime_type(result: ToolValue) -> str:
+    """Return the MIME type the Gemini wire sends for the first audio or video of a tool value."""
+    message = Message(role="user", audio=result.audios, videos=result.videos)
     route = gemini_wire.MediaRoute(provider="gemini", upload=None)
     contents, _ = asyncio.run(gemini_wire.format_contents([message], route))
     return contents[0]["parts"][0]["inline_data"]["mime_type"]
@@ -82,7 +83,7 @@ def test_worker_file_result_becomes_inline_bytes(tmp_path: Path) -> None:
     decoded = decode_media_result(json.loads(wire))
 
     assert str(path) not in wire
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     assert decoded.images
     assert decoded.images[0].content == b"generated-image"
     assert decoded.images[0].filepath is None
@@ -97,9 +98,9 @@ def test_worker_text_file_preserves_utf8_content(monkeypatch: pytest.MonkeyPatch
 
     decoded = decode_media_result(serialize_worker_tool_result(result))
 
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     assert decoded.files
-    assert decoded.files[0].get_content_bytes() == "h\u00e9llo".encode()
+    assert decoded.files[0].content == "h\u00e9llo".encode()
     monkeypatch.setattr(media_transport, "MAX_MEDIA_BYTES", 5)
     with pytest.raises(ValueError, match="byte limit"):
         serialize_worker_tool_result(result)
@@ -136,14 +137,14 @@ def test_document_name_and_type_survive_inlining(
     decoded = decode_media_result(serialize_worker_tool_result(result))
     path.unlink()
 
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     assert decoded.files
     document = decoded.files[0]
     assert document.filepath is None
     assert document.url is None
     assert document.filename == ("chosen.csv" if explicit else "report one.txt")
     assert document.mime_type == ("text/csv" if explicit else "text/plain")
-    payload = chat_file_part(tool_value(decoded).files[0])
+    payload = chat_file_part(decoded.files[0])
     assert payload is not None
     assert payload["file"]["filename"] == document.filename
     assert payload["file"]["file_data"].startswith(f"data:{document.mime_type};base64,")
@@ -176,7 +177,7 @@ def test_media_source_type_survives_inlining(
     decoded = decode_media_result(serialize_worker_tool_result(ToolResult(content="Media", **{field: [media]})))
     path.unlink()
 
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     if kind in {"mp3", "wav"}:
         assert decoded.audios
         item = decoded.audios[0]
@@ -189,7 +190,7 @@ def test_media_source_type_survives_inlining(
     assert item.filepath is None
     assert item.url is None
     if kind in {"mp3", "wav"}:
-        assert isinstance(item, Audio)
+        assert isinstance(item, OwnedAudio)
         assert _openai_audio_format(decoded) == kind
         assert _gemini_mime_type(decoded) == f"audio/{kind}"
     elif kind == "webm":
@@ -208,7 +209,7 @@ def test_explicit_media_format_precedes_resource_name(tmp_path: Path) -> None:
 
     decoded = decode_media_result(serialize_worker_tool_result(result))
 
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     assert decoded.audios
     assert decoded.audios[0].mime_type is None
     assert _openai_audio_format(decoded) == "mp3"
@@ -230,7 +231,7 @@ def test_unknown_file_type_remains_unset(monkeypatch: pytest.MonkeyPatch) -> Non
     result = ToolResult(content="Document", files=[File(url="https://8.8.8.8/download")])
     decoded = decode_media_result(serialize_worker_tool_result(result))
 
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     assert decoded.files
     assert decoded.files[0].mime_type is None
     assert decoded.files[0].filename == "download"
@@ -262,7 +263,7 @@ def test_worker_url_result_becomes_inline_bytes(monkeypatch: pytest.MonkeyPatch)
     envelope = serialize_worker_tool_result(result)
     decoded = decode_media_result(json.loads(json.dumps(envelope)))
 
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     assert decoded.images
     assert decoded.images[0].content == b"remote-image"
     assert decoded.images[0].url is None
@@ -369,13 +370,12 @@ def test_worker_audio_mime_fallback_reaches_provider(
     wire = json.dumps(serialize_worker_tool_result(ToolResult(content="Audio", audios=[source])))
     decoded = decode_media_result(json.loads(wire))
 
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     assert decoded.audios
     audio = decoded.audios[0]
     assert audio.content == b"audio-content"
     assert audio.url is None
     assert audio.filepath is None
-    assert audio.media_reference is None
     assert audio.format == expected_format
     if explicit_mime is not None:
         assert audio.mime_type == explicit_mime
@@ -397,7 +397,7 @@ def test_worker_audio_explicit_mime_supplies_missing_format(
     path.unlink()
     decoded = decode_media_result(json.loads(json.dumps(envelope)))
 
-    assert isinstance(decoded, ToolResult)
+    assert isinstance(decoded, ToolValue)
     assert decoded.audios
     item = decoded.audios[0]
     assert item.content == b"mp3-content"
@@ -476,6 +476,7 @@ def test_the_worker_media_wire_is_pinned_byte_for_byte(tmp_path: Path) -> None:
     )
 
     assert json.dumps(serialize_worker_tool_result(result)) == _PINNED_WIRE
+    assert json.dumps(serialize_worker_tool_result(read_tool_value(result))) == _PINNED_WIRE
     decoded = read_tool_value(decode_media_result(json.loads(_PINNED_WIRE)))
     assert decoded is not None
     assert decoded.content == "Generated artifacts"

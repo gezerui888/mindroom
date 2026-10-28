@@ -1947,10 +1947,9 @@ def test_view_file_from_worker_posts_and_decodes_bounded_media(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Primary file viewing should route to the selected worker and restore image bytes."""
-    from agno.media import Image  # noqa: PLC0415
-    from agno.tools.function import ToolResult  # noqa: PLC0415
-
+    from mindroom.llm.media import Image  # noqa: PLC0415
     from mindroom.tool_system.media_transport import encode_media_result  # noqa: PLC0415
+    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
 
     captured: dict[str, Any] = {}
     manager = _TrackingWorkerManager()
@@ -1973,7 +1972,7 @@ def test_view_file_from_worker_posts_and_decodes_bounded_media(
     )
     worker_target = _worker_target(runtime_paths, "shared", "code", execution_identity)
     envelope = encode_media_result(
-        ToolResult(content='{"view_status":"ready"}', images=[Image(content=b"png", mime_type="image/png")]),
+        ToolValue(content='{"view_status":"ready"}', images=(Image(content=b"png", mime_type="image/png"),)),
     )
     monkeypatch.setattr(
         sandbox_proxy_module,
@@ -7890,13 +7889,12 @@ def test_shell_extra_env_requires_explicit_patterns_for_service_urls() -> None:
 @pytest.mark.parametrize("tool_name", ["browser_mcp", "shell"])
 def test_worker_client_returns_raw_browser_envelopes(tool_name: str) -> None:
     """The HTTP client leaves feature envelopes untouched for every tool."""
-    from agno.media import Image  # noqa: PLC0415
-    from agno.tools.function import ToolResult  # noqa: PLC0415
-
+    from mindroom.llm.media import Image  # noqa: PLC0415
     from mindroom.tool_system.media_transport import encode_media_result  # noqa: PLC0415
+    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
 
     envelope = encode_media_result(
-        ToolResult(content="screen", images=[Image(content=b"png", mime_type="image/png")]),
+        ToolValue(content="screen", images=(Image(content=b"png", mime_type="image/png"),)),
     )
     result = execute_worker_proxy_request(
         config=WorkerProxyClientConfig(
@@ -7927,7 +7925,7 @@ def test_proxy_composition_decodes_typed_media_for_every_tool(
     valid: bool,
 ) -> None:
     """Composition restores native images and rejects malformed native envelopes."""
-    from agno.tools.function import ToolResult  # noqa: PLC0415
+    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
 
     envelope = {
         "mindroom_tool_result": {
@@ -7965,7 +7963,7 @@ def test_proxy_composition_decodes_typed_media_for_every_tool(
             call()
     else:
         result = call()
-        assert isinstance(result, ToolResult)
+        assert isinstance(result, ToolValue)
         assert result.content == "screen"
-        assert result.images is not None
+        assert result.images
         assert result.images[0].content == b"png"

@@ -98,10 +98,11 @@ Design migrations around that assumption rather than adding machinery to coordin
 
 ### Agno Compatibility Policy
 
-- MindRoom owns its run loop, providers, storage, teams, and history; Agno stays only as the tool library and the knowledge reader layer.
-  What stays Agno: the `Toolkit`, `Function`, and `@tool` authoring API for MindRoom, plugin, and vendor tools (MindRoom's tools return text or `ToolValue`; the adapter reads a plugin or vendor `ToolResult` once), Agno's tool schema generation and argument coercion, the vendor toolkits with MindRoom's per-toolkit overrides, and the knowledge readers and chunkers in `knowledge/readers.py`.
-- The agent loop sees tools only as `ToolFunction`, produced by `adapt_toolkit` and `adapt_function` in `tool_system/agno_toolkits.py`.
-  Only the modules `tests/test_agno_boundary.py` allows may import Agno; every other module must take Agno's tool types from `tool_system/agno_toolkits.py` and must not use Agno's agent, team, model, run, storage, or learning layers.
+- MindRoom owns its run loop, providers, storage, teams, history, and tool authoring API; Agno stays only as the vendor tool library and the knowledge reader layer.
+  MindRoom's own tools use the owned `Toolkit` and `@tool` in `tool_system/authoring.py` and return text or `ToolValue`.
+  What stays Agno: the vendor toolkits with MindRoom's per-toolkit overrides, Agno's `Toolkit`, `Function`, and `@tool` for those toolkits and for plugins written against them (the adapter reads a plugin or vendor `ToolResult` once), Agno's schema generation and argument coercion for their functions, and the knowledge readers and chunkers in `knowledge/readers.py`.
+- The agent loop sees tools only as `ToolFunction`, produced by `adapt_toolkit` and `toolkit_function` in `tool_system/agno_toolkits.py`, which alone looks inside an Agno toolkit.
+  Only the modules `tests/test_agno_boundary.py` allows may import Agno; every other module handles a toolkit through the adapter's functions and MindRoom's own types, and must not use Agno's agent, team, model, run, storage, or learning layers.
 - The goal is to fix Agno weaknesses upstream and remove local workarounds as those fixes ship.
   Isolate substantive workarounds in `agno_compat_<subject>.py` beside their owning module; a tiny override may stay in a cohesive adapter.
 - Mark each independently removable workaround with a nearby source comment whose first line is `# AGNO_COMPAT: <short description of the upstream weakness>`, so `rg -n -F 'AGNO_COMPAT:' src/mindroom` lists each gap.

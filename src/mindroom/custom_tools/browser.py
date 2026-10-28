@@ -50,7 +50,7 @@ from mindroom.runtime_env_policy import SANDBOX_RUNTIME_ENV_BY_KEY
 from mindroom.server_fetch_url import validate_server_fetch_url
 from mindroom.tool_system.media_attachments import finalize_tool_media
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
-from mindroom.tool_system.tool_function import ToolValue
+from mindroom.tool_system.tool_function import ToolValue  # noqa: TC001 - Agno resolves tool annotations at runtime.
 from mindroom.tool_system.toolkit_aliases import apply_toolkit_function_aliases
 from mindroom.worker_computer.browser_bundle import COMPUTER_BROWSER_EXECUTABLE
 from mindroom.worker_computer.browser_proxy import (
@@ -1053,9 +1053,7 @@ class BrowserTools(Toolkit):
             if saveOnly:
                 return json.dumps(screenshot, sort_keys=True)
             result = await asyncio.to_thread(image_result, image_bytes, metadata=screenshot)
-            finalized = await asyncio.to_thread(finalize_tool_media, result)
-            assert isinstance(finalized, ToolValue)
-            return finalized
+            return await asyncio.to_thread(finalize_tool_media, result)
         if normalized_action == "navigate":
             target_url = _clean_str(targetUrl)
             if target_url is None:
@@ -1255,9 +1253,7 @@ class BrowserTools(Toolkit):
             timeout_seconds=self._timeout_seconds,
         )
         result = await asyncio.to_thread(image_result, image_bytes, metadata=result_payload)
-        finalized = await asyncio.to_thread(finalize_tool_media, result)
-        assert isinstance(finalized, ToolValue)
-        return finalized
+        return await asyncio.to_thread(finalize_tool_media, result)
 
     async def _status_payload(self, profile_name: str) -> dict[str, Any]:
         async with self._lock:

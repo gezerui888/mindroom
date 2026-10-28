@@ -23,6 +23,8 @@ from mindroom.api.worker_computer import router
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.custom_tools.browser import BrowserTools
+from mindroom.tool_system.media_transport import decode_media_result
+from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_key
 from mindroom.worker_computer.runtime import WorkerComputerRuntime
 from mindroom.worker_computer.worker_browser import WorkerBrowserRuntime
@@ -329,8 +331,6 @@ def test_native_functions_reuse_one_guarded_session(  # noqa: PLR0915 - full HTT
     enabled: bool,
 ) -> None:
     """Current native names route through one retained toolkit; disabled mode fails closed."""
-    from mindroom.tool_system.media_transport import decode_media_result  # noqa: PLC0415
-    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
     from mindroom.worker_computer.mcp_provider import WorkerBrowserMCP  # noqa: PLC0415
 
     identity = ToolExecutionIdentity(

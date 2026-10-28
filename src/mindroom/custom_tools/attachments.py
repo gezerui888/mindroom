@@ -510,9 +510,7 @@ class AttachmentTools(Toolkit):
         else:
             assert path is not None
             result = await self._view_path_image(context, path)
-        finalized = await asyncio.to_thread(finalize_tool_media, result)
-        assert isinstance(finalized, ToolValue)
-        return finalized
+        return await asyncio.to_thread(finalize_tool_media, result)
 
     def _tools_use_worker(self, context: ToolRuntimeContext) -> bool:
         """Return whether this agent's workspace tools run in a worker, away from runtime attachment storage."""
@@ -664,9 +662,7 @@ class AttachmentTools(Toolkit):
                     attachment_id=requested_attachment_id,
                     message=receipt["message"],
                 )
-            finalized = await asyncio.to_thread(finalize_tool_media, result)
-            assert isinstance(finalized, ToolValue)
-            return finalized
+            return await asyncio.to_thread(finalize_tool_media, result)
         return json.dumps(metadata, sort_keys=True)
 
     def _resolve_output_path_argument(

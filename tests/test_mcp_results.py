@@ -18,7 +18,6 @@ from mcp.types import (
 
 from mindroom.mcp.errors import MCPToolCallError
 from mindroom.mcp.results import tool_value_from_call_result
-from mindroom.tool_system.tool_function import ToolValue
 
 
 def test_tool_value_from_call_result_converts_text_images_and_resources() -> None:
@@ -49,7 +48,6 @@ def test_tool_value_from_call_result_converts_text_images_and_resources() -> Non
             structured_content={"ok": True},
         ),
     )
-    assert isinstance(result, ToolValue)
     assert result.content.startswith("hello")
     assert "embedded text" in result.content
     assert "structuredContent" not in result.content
@@ -106,8 +104,7 @@ def test_tool_value_from_call_result_converts_audio_blocks() -> None:
             ],
         ),
     )
-    assert isinstance(result, ToolValue)
-    assert result.audios is not None
+    assert result.audios
     assert result.audios[0].content == audio_bytes
     assert result.audios[0].mime_type == "audio/ogg"
 
@@ -128,6 +125,6 @@ def test_tool_value_from_call_result_keeps_invalid_base64_media_as_utf8_bytes() 
     assert result.images
     assert result.images[0].content == image_data.encode("utf-8")
     assert result.images[0].mime_type == "image/png"
-    assert result.audios is not None
+    assert result.audios
     assert result.audios[0].content == audio_data.encode("utf-8")
     assert result.audios[0].mime_type == "audio/wav"

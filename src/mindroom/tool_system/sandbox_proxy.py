@@ -1003,7 +1003,8 @@ def _call_proxy_sync(
         from mindroom.tool_system.media_attachments import finalize_tool_media  # noqa: PLC0415
 
         if tool_name == "browser_mcp" or is_media_result_envelope(result):
-            return finalize_tool_media(decode_media_result(result))
+            decoded = decode_media_result(result)
+            return finalize_tool_media(decoded) if isinstance(decoded, ToolValue) else decoded
         return result
 
 

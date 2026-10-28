@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlsplit
 import httpx
 from httpx._utils import get_environment_proxies
 
-from mindroom.llm.media import DOCUMENT_MIME_TYPES, Audio, File, Image, Video, canonical_mime_type
+from mindroom.llm.media import Audio, File, Image, Video, canonical_mime_type, named_by_resource
 from mindroom.server_fetch_url import ServerFetchHTTPTransport, ServerFetchUrlError, validate_server_fetch_url
 from mindroom.tool_system import media_transport
 from mindroom.tool_system.agno_toolkits import read_tool_value
@@ -105,10 +105,8 @@ def _inline_metadata(media: _Media, declared_mime: str | None) -> dict[str, Any]
     """Retain provider-relevant resource identity before dropping its location."""
     name = _resource_name(media)
     if isinstance(media, File):
-        filename = media.filename or media.name or name or None
-        candidates = (declared_mime, mimetypes.guess_type(filename or "")[0], mimetypes.guess_type(name)[0])
-        mime = media.mime_type or next((value for value in candidates if value in DOCUMENT_MIME_TYPES), None)
-        return {"filename": filename, "mime_type": mime}
+        named = named_by_resource(media, name, declared_mime)
+        return {"filename": named.filename, "mime_type": named.mime_type}
     updates: dict[str, Any] = {}
     if media.mime_type is None and media.format is None:
         family = media_transport.MEDIA_MIME_FAMILIES[type(media)]
@@ -146,7 +144,7 @@ def _materialize_media(media: _Media, limit: int) -> tuple[_Media, int]:
         raise ValueError(msg) from None
     if isinstance(content, str):
         content = content.encode("utf-8")
-    if not isinstance(content, bytes) or not content or len(content) > limit:
+    if not content or len(content) > limit:
         msg = "Worker media must contain bytes within the byte limit."
         raise ValueError(msg)
     updates = {"content": content, "url": None, "filepath": None, **_inline_metadata(media, declared_mime)}

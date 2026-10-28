@@ -359,7 +359,7 @@ def _normalize_json_value(value: object) -> object:  # noqa: PLR0911 - One branc
 def _serialize_tool_output(result: object) -> _SerializedToolOutput | str:
     if (value := read_tool_value(result)) is not None:
         if any(value.media()):
-            return "ToolResult media artifacts cannot be redirected to workspace files."
+            return "Tool media results cannot be redirected to workspace files."
         serialized = _SerializedToolOutput(payload=value.content.encode("utf-8"), format="text")
     elif isinstance(result, str):
         serialized = _SerializedToolOutput(payload=result.encode("utf-8"), format="text")

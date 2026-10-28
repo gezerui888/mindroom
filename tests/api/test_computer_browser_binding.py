@@ -34,7 +34,7 @@ def test_action_browser_encoder_preserves_media_and_ordinary_json() -> None:
 
     decoded = decode_media_result(media)
     assert isinstance(decoded, ToolValue)
-    assert decoded.images is not None
+    assert decoded.images
     assert decoded.images[0].content == b"png"
     assert provider.encode_result({"ok": True}) == {"ordinary": {"ok": True}}
 

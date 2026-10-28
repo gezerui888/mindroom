@@ -16,6 +16,7 @@ import re
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, get_type_hints, runtime_checkable
 
 from agno.run import RunContext
@@ -29,7 +30,7 @@ from agno.utils.schema import (
     unwrap_annotation,
 )
 
-from mindroom.llm.media import Audio, File, Image, Video
+from mindroom.llm.media import Audio, File, Image, Video, named_by_resource
 from mindroom.logging_config import get_logger
 from mindroom.tool_system import authoring
 from mindroom.tool_system.declarations import finished_tool_schema
@@ -613,7 +614,7 @@ def _owned_video(video: AgnoVideo) -> Video:
 
 def _owned_file(file: AgnoFile) -> File:
     content = file.content if isinstance(file.content, bytes | str) else None
-    return File(
+    owned = File(
         **_media_id(file.id),
         url=file.url,
         filepath=_filepath(file.filepath, content),
@@ -626,6 +627,10 @@ def _owned_file(file: AgnoFile) -> File:
         name=file.name,
         metadata=file.metadata,
     )
+    if file.filepath is None or owned.filepath is not None:
+        return owned
+    # The bytes stand in for the path, unread, so the file keeps the name and type the path gives it.
+    return named_by_resource(owned, Path(file.filepath).name)
 
 
 __all__ = [

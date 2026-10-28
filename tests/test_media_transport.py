@@ -160,3 +160,12 @@ def test_decoder_reads_an_integer_for_a_float_and_a_null_for_any_attribute() -> 
     [audio] = decoded.audios
     assert (audio.content, audio.duration, audio.transcript, audio.sample_rate) == (b"png", 2, None, 24000)
     assert audio.id
+
+
+@pytest.mark.parametrize("source", [{"url": "https://example.org/report.txt"}, {"filepath": "/workspace/report.txt"}])
+def test_encoder_refuses_media_that_still_names_a_resource(source: dict[str, str]) -> None:
+    """A medium crosses the wire only as its inline bytes, so one that still names a path or URL is refused."""
+    report = File(content=b"report", mime_type="text/plain", **source)
+
+    with pytest.raises(ValueError, match="worker tool result"):
+        encode_media_result(ToolValue(content="report", files=(report,)))

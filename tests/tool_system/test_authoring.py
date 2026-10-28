@@ -108,6 +108,50 @@ def test_a_subclass_passes_agnos_constructor_keywords() -> None:
     assert (toolkit.name, toolkit.instructions, list(toolkit.functions)) == ("lookup", "Look things up.", ["find"])
 
 
+def test_a_subclass_offers_its_bases_tool_methods_first() -> None:
+    """Inherited ``@tool`` methods keep the base's order, a marked override keeps its place, and new ones follow."""
+
+    class BaseTools(Toolkit):
+        @tool
+        def first(self) -> str:
+            return "first"
+
+        @tool
+        def second(self) -> str:
+            return "second"
+
+    class SubTools(BaseTools):
+        @tool
+        def third(self) -> str:
+            return "third"
+
+        @tool
+        def second(self) -> str:
+            return "overridden"
+
+    toolkit = SubTools()
+
+    assert list(toolkit.functions) == ["first", "second", "third"]
+    assert toolkit.functions["second"]() == "overridden"
+
+
+def test_only_tool_marks_make_a_class_attribute_a_function() -> None:
+    """An attribute that answers any attribute lookup, such as a lazy client proxy, is no tool function."""
+
+    class AnswersEverything:
+        def __getattr__(self, name: str) -> str:
+            return name
+
+    class ProxyHoldingTools(Toolkit):
+        client = AnswersEverything()
+
+        @tool
+        def ping(self) -> str:
+            return "pong"
+
+    assert list(ProxyHoldingTools().functions) == ["ping"]
+
+
 def test_two_functions_under_one_name_raise() -> None:
     """The model calls a function by its name, so a toolkit offers one function per name."""
 
@@ -193,6 +237,30 @@ def test_an_owned_function_that_takes_an_agno_framework_object_is_refused() -> N
 
 
 @pytest.mark.asyncio
+async def test_an_owned_functions_media_named_parameter_is_the_models() -> None:
+    """Only Agno hands a tool the run's media by name; an owned function's ``files`` is an argument like any other."""
+
+    class AttachTools(Toolkit):
+        @tool
+        def attach(self, files: list[str]) -> str:
+            """Attach files.
+
+            Args:
+                files: The file names.
+
+            """
+            return ",".join(files)
+
+    [attach] = adapt_toolkit(AttachTools()).functions
+
+    outcome = await execute_tool_call(attach, {"files": ["a.txt", "b.txt"]}, _CONTEXT, middleware=())
+
+    assert attach.injected_params == {}
+    assert attach.parameters["required"] == ["files"]
+    assert outcome.content == "a.txt,b.txt"
+
+
+@pytest.mark.asyncio
 async def test_current_call_names_the_call_a_function_runs_for() -> None:
     """Asynchronous and synchronous bodies read the call's id, toolkit, session, and runtime context."""
     seen: list[CurrentCall | None] = []
@@ -242,6 +310,8 @@ def test_toolkit_functions_returns_one_callable_per_name() -> None:
     owned = GreeterTools(tools=[shout])
     agno = AgnoToolkit(name="dual", tools=[lookup])
     agno.async_functions["lookup"] = Function(name="lookup", entrypoint=alookup)
+    # A function rebuilt from its stored definition has nothing to call.
+    agno.async_functions["described_only"] = Function(name="described_only")
 
     assert toolkit_functions(owned) == {"greet": owned.greet, "farewell": owned.bye, "shout": shout}
     assert toolkit_functions(agno) == {"lookup": alookup}

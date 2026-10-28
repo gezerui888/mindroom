@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import AsyncIterator  # noqa: TC003 - Validation resolves the probe's annotations.
 from enum import Enum
 from typing import (  # noqa: UP035 - The bare typing aliases are annotation-kind cases.
     TYPE_CHECKING,
@@ -30,7 +31,7 @@ from pydantic import BaseModel
 from mindroom.tool_system.agno_toolkits import AGNO_EMPTY_PARAMETERS, adapt_toolkit
 from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.declarations import tool_schema_source
-from mindroom.tool_system.tool_schema import tool_description, tool_parameters
+from mindroom.tool_system.tool_schema import tool_description, tool_parameters, validated_entrypoint
 from tests.agno_parity import tool_argument_probes as probes
 from tests.tool_system import agno_parity_support as support
 
@@ -377,6 +378,25 @@ def test_variadic_parameters_stay_out_of_the_schema() -> None:
         "properties": {"query": {"type": "string"}},
         "required": ["query"],
     }
+
+
+@pytest.mark.asyncio
+async def test_a_validated_stream_closes_the_stream_it_wraps() -> None:
+    """A consumer that stops early closes the validated stream, which closes the tool's own."""
+    closed: list[bool] = []
+
+    async def count_up(limit: int) -> AsyncIterator[int]:
+        try:
+            for number in range(limit):
+                yield number
+        finally:
+            closed.append(True)
+
+    stream = validated_entrypoint(count_up)("3")
+
+    assert await anext(stream) == 0
+    await stream.aclose()
+    assert closed == [True]
 
 
 def test_an_annotation_that_does_not_resolve_raises() -> None:

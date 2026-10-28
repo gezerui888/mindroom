@@ -18,7 +18,7 @@ from mindroom.llm.messages import Message
 from mindroom.providers.gemini import wire as gemini_wire
 from mindroom.providers.openai.media import chat_audio_part, chat_file_part
 from mindroom.tool_system import media_transport
-from mindroom.tool_system.agno_toolkits import tool_value
+from mindroom.tool_system.agno_toolkits import read_tool_value, tool_value
 from mindroom.tool_system.media_transport import decode_media_result
 from mindroom.tool_system.worker_media import serialize_worker_tool_result
 
@@ -405,3 +405,122 @@ def test_worker_audio_explicit_mime_supplies_missing_format(
     assert item.mime_type == "audio/mpeg"
     assert item.format == "mp3"
     assert _openai_audio_format(decoded) == "mp3"
+
+
+# What a worker sends the primary for one result with media of every kind, byte for byte. A worker and the primary it
+# serves may run different releases while a deployment rolls out, so this is the wire both sides must keep.
+_PINNED_WIRE = (
+    '{"mindroom_tool_result": {"version": 1, "kind": "tool_result", "content": "Generated artifacts", "images": '
+    '[{"id": "image-1", "mime_type": "image/png", "detail": "high", "original_prompt": "a tree", "revised_prompt": '
+    '"an oak", "alt_text": "An oak", "metadata": {"seed": 7}, "data_base64": "iVBORy1ieXRlcw=="}, {"id": "image-2", '
+    '"mime_type": "image/png", "data_base64": "iVBORy1pbWFnZQ=="}], "audios": [{"id": "audio-1", "format": "mp3", '
+    '"duration": 1.5, "sample_rate": 24000, "channels": 1, "transcript": "Hello", "data_base64": "SUQzLWF1ZGlv"}], '
+    '"videos": [{"id": "video-1", "mime_type": "video/mp4", "duration": 2.0, "width": 640, "height": 480, "fps": '
+    '30.0, "eta": "now", "data_base64": "bXA0LWJ5dGVz"}], "files": [{"id": "file-1", "mime_type": "text/plain", '
+    '"filename": "note.txt", "size": 6, "format": "txt", "name": "note", "data_base64": "aMOpbGxv"}, {"id": '
+    '"file-2", "mime_type": "application/pdf", "file_type": "document", "data_base64": "JVBERg=="}, {"id": "file-3", '
+    '"mime_type": "text/csv", "filename": "table.csv", "data_base64": "YSxi"}, {"id": "file-4", "filename": '
+    '"photo.png", "data_base64": "cG5n"}]}}'
+)
+
+
+def test_the_worker_media_wire_is_pinned_byte_for_byte(tmp_path: Path) -> None:
+    """A tool's media crosses the worker wire in the pinned bytes, and the pinned bytes decode to the same media."""
+    (tmp_path / "clip.mp3").write_bytes(b"ID3-audio")
+    (tmp_path / "page.png").write_bytes(b"\x89PNG-image")
+    (tmp_path / "table.csv").write_bytes(b"a,b")
+    (tmp_path / "photo.png").write_bytes(b"png")
+    result = ToolResult(
+        content="Generated artifacts",
+        images=[
+            Image(
+                id="image-1",
+                content=b"\x89PNG-bytes",
+                mime_type="image/png",
+                detail="high",
+                original_prompt="a tree",
+                revised_prompt="an oak",
+                alt_text="An oak",
+                metadata={"seed": 7},
+            ),
+            Image(id="image-2", filepath=tmp_path / "page.png"),
+        ],
+        audios=[Audio(id="audio-1", filepath=tmp_path / "clip.mp3", duration=1.5, transcript="Hello")],
+        videos=[
+            Video(
+                id="video-1",
+                content=b"mp4-bytes",
+                mime_type="video/mp4",
+                duration=2.0,
+                width=640,
+                height=480,
+                fps=30.0,
+                eta="now",
+            ),
+        ],
+        files=[
+            File(
+                id="file-1",
+                content="héllo",
+                mime_type="text/plain",
+                filename="note.txt",
+                size=6,
+                format="txt",
+                name="note",
+            ),
+            File(id="file-2", content=b"%PDF", mime_type="application/pdf", file_type="document"),
+            File(id="file-3", filepath=tmp_path / "table.csv"),
+            # A guessed type outside the document types a file may carry stays unset.
+            File(id="file-4", filepath=tmp_path / "photo.png"),
+        ],
+    )
+
+    assert json.dumps(serialize_worker_tool_result(result)) == _PINNED_WIRE
+    decoded = read_tool_value(decode_media_result(json.loads(_PINNED_WIRE)))
+    assert decoded is not None
+    assert decoded.content == "Generated artifacts"
+    assert [(item.id, item.content, item.mime_type) for _kind, item in decoded.media()] == [
+        ("image-1", b"\x89PNG-bytes", "image/png"),
+        ("image-2", b"\x89PNG-image", "image/png"),
+        ("audio-1", b"ID3-audio", None),
+        ("video-1", b"mp4-bytes", "video/mp4"),
+        ("file-1", "héllo".encode(), "text/plain"),
+        ("file-2", b"%PDF", "application/pdf"),
+        ("file-3", b"a,b", "text/csv"),
+        ("file-4", b"png", None),
+    ]
+    [first, _second] = decoded.images
+    assert (first.detail, first.original_prompt, first.revised_prompt, first.alt_text, first.metadata) == (
+        "high",
+        "a tree",
+        "an oak",
+        "An oak",
+        {"seed": 7},
+    )
+    [audio] = decoded.audios
+    assert (audio.format, audio.duration, audio.sample_rate, audio.channels, audio.transcript) == (
+        "mp3",
+        1.5,
+        24000,
+        1,
+        "Hello",
+    )
+    [video] = decoded.videos
+    assert (video.duration, video.width, video.height, video.fps, video.eta) == (2.0, 640, 480, 30.0, "now")
+    note, pdf, table, photo = decoded.files
+    assert (note.filename, note.size, note.format, note.name) == ("note.txt", 6, "txt", "note")
+    assert pdf.file_type == "document"
+    assert (table.filename, photo.filename) == ("table.csv", "photo.png")
+
+
+def test_a_worker_envelope_with_the_tools_metadata_still_decodes() -> None:
+    """An earlier worker sends a tool's own metadata beside its media; the primary bounds it and reads past it."""
+    envelope = json.loads(_PINNED_WIRE)
+    envelope["mindroom_tool_result"]["metadata"] = {"job": "complete"}
+
+    assert read_tool_value(decode_media_result(envelope)) == read_tool_value(
+        decode_media_result(json.loads(_PINNED_WIRE)),
+    )
+    envelope["mindroom_tool_result"]["metadata"] = {"job": "x" * (64 * 1024)}
+    with pytest.raises(ValueError, match="worker tool result"):
+        decode_media_result(envelope)

@@ -28,7 +28,8 @@ The owned code takes the extension points MindRoom needs as plain parameters ins
 
 Agno stays for the parts that touch no loop, model, or storage, all called through public API:
 
-- `Toolkit`, `Function`, the `@tool` decorator, and `ToolResult` remain the authoring API for MindRoom, plugin, and vendor tools, including signature-and-docstring schema generation and pydantic argument coercion.
+- `Toolkit`, `Function`, and the `@tool` decorator remain the authoring API for MindRoom, plugin, and vendor tools, including signature-and-docstring schema generation and pydantic argument coercion.
+  `ToolResult` stayed in that API at first; once the replacement had shipped, MindRoom's tools moved to returning text or MindRoom's `ToolValue`, and the adapter reads a plugin or vendor `ToolResult` as one, because keeping it left MindRoom's media tools, the worker media wire, and saved job results on Agno's pydantic media, converted again wherever they were read.
 - Its vendor toolkits stay as dependencies, with MindRoom's existing per-toolkit overrides.
 - Its knowledge file readers and chunkers stay.
 

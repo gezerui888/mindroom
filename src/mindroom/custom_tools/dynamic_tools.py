@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from mindroom.tool_system.authoring import Toolkit, passthrough_tool, tool
@@ -14,7 +13,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
     from mindroom.tool_system.dynamic_toolkits import DeferredToolkit
-    from mindroom.tool_system.tool_function import ToolFunction
 
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -49,14 +47,6 @@ class DynamicToolsToolkit(Toolkit):
     def __init__(self, *, deferred_toolkits: Callable[[], Sequence[DeferredToolkit]]) -> None:
         self._deferred_toolkits = deferred_toolkits
         super().__init__(name="dynamic_tools")
-
-    def offered_function(self, function: ToolFunction) -> ToolFunction:
-        """Offer ``call_tool`` with the confirmation and external-execution flags set False."""
-        # TODO(simplify): a passthrough function leaves both flags None, which every reader takes as False; the tool
-        # goldens record them False for call_tool, as Agno's registration set them.
-        if function.name != "call_tool":
-            return function
-        return replace(function, requires_confirmation=False, external_execution=False)
 
     @staticmethod
     def _payload(status: str, **kwargs: object) -> str:

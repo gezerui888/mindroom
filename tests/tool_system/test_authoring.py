@@ -645,7 +645,7 @@ async def test_a_passthrough_function_keeps_its_schema_and_takes_its_arguments_a
     assert tag.parameters is not _TAG_SCHEMA
     assert outcome.content == "{'tag': 7, 'extra': True}"
     assert not tag.entrypoint_processed
-    assert (tag.requires_confirmation, tag.external_execution, tag.strict) == (None, None, None)
+    assert (tag.requires_confirmation, tag.external_execution, tag.strict) == (False, False, None)
 
 
 def test_a_toolkit_fits_a_derived_function_to_its_instance_before_the_output_path_joins(tmp_path: Path) -> None:

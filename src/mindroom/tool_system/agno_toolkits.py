@@ -498,16 +498,14 @@ def _owned_function(toolkit: authoring.Toolkit, name: str, finishing: _Finishing
     authored = authoring.passthrough_parameters(function)
     entrypoint, output_files = finishing.entrypoint(name, function, authored)
     derived = authored is None
-    # TODO(simplify): a derived function carries the False flags Agno's registration sets, and one a schema defines
-    # leaves them None as an Agno function built from a definition does; the loop reads both as False.
-    unset = False if derived else None
     offered = toolkit.offered_function(
         ToolFunction(
             name=name,
             description=authoring.authored_description(function) or (tool_description(entrypoint) if derived else None),
             parameters=tool_parameters(entrypoint) if authored is None else deepcopy(authored),
-            requires_confirmation=unset,
-            external_execution=unset,
+            # The flags Agno's registration sets for a function no toolkit option asks anything of.
+            requires_confirmation=False,
+            external_execution=False,
             entrypoint=validated_entrypoint(entrypoint) if derived else entrypoint,
             entrypoint_processed=derived,
         ),

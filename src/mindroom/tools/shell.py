@@ -35,7 +35,7 @@ from mindroom.tool_system.output_files import ToolOutputFileHandled, current_too
 from mindroom.tool_system.progress import report_tool_progress
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.tool_environment import ToolEnvironment, current_tool_environment
-from mindroom.tool_system.tool_schema import authored_parameters
+from mindroom.tool_system.tool_schema import closed_parameters
 from mindroom.vendor_telemetry import vendor_telemetry_env_values
 
 if TYPE_CHECKING:
@@ -390,7 +390,7 @@ def shell_tools() -> type[Toolkit]:
             return replace(
                 function,
                 description="\n\n".join((function.description or "", *notes)).strip(),
-                parameters=authored_parameters(self.run_shell_command, function.parameters),
+                parameters=closed_parameters(self.run_shell_command, function.parameters),
             )
 
         async def run_shell_command(

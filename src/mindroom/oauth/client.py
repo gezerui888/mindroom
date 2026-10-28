@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum, auto
-from functools import partial
+from functools import partial, wraps
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from google.auth.exceptions import GoogleAuthError, RefreshError
@@ -208,6 +208,15 @@ class ScopedOAuthClientMixin(AgnoGoogleAuthBindingMixin):
         if defer_to_original_auth:
             return None
         return self._load_stored_credentials()
+
+    def _oauth_entrypoint(self, entrypoint: Callable[..., object]) -> Callable[..., object]:
+        """Return ``entrypoint`` called through the OAuth call policy, with its signature for schema derivation."""
+
+        @wraps(entrypoint)
+        def oauth_entrypoint(*args: object, **kwargs: object) -> object:
+            return self._run_oauth_entrypoint(entrypoint, args, kwargs)
+
+        return oauth_entrypoint
 
     def _run_oauth_entrypoint(
         self,

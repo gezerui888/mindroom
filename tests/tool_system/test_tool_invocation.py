@@ -20,7 +20,7 @@ from agno.tools import Toolkit
 from agno.tools.function import Function, ToolResult
 
 from mindroom.llm.media import Audio, File, Image, Video
-from mindroom.tool_system.agno_toolkits import ToolCallActor, adapt_function, adapt_toolkit
+from mindroom.tool_system.agno_toolkits import ToolCallActor, adapt_toolkit
 from mindroom.tool_system.invocation import (
     ToolArgumentError,
     ToolCall,
@@ -34,6 +34,7 @@ from mindroom.tool_system.invocation import (
 )
 from mindroom.tool_system.tool_function import ToolOutcome, ToolValue
 from mindroom.tool_system.tool_hooks import SyncToolCompletionTracker, track_sync_tool_completion
+from tests.agent_tool_helpers import offered_agno_function
 from tests.tool_system import agno_parity_support as support
 
 if TYPE_CHECKING:
@@ -193,7 +194,7 @@ async def test_a_schema_may_give_the_model_a_media_name_but_never_an_identity_na
         "properties": {"query": {"type": "string"}, "agent": {"type": "string"}, "files": {"type": "array"}},
         "required": ["query"],
     }
-    function = adapt_function(
+    function = offered_agno_function(
         Function(name="tool", entrypoint=tool, parameters=schema, skip_entrypoint_processing=True),
     )
 

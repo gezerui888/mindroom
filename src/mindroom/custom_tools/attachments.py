@@ -50,7 +50,7 @@ from mindroom.tool_system.sandbox_proxy import (
     view_file_from_worker,
 )
 from mindroom.tool_system.tool_function import ToolValue
-from mindroom.tool_system.tool_schema import authored_parameters
+from mindroom.tool_system.tool_schema import closed_parameters
 
 if TYPE_CHECKING:
     from mindroom.config.models import FileAccess
@@ -551,7 +551,7 @@ class AttachmentTools(Toolkit):
         parameters["properties"]["attachment_id"] = {
             "description": "Context-scoped attachment ID returned by list_attachments.",
         }
-        return replace(function, parameters=authored_parameters(self.get_attachment, parameters))
+        return replace(function, parameters=closed_parameters(self.get_attachment, parameters))
 
     async def list_attachments(self, target: str | None = None) -> str:
         """List attachment metadata for current tool context."""

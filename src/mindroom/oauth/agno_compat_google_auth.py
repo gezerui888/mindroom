@@ -7,7 +7,6 @@ required by Agno's Google toolkits.
 
 from __future__ import annotations
 
-from functools import wraps
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -41,7 +40,7 @@ class AgnoGoogleAuthBindingMixin:
     _original_auth: Callable[[], Any]
 
     _authenticate: Callable[[], None]
-    _run_oauth_entrypoint: Callable[[Callable[..., object], tuple[object, ...], dict[str, object]], object]
+    _oauth_entrypoint: Callable[[Callable[..., object]], Callable[..., object]]
 
     def _set_original_auth(self, auth_method: _AuthDescriptor) -> None:
         """Retain the owner's bound fallback behind Agno's descriptor protocol."""
@@ -51,15 +50,6 @@ class AgnoGoogleAuthBindingMixin:
         """Route Agno's private resolver call through the owner's auth policy."""
         self._authenticate()
         return self.creds
-
-    def _oauth_entrypoint(self, entrypoint: Callable[..., object]) -> Callable[..., object]:
-        """Return ``entrypoint`` called through the owner's call policy, with its signature for schema derivation."""
-
-        @wraps(entrypoint)
-        def oauth_entrypoint(*args: object, **kwargs: object) -> object:
-            return self._run_oauth_entrypoint(entrypoint, args, kwargs)
-
-        return oauth_entrypoint
 
     def _wrap_oauth_function_entrypoints(self) -> None:
         """Route each registered Agno Function, and a direct call of its method, through the owner's call policy."""

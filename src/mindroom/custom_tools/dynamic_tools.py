@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import json
 import re
-from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.authoring import Toolkit, passthrough_tool, tool
 from mindroom.tool_system.tool_access import tool_definition
 
 if TYPE_CHECKING:
@@ -49,26 +48,21 @@ class DynamicToolsToolkit(Toolkit):
 
     def __init__(self, *, deferred_toolkits: Callable[[], Sequence[DeferredToolkit]]) -> None:
         self._deferred_toolkits = deferred_toolkits
-        super().__init__(name="dynamic_tools", tools=[self.tool_search, self.call_tool])
+        super().__init__(name="dynamic_tools")
 
     def offered_function(self, function: ToolFunction) -> ToolFunction:
-        """Offer ``call_tool`` with the schema of the MCP call_tool bridge, taking its arguments as sent."""
+        """Offer ``call_tool`` with the confirmation and external-execution flags set False."""
+        # TODO(simplify): a passthrough function leaves both flags None, which every reader takes as False; the tool
+        # goldens record them False for call_tool, as Agno's registration set them.
         if function.name != "call_tool":
             return function
-        # A typed dict would render its argument values as empty objects, and Gemini conversion drops the
-        # description of an optional object, so the wrapper declares the same shape as the MCP call_tool bridge.
-        return replace(
-            function,
-            description=_CALL_TOOL_DESCRIPTION,
-            parameters=deepcopy(_CALL_TOOL_PARAMETERS),
-            entrypoint=self.call_tool,
-            entrypoint_processed=False,
-        )
+        return replace(function, requires_confirmation=False, external_execution=False)
 
     @staticmethod
     def _payload(status: str, **kwargs: object) -> str:
         return json.dumps({"status": status, "tool": "dynamic_tools", **kwargs}, sort_keys=True)
 
+    @tool
     def tool_search(self, query: str = "", max_results: int = 5) -> str:
         """Search deferred functions by name or keywords and return their full definitions, or list them.
 
@@ -141,6 +135,9 @@ class DynamicToolsToolkit(Toolkit):
         payload["functions"] = listed
         return self._payload("ok", **payload)
 
+    # A typed dict would render its argument values as empty objects, and Gemini conversion drops the description of
+    # an optional object, so the wrapper declares the same shape as the MCP call_tool bridge.
+    @passthrough_tool(description=_CALL_TOOL_DESCRIPTION, parameters=_CALL_TOOL_PARAMETERS)
     def call_tool(self, name: str = "", arguments: object = None, **_extra: object) -> str:
         """Report a wrapper call that could not be routed to a deferred function.
 

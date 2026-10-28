@@ -43,7 +43,7 @@ from mindroom.response_turn import PausedAnswer, PausedAttempt, apply_exact_appr
 from mindroom.run_storage import RunStorage
 from mindroom.session_storage.agent_storage import create_session_storage, create_state_storage
 from mindroom.tool_system.agent_tool_calls import AgentToolCallWaiting, DeferredAgentToolkit, execute_agent_tool_call
-from mindroom.tool_system.agno_toolkits import adapt_function, adapt_toolkit
+from mindroom.tool_system.agno_toolkits import adapt_toolkit
 from mindroom.tool_system.events import CollectedStreamPresentation
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, tool_runtime_context
@@ -52,6 +52,7 @@ from mindroom.tool_system.tool_access import ToolKey
 from mindroom.tool_system.tool_function import AdaptedToolkit
 from mindroom.turn_continuation import continuation_decision_from_tools
 from tests.access_schema_support import with_responder_access
+from tests.agent_tool_helpers import offered_agno_function
 from tests.approval_continuation_helpers import approval_continuation
 from tests.conftest import bind_runtime_paths, live_turn_tools_for_test, seed_session_row
 from tests.delegation_helpers import ScriptedAgents, _delegate_runtime_context, _runtime_paths, registered_report_tool
@@ -86,7 +87,7 @@ def _flagged(name: str, *entrypoints: Callable[..., object], **flags: object) ->
         function = Function.from_callable(entrypoint)
         for flag, value in flags.items():
             setattr(function, flag, value)
-        functions.append(adapt_function(function))
+        functions.append(offered_agno_function(function))
     return AdaptedToolkit(name=name, functions=tuple(functions), instructions=None)
 
 

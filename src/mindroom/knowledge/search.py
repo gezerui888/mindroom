@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Protocol
 from mindroom.logging_config import get_logger
 from mindroom.tool_system.agno_toolkits import adapt_callable
 from mindroom.tool_system.authoring import tool
-from mindroom.tool_system.tool_schema import authored_parameters
+from mindroom.tool_system.tool_schema import closed_parameters
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -181,7 +181,7 @@ class AgentKnowledge:
         )
         function = adapt_callable(tool(name=KNOWLEDGE_SEARCH_TOOL_NAME, description=description)(search_knowledge_base))
         # TODO(simplify): closed to other properties as Agno closed a schema it derived ahead of processing.
-        return replace(function, parameters=authored_parameters(search_knowledge_base, function.parameters))
+        return replace(function, parameters=closed_parameters(search_knowledge_base, function.parameters))
 
     def prompt_block(self) -> str:
         """Return the system-prompt block that tells the model to search before answering."""

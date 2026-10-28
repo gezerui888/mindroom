@@ -76,7 +76,7 @@ def tool_parameters(entrypoint: Callable[..., Any]) -> dict[str, Any]:
     return {"type": "object", "properties": properties, "required": required}
 
 
-def authored_parameters(entrypoint: Callable[..., Any], parameters: Mapping[str, Any]) -> dict[str, Any]:
+def closed_parameters(entrypoint: Callable[..., Any], parameters: Mapping[str, Any]) -> dict[str, Any]:
     """Return ``parameters``, the schema a toolkit authored for ``entrypoint`` in place of the derived one, completed.
 
     As Agno completes an authored schema whose arguments it still validates, it requires each of its properties the
@@ -202,4 +202,4 @@ def _inlined(node: Any, definitions: dict[str, Any], active: frozenset[str]) -> 
     return _inlined(definitions[name], definitions, active | {name})
 
 
-__all__ = ["authored_parameters", "tool_description", "tool_parameters", "validated_entrypoint"]
+__all__ = ["closed_parameters", "tool_description", "tool_parameters", "validated_entrypoint"]

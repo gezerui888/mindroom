@@ -430,13 +430,6 @@ def _without_instructions(function: Function) -> Function:
     return copy
 
 
-def adapt_function(function: Function) -> ToolFunction:
-    """Return one Agno function as a ``ToolFunction``, refusing it when it sets a field MindRoom refuses."""
-    if (refusal := _refusal(function)) is not None:
-        raise ValueError(refusal)
-    return _adapt(function, _Finishing())
-
-
 def _refusal(function: Function) -> str | None:
     """Return why MindRoom refuses ``function``: the first field it sets that the agent loop cannot honor."""
     for handling in _FUNCTION_FIELDS.values():
@@ -502,7 +495,7 @@ def _owned_function(toolkit: authoring.Toolkit, name: str, finishing: _Finishing
             " read the call through current_call() instead"
         )
         raise ValueError(msg)
-    authored = authoring.authored_parameters(function)
+    authored = authoring.passthrough_parameters(function)
     entrypoint, output_files = finishing.entrypoint(name, function, authored)
     derived = authored is None
     # TODO(simplify): a derived function carries the False flags Agno's registration sets, and one a schema defines
@@ -773,7 +766,6 @@ __all__ = [
     "ToolCallActor",
     "Toolkit",
     "adapt_callable",
-    "adapt_function",
     "adapt_toolkit",
     "configure_toolkit_functions",
     "framework_arguments",

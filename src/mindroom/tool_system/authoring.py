@@ -115,7 +115,7 @@ def authored_description(function: Callable[..., Any]) -> str | None:
     return None if mark is None else mark.description
 
 
-def authored_parameters(function: Callable[..., Any]) -> Mapping[str, Any] | None:
+def passthrough_parameters(function: Callable[..., Any]) -> Mapping[str, Any] | None:
     """Return the schema ``passthrough_tool`` gave ``function``; None for a function whose signature derives one."""
     mark = _mark(function)
     return None if mark is None else mark.parameters
@@ -248,8 +248,8 @@ __all__ = [
     "CurrentCall",
     "Toolkit",
     "authored_description",
-    "authored_parameters",
     "current_call",
+    "passthrough_parameters",
     "passthrough_tool",
     "tool",
     "toolkit_functions",

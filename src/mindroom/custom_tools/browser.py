@@ -53,7 +53,7 @@ from mindroom.tool_system.runtime_context import get_tool_runtime_context
 from mindroom.tool_system.tool_function import (
     ToolValue,  # noqa: TC001 - The schema reads the tool's annotations at runtime.
 )
-from mindroom.tool_system.tool_schema import authored_parameters
+from mindroom.tool_system.tool_schema import closed_parameters
 from mindroom.worker_computer.browser_bundle import COMPUTER_BROWSER_EXECUTABLE
 from mindroom.worker_computer.browser_proxy import (
     PROXIED_WEBRTC_ONLY_ARG,
@@ -795,7 +795,7 @@ class BrowserTools(Toolkit):
         properties["saveOnly"] = save_only_schema
 
         parameters["properties"] = properties
-        return replace(function, parameters=authored_parameters(self.browser, parameters))
+        return replace(function, parameters=closed_parameters(self.browser, parameters))
 
     async def _close_profiles(self) -> None:
         """Close all active browser profiles."""

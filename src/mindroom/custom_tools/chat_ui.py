@@ -184,7 +184,7 @@ class ChatUITools(Toolkit):
 
     @property
     def instructions(self) -> str:
-        """Map only the functions this toolkit was built with; include_tools and exclude_tools remove the others."""
+        """Map the built functions; ``with_offered_instructions`` narrows them to the ones an agent is offered."""
         return self.instructions_for(self.functions)
 
     def instructions_for(self, function_names: Collection[str]) -> str:

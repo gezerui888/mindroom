@@ -30,7 +30,7 @@ from mindroom.tool_jobs.settings import background_tool_jobs_enabled, toolkit_is
 from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.invocation import current_tool_call
 from mindroom.tool_system.runtime_context import current_budget_monitor, get_tool_runtime_context
-from mindroom.tool_system.tool_schema import authored_parameters
+from mindroom.tool_system.tool_schema import closed_parameters
 from mindroom.tool_system.worker_routing import (
     build_tool_execution_identity,
 )
@@ -94,7 +94,7 @@ class DelegateTools(Toolkit):
         if not hidden:
             return replace(function, description=description)
         properties = {name: value for name, value in function.parameters["properties"].items() if name not in hidden}
-        parameters = authored_parameters(self.run_subagent, {**function.parameters, "properties": properties})
+        parameters = closed_parameters(self.run_subagent, {**function.parameters, "properties": properties})
         return replace(function, description=description, parameters=parameters)
 
     def _build_instructions(self) -> str:

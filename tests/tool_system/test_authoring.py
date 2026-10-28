@@ -37,7 +37,7 @@ from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT, ToolOutputFi
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.registry_state import capture_tool_registry_snapshot, restore_tool_registry_snapshot
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
-from mindroom.tool_system.tool_schema import authored_parameters
+from mindroom.tool_system.tool_schema import closed_parameters
 from tests.tool_system import agno_parity_support as support
 
 if TYPE_CHECKING:
@@ -671,7 +671,7 @@ def test_an_authored_schema_requires_the_arguments_without_a_default_and_admits_
     def lookup(city: str, country: str = "NL", *args: object, **kwargs: object) -> str:
         return city + country + str(args) + str(kwargs)
 
-    parameters = authored_parameters(
+    parameters = closed_parameters(
         lookup,
         {"type": "object", "properties": {"city": {"type": "string"}, "country": {"type": "string"}}},
     )

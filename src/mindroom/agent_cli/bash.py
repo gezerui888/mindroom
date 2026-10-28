@@ -9,7 +9,7 @@ from mindroom.tool_system.agno_toolkits import adapt_callable
 from mindroom.tool_system.invocation import current_tool_call
 from mindroom.tool_system.tool_access import ToolKey
 from mindroom.tool_system.tool_function import AdaptedToolkit, ToolValue  # The schema reads it from module globals.
-from mindroom.tool_system.tool_schema import authored_parameters
+from mindroom.tool_system.tool_schema import closed_parameters
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -61,5 +61,5 @@ def minimal_bash_toolkit(
     # TODO(simplify): the schema derived from the signature and docstring is closed to other properties as Agno closed
     # a schema it derived ahead of processing.
     function = adapt_callable(bash)
-    function = replace(function, parameters=authored_parameters(bash, function.parameters))
+    function = replace(function, parameters=closed_parameters(bash, function.parameters))
     return AdaptedToolkit(name="minimal_bash", functions=(function,), instructions=None)

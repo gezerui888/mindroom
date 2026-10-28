@@ -651,7 +651,7 @@ def output_file_entrypoint(
         wrapper = sync_wrapper
 
     wrapper.__name__ = getattr(entrypoint, "__name__", "tool_entrypoint")
-    # The schema finisher describes the output path, so the docstring, whose Args describe the other arguments, stays.
+    # with_optional_output_path describes the output path, so the docstring, whose Args describe the others, stays.
     wrapper.__doc__ = entrypoint.__doc__
     wrapper.__module__ = getattr(entrypoint, "__module__", __name__)
     functools.update_wrapper(wrapper, entrypoint, assigned=(), updated=())

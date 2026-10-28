@@ -31,7 +31,7 @@ import pytest
 from pydantic import BaseModel
 
 from mindroom.tool_system.agno_toolkits import AGNO_EMPTY_PARAMETERS, adapt_toolkit
-from mindroom.tool_system.authoring import Toolkit, authored_parameters
+from mindroom.tool_system.authoring import Toolkit, passthrough_parameters
 from mindroom.tool_system.tool_schema import tool_description, tool_parameters, validated_entrypoint
 from tests.agno_parity import tool_argument_probes as probes
 from tests.tool_system import agno_parity_support as support
@@ -109,7 +109,7 @@ def test_every_mindroom_authored_function_derives_agnos_schema(
         toolkit = support.build_toolkit(tool_name, config, runtime_paths, overrides)
     if isinstance(toolkit, Toolkit):
         entrypoints = {
-            name: function for name, function in toolkit.functions.items() if authored_parameters(function) is None
+            name: function for name, function in toolkit.functions.items() if passthrough_parameters(function) is None
         }
     else:
         entrypoints = {

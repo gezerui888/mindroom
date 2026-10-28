@@ -2676,6 +2676,7 @@ depends_on = [
     "mindroom.agent_loop",
     "mindroom.constants",
     "mindroom.entity_resolution",
+    "mindroom.history.conversation_text",
     "mindroom.history.policy",
     "mindroom.history.prompt_tokens",
     "mindroom.history.request_messages",
@@ -8054,10 +8055,12 @@ depends_on = [
     "mindroom.history.run_visibility",
     "mindroom.history.summary_message",
     "mindroom.hooks.enrichment",
+    "mindroom.llm",
     "mindroom.prompt_message_tags",
     "mindroom.turn_origin",
 ]
 visibility = [
+    "mindroom.execution_preparation",
     "mindroom.history.compaction",
     "mindroom.knowledge_graph.episodes",
     "mindroom.memory.auto_flush",
@@ -9476,6 +9479,7 @@ depends_on = [
     "mindroom.approval.tool_approval",
     "mindroom.session_storage.agent_storage",
     "mindroom.helper_usage",
+    "mindroom.history.types",
     "mindroom.llm",
     "mindroom.model_usage",
     "mindroom.providers.registry",

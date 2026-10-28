@@ -74,11 +74,11 @@ class _OwnedFunction(Function):
     """A function of an owned toolkit, carried in Agno's toolkit containers; adapting it uses no Agno code."""
 
 
-def agno_toolkit(toolkit: Toolkit | authoring.Toolkit) -> Toolkit:
+def _as_agno_toolkit(toolkit: Toolkit | authoring.Toolkit) -> Toolkit:
     """Return ``toolkit``, an owned one as an Agno toolkit holding its functions where Agno would register them.
 
-    ``get_tool_by_name`` edits Agno's function maps before adaptation (see its TODO), so an owned toolkit is carried
-    in them. Its functions stay owned: adapting one derives its schema with ``tool_schema``, not Agno.
+    An owned toolkit so adapts in the order and with the flags an Agno one does; its functions stay owned, so adapting
+    one derives its schema with ``tool_schema``, not Agno.
     """
     if isinstance(toolkit, Toolkit):
         return toolkit
@@ -239,7 +239,7 @@ def adapt_toolkit(
     other field MindRoom refuses is adapted without it and named in ``refused``, so whoever offers the toolkit
     refuses it only for a function it still offers.
     """
-    toolkit = agno_toolkit(toolkit)
+    toolkit = _as_agno_toolkit(toolkit)
     functions = toolkit.get_async_functions().values()
     actor_state: dict[str, Any] = {}
     adapted: list[ToolFunction] = []
@@ -637,7 +637,6 @@ __all__ = [
     "Toolkit",
     "adapt_function",
     "adapt_toolkit",
-    "agno_toolkit",
     "framework_arguments",
     "injected_parameters",
     "model_arguments",

@@ -11,11 +11,12 @@ from unittest.mock import Mock
 import pytest
 
 from mindroom.history.types import HistoryScope
-from mindroom.tool_system.agno_toolkits import Function, adapt_toolkit, agno_toolkit
+from mindroom.tool_system.agno_toolkits import Function, adapt_toolkit
 from mindroom.tool_system.agno_toolkits import Toolkit as AgnoToolkit
 from mindroom.tool_system.authoring import CurrentCall, Toolkit, current_call, tool, toolkit_functions
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
+from tests.tool_system import agno_parity_support as support
 
 if TYPE_CHECKING:
     from mindroom.tool_system.tool_function import ToolFunction
@@ -306,4 +307,37 @@ def test_toolkit_functions_returns_one_callable_per_name() -> None:
 
     assert toolkit_functions(owned) == {"greet": owned.greet, "farewell": owned.bye, "shout": shout}
     assert toolkit_functions(agno) == {"lookup": alookup}
-    assert toolkit_functions(agno_toolkit(owned)) == {"farewell": owned.bye, "shout": shout, "greet": owned.greet}
+
+
+def test_an_owned_toolkit_adapts_to_what_its_agno_authored_twin_adapts_to() -> None:
+    """The same methods give the same functions, flags, and instructions whichever authoring API declares them."""
+
+    class OwnedTwinTools(Toolkit):
+        name = "twin"
+        instructions = "Count and shout words."
+
+        @tool
+        def count_words(self, text: str, limit: int | None = None) -> str:
+            """Count the words of a text.
+
+            Args:
+                text: The text.
+                limit: The most words to count.
+
+            """
+            return str(len(text.split()[:limit]))
+
+        @tool
+        async def shout_text(self, text: str) -> str:
+            """Shout a text.
+
+            Args:
+                text: The text.
+
+            """
+            return text.upper()
+
+    owned = OwnedTwinTools()
+    agno = AgnoToolkit(name="twin", tools=[owned.count_words, owned.shout_text], instructions="Count and shout words.")
+
+    assert support.golden_entry(adapt_toolkit(owned)) == support.golden_entry(adapt_toolkit(agno))

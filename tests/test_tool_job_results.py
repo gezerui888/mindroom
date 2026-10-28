@@ -33,7 +33,7 @@ def _saved(payload: ToolResultPayload) -> ToolResultPayload:
 
 
 _LEGACY_PAYLOADS = Path(__file__).parent / "fixtures" / "tool_jobs" / "agno_executor_payloads.json"
-# A payload as releases through v2026.10.625 saved it, with its tool value tagged `ToolResult`.
+# A payload as releases through v2026.10.634 saved it, with its tool value tagged `ToolResult`.
 _TOOL_RESULT_TAGGED = Path(__file__).parent / "fixtures" / "tool_jobs" / "tool_result_tagged_payload.json"
 
 

@@ -29,7 +29,7 @@ def drop_legacy_payload_fields(fields: dict[str, Any]) -> dict[str, Any]:
 # LEGACY_COMPAT: Tool values tagged `ToolResult` in saved tool-job result payloads.
 # Legacy format: a payload's tool value, its text and media, is tagged `ToolResult`, Agno's name for it, where the
 # current encoder writes `ToolValue`; selected by that tag.
-# Last legacy release: v2026.10.625; replacement: v2026.10.626 tags it `ToolValue`.
+# Last legacy release: v2026.10.634; replacement: v2026.10.635 tags it `ToolValue`.
 # Handling: the decoder reads the `ToolResult` tag as `ToolValue`, so a job saved before the upgrade is consumed with
 # the same text and media. An earlier release rejects the new tag, so after a rollback a job that finished on the
 # newer release fails when consumed; a payload lives only until its job is consumed.

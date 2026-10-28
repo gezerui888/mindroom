@@ -165,7 +165,7 @@ def decode_media_result(payload: object) -> object:
     # LEGACY_COMPAT: Worker media envelopes that carry the tool's own metadata.
     # Legacy format: the `tool_result` value also holds `metadata`, the `metadata` of the Agno `ToolResult` a tool
     # returned, when the tool set it; no MindRoom or vendor tool sets it.
-    # Last legacy release: v2026.10.625; replacement: v2026.10.626 tools return a `ToolValue`, which has no metadata,
+    # Last legacy release: v2026.10.634; replacement: v2026.10.635 tools return a `ToolValue`, which has no metadata,
     # and workers never write the key. A worker may run an earlier release than its primary while a deployment rolls out.
     # Handling: the key is still accepted and bounded with the media's metadata, then ignored, as nothing reads it.
     # Coverage: tests/test_worker_media.py::test_a_worker_envelope_with_the_tools_metadata_still_decodes.

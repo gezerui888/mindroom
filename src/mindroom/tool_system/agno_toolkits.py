@@ -80,7 +80,7 @@ def agno_toolkit(toolkit: Toolkit | authoring.Toolkit) -> Toolkit:
     ``get_tool_by_name`` edits Agno's function maps before adaptation (see its TODO), so an owned toolkit is carried
     in them. Its functions stay owned: adapting one derives its schema with ``tool_schema``, not Agno.
     """
-    if isinstance(toolkit, Toolkit):
+    if not isinstance(toolkit, authoring.Toolkit):
         return toolkit
     container = Toolkit(name=toolkit.name, instructions=toolkit.instructions)
     for name, entrypoint in toolkit.functions.items():

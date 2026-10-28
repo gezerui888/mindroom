@@ -197,7 +197,7 @@ def _decode_tool_value(value: dict[str, Any]) -> ToolValue:
     max_encoded = 4 * ((MAX_TOTAL_MEDIA_BYTES + 2) // 3) + 4 * (MAX_MEDIA_COUNT - 1)
     if metadata_size > _MAX_METADATA_CHARS or sum(len(item.data) for item in pending) > max_encoded:
         raise _invalid()
-    decoded: dict[str, list[_Media]] = {field: [] for field in _MEDIA_MODELS}
+    decoded: dict[str, list[Any]] = {field: [] for field in _MEDIA_MODELS}
     total = 0
     for item in pending:
         media, data = _decode_media_entry(item)
@@ -205,13 +205,7 @@ def _decode_tool_value(value: dict[str, Any]) -> ToolValue:
         if total > MAX_TOTAL_MEDIA_BYTES:
             raise _invalid()
         decoded[item.field].append(media)
-    return ToolValue(
-        content=content,
-        images=tuple(cast("list[Image]", decoded["images"])),
-        audios=tuple(cast("list[Audio]", decoded["audios"])),
-        videos=tuple(cast("list[Video]", decoded["videos"])),
-        files=tuple(cast("list[File]", decoded["files"])),
-    )
+    return ToolValue(content=content, **{field: tuple(items) for field, items in decoded.items()})
 
 
 def _decode_media_entry(item: _EncodedMedia) -> tuple[_Media, bytes]:

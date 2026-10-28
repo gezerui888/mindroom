@@ -17,7 +17,7 @@ from mindroom.constants import resolve_runtime_paths
 from mindroom.llm.media import Audio as OwnedAudio
 from mindroom.llm.messages import Message
 from mindroom.providers.gemini import wire as gemini_wire
-from mindroom.providers.openai.media import chat_audio_part, chat_file_part
+from mindroom.providers.openai.media import chat_audio_part, chat_file_part, responses_file_part
 from mindroom.tool_system import media_transport
 from mindroom.tool_system.agno_toolkits import read_tool_value
 from mindroom.tool_system.media_transport import decode_media_result
@@ -525,3 +525,47 @@ def test_a_worker_envelope_with_the_tools_metadata_still_decodes() -> None:
     envelope["mindroom_tool_result"]["metadata"] = {"job": "x" * (64 * 1024)}
     with pytest.raises(ValueError, match="worker tool result"):
         decode_media_result(envelope)
+
+
+# What a worker sent for files a tool returned as bytes beside the path it saved them under, before tools returned
+# MindRoom's tool values.
+_BYTES_BESIDE_A_PATH_WIRE = (
+    '{"mindroom_tool_result": {"version": 1, "kind": "tool_result", "content": "Created", "images": [], "audios": [], '
+    '"videos": [], "files": [{"id": "report", "mime_type": "application/pdf", "filename": "report.pdf", '
+    '"data_base64": "JVBERi0xLjc="}, {"id": "named", "mime_type": "application/pdf", "filename": "Report", "name": '
+    '"Report", "data_base64": "JVBERi0xLjc="}, {"id": "typed", "mime_type": "text/csv", "filename": "table.csv", '
+    '"data_base64": "YSxi"}, {"id": "unknown", "filename": "blob.bin", "data_base64": "AA=="}]}}'
+)
+
+
+def test_a_file_returned_as_bytes_beside_its_path_keeps_the_paths_name_and_type() -> None:
+    """A file a tool returns as bytes with the path it saved them under is named and typed by that path, unread.
+
+    The paths here do not exist, so neither the worker nor the primary can have read them.
+    """
+    result = ToolResult(
+        content="Created",
+        files=[
+            File(id="report", content=b"%PDF-1.7", filepath="report.pdf"),
+            File(id="named", content=b"%PDF-1.7", filepath="out/report.pdf", name="Report"),
+            File(id="typed", content=b"a,b", filepath="export.bin", filename="table.csv"),
+            File(id="unknown", content=b"\x00", filepath="blob.bin"),
+        ],
+    )
+
+    wire = json.dumps(serialize_worker_tool_result(result))
+    owned = read_tool_value(result)
+
+    assert wire == _BYTES_BESIDE_A_PATH_WIRE
+    assert owned is not None
+    assert [(file.filepath, file.filename, file.mime_type) for file in owned.files] == [
+        (None, "report.pdf", "application/pdf"),
+        (None, "Report", "application/pdf"),
+        (None, "table.csv", "text/csv"),
+        (None, "blob.bin", None),
+    ]
+    decoded = decode_media_result(json.loads(wire))
+    assert isinstance(decoded, ToolValue)
+    part = responses_file_part(decoded.files[0])
+    assert part is not None
+    assert (part["filename"], part["file_data"].split(";", 1)[0]) == ("report.pdf", "data:application/pdf")

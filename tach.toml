@@ -5611,6 +5611,10 @@ depends_on = [
 ]
 
 [[modules]]
+path = "mindroom.tool_system.tool_schema"
+depends_on = []
+
+[[modules]]
 path = "mindroom.failure_text"
 depends_on = []
 

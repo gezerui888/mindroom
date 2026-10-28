@@ -56,8 +56,6 @@ from mindroom.hooks import HookRegistry
 from mindroom.message_target import MessageTarget
 from mindroom.runtime_env_policy import VENDOR_TELEMETRY_ENV_VALUES
 from mindroom.tool_system.agno_toolkits import adapt_function, adapt_toolkit
-from mindroom.tool_system.authoring import Toolkit as OwnedToolkit
-from mindroom.tool_system.authoring import tool
 from mindroom.tool_system.declarations import ToolExecutionTarget, ToolFileAccess
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.metadata import (
@@ -1000,82 +998,6 @@ async def test_sandbox_runner_runs_the_function_a_primary_run_offers(tmp_path: P
         assert await sandbox_runner_module._call_entrypoint(entrypoint, [], {}) == "async"
     finally:
         restore_tool_registry_snapshot(snapshot)
-
-
-@pytest.mark.asyncio
-async def test_an_owned_toolkit_routed_to_a_worker_validates_on_the_primary_and_runs_on_the_worker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An owned function keeps its owned schema behind the proxy, sends coerced arguments, and the runner finds it."""
-    captured: dict[str, Any] = {}
-    tool_name = "test_proxy_owned_tool"
-
-    class _OwnedTools(OwnedToolkit):
-        name = tool_name
-
-        @tool
-        def repeat(self, word: str, times: int = 1) -> str:
-            """Repeat a word.
-
-            Args:
-                word: The word.
-                times: How often.
-
-            """
-            return word * times
-
-    snapshot = capture_tool_registry_snapshot()
-
-    @register_tool_with_metadata(
-        name=tool_name,
-        file_access=ToolFileAccess.NONE,
-        display_name="Owned Proxy Tool",
-        description="Test-only owned toolkit behind the worker proxy.",
-        category=ToolCategory.DEVELOPMENT,
-    )
-    def _owned_factory() -> type[_OwnedTools]:
-        return _OwnedTools
-
-    runtime_paths = _configure_proxy_runtime(
-        monkeypatch,
-        proxy_url="http://sandbox-runner:8765",
-        proxy_token=_TEST_AUTH_TOKEN,
-        execution_mode="selective",
-        proxy_tools={tool_name},
-        credential_policy={},
-    )
-    monkeypatch.setattr(
-        "mindroom.tool_system.sandbox_proxy.httpx.Client",
-        _recording_client_class(captured=captured),
-    )
-    try:
-        [function] = adapt_toolkit(get_tool_by_name(tool_name, runtime_paths, worker_target=None)).functions
-        outcome = await execute_tool_call(
-            function,
-            {"word": "ab", "times": "2"},
-            ToolCallContext(run_id="run-1", session_id="session-1", user_id=None),
-            middleware=(),
-        )
-        _toolkit, entrypoint = sandbox_runner_module._resolve_entrypoint(
-            runtime_paths=runtime_paths,
-            config=Config(agents={}, models={}),
-            tool_name=tool_name,
-            function_name="repeat",
-        )
-    finally:
-        restore_tool_registry_snapshot(snapshot)
-
-    assert function.parameters == {
-        "type": "object",
-        "properties": {
-            "word": {"type": "string", "description": "The word."},
-            "times": {"type": "integer", "description": "How often."},
-        },
-        "required": ["word"],
-    }
-    assert outcome.content == "sandbox-result"
-    assert captured["json"]["kwargs"] == {"word": "ab", "times": 2}
-    assert entrypoint(word="ab", times=2) == "abab"
 
 
 @pytest.mark.asyncio

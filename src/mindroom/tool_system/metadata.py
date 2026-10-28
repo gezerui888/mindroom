@@ -674,7 +674,6 @@ def get_tool_by_name(
 
         # Imported on first tool construction so importing the registry stays free
         # of the agno runtime import chain (#1436).
-        from mindroom.tool_system.agno_toolkits import agno_toolkit  # noqa: PLC0415
         from mindroom.tool_system.output_files import (  # noqa: PLC0415
             ToolOutputFilePolicy,
             wrap_toolkit_for_output_files,
@@ -736,11 +735,10 @@ def get_tool_by_name(
         include_tools, exclude_tools = _pop_implicit_toolkit_filters(metadata, init_kwargs)
         # TODO(simplify): the filters, output-file wrapping, and sandbox proxy below mutate the Agno toolkit before
         # adaptation because get_tool_by_name returns it to plugins. Return the adapted toolkit and run these steps
-        # over its ToolFunctions, so an owned toolkit no longer rides in Agno's containers (agno_toolkit). Plugin
-        # authors who read the returned toolkit's functions would notice.
+        # over its ToolFunctions. Plugin authors who read the returned toolkit's functions would notice.
 
         with optional_dependency_environment():
-            toolkit = agno_toolkit(cast("Any", tool_class)(**init_kwargs))
+            toolkit = cast("Any", tool_class)(**init_kwargs)
         _apply_implicit_toolkit_filters(
             toolkit,
             include_tools=include_tools,

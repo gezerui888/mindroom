@@ -35,7 +35,7 @@ from mindroom.tool_system.output_files import ToolOutputFileHandled, current_too
 from mindroom.tool_system.progress import report_tool_progress
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.tool_environment import ToolEnvironment, current_tool_environment
-from mindroom.tool_system.tool_schema import authored_parameters, tool_description, tool_parameters
+from mindroom.tool_system.tool_schema import authored_parameters
 from mindroom.vendor_telemetry import vendor_telemetry_env_values
 
 if TYPE_CHECKING:
@@ -387,12 +387,10 @@ def shell_tools() -> type[Toolkit]:
             notes = (
                 (_WORKSPACE_CWD_NOTE, _WORKING_METHOD_NOTE) if self.base_dir is not None else (_WORKING_METHOD_NOTE,)
             )
-            # TODO(simplify): derived from the method itself, the schema keeps the parameter descriptions that deriving
-            # it from the output-file wrapper's docstring drops for every other function.
             return replace(
                 function,
-                description="\n\n".join((tool_description(self.run_shell_command), *notes)).strip(),
-                parameters=authored_parameters(self.run_shell_command, tool_parameters(self.run_shell_command)),
+                description="\n\n".join((function.description or "", *notes)).strip(),
+                parameters=authored_parameters(self.run_shell_command, function.parameters),
             )
 
         async def run_shell_command(

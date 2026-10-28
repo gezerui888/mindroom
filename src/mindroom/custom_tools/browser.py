@@ -50,8 +50,10 @@ from mindroom.server_fetch_url import validate_server_fetch_url
 from mindroom.tool_system.authoring import Toolkit, tool
 from mindroom.tool_system.media_attachments import finalize_tool_media
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
-from mindroom.tool_system.tool_function import ToolValue
-from mindroom.tool_system.tool_schema import authored_parameters, tool_parameters
+from mindroom.tool_system.tool_function import (
+    ToolValue,  # noqa: TC001 - The schema reads the tool's annotations at runtime.
+)
+from mindroom.tool_system.tool_schema import authored_parameters
 from mindroom.worker_computer.browser_bundle import COMPUTER_BROWSER_EXECUTABLE
 from mindroom.worker_computer.browser_proxy import (
     PROXIED_WEBRTC_ONLY_ARG,
@@ -748,9 +750,7 @@ class BrowserTools(Toolkit):
 
     def offered_function(self, function: ToolFunction) -> ToolFunction:
         """Describe the browser actions, targets, and screenshot options the model routes a call by."""
-        # TODO(simplify): derived from the method itself, the schema keeps the parameter descriptions that deriving it
-        # from the output-file wrapper's docstring drops for every other function.
-        parameters = tool_parameters(self.browser)
+        parameters = dict(function.parameters)
         properties = dict(parameters.get("properties") or {})
 
         action_schema = dict(properties.get("action") or {})
@@ -1042,9 +1042,7 @@ class BrowserTools(Toolkit):
             if saveOnly:
                 return json.dumps(screenshot, sort_keys=True)
             result = await asyncio.to_thread(image_result, image_bytes, metadata=screenshot)
-            finalized = await asyncio.to_thread(finalize_tool_media, result)
-            assert isinstance(finalized, ToolValue)
-            return finalized
+            return await asyncio.to_thread(finalize_tool_media, result)
         if normalized_action == "navigate":
             target_url = _clean_str(targetUrl)
             if target_url is None:
@@ -1244,9 +1242,7 @@ class BrowserTools(Toolkit):
             timeout_seconds=self._timeout_seconds,
         )
         result = await asyncio.to_thread(image_result, image_bytes, metadata=result_payload)
-        finalized = await asyncio.to_thread(finalize_tool_media, result)
-        assert isinstance(finalized, ToolValue)
-        return finalized
+        return await asyncio.to_thread(finalize_tool_media, result)
 
     async def _status_payload(self, profile_name: str) -> dict[str, Any]:
         async with self._lock:

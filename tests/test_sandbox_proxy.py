@@ -19,7 +19,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Self
@@ -41,6 +41,7 @@ from mindroom.agent_cli.shell_contract import AgentCliShellEnv, bound_agent_cli_
 from mindroom.api.sandbox_runner_app import app as sandbox_runner_app
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.main import Config, load_config
+from mindroom.config.models import ModelConfig
 from mindroom.constants import (
     RETAINED_MEDIA_MAX_BYTES,
     RuntimePaths,
@@ -53,6 +54,7 @@ from mindroom.constants import (
 )
 from mindroom.credentials.manager import CredentialsManager, get_runtime_credentials_manager, save_scoped_credentials
 from mindroom.hooks import HookRegistry
+from mindroom.llm.media import Image
 from mindroom.message_target import MessageTarget
 from mindroom.runtime_env_policy import VENDOR_TELEMETRY_ENV_VALUES
 from mindroom.tool_system.agno_toolkits import (
@@ -63,6 +65,7 @@ from mindroom.tool_system.agno_toolkits import (
 from mindroom.tool_system.authoring import Toolkit as OwnedToolkit
 from mindroom.tool_system.declarations import ToolExecutionTarget, ToolFileAccess
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
+from mindroom.tool_system.media_transport import encode_media_result
 from mindroom.tool_system.metadata import (
     TOOL_METADATA,
     TOOL_REGISTRY,
@@ -85,6 +88,7 @@ from mindroom.tool_system.runtime_context import (
     worker_runtime_context,
 )
 from mindroom.tool_system.tool_environment import ToolEnvironment
+from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.tool_hooks import build_tool_hook_middleware
 from mindroom.tool_system.worker_proxy_client import WorkerProxyClientConfig, execute_worker_proxy_request
 from mindroom.tool_system.worker_routing import (
@@ -111,6 +115,7 @@ from tests.conftest import (
 )
 from tests.process_helpers import assert_linux_pid_not_running
 from tests.test_agent_tool_calls import _catalog, _events
+from tests.test_attachments_tool import _tool_context
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -1986,10 +1991,6 @@ def test_view_file_from_worker_posts_and_decodes_bounded_media(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Primary file viewing should route to the selected worker and restore image bytes."""
-    from mindroom.llm.media import Image  # noqa: PLC0415
-    from mindroom.tool_system.media_transport import encode_media_result  # noqa: PLC0415
-    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
-
     captured: dict[str, Any] = {}
     manager = _TrackingWorkerManager()
     monkeypatch.setenv("MINDROOM_WORKER_BACKEND", "kubernetes")
@@ -2050,8 +2051,6 @@ async def test_view_file_reports_malformed_worker_responses(
 ) -> None:
     """Malformed worker replies remain structured file-view errors at the public tool boundary."""
     from mindroom.custom_tools.attachments import AttachmentTools  # noqa: PLC0415
-    from mindroom.tool_system.media_transport import encode_media_result  # noqa: PLC0415
-    from tests.test_attachments_tool import _tool_context  # noqa: PLC0415
 
     manager = _TrackingWorkerManager()
     monkeypatch.setenv("MINDROOM_WORKER_BACKEND", "kubernetes")
@@ -7933,10 +7932,6 @@ def test_shell_extra_env_requires_explicit_patterns_for_service_urls() -> None:
 @pytest.mark.parametrize("tool_name", ["browser_mcp", "shell"])
 def test_worker_client_returns_raw_browser_envelopes(tool_name: str) -> None:
     """The HTTP client leaves feature envelopes untouched for every tool."""
-    from mindroom.llm.media import Image  # noqa: PLC0415
-    from mindroom.tool_system.media_transport import encode_media_result  # noqa: PLC0415
-    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
-
     envelope = encode_media_result(
         ToolValue(content="screen", images=(Image(content=b"png", mime_type="image/png"),)),
     )
@@ -7969,8 +7964,6 @@ def test_proxy_composition_decodes_typed_media_for_every_tool(
     valid: bool,
 ) -> None:
     """Composition restores native images and rejects malformed native envelopes."""
-    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
-
     envelope = {
         "mindroom_tool_result": {
             "version": 1 if valid else 999,
@@ -8011,3 +8004,45 @@ def test_proxy_composition_decodes_typed_media_for_every_tool(
         assert result.content == "screen"
         assert result.images
         assert result.images[0].content == b"png"
+
+
+@pytest.mark.parametrize("tool_name", ["browser_mcp", "shell"])
+def test_proxy_composition_finalizes_decoded_media_and_returns_json_as_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    """A worker's image view is finalized for the calling model; a JSON envelope's value comes back as it is."""
+    context = replace(_tool_context(tmp_path), active_model_name="text_only")
+    context.config.models["text_only"] = ModelConfig(provider="cerebras", id="test-model")
+    viewed = ToolValue(content='{"view_status": "ready"}', images=(Image(content=b"png", mime_type="image/png"),))
+    ordinary = {"mindroom_tool_result": {"version": 777}}
+    responses = iter([encode_media_result(viewed), encode_media_result(ordinary)])
+    paths = _configure_proxy_runtime(
+        monkeypatch,
+        proxy_url="http://sandbox-runner:8765",
+        proxy_token=_TEST_AUTH_TOKEN,
+        execution_mode="selective",
+        proxy_tools={tool_name},
+        credential_policy={},
+    )
+    monkeypatch.setattr(sandbox_proxy_module, "execute_worker_proxy_request", lambda **_kwargs: next(responses))
+
+    def call() -> object:
+        return call_proxy_sync_for_test(
+            runtime_paths=paths,
+            tool_name=tool_name,
+            function_name="browser_take_screenshot",
+            args=(),
+            kwargs={},
+            credentials_manager=None,
+        )
+
+    with tool_runtime_context(context):
+        media = call()
+        plain = call()
+
+    assert isinstance(media, ToolValue)
+    assert not media.images
+    assert json.loads(media.content)["view_status"] == "unsupported"
+    assert plain == ordinary

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException
 
 from mindroom.tool_system.agno_toolkits import toolkit_function
+from mindroom.tool_system.media_transport import encode_media_result
 from mindroom.tool_system.tool_function import ToolValue
 from mindroom.worker_computer.protocol import BrowserSession
 
@@ -82,7 +83,6 @@ def select_browser_provider(
     # Browser SDK imports remain lazy for slim runner startup.
     from mindroom.custom_tools.browser import BrowserTools  # noqa: PLC0415
     from mindroom.custom_tools.browser_mcp import BrowserMCPTools  # noqa: PLC0415
-    from mindroom.tool_system.media_transport import encode_media_result  # noqa: PLC0415
     from mindroom.tools.browser import browser_tools  # noqa: PLC0415
     from mindroom.tools.browser_mcp import browser_mcp_tools  # noqa: PLC0415
     from mindroom.worker_computer.mcp_catalog import browser_mcp_catalog  # noqa: PLC0415

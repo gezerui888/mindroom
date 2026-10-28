@@ -477,8 +477,8 @@ def test_the_worker_media_wire_is_pinned_byte_for_byte(tmp_path: Path) -> None:
 
     assert json.dumps(serialize_worker_tool_result(result)) == _PINNED_WIRE
     assert json.dumps(serialize_worker_tool_result(read_tool_value(result))) == _PINNED_WIRE
-    decoded = read_tool_value(decode_media_result(json.loads(_PINNED_WIRE)))
-    assert decoded is not None
+    decoded = decode_media_result(json.loads(_PINNED_WIRE))
+    assert isinstance(decoded, ToolValue)
     assert decoded.content == "Generated artifacts"
     assert [(item.id, item.content, item.mime_type) for _kind, item in decoded.media()] == [
         ("image-1", b"\x89PNG-bytes", "image/png"),
@@ -519,9 +519,7 @@ def test_a_worker_envelope_with_the_tools_metadata_still_decodes() -> None:
     envelope = json.loads(_PINNED_WIRE)
     envelope["mindroom_tool_result"]["metadata"] = {"job": "complete"}
 
-    assert read_tool_value(decode_media_result(envelope)) == read_tool_value(
-        decode_media_result(json.loads(_PINNED_WIRE)),
-    )
+    assert decode_media_result(envelope) == decode_media_result(json.loads(_PINNED_WIRE))
     envelope["mindroom_tool_result"]["metadata"] = {"job": "x" * (64 * 1024)}
     with pytest.raises(ValueError, match="worker tool result"):
         decode_media_result(envelope)

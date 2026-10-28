@@ -10,7 +10,6 @@ import pytest
 from PIL import Image
 
 from mindroom import media_delivery
-from mindroom.tool_system.tool_function import ToolValue
 
 
 def image_bytes(size: tuple[int, int] = (80, 60), *, image_format: str = "PNG") -> bytes:
@@ -24,7 +23,6 @@ def test_image_result_carries_image_bytes_separately() -> None:
     """Image result carries image bytes separately."""
     data = image_bytes()
     result = media_delivery.image_result(data, metadata={"path": "plots/result.png"})
-    assert isinstance(result, ToolValue)
     assert result.images
     assert result.images[0].content == data
     assert result.images[0].mime_type == "image/png"

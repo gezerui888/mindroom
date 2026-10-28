@@ -2770,6 +2770,7 @@ depends_on = [
     "mindroom.session_storage.store",
     "mindroom.background_tasks",
     "mindroom.error_handling",
+    "mindroom.history.conversation_text",
     "mindroom.history.replay",
     "mindroom.history.storage",
     "mindroom.history.summary_call",
@@ -4685,7 +4686,6 @@ depends_on = [
     "mindroom.tool_system.runtime_context",
     "mindroom.tool_system.tool_function",
     "mindroom.matrix_rtc.voice_agent",
-    "mindroom.session_storage.lanes",
     "mindroom.session_storage.types",
     "mindroom.tool_jobs.execution",
 ]
@@ -5492,7 +5492,6 @@ depends_on = [
     "mindroom.tool_system.declarations",
     "mindroom.workspaces",
     "mindroom.tool_system.agno_toolkits",
-    "mindroom.tool_system.tool_function",
 ]
 
 [[modules]]
@@ -5802,7 +5801,6 @@ path = "mindroom.tool_system.media_attachments"
 depends_on = [
     "mindroom.providers.registry",
     "mindroom.tool_system.runtime_context",
-    "mindroom.tool_system.tool_function",
 ]
 
 [[modules]]
@@ -7211,6 +7209,7 @@ expose = [
     "resolve_current_session_id",
     "resolve_tool_runtime_hook_bindings",
     "runtime_context_from_dispatch_context",
+    "scope_hook_context_kwargs",
     "tool_runtime_context",
     "tool_runtime_model_context",
     "worker_progress_pump_scope",
@@ -7343,6 +7342,7 @@ expose = [
     "ToolAfterCallContext",
     "ToolBeforeCallContext",
     "ToolEnvironmentContext",
+    "TranscriptLine",
     "TRUSTED_INTERNAL_RELAY_SOURCE_KIND",
     "TurnIntent",
     "TurnOrigin",
@@ -8112,6 +8112,7 @@ depends_on = [
     "mindroom.turn_origin",
 ]
 visibility = [
+    "mindroom.history.compaction",
     "mindroom.knowledge_graph.episodes",
     "mindroom.memory.auto_flush",
     "mindroom.skill_learning.transcript",

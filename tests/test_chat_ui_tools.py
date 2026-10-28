@@ -24,6 +24,7 @@ from mindroom.matrix.client_visible_messages import extract_visible_message, is_
 from mindroom.matrix.journal_ingress import ingestion_timeline_views
 from mindroom.matrix.room_history_reads import parse_room_message_event
 from mindroom.message_target import MessageTarget
+from mindroom.tool_system.agno_toolkits import toolkit_function_names
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from tests.agent_tool_helpers import toolkit_offers
@@ -96,6 +97,20 @@ def test_chat_ui_tool_registered_and_exposes_only_bounded_arguments(tmp_path: Pa
     assert inspect.signature(ChatUITools.open_panel).parameters["panel"].default == "members"
     function = toolkit_offers(ChatUITools(), "open_panel")
     assert function.parameters["properties"]["panel"]["enum"] == ["members", "computer"]
+
+
+def test_excluding_a_function_an_option_left_off_is_a_no_op(tmp_path: Path) -> None:
+    """``show_canvas`` is declared but off by default, so excluding it keeps the toolkit and its other functions."""
+    context = _context(tmp_path)
+
+    toolkit = get_tool_by_name(
+        "chat_ui",
+        context.runtime_paths,
+        tool_config_overrides={"exclude_tools": ["show_canvas", "open_settings"]},
+        worker_target=None,
+    )
+
+    assert toolkit_function_names(toolkit) == ("show_computer", "open_panel")
 
 
 @pytest.mark.asyncio

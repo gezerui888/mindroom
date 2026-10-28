@@ -2002,6 +2002,14 @@ def test_call_tool_fallback_accepts_non_object_arguments() -> None:
     assert "'crm_lookup' was not called" in _tool_payload(result)["message"]
 
 
+def test_call_tool_fallback_takes_a_name_of_any_type() -> None:
+    """The fallback takes the model's arguments as sent, so a name that is no string still gets the guidance."""
+    function = toolkit_offers(_search_toolkit(), "call_tool")
+
+    assert "'7' was not called" in _tool_payload(function.entrypoint(name=7))["message"]
+    assert not function.entrypoint_processed
+
+
 def test_search_toolkit_construction_failure_does_not_stop_the_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

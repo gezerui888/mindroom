@@ -442,6 +442,27 @@ def test_function_with_existing_mindroom_output_path_is_skipped_with_debug(tmp_p
     assert result.result == "not-redirected"
 
 
+def test_a_function_whose_authored_schema_takes_the_output_path_keeps_its_own(tmp_path: Path) -> None:
+    """An authored schema that names ``mindroom_output_path`` keeps it, and the call hands it to the function."""
+
+    def passthrough(**kwargs: object) -> object:
+        return kwargs
+
+    schema = {
+        "type": "object",
+        "properties": {OUTPUT_PATH_ARGUMENT: {"type": "string", "description": "Where the tool itself writes."}},
+        "required": [],
+    }
+    adapted = _with_output_files(
+        Function(name="passthrough", entrypoint=passthrough, parameters=schema, skip_entrypoint_processing=True),
+        _policy(tmp_path),
+    )
+
+    assert adapted.parameters == schema
+    assert _execute(adapted, {OUTPUT_PATH_ARGUMENT: "own.txt"}).result == {OUTPUT_PATH_ARGUMENT: "own.txt"}
+    assert not list(tmp_path.iterdir())
+
+
 def test_text_result_written_as_utf8_and_receipt_returned(tmp_path: Path) -> None:
     toolkit = _EchoToolkit(result="hello \u2603")
     configure_toolkit_functions(toolkit, output_files=_policy(tmp_path))

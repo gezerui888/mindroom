@@ -19,6 +19,7 @@ from mindroom.tool_system.agno_toolkits import (
     adapt_function,
     adapt_toolkit,
     injected_parameters,
+    toolkit_function,
     with_offered_instructions,
 )
 from mindroom.tool_system.registry_state import BUILTIN_TOOL_METADATA
@@ -157,6 +158,16 @@ def test_functions_with_agno_hooks_are_rejected_instead_of_running_without_them(
 
     with pytest.raises(ValueError, match=r"'lookup' sets an Agno pre_hook, post_hook, or tool_hooks"):
         adapt_function(function)
+
+
+def test_looking_up_one_function_refuses_a_field_mindroom_cannot_honor() -> None:
+    """A function looked up alone by name raises the refusal its toolkit's adapter would name in ``refused``."""
+    toolkit = Toolkit(name="hooked")
+    toolkit.functions["lookup"] = Function(name="lookup", entrypoint=_lookup, pre_hook=_noop_hook)
+
+    assert set(adapt_toolkit(toolkit).refused) == {"lookup"}
+    with pytest.raises(ValueError, match="pre_hook"):
+        toolkit_function(toolkit, "lookup")
 
 
 def test_every_field_of_agnos_function_is_named_by_one_row_of_the_adapter_table() -> None:

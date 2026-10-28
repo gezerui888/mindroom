@@ -1995,7 +1995,7 @@ def test_view_file_from_worker_posts_and_decodes_bounded_media(
     )
 
     assert result is not None
-    assert result.images is not None
+    assert result.images
     assert result.images[0].content == b"png"
     assert captured["url"] == "http://worker/api/sandbox-runner/view-file"
     assert captured["json"]["path"] == "plots/result.png"
@@ -6279,7 +6279,7 @@ def test_static_runner_views_file_for_agent_added_after_seeding(
         )
 
     assert result is not None
-    assert result.images is not None
+    assert result.images
     assert result.images[0].mime_type == "image/png"
     assert sent_payloads[0]["config_snapshot"] is not None
     _assert_no_live_config_secrets(sent_payloads)

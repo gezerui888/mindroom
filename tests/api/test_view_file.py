@@ -230,5 +230,5 @@ async def test_view_file_endpoint_prefers_prepared_worker_workspace(
     assert response.ok is True
     result = decode_media_result(response.result)
     assert isinstance(result, ToolValue)
-    assert result.images is not None
+    assert result.images
     assert result.images[0].content == data

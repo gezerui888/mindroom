@@ -131,16 +131,13 @@ def _validate_media_entry(entry: object, model: type[_Media]) -> tuple[dict[str,
         raise _invalid()
     attributes = {key: value for key, value in entry.items() if key != "data_base64"}
     identifier = attributes.get("id")
-    if identifier is not None and (
-        not isinstance(identifier, str) or not identifier or len(identifier) > _MAX_MEDIA_ID_CHARS
-    ):
+    if identifier is not None and (not identifier or len(identifier) > _MAX_MEDIA_ID_CHARS):
         raise _invalid()
     mime = attributes.get("mime_type")
     if mime is not None:
         family = MEDIA_MIME_FAMILIES.get(model)
         if (
-            not isinstance(mime, str)
-            or "/" not in mime
+            "/" not in mime
             or any(character.isspace() for character in mime)
             or (family is not None and not mime.startswith(family))
             or (model is File and mime not in DOCUMENT_MIME_TYPES)

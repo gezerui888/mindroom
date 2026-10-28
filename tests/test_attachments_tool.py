@@ -260,7 +260,6 @@ async def test_get_attachment_view_returns_other_media(
 
     assert isinstance(result, ToolValue)
     media = {"audios": result.audios, "files": result.files, "videos": result.videos}[media_field]
-    assert media is not None
     assert len(media) == 1
     assert media[0].content == payload_bytes
     assert media[0].mime_type == mime_type
@@ -297,7 +296,7 @@ async def test_get_attachment_view_uses_source_filename_when_none_is_given(tmp_p
         result = await AttachmentTools().get_attachment(attachment.attachment_id, view=True)
 
     assert isinstance(result, ToolValue)
-    assert result.files is not None
+    assert result.files
     assert result.files[0].filename == "document.pdf"
 
 
@@ -1206,7 +1205,7 @@ async def test_registered_workspace_file_swapped_for_link_never_reads_link_targe
         if use == "view":
             result = await tool.get_attachment(attachment_id, view=True)
             assert isinstance(result, ToolValue)
-            assert result.files is not None
+            assert result.files
             assert result.files[0].content == b"public notes"
         elif use == "save":
             payload = json.loads(await tool.get_attachment(attachment_id, mindroom_output_path="copy.txt"))

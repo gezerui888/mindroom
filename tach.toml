@@ -5460,7 +5460,6 @@ depends_on = [
     "mindroom.tool_system.declarations",
     "mindroom.workspaces",
     "mindroom.tool_system.agno_toolkits",
-    "mindroom.tool_system.tool_function",
 ]
 
 [[modules]]

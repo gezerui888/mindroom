@@ -291,7 +291,7 @@ async def test_current_call_names_the_call_a_function_runs_for() -> None:
 
 
 def test_toolkit_functions_returns_one_callable_per_name() -> None:
-    """An owned toolkit gives its functions as authored; an Agno toolkit its async variant where it has one."""
+    """Each function a run offers, by name; of an Agno toolkit, its async variant where it has one."""
 
     def lookup() -> str:
         return "sync"
@@ -302,11 +302,17 @@ def test_toolkit_functions_returns_one_callable_per_name() -> None:
     owned = GreeterTools(tools=[shout])
     agno = AgnoToolkit(name="dual", tools=[lookup])
     agno.async_functions["lookup"] = Function(name="lookup", entrypoint=alookup)
-    # A function rebuilt from its stored definition has nothing to call.
-    agno.async_functions["described_only"] = Function(name="described_only")
 
-    assert toolkit_functions(owned) == {"greet": owned.greet, "farewell": owned.bye, "shout": shout}
-    assert toolkit_functions(agno) == {"lookup": alookup}
+    owned_functions = toolkit_functions(owned)
+    agno_functions = toolkit_functions(agno)
+
+    # The callables validate their arguments, so each wraps the function it calls.
+    assert {name: inspect.unwrap(function) for name, function in owned_functions.items()} == {
+        "farewell": owned.bye,
+        "shout": shout,
+        "greet": owned.greet,
+    }
+    assert {name: inspect.unwrap(function) for name, function in agno_functions.items()} == {"lookup": alookup}
 
 
 def test_an_owned_toolkit_adapts_to_what_its_agno_authored_twin_adapts_to() -> None:

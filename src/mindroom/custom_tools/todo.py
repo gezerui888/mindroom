@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
-from agno.tools import Toolkit
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from mindroom import yaml_io
@@ -37,6 +36,7 @@ from mindroom.path_confinement import (
     resolve_path_within_root,
 )
 from mindroom.runtime_resolution import resolve_agent_runtime
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, get_tool_runtime_context
 from mindroom.tool_system.skills import workspace_entry_names
 from mindroom.tool_system.worker_routing import agent_workspace_root_path

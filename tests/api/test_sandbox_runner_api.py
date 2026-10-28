@@ -3539,13 +3539,13 @@ def test_get_tool_by_name_loads_persisted_tool_credentials_without_explicit_mana
 ) -> None:
     """Config-backed tool rebuilds should use the runtime credential store by default."""
 
-    class DummyTool:
+    class DummyTool(Toolkit):
         def __init__(self, token: str | None = None) -> None:
-            self.name = "dummy"
             self.token = token
-            self.functions = {"run": type("F", (), {"entrypoint": lambda _unused: None})()}
-            self.async_functions = {}
-            self.requires_connect = False
+            super().__init__(name="dummy", tools=[self.run])
+
+        def run(self) -> None:
+            return None
 
     tool_name = "dummy_runtime_cred_tool"
     stored_value = "value123"

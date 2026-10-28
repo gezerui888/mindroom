@@ -126,7 +126,7 @@ async def test_background_shell_leaves_a_process_running_after_the_call_returns(
         worker_target=None,
         tool_init_overrides={"base_dir": str(tmp_path)},
     )
-    entrypoint = toolkit.async_functions["run_shell_command"].entrypoint
+    entrypoint = toolkit.functions["run_shell_command"]
     assert entrypoint is not None
 
     async def execute(tool: str, function: str, kwargs: dict[str, object], *, user: str | None = None) -> dict:

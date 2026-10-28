@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
 
 # Importing these SDKs to build their tools warns about their own deprecated usage.
 pytestmark = [
@@ -47,9 +48,13 @@ def assert_same_json(actual: object, golden: object) -> None:
     assert json.dumps(actual, indent=2) == json.dumps(golden, indent=2)
 
 
-def assert_no_function_instructions(toolkit: Toolkit) -> None:
-    """No function sets instructions of its own, so the toolkit's are all the prompt and the guidance carry."""
-    assert all(function.instructions is None for function in toolkit.get_async_functions().values())
+def assert_no_function_instructions(toolkit: AnyToolkit) -> None:
+    """No function sets instructions of its own, so the toolkit's are all the prompt and the guidance carry.
+
+    An owned toolkit's functions have no instructions of their own.
+    """
+    if isinstance(toolkit, Toolkit):
+        assert all(function.instructions is None for function in toolkit.get_async_functions().values())
 
 
 @pytest.mark.parametrize(

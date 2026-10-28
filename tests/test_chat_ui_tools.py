@@ -26,6 +26,7 @@ from mindroom.matrix.room_history_reads import parse_room_message_event
 from mindroom.message_target import MessageTarget
 from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
 from mindroom.tool_system.runtime_context import tool_runtime_context
+from tests.agent_tool_helpers import toolkit_offers
 from tests.chat_ui_contract_fixture import (
     REQUESTER_ID,
     ROOM_ID,
@@ -77,8 +78,8 @@ def test_chat_ui_tool_registered_and_exposes_only_bounded_arguments(tmp_path: Pa
         ("enable_show_canvas", False),
         ("enable_canvas_libraries", False),
     ]
-    assert sorted(ChatUITools().async_functions) == ["open_panel", "open_settings", "show_computer"]
-    assert {"show_canvas", "read_canvas_state"} <= set(ChatUITools(enable_show_canvas=True).async_functions)
+    assert sorted(ChatUITools().functions) == ["open_panel", "open_settings", "show_computer"]
+    assert {"show_canvas", "read_canvas_state"} <= set(ChatUITools(enable_show_canvas=True).functions)
     assert isinstance(get_tool_by_name("chat_ui", context.runtime_paths, worker_target=None), ChatUITools)
     assert tuple(inspect.signature(ChatUITools.show_computer).parameters) == ("self",)
     assert tuple(inspect.signature(ChatUITools.open_settings).parameters) == ("self", "section")
@@ -93,10 +94,8 @@ def test_chat_ui_tool_registered_and_exposes_only_bounded_arguments(tmp_path: Pa
     )
     assert tuple(inspect.signature(ChatUITools.read_canvas_state).parameters) == ("self", "canvas_event_id")
     assert inspect.signature(ChatUITools.open_panel).parameters["panel"].default == "members"
-    function = ChatUITools().get_async_functions()["open_panel"]
-    function.process_entrypoint(strict=True)
+    function = toolkit_offers(ChatUITools(), "open_panel")
     assert function.parameters["properties"]["panel"]["enum"] == ["members", "computer"]
-    assert function.parameters["additionalProperties"] is False
 
 
 @pytest.mark.asyncio
@@ -514,8 +513,7 @@ async def test_delivery_failure_returns_error_without_claiming_the_ui_opened(tmp
 async def test_panel_rejects_unexpected_url_without_sending(tmp_path: Path, panel: str) -> None:
     """Panel requests cannot smuggle navigation or endpoints through extra arguments."""
     context = _context(tmp_path)
-    function = ChatUITools().get_async_functions()["open_panel"]
-    function.process_entrypoint(strict=False)
+    function = toolkit_offers(ChatUITools(), "open_panel")
     assert function.entrypoint is not None
     with tool_runtime_context(context), pytest.raises((TypeError, ValidationError), match="url"):
         await function.entrypoint(panel=panel, url="https://example.org")

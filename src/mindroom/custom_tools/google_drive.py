@@ -38,8 +38,8 @@ from mindroom.path_confinement import (
     open_directory_within_root,
     resolve_path_within_root,
 )
+from mindroom.tool_system.agno_toolkits import rename_toolkit_functions
 from mindroom.tool_system.metadata import coerce_optional_finite_number
-from mindroom.tool_system.toolkit_aliases import apply_toolkit_function_aliases
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -223,7 +223,7 @@ class GoogleDriveTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin, Ag
         self._set_original_auth(AgnoGoogleDriveTools._resolve_creds)
         self._wrap_oauth_function_entrypoints()
         self._wrap_write_scope_entrypoints()
-        apply_toolkit_function_aliases(self, _MODEL_FUNCTION_NAME_ALIASES)
+        rename_toolkit_functions(self, _MODEL_FUNCTION_NAME_ALIASES)
 
     def _build_service(self, creds: Any) -> Any:  # noqa: ANN401
         """Build Drive without cloning MindRoom's tracked OAuth credential."""

@@ -5,16 +5,17 @@ from __future__ import annotations
 import json
 import re
 from copy import deepcopy
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-from agno.tools import Toolkit
-
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.tool_access import tool_definition
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
 
     from mindroom.tool_system.dynamic_toolkits import DeferredToolkit
+    from mindroom.tool_system.tool_function import ToolFunction
 
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -49,12 +50,20 @@ class DynamicToolsToolkit(Toolkit):
     def __init__(self, *, deferred_toolkits: Callable[[], Sequence[DeferredToolkit]]) -> None:
         self._deferred_toolkits = deferred_toolkits
         super().__init__(name="dynamic_tools", tools=[self.tool_search, self.call_tool])
-        # Agno would render the argument values of a typed dict as empty objects, and Gemini conversion drops the
+
+    def offered_function(self, function: ToolFunction) -> ToolFunction:
+        """Offer ``call_tool`` with the schema of the MCP call_tool bridge, taking its arguments as sent."""
+        if function.name != "call_tool":
+            return function
+        # A typed dict would render its argument values as empty objects, and Gemini conversion drops the
         # description of an optional object, so the wrapper declares the same shape as the MCP call_tool bridge.
-        call_tool = self.functions["call_tool"]
-        call_tool.description = _CALL_TOOL_DESCRIPTION
-        call_tool.parameters = deepcopy(_CALL_TOOL_PARAMETERS)
-        call_tool.skip_entrypoint_processing = True
+        return replace(
+            function,
+            description=_CALL_TOOL_DESCRIPTION,
+            parameters=deepcopy(_CALL_TOOL_PARAMETERS),
+            entrypoint=self.call_tool,
+            entrypoint_processed=False,
+        )
 
     @staticmethod
     def _payload(status: str, **kwargs: object) -> str:

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from mindroom.tool_jobs.execution import agent_tool_middleware
-from mindroom.tool_system.declarations import tool_schema_source
+from mindroom.tool_system.agno_toolkits import toolkit_function
 from mindroom.tool_system.invocation import ToolCall, ToolCallContext, execute_tool_call
 from mindroom.tool_system.tool_function import ToolFunction
 from mindroom.tool_system.tool_hooks import build_tool_hook_middleware
@@ -18,7 +18,16 @@ if TYPE_CHECKING:
 
     from mindroom.agent_loop.build import AgentBuild
     from mindroom.hooks import HookRegistry
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
     from mindroom.tool_system.tool_function import ToolOutcome
+
+
+def toolkit_offers(toolkit: AnyToolkit, name: str) -> ToolFunction:
+    """Return the function of ``name`` ``toolkit`` offers, as an agent's run offers it."""
+    function = toolkit_function(toolkit, name)
+    if function is None:
+        pytest.fail(f"The toolkit does not offer {name}")
+    return function
 
 
 def offered_function(build: AgentBuild, name: str) -> ToolFunction:
@@ -53,7 +62,7 @@ async def run_offered(
 
 def source_toolkit(function: ToolFunction) -> object:
     """Return the toolkit object whose bound method an adapted function finally calls."""
-    source = tool_schema_source(inspect.unwrap(function.entrypoint))
+    source = inspect.unwrap(function.entrypoint)
     owner = getattr(source, "__self__", None)
     if owner is None:
         pytest.fail(f"{function.name} does not call a toolkit method")

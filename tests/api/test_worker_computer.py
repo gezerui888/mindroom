@@ -23,6 +23,7 @@ from mindroom.api.worker_computer import router
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.custom_tools.browser import BrowserTools
+from mindroom.tool_system.authoring import tool
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_key
 from mindroom.worker_computer.runtime import WorkerComputerRuntime
 from mindroom.worker_computer.worker_browser import WorkerBrowserRuntime
@@ -99,6 +100,7 @@ def test_two_execute_requests_reuse_browser_and_disabled_uses_subprocess(
     monkeypatch.setattr(sandbox_worker_prep, "prepare_worker_request", lambda **_kwargs: prepared)
     pages = {}
 
+    @tool(name="browser_control")
     async def browser(self: BrowserTools, action: str, targetId: str | None = None) -> str:  # noqa: N803
         if action == "open":
             pages[id(self)] = "target-one"

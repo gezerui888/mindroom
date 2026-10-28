@@ -27,7 +27,6 @@ from mindroom.message_target import MessageTarget
 from mindroom.tool_jobs.execution import agent_tool_middleware
 from mindroom.tool_system import sandbox_proxy
 from mindroom.tool_system.agno_toolkits import ToolCallActor
-from mindroom.tool_system.declarations import tool_schema_source
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.runtime_context import (
     build_execution_identity_from_runtime_context,
@@ -588,7 +587,7 @@ async def test_browser_host_override_keeps_worker_transport_schema_and_hooks(
     function = offered_function(agent, "browser_control")
     toolkit = source_toolkit(function)
     assert isinstance(toolkit, BrowserTools)
-    assert inspect.unwrap(tool_schema_source(function.entrypoint)) == toolkit.browser
+    assert inspect.unwrap(function.entrypoint) == toolkit.browser
     schema = json.loads(json.dumps(function.parameters))
     assert function.requires_confirmation is True
     assert function.approval_type == "mindroom_policy"

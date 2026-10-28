@@ -25,6 +25,7 @@ from mindroom.tool_jobs.runtime import (
     get_background_runtime,
 )
 from mindroom.tool_jobs.settings import background_tool_jobs_enabled, pending_background_tool_jobs_restart
+from tests.agent_tool_helpers import toolkit_offers
 from tests.conftest import make_turn_context, test_runtime_paths
 from tests.delegation_helpers import ScriptedAgents
 from tests.fakes.scripted_model import ScriptedModel, answer
@@ -147,7 +148,7 @@ def test_disabled_delegation_describes_only_available_tools(tmp_path: Path) -> N
     config = Config(agents={"lead": AgentConfig(display_name="Lead", delegate_to=["lead"])})
     toolkit = DelegateTools("lead", ["lead"], test_runtime_paths(tmp_path), config)
     instructions = toolkit.instructions or ""
-    description = toolkit.async_functions["run_subagent"].description or ""
+    description = toolkit_offers(toolkit, "run_subagent").description or ""
     assert "background_after" not in instructions + description
     assert "job(action=" not in instructions + description
     assert "continue_subagent" in instructions + description

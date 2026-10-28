@@ -12,6 +12,7 @@ from mindroom.agent_cli.shell_access import minimal_shell_problems
 from mindroom.agent_cli.shell_contract import SHELL_OPERATION_NAMES
 from mindroom.approval.tool_approval import tool_may_require_approval
 from mindroom.runtime_resolution import resolve_agent_storage
+from mindroom.tool_system.agno_toolkits import toolkit_function_names
 from mindroom.tool_system.catalog import ensure_tool_registry_loaded, get_tool_by_name
 from mindroom.tool_system.dynamic_toolkits import visible_tool_surface
 from mindroom.tool_system.worker_routing import build_agent_toolkit_worker_target
@@ -68,7 +69,7 @@ def _shell_problems(
         )
     except (ImportError, ValueError):
         return [f"Fix the `shell` tool configuration of `{agent_name}` so it loads."]
-    if not set(SHELL_OPERATION_NAMES).issubset(toolkit.get_async_functions()):
+    if not set(SHELL_OPERATION_NAMES).issubset(toolkit_function_names(toolkit)):
         return [f"Allow the `run_shell_command` shell function for `{agent_name}`."]
     return []
 

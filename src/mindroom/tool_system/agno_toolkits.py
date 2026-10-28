@@ -17,7 +17,8 @@ from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, get_type_hints, runtime_checkable
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeGuard, get_type_hints, runtime_checkable
+from weakref import WeakKeyDictionary
 
 from agno.run import RunContext
 from agno.tools import Toolkit
@@ -33,7 +34,11 @@ from agno.utils.schema import (
 from mindroom.llm.media import Audio, File, Image, Video, named_by_resource
 from mindroom.logging_config import get_logger
 from mindroom.tool_system import authoring
-from mindroom.tool_system.declarations import finished_tool_schema
+from mindroom.tool_system.output_files import (
+    ToolOutputFilePolicy,
+    output_file_entrypoint,
+    with_optional_output_path,
+)
 from mindroom.tool_system.tool_function import AdaptedToolkit, InjectedValue, ToolFunction, ToolValue
 from mindroom.tool_system.tool_schema import tool_description, tool_parameters, validated_entrypoint
 
@@ -71,30 +76,88 @@ _FRAMEWORK_OBJECT_NAMES = frozenset(
 )
 
 
-class _OwnedFunction(Function):
-    """A function of an owned toolkit, carried in Agno's toolkit containers; adapting it uses no Agno code."""
+# A built toolkit: an owned one, or an Agno one, such as a vendor toolkit, which only this module looks inside.
+AnyToolkit = Toolkit | authoring.Toolkit
 
 
-def _as_agno_toolkit(toolkit: Toolkit | authoring.Toolkit) -> Toolkit:
-    """Return ``toolkit``, an owned one as an Agno toolkit holding its functions where Agno would register them.
+@dataclass(frozen=True, slots=True)
+class _Finishing:
+    """How one built toolkit's functions are offered: which ones, with output files, and through a worker route."""
 
-    An owned toolkit so adapts in the order and with the flags an Agno one does; its functions stay owned, so adapting
-    one derives its schema with ``tool_schema``, not Agno.
-    """
-    if isinstance(toolkit, Toolkit):
-        return toolkit
-    container = Toolkit(name=toolkit.name, instructions=toolkit.instructions)
-    for name, entrypoint in toolkit.functions.items():
-        registered = container.async_functions if inspect.iscoroutinefunction(entrypoint) else container.functions
-        # The flags Agno's registration sets for a function no toolkit option asks anything of.
-        registered[name] = _OwnedFunction(
-            name=name,
-            description=authoring.authored_description(entrypoint),
-            entrypoint=entrypoint,
-            requires_confirmation=False,
-            external_execution=False,
+    offered: frozenset[str] | None = None
+    output_files: ToolOutputFilePolicy | None = None
+    route: Callable[[str, Callable[..., object]], Callable[..., object]] | None = None
+
+    def entrypoint(
+        self,
+        name: str,
+        entrypoint: Callable[..., object],
+        parameters: Mapping[str, Any] | None,
+    ) -> tuple[Callable[..., object], bool]:
+        """Return the entrypoint a function's schema and validation derive from, and whether it takes output files.
+
+        ``parameters`` is the schema the tool authored, if any; a function that takes ``mindroom_output_path`` by
+        either keeps its own.
+        """
+        wrapped = (
+            None
+            if self.output_files is None
+            else output_file_entrypoint(entrypoint, self.output_files, tool_name=name, parameters=parameters)
         )
-    return container
+        entrypoint = wrapped or entrypoint
+        if self.route is not None:
+            entrypoint = self.route(name, entrypoint)
+        return entrypoint, wrapped is not None
+
+
+_FINISHING: WeakKeyDictionary[AnyToolkit, _Finishing] = WeakKeyDictionary()
+
+
+def configure_toolkit_functions[T: AnyToolkit](
+    toolkit: T,
+    *,
+    offered: Collection[str] | None = None,
+    output_files: ToolOutputFilePolicy | None = None,
+    route: Callable[[str, Callable[..., object]], Callable[..., object]] | None = None,
+) -> T:
+    """Record how whoever built ``toolkit`` offers its functions; every adaptation of the toolkit applies it.
+
+    ``offered`` names the functions an agent is offered, None every one, as ``get_tool_by_name``'s function filters
+    leave them. With ``output_files``, each function takes ``mindroom_output_path`` too, and ``route``, given a
+    function's name and entrypoint, returns the entrypoint that sends its calls to a worker.
+    """
+    _FINISHING[toolkit] = _Finishing(None if offered is None else frozenset(offered), output_files, route)
+    return toolkit
+
+
+def rename_toolkit_functions(toolkit: AnyToolkit, aliases: Mapping[str, str]) -> None:
+    """Offer each function of ``toolkit`` that ``aliases`` names under its alias, which also names it on the toolkit.
+
+    The original methods stay, so code calling them directly keeps working.
+    """
+    if isinstance(toolkit, authoring.Toolkit):
+        toolkit.functions = {aliases.get(name, name): function for name, function in toolkit.functions.items()}
+        entrypoints: Mapping[str, Callable[..., Any] | None] = toolkit.functions
+    else:
+        toolkit.functions = _aliased(toolkit.functions, aliases)
+        toolkit.async_functions = _aliased(toolkit.async_functions, aliases)
+        entrypoints = {name: function.entrypoint for name, function in toolkit.functions.items()}
+    for alias in aliases.values():
+        if (entrypoint := entrypoints.get(alias)) is not None:
+            setattr(toolkit, alias, entrypoint)
+
+
+def _aliased(functions: Mapping[str, Function], aliases: Mapping[str, str]) -> dict[str, Function]:
+    aliased: dict[str, Function] = {}
+    for name, function in functions.items():
+        function.name = aliases.get(name, name)
+        aliased[function.name] = function
+    return aliased
+
+
+def requires_connect(toolkit: AnyToolkit) -> TypeGuard[Toolkit]:
+    """Whether ``toolkit`` holds a connection its run opens and closes, as Agno's Postgres toolkit does."""
+    return isinstance(toolkit, Toolkit) and toolkit.requires_connect
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,50 +288,88 @@ class FunctionScopedInstructions(Protocol):
 
 
 def adapt_toolkit(
-    toolkit: Toolkit | authoring.Toolkit,
+    toolkit: AnyToolkit,
     *,
     key: str | None = None,
     registered: str | None = None,
 ) -> AdaptedToolkit:
-    """Adapt the functions of ``toolkit`` in Agno's async-run order, one per name; they share one ``actor_state``.
+    """Adapt the functions ``toolkit`` offers, one per name, in Agno's async-run order; they share one ``actor_state``.
 
-    ``key`` is the authored toolkit an agent is offered the functions from, which each one carries as its
-    ``toolkit``; None for a toolkit generated for the agent, and for a caller that names the toolkit beside each
-    function, as the MCP gateway's search does. ``registered`` is the registered tool they come from, which each
-    one carries as its ``registered_toolkit``; it is ``key`` unless an implied or preset tool brings the toolkit in.
-    A function's prompt instructions are handed over as ``function_instructions``, and a function that sets any
-    other field MindRoom refuses is adapted without it and named in ``refused``, so whoever offers the toolkit
-    refuses it only for a function it still offers.
+    Each function is offered as its builder configured it (``configure_toolkit_functions``). ``key`` is the authored
+    toolkit an agent is offered the functions from, which each one carries as its ``toolkit``; None for a toolkit
+    generated for the agent, and for a caller that names the toolkit beside each function, as the MCP gateway's search
+    does. ``registered`` is the registered tool they come from, which each one carries as its ``registered_toolkit``;
+    it is ``key`` unless an implied or preset tool brings the toolkit in. A function's prompt instructions are handed
+    over as ``function_instructions``, and a function that sets any other field MindRoom refuses is adapted without it
+    and named in ``refused``, so whoever offers the toolkit refuses it only for a function it still offers.
     """
-    toolkit = _as_agno_toolkit(toolkit)
-    functions = toolkit.get_async_functions().values()
+    finishing = _FINISHING.get(toolkit, _Finishing())
     actor_state: dict[str, Any] = {}
-    adapted: list[ToolFunction] = []
     refused: dict[str, str] = {}
-    for function in functions:
-        offered = _without_instructions(function)
-        if (refusal := _refusal(offered)) is not None:
-            refused[function.name] = refusal
-        adapted.append(
-            replace(_adapt(offered), toolkit=key, registered_toolkit=registered or key, actor_state=actor_state),
-        )
+    function_instructions: dict[str, str] = {}
+    adapted: list[ToolFunction] = []
+    if isinstance(toolkit, authoring.Toolkit):
+        adapted = [_owned_function(toolkit, name, finishing) for name in toolkit_function_names(toolkit)]
+    else:
+        for name in toolkit_function_names(toolkit):
+            function = toolkit.get_async_functions()[name]
+            if _FUNCTION_INSTRUCTIONS.sets(function) and function.instructions is not None:
+                function_instructions[name] = function.instructions
+            offered = _without_instructions(function)
+            if (refusal := _refusal(offered)) is not None:
+                refused[name] = refusal
+            adapted.append(_adapt(offered, finishing))
+    functions = tuple(
+        replace(function, toolkit=key, registered_toolkit=registered or key, actor_state=actor_state)
+        for function in adapted
+    )
     instructions = toolkit.instructions or None
     return AdaptedToolkit(
         name=toolkit.name,
-        functions=tuple(adapted),
+        functions=functions,
         instructions=instructions,
         guidance=instructions,
-        function_instructions={
-            function.name: function.instructions
-            for function in functions
-            if _FUNCTION_INSTRUCTIONS.sets(function) and function.instructions is not None
-        },
+        function_instructions=function_instructions,
         refused=refused,
     )
 
 
+def adapt_callable(entrypoint: Callable[..., Any]) -> ToolFunction:
+    """Derive ``entrypoint``, named and described as ``@tool`` marks it, as one function of an owned toolkit."""
+    (function,) = adapt_toolkit(authoring.Toolkit(tools=[entrypoint])).functions
+    return function
+
+
+def toolkit_function_names(toolkit: AnyToolkit) -> tuple[str, ...]:
+    """Return the names of the functions ``toolkit`` offers, in Agno's async-run order: synchronous ones first."""
+    offered = _FINISHING.get(toolkit, _Finishing()).offered
+    if isinstance(toolkit, authoring.Toolkit):
+        # TODO(simplify): an owned toolkit offers its synchronous functions before its async ones, as Agno's toolkit
+        # registers them; the order the class defines them in would reorder the tools of requests.
+        names = sorted(toolkit.functions, key=lambda name: inspect.iscoroutinefunction(toolkit.functions[name]))
+    else:
+        names = list(toolkit.get_async_functions())
+    return tuple(name for name in names if offered is None or name in offered)
+
+
+def toolkit_function(toolkit: AnyToolkit, name: str) -> ToolFunction | None:
+    """Return the function ``toolkit`` offers under ``name``, adapted and finished alone; None when it offers none.
+
+    The function names no toolkit; a function that sets a field MindRoom refuses raises ``ValueError``.
+    """
+    if name not in toolkit_function_names(toolkit):
+        return None
+    finishing = _FINISHING.get(toolkit, _Finishing())
+    if isinstance(toolkit, authoring.Toolkit):
+        return _owned_function(toolkit, name, finishing)
+    function = toolkit.get_async_functions()[name]
+    if (refusal := _refusal(function)) is not None:
+        raise ValueError(refusal)
+    return _adapt(function, finishing)
+
+
 def with_offered_instructions(
-    toolkit: Toolkit,
+    toolkit: AnyToolkit,
     adapted: AdaptedToolkit,
     *,
     authored_instructions: bool,
@@ -289,7 +390,7 @@ def with_offered_instructions(
     return replace(adapted, instructions=None, guidance=None)
 
 
-def _default_named(toolkit: Toolkit, instructions: str) -> frozenset[str]:
+def _default_named(toolkit: AnyToolkit, instructions: str) -> frozenset[str]:
     """Return the functions ``instructions``, the default ones of ``toolkit``, name of those its table row lists."""
     for cls in type(toolkit).__mro__:
         if (names := _DEFAULT_INSTRUCTION_FUNCTIONS.get(f"{cls.__module__}.{cls.__qualname__}")) is not None:
@@ -324,7 +425,7 @@ def adapt_function(function: Function) -> ToolFunction:
     """Return one Agno function as a ``ToolFunction``, refusing it when it sets a field MindRoom refuses."""
     if (refusal := _refusal(function)) is not None:
         raise ValueError(refusal)
-    return _adapt(function)
+    return _adapt(function, _Finishing())
 
 
 def _refusal(function: Function) -> str | None:
@@ -335,62 +436,80 @@ def _refusal(function: Function) -> str | None:
     return None
 
 
-def _adapt(function: Function) -> ToolFunction:
-    """Derive one function once and return it as a ``ToolFunction`` with its finished schema and the loop's flags.
+def _adapt(function: Function, finishing: _Finishing) -> ToolFunction:
+    """Derive one Agno function once and return it as a ``ToolFunction`` with its finished schema and the loop's flags.
 
-    An Agno function is processed on a copy, because ``process_entrypoint`` rewrites a user-authored schema in place
-    and replaces the entrypoint with its coercing wrapper, so the shared ``Function`` stays untouched for whoever else
-    holds it; an owned one is derived by ``_owned_definition``. A MindRoom wrapper that forges its entrypoint's
-    signature declares how the schema derived from it is completed. A field MindRoom refuses is left unread.
+    It is processed on a copy, because ``process_entrypoint`` rewrites a user-authored schema in place and replaces
+    the entrypoint with its coercing wrapper, so the shared ``Function`` stays untouched for whoever else holds it. A
+    field MindRoom refuses is left unread.
     """
     if function.entrypoint is None:
         msg = f"Tool function {function.name!r} has no entrypoint"
         raise ValueError(msg)
-    if isinstance(function, _OwnedFunction):
-        description, parameters, entrypoint = _owned_definition(function, function.entrypoint)
-        injected: dict[str, InjectedValue] = {}
-        processed = True
-    else:
-        prepared = function.model_copy(deep=False)
-        prepared.parameters = deepcopy(function.parameters)
-        # An explicit strict setting on the function wins; MindRoom never asks Agno for strict schemas otherwise.
-        prepared.process_entrypoint(strict=bool(function.strict))
-        assert prepared.entrypoint is not None
-        description, parameters, entrypoint = prepared.description, prepared.parameters, prepared.entrypoint
-        injected = injected_parameters(function.entrypoint)
-        processed = not function.skip_entrypoint_processing
+    authored = function.skip_entrypoint_processing or function.parameters != AGNO_EMPTY_PARAMETERS
+    entrypoint, output_files = finishing.entrypoint(
+        function.name,
+        function.entrypoint,
+        function.parameters if authored else None,
+    )
+    prepared = function.model_copy(deep=False)
+    prepared.entrypoint = entrypoint
+    prepared.parameters = deepcopy(function.parameters)
+    strict = False if output_files else function.strict
+    # An explicit strict setting on the function wins; MindRoom never asks Agno for strict schemas otherwise.
+    prepared.process_entrypoint(strict=bool(strict))
+    assert prepared.entrypoint is not None
     return ToolFunction(
         name=function.name,
-        description=description,
-        parameters=finished_tool_schema(function.entrypoint, parameters),
-        strict=function.strict,
+        description=prepared.description,
+        parameters=with_optional_output_path(prepared.parameters) if output_files else prepared.parameters,
+        strict=strict,
         requires_confirmation=function.requires_confirmation,
         approval_type=function.approval_type,
         external_execution=function.external_execution,
         external_execution_silent=function.external_execution_silent,
         stop_after_call=function.stop_after_tool_call,
-        entrypoint=entrypoint,
-        injected_params=injected,
-        entrypoint_processed=processed,
+        entrypoint=prepared.entrypoint,
+        injected_params=injected_parameters(function.entrypoint),
+        entrypoint_processed=not function.skip_entrypoint_processing,
     )
 
 
-def _owned_definition(
-    function: _OwnedFunction,
-    entrypoint: Callable[..., Any],
-) -> tuple[str, dict[str, Any], Callable[..., Any]]:
-    """Return an owned function's description, schema, and validating entrypoint, derived without Agno.
+def _owned_function(toolkit: authoring.Toolkit, name: str, finishing: _Finishing) -> ToolFunction:
+    """Derive one function of an owned toolkit without Agno: its description, schema, and entrypoint.
 
-    A parameter through which Agno would hand over a framework object is refused, because nothing fills it.
+    A function ``passthrough_tool`` marked keeps its schema and takes its arguments unvalidated; any other is derived
+    from its signature and docstring and validates its arguments. The toolkit's ``offered_function`` then fits it to
+    the instance, before its schema offers ``mindroom_output_path``. A parameter through which Agno would hand over a
+    framework object is refused, because nothing fills it.
     """
-    if taken := sorted(_FRAMEWORK_OBJECT_NAMES.intersection(inspect.signature(entrypoint).parameters)):
+    function = toolkit.functions[name]
+    if taken := sorted(_FRAMEWORK_OBJECT_NAMES.intersection(inspect.signature(function).parameters)):
         msg = (
-            f"Tool function {function.name!r} takes {', '.join(taken)}, which only Agno toolkits are handed;"
+            f"Tool function {name!r} takes {', '.join(taken)}, which only Agno toolkits are handed;"
             " read the call through current_call() instead"
         )
         raise ValueError(msg)
-    description = function.description or tool_description(entrypoint)
-    return description, tool_parameters(entrypoint), validated_entrypoint(entrypoint)
+    authored = authoring.authored_parameters(function)
+    entrypoint, output_files = finishing.entrypoint(name, function, authored)
+    derived = authored is None
+    # TODO(simplify): a derived function carries the False flags Agno's registration sets, and one a schema defines
+    # leaves them None as an Agno function built from a definition does; the loop reads both as False.
+    unset = False if derived else None
+    offered = toolkit.offered_function(
+        ToolFunction(
+            name=name,
+            description=authoring.authored_description(function) or (tool_description(entrypoint) if derived else None),
+            parameters=tool_parameters(entrypoint) if authored is None else deepcopy(authored),
+            requires_confirmation=unset,
+            external_execution=unset,
+            entrypoint=validated_entrypoint(entrypoint) if derived else entrypoint,
+            entrypoint_processed=derived,
+        ),
+    )
+    if not output_files:
+        return offered
+    return replace(offered, parameters=with_optional_output_path(offered.parameters), strict=False)
 
 
 def injected_parameters(entrypoint: Callable[..., Any]) -> dict[str, InjectedValue]:
@@ -635,18 +754,25 @@ def _owned_file(file: AgnoFile) -> File:
 
 __all__ = [
     "AGNO_EMPTY_PARAMETERS",
+    "AnyToolkit",
     "Function",
     "FunctionScopedInstructions",
     "StreamCollector",
     "ToolCallActor",
     "Toolkit",
+    "adapt_callable",
     "adapt_function",
     "adapt_toolkit",
+    "configure_toolkit_functions",
     "framework_arguments",
     "injected_parameters",
     "model_arguments",
     "offered_refusal",
     "read_tool_value",
+    "rename_toolkit_functions",
+    "requires_connect",
+    "toolkit_function",
+    "toolkit_function_names",
     "warm_agno_tool_imports",
     "with_offered_instructions",
 ]

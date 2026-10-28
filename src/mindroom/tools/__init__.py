@@ -172,7 +172,7 @@ from mindroom.tools.zep import zep_tools
 from mindroom.tools.zoom import zoom_tools
 
 if TYPE_CHECKING:
-    from agno.tools import Toolkit
+    from mindroom.tool_system.authoring import Toolkit
 
 
 __all__ = [
@@ -334,7 +334,7 @@ __all__ = [
 )
 def _openclaw_compat_tools() -> type[Toolkit]:
     """Return an empty toolkit — the real tools are loaded via tool preset expansion."""
-    from agno.tools import Toolkit
+    from mindroom.tool_system.authoring import Toolkit
 
     return Toolkit
 

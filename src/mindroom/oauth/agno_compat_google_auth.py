@@ -52,20 +52,19 @@ class AgnoGoogleAuthBindingMixin:
         self._authenticate()
         return self.creds
 
+    def _oauth_entrypoint(self, entrypoint: Callable[..., object]) -> Callable[..., object]:
+        """Return ``entrypoint`` called through the owner's call policy, with its signature for schema derivation."""
+
+        @wraps(entrypoint)
+        def oauth_entrypoint(*args: object, **kwargs: object) -> object:
+            return self._run_oauth_entrypoint(entrypoint, args, kwargs)
+
+        return oauth_entrypoint
+
     def _wrap_oauth_function_entrypoints(self) -> None:
-        """Route each registered Agno Function through the owner's call policy."""
+        """Route each registered Agno Function, and a direct call of its method, through the owner's call policy."""
         for function in self.functions.values():
-            entrypoint = function.entrypoint
-            if entrypoint is None:
+            if function.entrypoint is None:
                 continue
-
-            @wraps(entrypoint)
-            def oauth_entrypoint(
-                *args: object,
-                _entrypoint: Callable[..., object] = entrypoint,
-                **kwargs: object,
-            ) -> object:
-                return self._run_oauth_entrypoint(_entrypoint, args, kwargs)
-
-            function.entrypoint = oauth_entrypoint
-            setattr(self, function.name, oauth_entrypoint)
+            function.entrypoint = self._oauth_entrypoint(function.entrypoint)
+            setattr(self, function.name, function.entrypoint)

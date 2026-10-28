@@ -16,6 +16,7 @@ import pytest
 from mindroom.constants import RuntimePaths, resolve_runtime_paths, workspace_home_identity_env
 from mindroom.shell.execution import _MAX_OUTPUT_BYTES
 from mindroom.tool_jobs.control import JobControl, job_control_context
+from mindroom.tool_system.agno_toolkits import toolkit_function
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.progress import tool_progress_reporter
 from mindroom.tool_system.tool_environment import ToolEnvironment
@@ -28,10 +29,9 @@ from mindroom.tools.shell import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from agno.tools.function import Function
-    from agno.tools.toolkit import Toolkit
-
     from mindroom.constants import RuntimePaths
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
+    from mindroom.tool_system.tool_function import ToolFunction
 
 
 def _make_runtime_paths(tmp_path: Path, *, process_env: dict[str, str] | None = None) -> RuntimePaths:
@@ -48,7 +48,7 @@ def _make_runtime_paths(tmp_path: Path, *, process_env: dict[str, str] | None = 
     )
 
 
-def _get_toolkit(tmp_path: Path) -> Toolkit:
+def _get_toolkit(tmp_path: Path) -> AnyToolkit:
     runtime_paths = _make_runtime_paths(tmp_path)
     return get_tool_by_name("shell", runtime_paths, disable_sandbox_proxy=True, worker_target=None)
 
@@ -114,8 +114,10 @@ async def _stop_recorded_child(pid: int, stop_file: Path) -> None:
     raise AssertionError(message)
 
 
-def _get_run_shell_command_function(tool: Toolkit) -> Function:
-    return tool.async_functions["run_shell_command"]
+def _get_run_shell_command_function(tool: AnyToolkit) -> ToolFunction:
+    function = toolkit_function(tool, "run_shell_command")
+    assert function is not None
+    return function
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +129,7 @@ def _get_run_shell_command_function(tool: Toolkit) -> Function:
 async def test_run_shell_command_returns_output(tmp_path: Path) -> None:
     """Fast command should return stdout directly."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["echo", "hello world"])
@@ -138,7 +140,7 @@ async def test_run_shell_command_returns_output(tmp_path: Path) -> None:
 async def test_run_shell_command_bash_echo_returns_output(tmp_path: Path) -> None:
     """Normal shell output should still be returned."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["bash", "-lc", "echo hello"])
@@ -149,7 +151,7 @@ async def test_run_shell_command_bash_echo_returns_output(tmp_path: Path) -> Non
 async def test_run_shell_command_accepts_shell_command_string(tmp_path: Path) -> None:
     """Natural shell command strings should execute through bash."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint("echo $HOME")
@@ -168,7 +170,7 @@ async def test_run_shell_command_accepts_shell_command_string(tmp_path: Path) ->
 async def test_implicit_shell_does_not_run_login_startup(tmp_path: Path, command: str | list[str]) -> None:
     """Ordinary commands must not pay for or acquire side effects from login profiles."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
     assert await entrypoint(command) == "plain"
 
@@ -177,7 +179,7 @@ async def test_implicit_shell_does_not_run_login_startup(tmp_path: Path, command
 async def test_explicit_login_shell_remains_available(tmp_path: Path) -> None:
     """Callers opting into login initialization still get it."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
     assert await entrypoint(["bash", "-lc", "shopt -q login_shell && echo login"]) == "login"
 
@@ -197,7 +199,7 @@ async def test_run_shell_command_accepts_bracketed_shell_command_strings(
 ) -> None:
     """Shell grammar that starts with JSON-like characters should still execute through bash."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(command)
@@ -208,7 +210,7 @@ async def test_run_shell_command_accepts_bracketed_shell_command_strings(
 async def test_run_shell_command_accepts_single_item_shell_command_line(tmp_path: Path) -> None:
     """LLMs often send one shell command line inside the argv array."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["printf '%s' ok"])
@@ -230,7 +232,7 @@ def test_run_shell_command_schema_accepts_string_or_string_array(tmp_path: Path)
 async def test_run_shell_command_parses_json_string_args(tmp_path: Path) -> None:
     """JSON-stringified args should be parsed into a shell argv list."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint('["echo", "hello world"]')
@@ -241,7 +243,7 @@ async def test_run_shell_command_parses_json_string_args(tmp_path: Path) -> None
 async def test_run_shell_command_parses_single_item_json_args(tmp_path: Path) -> None:
     """A single command item in JSON string form should execute normally."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint('["ls"]')
@@ -264,7 +266,7 @@ async def test_run_shell_command_parses_single_item_json_args(tmp_path: Path) ->
 async def test_run_shell_command_rejects_invalid_stringified_args(tmp_path: Path, args: str) -> None:
     """Malformed or non-flat stringified args should fail validation."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(args)
@@ -276,7 +278,7 @@ async def test_run_shell_command_rejects_invalid_stringified_args(tmp_path: Path
 async def test_run_shell_command_empty_json_list_uses_existing_empty_behavior(tmp_path: Path) -> None:
     """An empty JSON list should fall through to the existing subprocess error path."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint("[]")
@@ -288,7 +290,7 @@ async def test_run_shell_command_empty_json_list_uses_existing_empty_behavior(tm
 async def test_run_shell_command_entrypoint_returns_error_for_empty_string_args(tmp_path: Path, args: str) -> None:
     """Direct entrypoint calls should return validation errors instead of raising."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(args)
@@ -300,7 +302,7 @@ async def test_run_shell_command_entrypoint_returns_error_for_empty_string_args(
 async def test_run_shell_command_returns_error_on_nonzero_exit(tmp_path: Path) -> None:
     """Non-zero exit should return its exit code and stderr."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["bash", "-c", "echo oops >&2; exit 1"])
@@ -311,7 +313,7 @@ async def test_run_shell_command_returns_error_on_nonzero_exit(tmp_path: Path) -
 async def test_run_shell_command_preserves_stdout_receipt_on_nonzero_exit(tmp_path: Path) -> None:
     """A nonterminal CLI receipt on stdout must retain its continuation handle."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["bash", "-c", 'printf \'{"status":"queued","call_id":"call-1"}\'; exit 3'])
@@ -323,7 +325,7 @@ async def test_run_shell_command_preserves_stdout_receipt_on_nonzero_exit(tmp_pa
 async def test_run_shell_command_preserves_both_failure_streams(tmp_path: Path) -> None:
     """Useful stdout must not displace the existing stderr failure detail."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["bash", "-c", "printf receipt; printf warning >&2; exit 3"])
@@ -336,7 +338,7 @@ async def test_run_shell_command_preserves_both_failure_streams(tmp_path: Path) 
 async def test_run_shell_command_returns_after_foreground_exit_with_inherited_pipe_child(tmp_path: Path) -> None:
     """Regression: tmux/auth helpers/watchers/daemons can inherit pipes after foreground exit."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     pid_file = tmp_path / "child.pid"
@@ -367,7 +369,7 @@ async def test_run_shell_command_returns_after_foreground_exit_with_inherited_pi
 async def test_run_shell_command_nonzero_foreground_exit_with_inherited_pipe_child(tmp_path: Path) -> None:
     """Nonzero foreground exit should return buffered stderr without waiting for descendant EOF."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     pid_file = tmp_path / "child-error.pid"
@@ -403,7 +405,7 @@ async def test_run_shell_command_nonzero_foreground_exit_with_inherited_pipe_chi
 async def test_run_shell_command_tail_parameter(tmp_path: Path) -> None:
     """Only the last N lines should be returned."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["bash", "-c", "for i in $(seq 1 20); do echo line$i; done"], tail=3)
@@ -415,7 +417,7 @@ async def test_run_shell_command_tail_parameter(tmp_path: Path) -> None:
 async def test_run_shell_command_truncates_large_output_by_bytes(tmp_path: Path) -> None:
     """A small line count with very large lines should not return an unbounded result."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     script = "for i in range(120): print(f'{i:03d}:' + 'x' * 1000)"
@@ -431,7 +433,7 @@ async def test_run_shell_command_truncates_large_output_by_bytes(tmp_path: Path)
 async def test_run_shell_command_truncates_large_stderr_by_bytes(tmp_path: Path) -> None:
     """Large stderr from failed commands should be byte-capped too."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     script = "import sys\nfor i in range(120): print(f'{i:03d}:' + 'x' * 1000, file=sys.stderr)\nsys.exit(1)\n"
@@ -447,7 +449,7 @@ async def test_run_shell_command_truncates_large_stderr_by_bytes(tmp_path: Path)
 async def test_run_shell_command_truncates_many_short_lines_by_rendered_bytes(tmp_path: Path) -> None:
     """Rendered newline separators should be included in the output byte cap."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     script = "for _ in range(10000): print('xxxxxx')"
@@ -461,7 +463,7 @@ async def test_run_shell_command_truncates_many_short_lines_by_rendered_bytes(tm
 async def test_run_shell_command_truncates_oversized_single_stdout_line(tmp_path: Path) -> None:
     """Output without newlines should still be retained and byte-capped."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint([sys.executable, "-c", "import sys; sys.stdout.write('A' * 100000)"])
@@ -475,7 +477,7 @@ async def test_run_shell_command_truncates_oversized_single_stdout_line(tmp_path
 async def test_run_shell_command_truncates_oversized_single_stderr_line(tmp_path: Path) -> None:
     """Oversized stderr lines should be surfaced instead of skipped."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(
@@ -491,7 +493,7 @@ async def test_run_shell_command_truncates_oversized_single_stderr_line(tmp_path
 async def test_run_shell_command_error_on_bad_command(tmp_path: Path) -> None:
     """Non-existent command should return an error."""
     tool = _get_toolkit(tmp_path)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["__nonexistent_command_xyz__"])
@@ -509,7 +511,7 @@ async def test_run_shell_command_respects_base_dir(tmp_path: Path) -> None:
         worker_target=None,
         tool_init_overrides={"base_dir": str(tmp_path)},
     )
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["pwd"])
@@ -525,8 +527,7 @@ def test_shell_registers_only_run_shell_command(tmp_path: Path) -> None:
     """A job is how a long command runs in the background, so the shell has no handle functions."""
     tool = _get_toolkit(tmp_path)
 
-    assert list(tool.async_functions) == ["run_shell_command"]
-    assert tool.functions == {}
+    assert list(tool.functions) == ["run_shell_command"]
 
 
 def test_shell_disabled_registers_no_tools(tmp_path: Path) -> None:
@@ -535,8 +536,7 @@ def test_shell_disabled_registers_no_tools(tmp_path: Path) -> None:
 
     cls = shell_tools()
     toolkit = cls(enable_run_shell_command=False, runtime_paths=runtime_paths)
-    assert len(toolkit.functions) == 0
-    assert len(toolkit.async_functions) == 0
+    assert toolkit.functions == {}
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +653,7 @@ async def test_local_shell_replaces_stale_agent_workspace_env(tmp_path: Path) ->
         worker_target=None,
         tool_init_overrides={"base_dir": str(workspace)},
     )
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint('printf %s "$MINDROOM_AGENT_WORKSPACE"')
@@ -672,7 +672,7 @@ def test_run_shell_command_description_uses_portable_workspace_paths(tmp_path: P
         tool_init_overrides={"base_dir": str(workspace)},
     )
 
-    description = tool.async_functions["run_shell_command"].description
+    description = _get_run_shell_command_function(tool).description
     assert description is not None
     assert "Always use relative paths" in description
     assert "$MINDROOM_AGENT_WORKSPACE" in description
@@ -698,7 +698,7 @@ def test_proxied_run_shell_command_description_does_not_claim_host_home(tmp_path
         tool_init_overrides={"base_dir": str(workspace)},
     )
 
-    description = tool.async_functions["run_shell_command"].description
+    description = _get_run_shell_command_function(tool).description
     assert description is not None
     assert "worker-routed execution maps `~` to the workspace" in description
     assert "`~` and `$HOME` point at the host home" not in description
@@ -708,7 +708,7 @@ def test_run_shell_command_description_has_no_workspace_note_without_base_dir(tm
     """Without a workspace there is no cwd contract to describe, but the working method still applies."""
     tool = _get_toolkit(tmp_path)
 
-    description = tool.async_functions["run_shell_command"].description
+    description = _get_run_shell_command_function(tool).description
     assert description is not None
     assert "[cwd:" not in description
     assert description.count("Working method:") == 1
@@ -729,7 +729,7 @@ async def test_env_passthrough_preserved(tmp_path: Path) -> None:
         process_env={},
     )
     tool = get_tool_by_name("shell", runtime_paths, disable_sandbox_proxy=True, worker_target=None)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["bash", "-lc", "printf '%s' \"$MY_TEST_VAR\""])
@@ -764,7 +764,7 @@ async def test_login_bash_preserves_runtime_path_after_profile_reset(tmp_path: P
         process_env={"PATH": "/worker-env/bin:/usr/bin:/bin"},
     )
     tool = get_tool_by_name("shell", runtime_paths, disable_sandbox_proxy=True, worker_target=None)
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint([str(fake_bash), "-lc", "printf '%s' \"$PATH\""])
@@ -783,7 +783,7 @@ async def test_run_shell_command_stops_a_command_past_its_timeout(tmp_path: Path
         worker_target=None,
         tool_init_overrides={"base_dir": str(tmp_path)},
     )
-    entrypoint = tool.async_functions["run_shell_command"].entrypoint
+    entrypoint = tool.functions["run_shell_command"]
     assert entrypoint is not None
 
     result = await entrypoint(["bash", "-c", "echo started; sleep 300"], timeout=1)

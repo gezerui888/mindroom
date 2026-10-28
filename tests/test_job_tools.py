@@ -162,7 +162,7 @@ async def test_job_wait_waits_and_restores_rich_result(tmp_path: Path) -> None:
             assert [image.content for image in result.images] == [b"proof"]
             assert result.content == "answer"
             assert json.loads(await tools.job("list"))[0]["job_id"] == "ordinary"
-            assert set(tools.get_async_functions()) == {"job"}
+            assert set(tools.functions) == {"job"}
     finally:
         await runtime.shutdown()
 

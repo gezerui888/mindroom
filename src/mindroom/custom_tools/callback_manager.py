@@ -8,7 +8,6 @@ from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agno.tools import Toolkit
 from pydantic import ValidationError
 
 from mindroom.callbacks.script import build_callback_script, write_callback_script
@@ -26,6 +25,7 @@ from mindroom.external_triggers.store import (
     ExternalTriggerTarget,
 )
 from mindroom.runtime_state import get_api_server_address
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.worker_routing import agent_workspace_root_path
 
 if TYPE_CHECKING:

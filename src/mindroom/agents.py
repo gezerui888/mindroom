@@ -60,9 +60,10 @@ from mindroom.tool_jobs.execution import JobActor, approval_can_run_as_job, asse
 from mindroom.tool_jobs.settings import background_tool_jobs_enabled, toolkit_is_background_excluded
 from mindroom.tool_system.agent_tool_calls import DeferredAgentToolkit
 from mindroom.tool_system.agno_toolkits import (
-    adapt_function,
     adapt_toolkit,
+    configure_toolkit_functions,
     offered_refusal,
+    toolkit_function_names,
     with_offered_instructions,
 )
 from mindroom.tool_system.catalog import (
@@ -88,7 +89,7 @@ from mindroom.tool_system.dynamic_toolkits import (
     defer_toolkit,
     visible_tool_surface,
 )
-from mindroom.tool_system.output_files import ToolOutputFilePolicy, wrap_toolkit_for_output_files
+from mindroom.tool_system.output_files import ToolOutputFilePolicy
 from mindroom.tool_system.plugins import load_plugins
 from mindroom.tool_system.runtime_context import ToolDispatchContext
 from mindroom.tool_system.sandbox_proxy import sandbox_proxy_enabled_for_tool
@@ -119,7 +120,7 @@ if TYPE_CHECKING:
     from mindroom.knowledge.search import AgentKnowledge
     from mindroom.llm.provider import ModelProvider
     from mindroom.session_storage.store import ConversationStore
-    from mindroom.tool_system.agno_toolkits import Toolkit
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
     from mindroom.tool_system.invocation import ToolCall, ToolMiddleware, ToolNext
     from mindroom.tool_system.skills import RefusedWorkspaceSkill, SkillsToolkit
     from mindroom.tool_system.tool_function import ToolFunction
@@ -168,7 +169,7 @@ class _ToolkitEntry:
     """
 
     adapted: AdaptedToolkit
-    toolkit: Toolkit | None = None
+    toolkit: AnyToolkit | None = None
     deferral: ToolDeferral | None = None
 
 
@@ -193,7 +194,7 @@ class _AgentToolAssembly:
         """Return the toolkits a run offers, in offer order."""
         return tuple(entry.adapted for entry in self.entries)
 
-    def job_sources(self) -> tuple[tuple[Toolkit, ToolFunction], ...]:
+    def job_sources(self) -> tuple[tuple[AnyToolkit, ToolFunction], ...]:
         """Return each function a run offers of a configured toolkit with the toolkit built for it, as tool jobs see it."""
         return tuple(
             (entry.toolkit, function)
@@ -658,10 +659,10 @@ class _MatrixRoomRuntimeToolCollisionError(ValueError):
     """Raised when another registered tool claims a reserved runtime function."""
 
 
-def _reject_matrix_room_runtime_tool_function_collisions(registered_tool_name: str, toolkit: Toolkit) -> None:
+def _reject_matrix_room_runtime_tool_function_collisions(registered_tool_name: str, toolkit: AnyToolkit) -> None:
     """Keep reserved room-runtime functions owned by their registered built-in tool, whatever else the toolkit holds."""
     reserved_names = set(MATRIX_ROOM_RUNTIME_TOOL_NAMES)
-    function_names = set(toolkit.get_async_functions())
+    function_names = set(toolkit_function_names(toolkit))
     collisions = sorted(name for name in function_names & reserved_names if registered_tool_name != name)
     if collisions:
         msg = f"Tool function name(s) {', '.join(collisions)} are reserved for Matrix room recovery tools."
@@ -715,7 +716,7 @@ def build_agent_toolkit(  # noqa: C901, PLR0911, PLR0912
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
     persona: SubagentPersona | None = None,
     deferred_toolkits: Callable[[], Sequence[DeferredToolkit]] | None = None,
-) -> Toolkit | None:
+) -> AnyToolkit | None:
     """Build one configured toolkit for an agent.
 
     ``persona`` is an authored subagent's persona; its ``delegate`` toolkit keeps
@@ -741,16 +742,16 @@ def build_agent_toolkit(  # noqa: C901, PLR0911, PLR0912
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
     shared_storage_path = shared_storage_root(storage_path)
 
-    def constructed(toolkit: Toolkit) -> Toolkit:
+    def constructed[T: AnyToolkit](toolkit: T) -> T:
         return bind_toolkit_construction(
             toolkit,
             ToolConstruction(tool_name, None, tool_config_signature(tool_config_overrides)),
         )
 
-    def wrap_direct(toolkit: Toolkit) -> Toolkit:
+    def wrap_direct[T: AnyToolkit](toolkit: T) -> T:
         threshold = config.defaults.tool_output_auto_save_threshold_bytes
         policy = _agent_tool_output_file_policy(agent_runtime, runtime_paths, threshold)
-        return constructed(wrap_toolkit_for_output_files(toolkit, policy))
+        return constructed(configure_toolkit_functions(toolkit, output_files=policy))
 
     if tool_name == "memory":
         if config.resolve_entity(agent_name).memory_backend == "none":
@@ -1121,7 +1122,7 @@ def _approval_may_gate(
 
 def apply_tool_approval_capability(
     adapted: AdaptedToolkit,
-    toolkit: Toolkit,
+    toolkit: AnyToolkit,
     config: Config,
     *,
     registered_tool_name: str,
@@ -1414,7 +1415,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
         return entry
 
     def offered_entry(
-        toolkit: Toolkit,
+        toolkit: AnyToolkit,
         adapted: AdaptedToolkit,
         tool_entry: EffectiveToolConfig,
         authored_name: str,
@@ -1712,7 +1713,7 @@ def _build_agent_instructions(
     return instructions
 
 
-def _job_controls_entry(controls: Toolkit) -> _ToolkitEntry:
+def _job_controls_entry(controls: AnyToolkit) -> _ToolkitEntry:
     """Assemble the job controls as their own authored toolkit, which no approval rule gates.
 
     The loop runs the caller's tool hooks around their calls as around any other, but they never ask for approval:
@@ -1796,9 +1797,7 @@ def _generated_entries(
     """
     generated: list[AdaptedToolkit] = []
     if knowledge is not None:
-        search = adapt_function(
-            knowledge.search_function(memory_search_available=_offers_function(entries, _MEMORY_SEARCH_TOOL_NAME)),
-        )
+        search = knowledge.search_function(memory_search_available=_offers_function(entries, _MEMORY_SEARCH_TOOL_NAME))
         if generated_visible(search):
             generated.append(AdaptedToolkit(name=KNOWLEDGE_SEARCH_TOOL_NAME, functions=(search,), instructions=None))
     if skills is not None and (visible_skills := _keep_functions(adapt_toolkit(skills), generated_visible)).functions:

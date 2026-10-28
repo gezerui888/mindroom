@@ -20,7 +20,7 @@ from docstring_parser import parse
 from pydantic import BaseModel, ConfigDict, validate_call
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Mapping
 
 _JSON_TYPES = {
     "int": "integer",
@@ -71,6 +71,22 @@ def tool_parameters(entrypoint: Callable[..., Any]) -> dict[str, Any]:
         if parameter.default is inspect.Parameter.empty and name in properties
     ]
     return {"type": "object", "properties": properties, "required": required}
+
+
+def authored_parameters(entrypoint: Callable[..., Any], parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``parameters``, the schema a toolkit authored for ``entrypoint`` in place of the derived one, completed.
+
+    As Agno completes an authored schema whose arguments it still validates, it requires each of its properties the
+    signature gives no default, and admits no other property.
+    """
+    # TODO(simplify): the toolkits that author a schema could state its required properties and closure themselves.
+    properties = parameters.get("properties") or {}
+    required = [
+        name
+        for name, parameter in inspect.signature(entrypoint).parameters.items()
+        if parameter.default is inspect.Parameter.empty and name in properties
+    ]
+    return {**parameters, "required": required, "additionalProperties": False}
 
 
 def validated_entrypoint[F: Callable[..., Any]](entrypoint: F) -> F:
@@ -183,4 +199,4 @@ def _inlined(node: Any, definitions: dict[str, Any], active: frozenset[str]) -> 
     return _inlined(definitions[name], definitions, active | {name})
 
 
-__all__ = ["tool_description", "tool_parameters", "validated_entrypoint"]
+__all__ = ["authored_parameters", "tool_description", "tool_parameters", "validated_entrypoint"]

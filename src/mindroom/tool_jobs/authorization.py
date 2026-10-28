@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
     from mindroom.config.models import EffectiveToolConfig
-    from mindroom.tool_system.agno_toolkits import Toolkit
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 
@@ -31,7 +31,7 @@ def authority_snapshot(config: Config, agent_name: str) -> dict[str, Any]:
     return {"scope": policy.effective_execution_scope, "file_access": config.resolve_entity(agent_name).file_access}
 
 
-def toolkit_authority(snapshot: Mapping[str, Any], toolkit: Toolkit) -> dict[str, Any]:
+def toolkit_authority(snapshot: Mapping[str, Any], toolkit: AnyToolkit) -> dict[str, Any]:
     """Return the evidence a toolkit's calls are granted by: the actor's snapshot and the toolkit's construction."""
     construction = get_toolkit_construction(toolkit)
     return {

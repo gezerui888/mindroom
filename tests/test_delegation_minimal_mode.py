@@ -23,6 +23,7 @@ from mindroom.custom_tools.delegate import DelegateTools
 from mindroom.delegation.state import DelegationChild
 from mindroom.response_turn import ResponseTurnContext
 from mindroom.runtime_state import clear_api_server_address, set_api_server_address
+from mindroom.tool_system.agno_toolkits import toolkit_function
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from tests.delegation_helpers import ScriptedAgents, _delegate_runtime_context
 from tests.fakes.scripted_model import ScriptedModel, answer, calls, tool_call
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from mindroom.agent_modes import AgentMode
     from mindroom.constants import RuntimePaths
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.tool_function import ToolFunction
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 _LONG_ROLE = "optional long role " * 200
@@ -112,7 +114,7 @@ async def _delegate(
     The native call's result is what the leader's next request answers the call with.
     """
     if leader is None:
-        return await toolkit.async_functions[tool_name].entrypoint(**arguments)
+        return await toolkit.functions[tool_name](**arguments)
     call_id = f"{tool_name}-call-{len(leader.requests)}"
     leader.turns.extend([calls(tool_call(tool_name, call_id, **arguments)), answer("Parent done")])
     result = await ai.ai_response(
@@ -131,13 +133,20 @@ async def _delegate(
     )
 
 
+def _run_subagent(toolkit: DelegateTools) -> ToolFunction:
+    """Return ``run_subagent`` as an agent offered ``toolkit`` is offered it."""
+    function = toolkit_function(toolkit, "run_subagent")
+    assert function is not None
+    return function
+
+
 def test_authoring_guidance_mentions_minimal_only_when_offered(tmp_path: Path) -> None:
     """A caller authoring its own copies is told minimal=true overrides a profile only when it can pass minimal."""
     config = _config(helper_tools=["shell"])
 
     def guidance() -> str:
         toolkit = DelegateTools("helper", ["helper"], _paths(tmp_path, {}), config)
-        return toolkit.async_functions["run_subagent"].description or ""
+        return _run_subagent(toolkit).description or ""
 
     # A local shell calls back through the running API, which this test starts only below.
     assert "minimal=true" not in guidance()
@@ -153,8 +162,7 @@ def test_minimal_option_is_advertised_only_for_capable_subagents(tmp_path: Path)
     config = _config(helper_tools=["shell"])
 
     def offered(toolkit: DelegateTools) -> bool:
-        function = toolkit.async_functions["run_subagent"]
-        function.process_entrypoint()  # Agno derives the schema the model sees on first use.
+        function = _run_subagent(toolkit)
         has_option = "minimal" in function.parameters["properties"]
         assert has_option == ("minimal mode" in (function.description or ""))
         return has_option
@@ -165,7 +173,7 @@ def test_minimal_option_is_advertised_only_for_capable_subagents(tmp_path: Path)
     set_api_server_address("0.0.0.0", 8765)  # noqa: S104 - the default bind address
     try:
         ready = DelegateTools("leader", ["helper", "plain"], _paths(tmp_path, _CLI_DEPLOYMENT_ENV), config)
-        description = ready.async_functions["run_subagent"].description or ""
+        description = _run_subagent(ready).description or ""
         assert "Subagents that support minimal mode: helper." in description
         assert "not important in its system prompt" in description
         # Hiding the option must not change the schema other callers receive.

@@ -10,17 +10,17 @@ from uuid import uuid4
 from mindroom.attachments.storage import register_bytes_attachment
 from mindroom.providers.registry import model_capabilities
 from mindroom.tool_system.runtime_context import append_tool_runtime_attachment_id, get_tool_runtime_context
-from mindroom.tool_system.tool_function import ToolValue
 
 if TYPE_CHECKING:
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.tool_function import ToolValue
 
 
 def _ready_receipt(result: ToolValue) -> dict[str, Any] | None:
     """Return the JSON receipt of a ready image view, or None when ``result`` is not one."""
     try:
         receipt = json.loads(result.content)
-    except (ValueError, TypeError):
+    except ValueError:
         return None
     return receipt if isinstance(receipt, dict) and receipt.get("view_status") == "ready" else None
 
@@ -77,9 +77,9 @@ def _image_marked_unsupported(result: ToolValue, context: ToolRuntimeContext) ->
     return replace(result, content=json.dumps(receipt, sort_keys=True), images=())
 
 
-def finalize_tool_media(result: object) -> object:
+def finalize_tool_media(result: ToolValue) -> ToolValue:
     """Retain artifacts before reporting a known model-adapter limitation."""
     context = get_tool_runtime_context()
-    if context is None or not isinstance(result, ToolValue) or not result.images:
+    if context is None or not result.images:
         return result
     return _image_marked_unsupported(_retain_tool_media(result, context), context)

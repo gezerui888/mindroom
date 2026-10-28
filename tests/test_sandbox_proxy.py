@@ -7974,3 +7974,54 @@ def test_proxy_composition_decodes_typed_media_for_every_tool(
         assert result.content == "screen"
         assert result.images
         assert result.images[0].content == b"png"
+
+
+@pytest.mark.parametrize("tool_name", ["browser_mcp", "shell"])
+def test_proxy_composition_finalizes_decoded_media_and_returns_json_as_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tool_name: str,
+) -> None:
+    """A worker's image view is finalized for the calling model; a JSON envelope's value comes back as it is."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    from mindroom.config.models import ModelConfig  # noqa: PLC0415
+    from mindroom.llm.media import Image  # noqa: PLC0415
+    from mindroom.tool_system.media_transport import encode_media_result  # noqa: PLC0415
+    from mindroom.tool_system.runtime_context import tool_runtime_context  # noqa: PLC0415
+    from mindroom.tool_system.tool_function import ToolValue  # noqa: PLC0415
+    from tests.test_attachments_tool import _tool_context  # noqa: PLC0415
+
+    context = replace(_tool_context(tmp_path), active_model_name="text_only")
+    context.config.models["text_only"] = ModelConfig(provider="cerebras", id="test-model")
+    viewed = ToolValue(content='{"view_status": "ready"}', images=(Image(content=b"png", mime_type="image/png"),))
+    ordinary = {"mindroom_tool_result": {"version": 777}}
+    responses = iter([encode_media_result(viewed), encode_media_result(ordinary)])
+    paths = _configure_proxy_runtime(
+        monkeypatch,
+        proxy_url="http://sandbox-runner:8765",
+        proxy_token=_TEST_AUTH_TOKEN,
+        execution_mode="selective",
+        proxy_tools={tool_name},
+        credential_policy={},
+    )
+    monkeypatch.setattr(sandbox_proxy_module, "execute_worker_proxy_request", lambda **_kwargs: next(responses))
+
+    def call() -> object:
+        return call_proxy_sync_for_test(
+            runtime_paths=paths,
+            tool_name=tool_name,
+            function_name="browser_take_screenshot",
+            args=(),
+            kwargs={},
+            credentials_manager=None,
+        )
+
+    with tool_runtime_context(context):
+        media = call()
+        plain = call()
+
+    assert isinstance(media, ToolValue)
+    assert not media.images
+    assert json.loads(media.content)["view_status"] == "unsupported"
+    assert plain == ordinary

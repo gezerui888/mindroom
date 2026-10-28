@@ -144,7 +144,7 @@ def _materialize_media(media: _Media, limit: int) -> tuple[_Media, int]:
         raise ValueError(msg) from None
     if isinstance(content, str):
         content = content.encode("utf-8")
-    if not isinstance(content, bytes) or not content or len(content) > limit:
+    if not content or len(content) > limit:
         msg = "Worker media must contain bytes within the byte limit."
         raise ValueError(msg)
     updates = {"content": content, "url": None, "filepath": None, **_inline_metadata(media, declared_mime)}

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast, overload
+from typing import TYPE_CHECKING, Any, overload
 
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
 
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
     from mindroom.history.types import HistoryScope
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
     from mindroom.tool_system.tool_function import ToolFunction
 
@@ -222,15 +223,7 @@ def current_call() -> CurrentCall | None:
     )
 
 
-class _AgnoToolkit(Protocol):
-    """An Agno toolkit, such as a vendor toolkit ``get_tool_by_name`` builds, as ``toolkit_functions`` takes it."""
-
-    def get_async_functions(self) -> Mapping[str, object]:
-        """Return the toolkit's functions by name, each one's async variant where it has one."""
-        ...
-
-
-def toolkit_functions(toolkit: Toolkit | _AgnoToolkit) -> dict[str, Callable[..., Any]]:
+def toolkit_functions(toolkit: AnyToolkit) -> dict[str, Callable[..., Any]]:
     """Return the callables of ``toolkit``'s functions by name, one per name, as an agent's run calls them.
 
     Each validates its arguments; for a toolkit ``get_tool_by_name`` built, each also handles ``mindroom_output_path``
@@ -242,7 +235,7 @@ def toolkit_functions(toolkit: Toolkit | _AgnoToolkit) -> dict[str, Callable[...
     # code calling a toolkit's functions runs inside MindRoom, which has loaded it already.
     from mindroom.tool_system.agno_toolkits import adapt_toolkit  # noqa: PLC0415
 
-    adapted = adapt_toolkit(cast("Any", toolkit))
+    adapted = adapt_toolkit(toolkit)
     return {function.name: function.entrypoint for function in adapted.functions}
 
 

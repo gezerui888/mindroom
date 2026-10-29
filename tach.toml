@@ -2794,7 +2794,6 @@ depends_on = [
     "mindroom.history.types",
     "mindroom.llm",
     "mindroom.logging_config",
-    "mindroom.providers.errors",
     "mindroom.timing",
 ]
 

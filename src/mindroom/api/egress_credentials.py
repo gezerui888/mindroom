@@ -244,7 +244,8 @@ class EgressCredentialService(EgressSourceStatus):
     editor can warn when a service of one's own sets the same one. `restrict_only` marks a service that only limits
     the paths of the other services on its hosts and never has a key or account of its own. `read_only_supported` says
     whether its account can be allowed read-only, and `separate_account` that the account is the service's own, not the
-    one the agent's tools use. `admin_key` marks a service whose one key only an administrator sets, on the dashboard.
+    one the agent's tools use. `admin_key` marks a service whose one key only an administrator sets, on the dashboard,
+    so its `can_manage` is false.
     """
 
     name: str
@@ -348,7 +349,8 @@ async def egress_services_for_agent(
             display_name=service.display_name or name.replace("_", " ").title(),
             description=service.description,
             is_shared=is_shared,
-            can_manage=can_manage,
+            # Only an administrator changes an `admin_key` service's key, on the dashboard.
+            can_manage=can_manage and not service.admin_key,
             source=service_source(config.egress_broker, name),
             rules=rule_summaries(service),
             placeholder_names=list(service.placeholder_env),

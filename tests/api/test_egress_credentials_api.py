@@ -3862,7 +3862,12 @@ def test_an_administrator_key_shows_set_but_this_page_never_changes_it(egress_po
 
     for user, agent in (("alice", "personal"), ("bob", "shared_dev")):
         row = _egress_row(portal, user, agent, "search")
-        assert (row["configured"], row["active_source"], row["admin_key"]) == (True, "key", True)
+        assert (row["configured"], row["active_source"], row["admin_key"], row["can_manage"]) == (
+            True,
+            "key",
+            True,
+            False,
+        )
         for response in (_put_key(portal, user, agent, "search"), _delete_key(portal, user, agent, "search")):
             assert response.status_code == 403, response.text
             assert response.json()["detail"] == "Only an administrator sets this service's key, on the dashboard"

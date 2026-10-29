@@ -1461,6 +1461,25 @@ describe("egress broker service editor", () => {
     expect(listings()).toHaveLength(1);
   });
 
+  it("offers the config's agents to limit a service to, by their display names", async () => {
+    await addMyapi();
+    openMoreOptions();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Agent coder" }));
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "One key for every agent, set only by an administrator",
+      }),
+    );
+    services = [...services, configRow("myapi", "Myapi")];
+    save();
+
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1));
+    expect(updateConfigValue).toHaveBeenCalledWith(
+      ["egress_broker", "services", "myapi"],
+      { preset: "openai", admin_key: true, agents: ["coder"] },
+    );
+  });
+
   it("loads the presets from the dashboard API when an editor opens, not before", async () => {
     render(<EgressBroker />);
     await screen.findByLabelText("GitHub");

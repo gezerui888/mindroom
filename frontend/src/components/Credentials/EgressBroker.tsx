@@ -209,6 +209,7 @@ function ServiceSection({
   onListing: (listing: ServicesListing) => void;
 }) {
   const config = useConfigStore((state) => state.config);
+  const agents = useConfigStore((state) => state.agents);
   const dirtyRoots = useConfigStore((state) => state.dirtyRoots);
   const updateConfigValue = useConfigStore((state) => state.updateConfigValue);
   const restoreConfigValue = useConfigStore(
@@ -402,6 +403,10 @@ function ServiceSection({
           <EgressServiceEditor
             key={editor.kind === "add" ? "add" : `edit:${editor.name}`}
             context="operator"
+            agentOptions={agents.map((agent) => ({
+              id: agent.id,
+              label: agent.display_name || agent.id,
+            }))}
             name={editor.kind === "edit" ? editor.name : undefined}
             service={
               editor.kind === "edit" ? authoredServices[editor.name] : null

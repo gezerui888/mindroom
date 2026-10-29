@@ -3847,3 +3847,37 @@ def test_service_presets_and_log_responses_are_private_and_never_cached(
     for label, response in responses.items():
         assert response.headers["cache-control"] == "private, no-store", label
         assert response.headers["referrer-policy"] == "no-referrer", label
+
+
+_SEARCH = {"rules": [{"host": "api.search.example", "auth": {"type": "bearer"}}]}
+
+
+def test_an_administrator_key_shows_set_but_this_page_never_changes_it(egress_portal: dict[str, Any]) -> None:
+    """Users and credential managers see the administrator's key set for their agents, and cannot set or remove it."""
+    portal = egress_portal
+    portal["payload"]["egress_broker"]["services"]["search"] = {**_SEARCH, "admin_key": True}
+    _republish(portal)
+    manager = get_runtime_credentials_manager(portal["paths"])
+    secrets.save_secret(manager, None, "search", "admin-key")
+
+    for user, agent in (("alice", "personal"), ("bob", "shared_dev")):
+        row = _egress_row(portal, user, agent, "search")
+        assert (row["configured"], row["active_source"], row["admin_key"]) == (True, "key", True)
+        for response in (_put_key(portal, user, agent, "search"), _delete_key(portal, user, agent, "search")):
+            assert response.status_code == 403, response.text
+            assert response.json()["detail"] == "Only an administrator sets this service's key, on the dashboard"
+    assert secrets.load_secret(manager, None, "search") == "admin-key"
+    assert _egress_row(portal, "alice", "personal", "github")["admin_key"] is False
+
+
+def test_a_service_limited_to_other_agents_is_not_offered_for_them(egress_portal: dict[str, Any]) -> None:
+    """Agents a service's list leaves out neither list it nor take a key for it."""
+    portal = egress_portal
+    portal["payload"]["egress_broker"]["services"]["search"] = {**_SEARCH, "agents": ["shared_dev"]}
+    _republish(portal)
+
+    agents = _listed_agents(portal, "bob")
+    assert "search" not in [row["name"] for row in agents["personal"]["services"]]
+    assert "search" in [row["name"] for row in agents["shared_dev"]["services"]]
+    assert _put_key(portal, "alice", "personal", "search").status_code == 404
+    assert _put_key(portal, "bob", "shared_dev", "search").status_code == 204

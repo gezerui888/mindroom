@@ -40,7 +40,7 @@ from mindroom.api.egress_status import (
 from mindroom.egress_broker.env import egress_agent_scope, personal_page_served
 from mindroom.egress_broker.oauth_reuse import set_oauth_reuse
 from mindroom.egress_broker.oauth_source import broker_credential_context
-from mindroom.egress_broker.secrets import PERSONAL_WORKER_SCOPES, delete_secret, save_secret
+from mindroom.egress_broker.secrets import PERSONAL_WORKER_SCOPES, delete_secret, key_target, save_secret
 from mindroom.egress_broker.service import active_audit_log, active_ca_pem
 from mindroom.egress_broker.user_services import ServiceSource, service_source
 from mindroom.oauth.registry import load_oauth_providers_for_snapshot
@@ -65,7 +65,9 @@ class _ServiceStatus(EgressSourceStatus):
     `source` is `config` for the administrator's services and `user` for services the selected scope defines for
     itself, which the panel shows read-only: they are edited on the personal egress page. `restrict_only` marks a
     service that only limits the paths of the other services on its hosts and never has a key or account.
-    `read_only_supported` says whether its account can be allowed read-only.
+    `read_only_supported` says whether its account can be allowed read-only. `admin_key` marks a service whose one key
+    serves every scope, which this panel sets whichever scope is selected, and `agents` lists the agents the service
+    serves (null for every agent); the panel lists it for the other agents too.
     """
 
     name: str
@@ -75,6 +77,8 @@ class _ServiceStatus(EgressSourceStatus):
     rules: list[EgressRuleSummary]
     restrict_only: bool
     read_only_supported: bool
+    admin_key: bool
+    agents: list[str] | None
 
 
 class ServicesResponse(BaseModel):
@@ -136,6 +140,8 @@ async def _load_service_statuses_for_target(
             rules=rule_summaries(service_config),
             restrict_only=service_config.restrict_only,
             read_only_supported=service_config.read_only is not None,
+            admin_key=service_config.admin_key,
+            agents=service_config.agents,
             **asdict(sources),
         )
 
@@ -282,7 +288,7 @@ def put_service_secret(
     body: PutSecretRequest,
     agent_name: Annotated[str | None, Query()] = None,
 ) -> None:
-    """Set an egress service secret.
+    """Set an egress service secret: the selected scope's, or an `admin_key` service's one key whatever the scope.
 
     Raises 404 if the service is neither configured nor one of the selected scope's own services, 422 if the
     secret is invalid or the service takes no key (`key_refusal`).
@@ -292,7 +298,7 @@ def put_service_secret(
         raise HTTPException(status_code=422, detail=refusal)
 
     try:
-        save_secret(target.base_manager, worker_target, name, body.secret)
+        save_secret(target.base_manager, key_target(service, worker_target), name, body.secret)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -303,9 +309,9 @@ def delete_service_secret(
     name: str,
     agent_name: Annotated[str | None, Query()] = None,
 ) -> None:
-    """Delete an egress service secret."""
-    target, worker_target, _service = _resolve_scope_and_service(request, name, agent_name)
-    delete_secret(target.base_manager, worker_target, name)
+    """Delete an egress service secret: the selected scope's, or an `admin_key` service's one key whatever the scope."""
+    target, worker_target, service = _resolve_scope_and_service(request, name, agent_name)
+    delete_secret(target.base_manager, key_target(service, worker_target), name)
 
 
 @router.post("/services/{name}/connect")

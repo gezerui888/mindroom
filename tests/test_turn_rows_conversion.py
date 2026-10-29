@@ -953,7 +953,8 @@ async def test_a_turn_finds_its_room_through_an_earlier_login(journal: Journal) 
     # The current login admitted something else, so the agent has two logins to look the source up under.
     await admit(store.principal(PRINCIPAL), "$other", room_id=ROOMS["b"])
     await admit(store.principal(EARLIER_LOGIN), "$m", room_id=ROOM)
-    await seed_rows(store, every_index(blob(["$m"], response="$r")))
+    # Without a conversation target the room can only come from the admitted events.
+    await seed_rows(store, every_index(blob(["$m"], response="$r", room=None)))
     await store.close()
     journal.opened.remove(store)
 
@@ -964,3 +965,21 @@ async def test_a_turn_finds_its_room_through_an_earlier_login(journal: Journal) 
 
     assert row is not None
     assert row["room_id"] == ROOM
+
+
+async def test_the_runtime_writes_through_a_connection_opened_after_the_upgrade(tmp_path: Path) -> None:
+    """The writer is not the connection the schema upgrade ran on, which keeps the row counts its statistics loaded."""
+    upgraded_on: list[sqlite3.Connection] = []
+    upgrade = upgrades.upgrade_schema
+
+    def recording(transaction: Transaction, inspector: Any) -> None:  # noqa: ANN401
+        upgraded_on.append(transaction.connection)
+        upgrade(transaction, inspector)
+
+    with patch("mindroom.event_journal.sqlite_backend.upgrade_schema", recording):
+        store = EventJournalStore.open_sqlite(tmp_path / "journal.db")
+    try:
+        assert len(upgraded_on) == 1
+        assert store.backend._writer is not upgraded_on[0]
+    finally:
+        await store.close()

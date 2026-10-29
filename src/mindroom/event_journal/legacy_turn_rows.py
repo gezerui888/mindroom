@@ -347,14 +347,13 @@ def _forget_statistics(transaction: Transaction, inspector: SchemaInspector, tab
     """Drop the SQLite statistics the conversion took, so the runtime plans as it did before the upgrade.
 
     SQLite never refreshes them on its own, and the counts of a journal that grows after a small upgrade would steer
-    later plans into scans. PostgreSQL refreshes its statistics itself, so they stay.
+    later plans into scans. The runtime writes through a connection opened after the schema transaction, which loads
+    none of them. PostgreSQL refreshes its statistics itself, so they stay.
     """
     if inspector.dialect is not SQLITE_DIALECT:
         return
     placeholders = ", ".join("?" for _ in tables)
     transaction.execute(f"DELETE FROM sqlite_stat1 WHERE tbl IN ({placeholders})", tuple(tables))  # noqa: S608
-    # The planner keeps the statistics it loaded until told to read them again.
-    transaction.execute("ANALYZE sqlite_schema")
 
 
 def _agent_logins(transaction: Transaction) -> dict[str, tuple[str, ...]]:

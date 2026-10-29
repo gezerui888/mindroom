@@ -51,7 +51,7 @@ from mindroom.session_storage.store import ConversationStore
 from mindroom.teams.envelope import prepare_materialized_team_execution, team_response_stream
 from mindroom.teams.formation import resolve_live_shared_agent_names
 from mindroom.teams.members import build_team_spec, resolve_team_members
-from mindroom.teams.presentation import TeamStreamPresentation, url_safe_member_id
+from mindroom.teams.presentation import TeamStreamPresentation
 from mindroom.teams.spec import TeamMode
 from mindroom.timing import DispatchPipelineTiming
 from mindroom.turn_model import ModelScope, resolve_turn_model
@@ -410,9 +410,9 @@ async def test_a_member_pause_shows_the_member_s_text_and_pending_call_beside_th
     assert "**GeneralAgent**: Member answer.\n\n🔧 `touch` [1] ⏳" in paused.response_text
     restored = _restored(paused, ["general"], show_tool_calls=True)
     assert restored.consensus.startswith("Consensus before approval.")
-    assert [(entry.tool_call_id, entry.scope_key) for entry in restored.tool_trace] == [
-        ("call-touch", "agent:general"),
-        ("call-team", "team"),
+    assert [(entry.tool_call_id, entry.member_id) for entry in restored.tool_trace] == [
+        ("call-touch", "general"),
+        ("call-team", None),
     ]
     assert paused.team_member_model_names == (("general", "general-model"),)
     record, [member] = team.stored_runs()
@@ -442,13 +442,13 @@ async def test_a_member_s_pending_call_gets_its_own_line_under_the_member_s_name
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("show_tool_calls", [True, False])
-async def test_a_pause_keys_a_member_by_its_url_safe_id_and_keeps_its_config_name(
+async def test_a_pause_keys_a_member_by_its_config_name(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     show_tool_calls: bool,
 ) -> None:
-    """Stored documents key a member by Agno's url-safe id; the approval still names the authored member."""
+    """Stored documents key a member by its config name, the name the approval gives the member too."""
     team = _team(
         tmp_path,
         monkeypatch,
@@ -468,12 +468,10 @@ async def test_a_pause_keys_a_member_by_its_url_safe_id_and_keeps_its_config_nam
 
     paused = await _paused(team, show_tool_calls=show_tool_calls)
 
-    member_id = url_safe_member_id("Code_Review")
-    assert member_id == "code-review"
     [member] = paused.response_presentation_state["members"]
-    assert (member["id"], member["config_name"], member["display_name"]) == (member_id, "Code_Review", "Code Review")
+    assert (member["id"], member["display_name"]) == ("Code_Review", "Code Review")
     assert str(member["content"]).startswith("Member answer.")
-    assert paused.tool_trace[0].scope_key == f"agent:{member_id}"
+    assert paused.tool_trace[0].member_id == "Code_Review"
     assert paused.toolkit_owners[("Code_Review", "touch")] == PROBE_TOOL
     require_ordered_pause_presentation(paused, show_tool_calls=show_tool_calls)
 
@@ -498,9 +496,9 @@ async def test_two_members_reusing_one_call_id_keep_their_own_finished_and_pendi
     paused = await _paused(team)
 
     restored = _restored(paused, ["general", "research"], show_tool_calls=True)
-    assert [(entry.scope_key, entry.tool_call_id, entry.type) for entry in restored.tool_trace][:2] == [
-        ("agent:general", "call-1", "tool_call_completed"),
-        ("agent:research", "call-1", "tool_call_started"),
+    assert [(entry.member_id, entry.tool_call_id, entry.type) for entry in restored.tool_trace][:2] == [
+        ("general", "call-1", "tool_call_completed"),
+        ("research", "call-1", "tool_call_started"),
     ]
     assert "🔧 `scope` [1]" in restored.per_member["general"]
     assert "🔧 `touch` [2] ⏳" in restored.per_member["research"]
@@ -1375,9 +1373,9 @@ async def test_a_resume_shows_the_saved_document_first_then_each_change_and_coll
     assert "**GeneralAgent**: Before approval.\n\n🔧 `touch` [1]\n\nAfter approval." in result.response_text
     assert result.response_text.endswith("Done.")
     assert result.metadata_content[AI_RUN_METADATA_KEY]["status"] == "completed"
-    assert [(entry.tool_call_id, entry.scope_key, entry.type) for entry in trace] == [
-        ("call-touch", "agent:general", "tool_call_completed"),
-        ("call-team", "team", "tool_call_completed"),
+    assert [(entry.tool_call_id, entry.member_id, entry.type) for entry in trace] == [
+        ("call-touch", "general", "tool_call_completed"),
+        ("call-team", None, "tool_call_completed"),
     ]
 
 

@@ -25,6 +25,7 @@ __all__ = [
     "Secret",
     "SecretMissing",
     "SecretNeedsReconnect",
+    "SecretNotForAgent",
     "SecretReadOnly",
     "SecretRequest",
     "SecretResult",
@@ -33,6 +34,7 @@ __all__ = [
     "delete_egress_document",
     "delete_secret",
     "is_personal_target",
+    "key_target",
     "load_egress_document",
     "load_secret",
     "save_egress_document",
@@ -52,6 +54,14 @@ type OAuthAccess = Literal["read", "read_write"]
 def is_personal_target(target: ResolvedWorkerTarget | None) -> bool:
     """Return whether `target` has a personal worker scope; None is the global store, which is not personal."""
     return target is not None and target.worker_scope in PERSONAL_WORKER_SCOPES
+
+
+def key_target(service: EgressService, target: ResolvedWorkerTarget | None) -> ResolvedWorkerTarget | None:
+    """Return whose store holds `service`'s key for `target`: the global store for an `admin_key` service, else its own.
+
+    An administrator's key is one key for every scope, so every read and write of it resolves here.
+    """
+    return None if service.admin_key else target
 
 
 def load_egress_document(
@@ -230,7 +240,7 @@ class SecretMissing:
     `reuse_off` means nobody allowed Agent Keys to use the `provider` account for this service, so it was not read
     and there is no link; `requester_owned` says the account is the requester's own, which only they can allow.
     `own_account` means the service's own account is not connected, or with `reuse_off` not allowed, which only its row
-    on the egress page does.
+    on the egress page does. `admin_key` means the service's one key is the administrator's, which nobody else sets.
     """
 
     provider: str | None = None
@@ -238,6 +248,12 @@ class SecretMissing:
     reuse_off: bool = False
     requester_owned: bool = False
     own_account: bool = False
+    admin_key: bool = False
+
+
+@dataclass(frozen=True)
+class SecretNotForAgent:
+    """The service's `agents` list leaves out the requesting agent, so nothing was read."""
 
 
 @dataclass(frozen=True)
@@ -281,7 +297,13 @@ class SecretServiceChanged:
 
 
 type SecretResult = (
-    Secret | SecretMissing | SecretNeedsReconnect | SecretUnavailable | SecretReadOnly | SecretServiceChanged
+    Secret
+    | SecretMissing
+    | SecretNeedsReconnect
+    | SecretUnavailable
+    | SecretReadOnly
+    | SecretServiceChanged
+    | SecretNotForAgent
 )
 
 
@@ -337,12 +359,13 @@ def service_status(
 
     `oauth_status(provider_id, target)` reports the service's OAuth provider for the same target; it is not
     called for services without one. A service with its own account (`oauth_separate_account`) has no key, as the
-    broker never uses one for it. Never returns a secret or token.
+    broker never uses one for it, and an `admin_key` service's key is read from the global store (`key_target`).
+    Never returns a secret or token.
     """
     key = (
         None
         if service.oauth_separate_account
-        else load_egress_document(manager, target, egress_credential_service(name))
+        else load_egress_document(manager, key_target(service, target), egress_credential_service(name))
     )
     oauth = oauth_status(service.oauth_provider, target) if service.oauth_provider is not None else None
     active_source: Literal["key", "oauth"] | None = None

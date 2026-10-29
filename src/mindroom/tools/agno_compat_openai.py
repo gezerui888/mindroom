@@ -101,8 +101,8 @@ class MindRoomOpenAITools(OpenAITools):
 
     # AGNO_COMPAT: OpenAITools.generate_speech speaks only through /v1/audio/speech.
     # Reason: Agno 3.0.9 sends every text-to-speech model to the speech endpoint, whose OpenAI models
-    # (tts-1, tts-1-hd, gpt-4o-mini-tts) shut down on 2027-01-06; their replacement, gpt-realtime-2.1-mini,
-    # is served only over the Realtime API, so the toolkit's default speech would stop working.
+    # (tts-1, tts-1-hd, gpt-4o-mini-tts) shut down on 2027-01-06; their gpt-realtime replacement is served
+    # only over the Realtime API, so the toolkit's default speech would stop working.
     # Upstream issue: Tracking gap; a search of agno-agi/agno issues and PRs on 2026-10-29 found none.
     # Upstream PR: None identified.
     # Remove when: OpenAITools synthesizes gpt-realtime models through the Realtime API, reading the text

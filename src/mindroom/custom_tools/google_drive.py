@@ -39,7 +39,7 @@ from mindroom.path_confinement import (
     open_directory_within_root,
     resolve_path_within_root,
 )
-from mindroom.tool_system.agno_toolkits import rename_toolkit_functions
+from mindroom.tool_system.agno_toolkits import rename_toolkit_functions, toolkit_function_names
 from mindroom.tool_system.metadata import coerce_optional_finite_number
 
 if TYPE_CHECKING:
@@ -322,7 +322,8 @@ class GoogleDriveTools(
         )
 
     def _download_guidance(self) -> str:
-        if "google_drive_download_file" in self.functions:
+        """Name the download function, while this toolkit offers it, as the way past a read it refuses."""
+        if "google_drive_download_file" in toolkit_function_names(self):
             return " Use google_drive_download_file instead."
         return ""
 
@@ -494,6 +495,7 @@ class GoogleDriveTools(
     # download function, and extracts complete Office text with dependencies MindRoom ships or refuses it;
     # keep MindRoom's function aliases.
     # Coverage: tests/test_google_drive_oauth_tool.py::test_google_drive_read_refuses_binary_content_and_names_enabled_download_function;
+    # tests/test_google_drive_oauth_tool.py::test_google_drive_read_names_no_download_function_its_filters_leave_out;
     # tests/test_google_drive_oauth_tool.py::test_google_drive_read_returns_text_without_nul_bytes.
     @authenticate
     def read_file(self, file_id: str) -> str:

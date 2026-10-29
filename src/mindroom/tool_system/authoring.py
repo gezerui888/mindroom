@@ -235,6 +235,8 @@ def toolkit_functions(toolkit: Toolkit | _AgnoToolkit) -> dict[str, Callable[...
 
     Each validates its arguments; for a toolkit ``get_tool_by_name`` built, each also handles ``mindroom_output_path``
     and sends a call routed to a worker there. For an Agno toolkit, a function's async variant wins where it has one.
+    A call through one inside an async tool shares that call's ownership of the synchronous work it starts, so the
+    tool may call them any number of times, at once too; a tool that calls them must be async.
     """
     # Deferred because the adapter loads Agno for vendor toolkits, which plugin code importing this module must not;
     # code calling a toolkit's functions runs inside MindRoom, which has loaded it already.

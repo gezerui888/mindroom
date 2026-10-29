@@ -4914,8 +4914,17 @@ depends_on = [
 ]
 
 [[modules]]
+path = "mindroom.matrix_rtc.realtime_tts"
+depends_on = []
+
+[[modules]]
 path = "mindroom.matrix_rtc.voice_agent"
-depends_on = ["mindroom.llm", "mindroom.logging_config", "mindroom.tool_system.dependencies"]
+depends_on = [
+    "mindroom.llm",
+    "mindroom.logging_config",
+    "mindroom.matrix_rtc.realtime_tts",
+    "mindroom.tool_system.dependencies",
+]
 
 [[modules]]
 path = "mindroom.matrix_rtc.spoken_turns"

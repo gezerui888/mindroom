@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from itertools import count
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 from urllib.parse import unquote, urlsplit
@@ -175,6 +175,7 @@ from mindroom.session_storage.agent_storage import create_state_storage
 from mindroom.session_storage.schema import quote_identifier
 from mindroom.session_storage.store import _session_state, _write_session_state, ensure_session_row, persist_to
 from mindroom.thread_utils import decide_agent_response
+from mindroom.tool_system import plugin_imports
 from mindroom.turn_origin import TurnOrigin, classify_turn_origin
 from mindroom.turn_policy import PreparedDispatch, TurnPolicy
 from mindroom.turn_store import _CLAIM_REGISTRIES, TurnClaim, TurnStore, _ClaimRegistry
@@ -2673,6 +2674,19 @@ def runtime_paths_for(config: Config) -> RuntimePaths:
         msg = "Test config is missing bound RuntimePaths"
         raise KeyError(msg)
     return runtime_paths
+
+
+def cached_plugin_entry(module_path: Path) -> plugin_imports._ModuleCacheEntry:
+    """Return the one plugin module cache entry for a file, whatever other plugins earlier tests left cached."""
+    (entry,) = (
+        cached for cached in plugin_imports._MODULE_IMPORT_CACHE.values() if cached.module.__file__ == str(module_path)
+    )
+    return entry
+
+
+def cached_plugin_module(module_path: Path) -> ModuleType:
+    """Return the one cached plugin module imported from a file."""
+    return cached_plugin_entry(module_path).module
 
 
 def create_mock_room(

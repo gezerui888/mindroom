@@ -23,6 +23,7 @@ from mindroom.bounded_bytes import ByteLimitExceededError
 from mindroom.custom_tools.google_service import ThreadLocalGoogleServiceMixin
 from mindroom.file_access import AuthorizedFile, resolve_agent_file
 from mindroom.logging_config import get_logger
+from mindroom.oauth.agno_compat_google_auth import AgnoGoogleAuthBindingMixin
 from mindroom.oauth.client import ScopedOAuthClientMixin
 from mindroom.oauth.credential_lifecycle import oauth_credentials_have_scopes
 from mindroom.oauth.google_drive import (
@@ -151,7 +152,12 @@ def _open_upload_media(authorized: AuthorizedFile, mime_type: str) -> Iterator[M
         yield MediaIoBaseUpload(file, mimetype=mime_type, resumable=True)
 
 
-class GoogleDriveTools(ScopedOAuthClientMixin, ThreadLocalGoogleServiceMixin, AgnoGoogleDriveTools):
+class GoogleDriveTools(
+    ScopedOAuthClientMixin,
+    AgnoGoogleAuthBindingMixin,
+    ThreadLocalGoogleServiceMixin,
+    AgnoGoogleDriveTools,
+):
     """Google Drive toolkit that uses MindRoom-scoped OAuth credentials."""
 
     _oauth_provider = google_drive_oauth_provider()

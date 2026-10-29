@@ -8963,7 +8963,12 @@ expose = ["record_provider_failure", "call_with_provider_failure_capture", "is_p
 [[modules]]
 path = "mindroom.oauth.agno_compat_google_auth"
 depends_on = []
-visibility = ["mindroom.oauth.client"]
+visibility = [
+    "mindroom.custom_tools.gmail",
+    "mindroom.custom_tools.google_calendar",
+    "mindroom.custom_tools.google_drive",
+    "mindroom.custom_tools.google_sheets",
+]
 
 [[interfaces]]
 from = ["mindroom.oauth.agno_compat_google_auth"]

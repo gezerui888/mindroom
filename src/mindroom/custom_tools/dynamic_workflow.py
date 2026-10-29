@@ -25,8 +25,8 @@ from mindroom.custom_tools.dynamic_workflow_context import (
     dynamic_workflow_store,
     dynamic_workflow_store_and_owner,
 )
+from mindroom.custom_tools.json_schemas import JSON_OBJECT_SCHEMA
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
-from mindroom.custom_tools.toolkit_functions import JSON_OBJECT_SCHEMA
 from mindroom.delegation.direct import run_direct_child_turn
 from mindroom.delegation.lifecycle import finish_child_turn, prepare_child_turn
 from mindroom.delegation.personas import (

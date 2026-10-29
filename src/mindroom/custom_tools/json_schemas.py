@@ -1,4 +1,4 @@
-"""Shared schema constants for schema-driven custom toolkits."""
+"""JSON schema constants for the custom toolkits that author their functions' schemas."""
 
 from __future__ import annotations
 

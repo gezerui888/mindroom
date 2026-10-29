@@ -11,8 +11,8 @@ from mindroom.custom_tools.dynamic_workflow_context import (
     authorize_dynamic_workflow_run,
     dynamic_workflow_store_and_owner,
 )
+from mindroom.custom_tools.json_schemas import JSON_OBJECT_SCHEMA
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
-from mindroom.custom_tools.toolkit_functions import JSON_OBJECT_SCHEMA
 from mindroom.dynamic_workflows.validation import DynamicWorkflowError
 from mindroom.report_publishing.store import (
     ARTIFACT_KIND_STATIC_SITE,

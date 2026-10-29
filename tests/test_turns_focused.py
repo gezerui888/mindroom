@@ -564,7 +564,6 @@ def _build_harness(
         config=config,
         runtime_paths=runtime_paths,
         agent_reply_memberships=AgentReplyMembershipIndex(),
-        enable_streaming=True,
         orchestrator=None,
     )
 

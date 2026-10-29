@@ -196,25 +196,29 @@ async def _run_orchestrator_start_until_ready(
     orchestrator: _MultiAgentOrchestrator,
     *,
     wait_for_startup_maintenance: bool = False,
+    startup_config: Config | None = None,
 ) -> None:
-    """Run start() until readiness, then explicitly shut the runtime down."""
+    """Run start() until readiness, then explicitly shut the runtime down.
+
+    ``startup_config`` stands in for the config startup loaded; it defaults to the orchestrator's current config.
+    """
     ready = asyncio.Event()
-    start_sync_task = orchestrator._start_sync_task
+    start_sync = orchestrator.fleet.start_sync
 
     def mark_ready() -> None:
         ready.set()
 
-    def start_sync_task_and_publish_router_readiness(entity_name: str, bot: object) -> None:
+    def start_sync_and_publish_router_readiness(bots: list[AgentBot]) -> None:
         # Stand in for the router's first sync, which publishes its reply memberships.
-        start_sync_task(entity_name, bot)
-        if entity_name == ROUTER_AGENT_NAME:
+        start_sync(bots)
+        if any(bot.agent_name == ROUTER_AGENT_NAME for bot in bots):
             orchestrator._router_reply_memberships_live_sync_ready.set()
 
     with (
         patch("mindroom.orchestrator.set_runtime_ready", side_effect=mark_ready),
-        patch.object(orchestrator, "_start_sync_task", side_effect=start_sync_task_and_publish_router_readiness),
+        patch.object(orchestrator.fleet, "start_sync", side_effect=start_sync_and_publish_router_readiness),
     ):
-        runtime_task = asyncio.create_task(orchestrator.start())
+        runtime_task = asyncio.create_task(orchestrator.start(startup_config or orchestrator._require_config()))
         try:
             await asyncio.wait_for(ready.wait(), timeout=SETTLE_TIMEOUT_SECONDS)
             if wait_for_startup_maintenance:
@@ -538,7 +542,6 @@ def _mock_managed_bot(config: Config) -> MagicMock:
     """Return a lightweight managed-bot double for orchestrator reload tests."""
     bot = MagicMock()
     bot.config = config
-    bot.enable_streaming = config.defaults.enable_streaming
     bot._set_presence_with_model_info = AsyncMock()
     bot.recover_pending_turn_journal_events = AsyncMock()
     return bot

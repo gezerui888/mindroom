@@ -67,10 +67,9 @@ def setup_test_bot(
     agent: AgentMatrixUser,
     storage_path: Path,
     room_id: str,
-    enable_streaming: bool = False,
     config: Config | None = None,
 ) -> AgentBot:
-    """Set up a test bot with all required mocks."""
+    """Set up a non-streaming test bot with all required mocks."""
     runtime_paths = test_runtime_paths(storage_path)
     if config is None:
         config = bind_runtime_paths(Config(router=RouterConfig(model="default")), runtime_paths)
@@ -80,6 +79,7 @@ def setup_test_bot(
         except KeyError:
             config = bind_runtime_paths(config, runtime_paths)
     persist_entity_accounts(config, runtime_paths_for(config))
+    config.defaults.enable_streaming = False
 
     bot = make_test_agent_bot(
         agent,
@@ -87,7 +87,6 @@ def setup_test_bot(
         config,
         runtime_paths_for(config),
         rooms=[room_id],
-        enable_streaming=enable_streaming,
     )
     install_direct_response_admission(bot)
     bot.client = _make_matrix_client_mock()
@@ -102,6 +101,7 @@ def setup_test_bot(
     # Mock orchestrator
     mock_orchestrator = MagicMock()
     mock_orchestrator.current_config = config
+    mock_orchestrator.agent_bots = {name: MagicMock(running=True) for name in (*config.agents, *config.teams)}
     bot.orchestrator = mock_orchestrator
 
     return bot

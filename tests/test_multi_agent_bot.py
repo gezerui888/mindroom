@@ -168,18 +168,6 @@ class TestAgentBot(AgentBotTestBase):
         assert bot.agent_name == "calculator"
         assert bot.rooms == ["!test:localhost"]
         assert not bot.running
-        assert bot.enable_streaming is True  # Default value
-
-        # Test with streaming disabled
-        bot_no_stream = make_test_agent_bot(
-            mock_agent_user,
-            tmp_path,
-            rooms=["!test:localhost"],
-            enable_streaming=False,
-            config=config,
-            runtime_paths=runtime_paths_for(config),
-        )
-        assert bot_no_stream.enable_streaming is False
 
     def test_journal_admission_is_given_a_matrix_id_not_a_journal_principal(
         self,
@@ -865,52 +853,6 @@ class TestAgentBot(AgentBotTestBase):
             await owned_journal.close()
 
     @pytest.mark.asyncio
-    async def test_agent_bot_try_start_reraises_permanent_startup_error(
-        self,
-        mock_agent_user: AgentMatrixUser,
-        tmp_path: Path,
-    ) -> None:
-        """Permanent startup failures should stop retrying immediately."""
-        config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
-
-        with (
-            patch.object(
-                bot,
-                "start",
-                new=AsyncMock(side_effect=PermanentMatrixStartupError("boom")),
-            ) as mock_start,
-            pytest.raises(PermanentMatrixStartupError, match="boom"),
-        ):
-            await bot.try_start()
-
-        mock_start.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_agent_bot_try_start_does_not_retry_after_cancellation(
-        self,
-        mock_agent_user: AgentMatrixUser,
-        tmp_path: Path,
-    ) -> None:
-        """Cancelling a start stuck in login ends it instead of starting another attempt."""
-        config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
-        start_entered = asyncio.Event()
-
-        async def _blocked_start() -> None:
-            start_entered.set()
-            await asyncio.Event().wait()
-
-        with patch.object(bot, "start", new=AsyncMock(side_effect=_blocked_start)) as mock_start:
-            start = asyncio.create_task(bot.try_start())
-            await asyncio.wait_for(start_entered.wait(), timeout=1.0)
-            start.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(start, timeout=1.0)
-
-        mock_start.assert_awaited_once()
-
-    @pytest.mark.asyncio
     async def test_agent_bot_stop(self, mock_agent_user: AgentMatrixUser, tmp_path: Path) -> None:
         """Test stopping an agent bot."""
         config = self._config_for_storage(tmp_path)
@@ -1101,6 +1043,7 @@ class TestAgentBot(AgentBotTestBase):
         mock_should_use_streaming.return_value = enable_streaming
 
         config = self._config_for_storage(tmp_path)
+        config.defaults.enable_streaming = enable_streaming
         mention_id = f"@mindroom_calculator:{config.get_domain(runtime_paths_for(config))}"
         agent_user = AgentMatrixUser(
             agent_name="calculator",
@@ -1113,7 +1056,6 @@ class TestAgentBot(AgentBotTestBase):
             agent_user,
             tmp_path,
             rooms=["!test:localhost"],
-            enable_streaming=enable_streaming,
             config=config,
             runtime_paths=runtime_paths_for(config),
         )
@@ -1536,6 +1478,7 @@ class TestAgentBot(AgentBotTestBase):
         """Test agent bot thread response behavior based on agent participation."""
         # Use the helper method to create mock config
         config = self._config_for_storage(tmp_path)
+        config.defaults.enable_streaming = enable_streaming
         mock_load_config.return_value = config
 
         mock_resolve_agent_knowledge_access.return_value = _KnowledgeResolution(knowledge=None)
@@ -1552,7 +1495,6 @@ class TestAgentBot(AgentBotTestBase):
             config,
             runtime_paths_for(config),
             rooms=["!test:localhost"],
-            enable_streaming=enable_streaming,
         )
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()

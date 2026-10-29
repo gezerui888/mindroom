@@ -1446,6 +1446,8 @@ Every section rejects keys MindRoom does not define, except free-form maps such 
 Edits to `config.yaml` apply by hot reload without restarting MindRoom, except [event journal](https://docs.mindroom.chat/deployment/storage/#event-journal) changes and turning [background tool jobs](https://docs.mindroom.chat/tools/agent-orchestration/#background-jobs) on or off or changing their excluded toolkits, which need a restart.
 Edits to an agent's or team's own settings, such as `instructions`, `model`, `tools`, or a team's `mode`, apply from its next reply without restarting it.
 Changing `display_name` or `accept_invites`, an agent's `private` settings, whether an agent has the `desktop` tool, or which MCP tools it has restarts that agent or team.
+Removing an agent or team makes it leave its rooms, except direct messages, when the reload applies.
+An edit saved while MindRoom is still starting applies once startup finishes.
 An edit that restarts no agent, team, or router and changes no access, room, or authorization setting, such as a model definition, knowledge base, or agent instruction change, applies within seconds even while agents are replying.
 Other edits, including ones that restart an agent or team, an agent's or team's `access` or `rooms`, `administrators`, `authorization`, `room_defaults`, `rooms`, or `router.access`, first wait for active responses to finish, for at most 600 seconds.
 To confirm that a reload finished, use [`mindroom config check-applied`](https://docs.mindroom.chat/deployment/config-bundles/#config-fingerprint-and-config-check-applied).
@@ -2828,7 +2830,7 @@ After accepting an invitation into a room with no message history, the router po
 At startup, empty configured rooms get a welcome listing their configured responders.
 Send [`!hi`](https://docs.mindroom.chat/chat-commands/#hi) to see the welcome again, limited to responders visible to you.
 
-The router's other duties are documented on their own pages: [command handling](https://docs.mindroom.chat/chat-commands/#command-handling), [room management](https://docs.mindroom.chat/rooms/#room-management), [voice message processing](https://docs.mindroom.chat/voice/#voice-message-processing), [configuration confirmations](https://docs.mindroom.chat/chat-commands/#configuration-confirmations), and [scheduled task restoration](https://docs.mindroom.chat/scheduling/#scheduled-task-restoration).
+The router's other duties are documented on their own pages: [command handling](https://docs.mindroom.chat/chat-commands/#command-handling), [room management](https://docs.mindroom.chat/rooms/#room-management), [voice message processing](https://docs.mindroom.chat/voice/#voice-message-processing), [configuration confirmations](https://docs.mindroom.chat/chat-commands/#configuration-confirmations), and [running scheduled tasks](https://docs.mindroom.chat/scheduling/#scheduled-task-restoration).
 
 # Threads, Replies & Participation
 
@@ -4761,8 +4763,12 @@ The homeserver must support `GET /_matrix/client/v3/rooms/{roomId}/state/{eventT
 
 ### Scheduled Task Restoration
 
-The router restores a room's schedules and pending configuration changes when it joins the room after startup.
-A one-time task missed by less than 24 hours runs once Matrix sync is ready; an older one is marked failed instead.
+The router runs a schedule when, at the time the schedule is saved, it may post its trigger and save schedule state in the room; otherwise the agent that saved the schedule runs it, as in a DM or an agent's personal room.
+Every agent restores the schedules it runs in a room when it joins that room, at startup or when it accepts an invitation, and the router also restores the room's pending configuration changes.
+Schedules keep running when their agent restarts, for example after a config edit: a one-time task that came due during the restart runs once the agent is back, and a recurring task runs the occurrence that came due if it is still within the catch-up window.
+A one-time task missed by less than 24 hours runs once its agent's Matrix sync is ready; an older one is marked failed instead.
+When an agent is removed from the config while MindRoom runs, each schedule it runs is marked failed and the agent says so in the schedule's thread, or in the room for a schedule without one; its schedules never move to another agent.
+When it is removed while MindRoom is stopped, a bot that may save schedule state in a room marks the agent's schedules there failed and says so when it rejoins that room, and schedules in the agent's DMs stay pending.
 
 ### Recurring task recovery
 

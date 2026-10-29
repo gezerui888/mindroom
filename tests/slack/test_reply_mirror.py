@@ -110,7 +110,6 @@ class World:
             config=self.config,
             runtime_paths=self.paths,
             agent_reply_memberships=AgentReplyMembershipIndex(),
-            enable_streaming=False,
             orchestrator=None,
         )
         validator = IngressValidator(

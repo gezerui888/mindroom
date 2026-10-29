@@ -55,6 +55,11 @@ if TYPE_CHECKING:
     from mindroom.teams.envelope import TeamTurnSpec
 
 
+def _running_members() -> dict[str, MagicMock]:
+    """Return the live fleet the team and its members run in."""
+    return {name: MagicMock(running=True) for name in ("t1", "a1", "a2")}
+
+
 def _bind_runtime_paths(config: Config, tmp_path: Path) -> Config:
     return bind_runtime_paths(config, test_runtime_paths(tmp_path))
 
@@ -171,13 +176,13 @@ async def test_preformed_team_bot_responds_when_mentioned(config_with_team: Conf
         display_name="Team One",
         password="p",  # noqa: S106
     )
+    config_with_team.defaults.enable_streaming = False
     bot = make_test_agent_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
         runtime_paths=runtime_paths,
         rooms=["!room:localhost"],
-        enable_streaming=False,
     )
     install_direct_response_admission(bot)
     bot.client = _make_matrix_client_mock()
@@ -188,6 +193,7 @@ async def test_preformed_team_bot_responds_when_mentioned(config_with_team: Conf
 
     # Minimal orchestrator stub is fine because we patch team_response_stream
     bot.orchestrator = MagicMock()
+    bot.orchestrator.agent_bots = _running_members()
 
     team_user_id = ids["t1"].full_id
     room = _mock_room("!room:localhost", [team_user_id, "@user:localhost"])
@@ -236,17 +242,18 @@ async def _team_memory_saves(
         display_name=entity_name,
         password="p",  # noqa: S106
     )
+    config.defaults.enable_streaming = False
     bot = make_test_agent_bot(
         agent_user=user,
         storage_path=tmp_path,
         config=config,
         runtime_paths=runtime_paths,
         rooms=["!room:localhost"],
-        enable_streaming=False,
     )
     bot.client = _make_matrix_client_mock()
     install_runtime_journal_support(bot)
     bot.orchestrator = MagicMock()
+    bot.orchestrator.agent_bots = _running_members()
 
     store_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
     scheduled_tasks: list[asyncio.Task[Any]] = []
@@ -410,13 +417,13 @@ async def test_preformed_team_rejection_edits_existing_message(config_with_team:
         display_name="Team One",
         password="p",  # noqa: S106
     )
+    config_with_team.defaults.enable_streaming = False
     bot = make_test_agent_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
         runtime_paths=runtime_paths,
         rooms=["!room:localhost"],
-        enable_streaming=False,
     )
     install_direct_response_admission(bot)
     bot.client = _make_matrix_client_mock()
@@ -478,17 +485,18 @@ async def test_preformed_team_plain_reply_does_not_continue_existing_thread_root
         display_name="Team One",
         password="p",  # noqa: S106
     )
+    config_with_team.defaults.enable_streaming = False
     bot = make_test_agent_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
         runtime_paths=runtime_paths,
         rooms=["!room:localhost"],
-        enable_streaming=False,
     )
     bot.client = _make_matrix_client_mock()
     install_runtime_journal_support(bot)
     bot.orchestrator = MagicMock()
+    bot.orchestrator.agent_bots = _running_members()
 
     team_user_id = ids["t1"].full_id
     room = _mock_room("!room:localhost", [team_user_id, "@user:localhost"])
@@ -548,17 +556,18 @@ async def test_team_does_not_respond_to_different_domain_mention(config_with_tea
         display_name="Team One",
         password="p",  # noqa: S106
     )
+    config_with_team.defaults.enable_streaming = False
     bot = make_test_agent_bot(
         agent_user=team_user,
         storage_path=tmp_path,
         config=config_with_team,
         runtime_paths=runtime_paths,
         rooms=["!room:localhost"],
-        enable_streaming=False,
     )
     bot.client = _make_matrix_client_mock()
     install_runtime_journal_support(bot)
     bot.orchestrator = MagicMock()
+    bot.orchestrator.agent_bots = _running_members()
 
     async def fake_team_response_stream(*_args: Any, **_kwargs: Any) -> AsyncIterator[str]:  # noqa: ANN401
         yield "🤝 Team Response (a1, a2): ok"

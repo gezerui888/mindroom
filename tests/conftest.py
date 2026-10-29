@@ -61,7 +61,6 @@ import mindroom.managed_avatars as managed_avatars_module
 import mindroom.matrix.client_room_admin as client_room_admin_module
 import mindroom.matrix.rooms as matrix_rooms_module
 import mindroom.memory._entrypoint_snapshots as memory_entrypoint_snapshots_module
-import mindroom.scheduling.tasks as scheduling_module
 import mindroom.tool_jobs.instances as tool_jobs_instances
 import mindroom.tool_system.sandbox_proxy as sandbox_proxy_module
 from mindroom import ai as mindroom_ai
@@ -78,6 +77,7 @@ from mindroom.bot import AgentBot
 from mindroom.coalescing.batch import PendingEvent
 from mindroom.coalescing.gate import CoalescingDrainResult
 from mindroom.command_turn_executor import CommandTurnExecutor
+from mindroom.config.load_attempt import ConfigLoad, ConfigLoadResult
 from mindroom.config.main import Config, load_config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths, safe_replace
 from mindroom.conversation_resolver import DispatchContextResult, MessageContext
@@ -148,6 +148,7 @@ from mindroom.matrix.thread_diagnostics import is_thread_history_degraded
 from mindroom.mcp import toolkit as mcp_toolkit_module
 from mindroom.message_target import MessageTarget
 from mindroom.model_defaults import OLLAMA_HOST_DEFAULT
+from mindroom.orchestration.config_lifecycle import load_startup_config
 from mindroom.personal_room_lifecycle import PersonalRoomLifecycle
 from mindroom.providers import registry as provider_registry
 from mindroom.providers.pipeline import media as media_pipeline
@@ -200,6 +201,7 @@ if TYPE_CHECKING:
     from mindroom.llm.provider import ModelProvider
     from mindroom.llm.runs import AnyRunRecord
     from mindroom.matrix_rtc.call_manager import CallManager
+    from mindroom.orchestrator import _MultiAgentOrchestrator
     from mindroom.session_storage.store import ConversationStore
     from mindroom.session_storage.types import ConversationSession
     from mindroom.streaming import StreamingResponse
@@ -2480,6 +2482,21 @@ def test_runtime_paths(tmp_root: Path) -> RuntimePaths:
 test_runtime_paths.__test__ = False
 
 
+def install_bots(orchestrator: "_MultiAgentOrchestrator", bots: Mapping[str, object]) -> None:
+    """Register test bots with a real orchestrator's entity fleet, which owns every managed bot."""
+    for entity_name, bot in bots.items():
+        orchestrator.fleet.add(entity_name, cast("AgentBot", bot))
+
+
+def swap_fleet_bot(orchestrator: "_MultiAgentOrchestrator", entity_name: str, bot: object | None) -> None:
+    """Swap or drop one fleet bot in place, as a finished replacement or removal leaves it, without its lifecycle."""
+    slots = orchestrator.fleet._slots
+    if bot is None:
+        del slots[entity_name]
+    else:
+        slots[entity_name].bot = cast("AgentBot", bot)
+
+
 def orchestrator_runtime_paths(
     storage_path: Path,
     *,
@@ -2505,6 +2522,34 @@ def orchestrator_runtime_paths(
 def load_config_yaml(config_path: Path) -> Config:
     """Load a config YAML file through the production runtime-aware loader."""
     return load_config(resolve_runtime_paths(config_path=Path(config_path).expanduser().resolve()))
+
+
+def published_config_load(config: Config) -> ConfigLoad:
+    """Return a successful load of ``config`` that no newer API commit superseded."""
+    return ConfigLoad(
+        result=ConfigLoadResult(success=True, uses_includes=config.uses_includes),
+        config=config,
+        source_fingerprint=config.source_fingerprint,
+        source_files=config.source_files,
+    )
+
+
+async def initialize_from_config_file(orchestrator: "_MultiAgentOrchestrator") -> Config:
+    """Load the orchestrator's config file the way `mindroom run` startup does, then initialize from that load."""
+    config = await load_startup_config(orchestrator.runtime_paths, api_enabled=orchestrator.api_enabled)
+    await orchestrator.initialize(config)
+    return config
+
+
+def failed_config_load(error: Exception) -> ConfigLoad:
+    """Return a load that failed with ``error`` and that no newer API commit superseded."""
+    return ConfigLoad(
+        result=ConfigLoadResult(success=False, error_status_code=422, error_detail=str(error)),
+        config=None,
+        source_fingerprint=None,
+        source_files=None,
+        error=error,
+    )
 
 
 def write_config_yaml(config: Config, config_path: Path) -> None:
@@ -2767,7 +2812,6 @@ def sync_bot_runtime_state(bot: RuntimeBot) -> None:
         client.user_id = bot.matrix_id.full_id
     runtime.client = bot.client
     runtime.config = bot.config
-    runtime.enable_streaming = bot.enable_streaming
     runtime.orchestrator = bot.orchestrator
 
 
@@ -3357,13 +3401,6 @@ def _pin_matrix_homeserver(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINDROOM_NAMESPACE", raising=False)
     monkeypatch.delenv("MINDROOM_CONFIG_PATH", raising=False)
     monkeypatch.delenv("MINDROOM_STORAGE_PATH", raising=False)
-
-
-@pytest.fixture(autouse=True)
-def _reset_scheduled_task_runner_owner(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep a router registered as the scheduled-task runner owner, or a bot as a state writer, from leaking."""
-    monkeypatch.setattr(scheduling_module, "_runner_owner", None)
-    monkeypatch.setattr(scheduling_module, "_state_writers", {})
 
 
 @pytest.fixture(autouse=True)

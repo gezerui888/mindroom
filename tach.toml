@@ -1288,6 +1288,7 @@ visibility = [
     "mindroom.commands.auto_approve_commands",
     "mindroom.scheduling.tasks",
     "mindroom.tool_jobs.approvals",
+    "mindroom.scheduling.runtime",
 ]
 
 [[modules]]
@@ -1745,6 +1746,7 @@ depends_on = []
 [[modules]]
 path = "mindroom.api.config_lifecycle"
 depends_on = [
+    "mindroom.config.load_attempt",
     "mindroom.config.main",
     "mindroom.config.yaml_includes",
     "mindroom.config.reload_status",
@@ -3231,6 +3233,8 @@ depends_on = [
 [[modules]]
 path = "mindroom.orchestration.config_lifecycle"
 depends_on = [
+    "mindroom.api.main",
+    "mindroom.config.load_attempt",
     "mindroom.config.main",
     "mindroom.config.yaml_includes",
     "mindroom.config.reload_status",
@@ -3289,6 +3293,18 @@ depends_on = [
 visibility = ["mindroom.orchestrator"]
 
 [[modules]]
+path = "mindroom.orchestration.rooms"
+depends_on = [
+    "mindroom.constants",
+    "mindroom.entity_resolution",
+    "mindroom.matrix.client_room_admin",
+    "mindroom.matrix.rooms",
+    "mindroom.matrix.state",
+    "mindroom.matrix.users",
+    "mindroom.matrix_identifiers",
+]
+
+[[modules]]
 path = "mindroom.orchestrator"
 depends_on = [
     "mindroom.agent_cli.session",
@@ -3296,8 +3312,6 @@ depends_on = [
     "mindroom.api.startup_probes",
     "mindroom.approval.manager",
     "mindroom.approval.recovery",
-    "mindroom.matrix.room_reconciliation",
-    "mindroom.config.reload_status",
     "mindroom.matrix_rtc.call_manager",
     "mindroom.knowledge.status",
     "mindroom.knowledge.refresh_scheduler",
@@ -3312,7 +3326,6 @@ depends_on = [
     "mindroom.api.script_gateway",
     "mindroom.approval.transport",
     "mindroom.bot",
-    "mindroom.config.main",
     "mindroom.constants",
     "mindroom.delegation.recovery",
     "mindroom.desktop.identity",
@@ -3322,20 +3335,14 @@ depends_on = [
     "mindroom.hooks",
     "mindroom.integrations",
     "mindroom.knowledge.watch",
-    "mindroom.matrix.client_room_admin",
-    "mindroom.matrix.client_session",
     "mindroom.matrix.provisioning_heartbeat",
-    "mindroom.matrix.rooms",
-    "mindroom.matrix.state",
-    "mindroom.matrix.thread_diagnostics",
     "mindroom.matrix.users",
-    "mindroom.matrix_identifiers",
     "mindroom.mcp.manager",
-    "mindroom.mcp.registry",
     "mindroom.mcp.toolkit",
     "mindroom.memory",
     "mindroom.orchestration.config_lifecycle",
     "mindroom.orchestration.external_trigger_runtime",
+    "mindroom.orchestration.rooms",
     "mindroom.orchestration.runtime",
     "mindroom.orchestration.script_runtime",
     "mindroom.orchestration.todo_poke_runtime",
@@ -3343,6 +3350,7 @@ depends_on = [
     "mindroom.response_activity",
     "mindroom.response_admission",
     "mindroom.scheduling.executor",
+    "mindroom.scheduling.runtime",
     "mindroom.thread_export.workspace_sync",
     "mindroom.approval.tool_approval",
     "mindroom.tool_system.plugins",
@@ -4116,7 +4124,6 @@ depends_on = ["mindroom.logging_config", "mindroom.matrix.room_power"]
 visibility = [
     "mindroom.matrix.client_room_admin",
     "mindroom.matrix.rooms",
-    "mindroom.orchestrator",
     "mindroom.thread_tags",
     "mindroom.topic_generator",
 ]
@@ -4155,8 +4162,8 @@ visibility = [
     "mindroom.matrix.room_cleanup",
     "mindroom.matrix.rooms",
     "mindroom.orchestration.external_trigger_runtime",
+    "mindroom.orchestration.rooms",
     "mindroom.orchestration.todo_poke_runtime",
-    "mindroom.orchestrator",
 ]
 
 [[modules]]
@@ -4207,7 +4214,6 @@ visibility = [
     "mindroom.matrix.typing",
     "mindroom.matrix.users",
     "mindroom.orchestration.runtime",
-    "mindroom.orchestrator",
 ]
 
 [[modules]]
@@ -5426,19 +5432,46 @@ depends_on = [
 path = "mindroom.scheduling.tasks"
 depends_on = [
     "mindroom.helper_usage",
+    "mindroom.constants",
     "mindroom.entity_resolution",
-    "mindroom.hooks",
     "mindroom.matrix.conversation_reads",
     "mindroom.providers.registry",
     "mindroom.agent_loop.helper",
     "mindroom.llm",
-    "mindroom.scheduling.executor",
-    "mindroom.scheduling.recurring_schedule",
-    "mindroom.requester_identity",
     "mindroom.approval.manager",
     "mindroom.approval.tool_approval",
     "mindroom.failure_text",
     "mindroom.config.resolution",
+    "mindroom.scheduling.ownership",
+]
+
+[[modules]]
+path = "mindroom.scheduling.runtime"
+depends_on = [
+    "mindroom.approval.manager",
+    "mindroom.constants",
+    "mindroom.entity_resolution",
+    "mindroom.failure_text",
+    "mindroom.logging_config",
+    "mindroom.message_target",
+    "mindroom.requester_identity",
+    "mindroom.runtime_shutdown",
+    "mindroom.scheduling.executor",
+    "mindroom.scheduling.ownership",
+    "mindroom.scheduling.recurring_schedule",
+    "mindroom.scheduling.tasks",
+]
+
+[[modules]]
+path = "mindroom.scheduling.ownership"
+depends_on = [
+    "mindroom.constants",
+    "mindroom.entity_resolution",
+    "mindroom.scheduling.executor",
+]
+visibility = [
+    "mindroom.scheduling.runtime",
+    "mindroom.scheduling.tasks",
 ]
 
 [[modules]]
@@ -5459,8 +5492,8 @@ depends_on = [
     "mindroom.logging_config",
 ]
 visibility = [
-    "mindroom.scheduling.tasks",
     "mindroom.scheduling.executor",
+    "mindroom.scheduling.runtime",
 ]
 
 [[modules]]
@@ -6865,11 +6898,10 @@ from = ["mindroom.config.memory"]
 [[interfaces]]
 expose = [
     "ConversationRef",
-    "MemoryAutoFlushWorker",
+    "MemoryAutoFlushService",
     "MemoryPromptParts",
     "add_agent_memory",
     "append_agent_daily_memory",
-    "auto_flush_enabled",
     "build_memory_prompt_parts",
     "conversation_entrypoint_preamble",
     "delete_agent_memory",
@@ -8026,6 +8058,10 @@ visibility = ["mindroom.cli.main"]
 [[modules]]
 path = "mindroom.config.reload_status"
 depends_on = []
+
+[[modules]]
+path = "mindroom.config.load_attempt"
+depends_on = ["mindroom.config.main", "mindroom.config.yaml_includes", "mindroom.logging_config"]
 
 [[modules]]
 path = "mindroom.config.bundle"

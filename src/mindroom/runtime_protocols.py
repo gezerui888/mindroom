@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable
+    from collections.abc import Awaitable, Mapping
 
     import nio
 
@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.orchestration.config_lifecycle import ConfigReloadLifecycle
     from mindroom.response_admission import ResponseAdmissionGate
+    from mindroom.scheduling.runtime import ScheduledTaskRuntime
     from mindroom.skill_learning.runner import SkillReviewRunner
     from mindroom.tool_system.plugins import PluginReloadResult
 
@@ -55,7 +56,7 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
     def api_enabled(self) -> bool: ...  # noqa: D102
 
     @property
-    def agent_bots(self) -> object: ...  # noqa: D102
+    def agent_bots(self) -> Mapping[str, AgentBot]: ...  # noqa: D102
 
     @property
     def knowledge_refresh_scheduler(self) -> KnowledgeRefreshScheduler: ...  # noqa: D102
@@ -71,6 +72,9 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
 
     @property
     def budgets(self) -> BudgetMonitor: ...  # noqa: D102
+
+    @property
+    def scheduled_tasks(self) -> ScheduledTaskRuntime: ...  # noqa: D102
 
     @property
     def agent_reply_memberships(self) -> AgentReplyMembershipIndex: ...  # noqa: D102

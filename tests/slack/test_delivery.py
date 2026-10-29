@@ -1059,7 +1059,6 @@ async def test_slack_turn_reaches_the_agent_with_its_hook_source_and_requester(h
         config=harness.config,
         runtime_paths=harness.paths,
         agent_reply_memberships=AgentReplyMembershipIndex(),
-        enable_streaming=False,
         orchestrator=None,
     )
     validator = IngressValidator(

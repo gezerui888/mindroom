@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -15,7 +14,6 @@ if TYPE_CHECKING:
     from mindroom.agent_reply_membership import AgentReplyMembershipIndex
     from mindroom.bot import AgentBot
     from mindroom.config.main import Config
-    from mindroom.constants import RuntimePaths
     from mindroom.external_triggers.store import TriggerDeliverySnapshot
 
 
@@ -23,7 +21,6 @@ if TYPE_CHECKING:
 class ExternalTriggerRuntimeCoordinator:
     """Own external trigger API runtime binding and live deliverability state."""
 
-    runtime_paths: RuntimePaths
     agent_reply_memberships: AgentReplyMembershipIndex
     api_enabled: bool = True
 
@@ -50,6 +47,7 @@ class ExternalTriggerRuntimeCoordinator:
             api_main.app,
             client=router_bot.client,
             conversation_reader=router_bot._conversation_reader,
+            runtime_config=config,
             is_trigger_snapshot_ready=is_trigger_snapshot_ready,
             agent_reply_memberships=self.agent_reply_memberships,
             response_admission_gate=router_bot.admission_gate,
@@ -98,24 +96,3 @@ class ExternalTriggerRuntimeCoordinator:
         return (
             snapshot.resolved_room_id in router_joined_room_ids and snapshot.resolved_room_id in target_joined_room_ids
         )
-
-    async def sync_api_config_snapshot(
-        self,
-        new_config: Config,
-    ) -> None:
-        """Publish the current config to the bundled API before binding trigger runtime."""
-        if not self.api_enabled:
-            return
-        from mindroom.api import main as api_main  # noqa: PLC0415
-
-        api_main.initialize_api_app(api_main.app, self.runtime_paths)
-        published = await asyncio.to_thread(
-            api_main.config_lifecycle._publish_runtime_config_into_app,
-            new_config,
-            self.runtime_paths,
-            api_main.app,
-        )
-        if not published:
-            self.unbind()
-            message = "Failed to publish external trigger API config snapshot"
-            raise RuntimeError(message)

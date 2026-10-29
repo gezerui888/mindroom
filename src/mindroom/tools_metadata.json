@@ -5213,7 +5213,7 @@
         },
         {
           "authored_override": true,
-          "default": "mp3",
+          "default": "wav",
           "description": null,
           "label": "Text To Speech Format",
           "name": "text_to_speech_format",

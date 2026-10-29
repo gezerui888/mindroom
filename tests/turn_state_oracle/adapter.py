@@ -70,6 +70,11 @@ def controlled_clock(clock: Clock) -> Iterator[None]:
         yield
 
 
+def pending_response_intent(transaction: Transaction, agent_name: str, event_ids: tuple[str, ...]) -> bool:
+    """Return whether an unfinished turn these events answer to owns a response attempt, as a pending write reads it."""
+    return turn_rows._owners(transaction, agent_name, event_ids).pending_response_intent(event_ids)
+
+
 def _metadata_json(metadata: SourceEventMetadata) -> dict[str, object]:
     """Return one source's attribution in the recordings' shape, naming only the facts it holds."""
     fields = {
@@ -391,7 +396,7 @@ class TurnStateAdapter:
 
     async def pending_intent(self, event_id: str) -> bool:
         """Return whether the source owns an incomplete response attempt."""
-        return await self.store.deps.turn_records.read(turn_store._has_pending_response_intent, (event_id,))
+        return await self.store.deps.turn_records.read(pending_response_intent, (event_id,))
 
     async def record_for_response(self, event_id: str) -> dict[str, Any] | None:
         """Return the turn whose visible response or echo is this event."""

@@ -9,7 +9,7 @@ import pytest
 
 from mindroom.event_journal import EventJournalStore, journal, turn_rows
 from mindroom.event_journal.identity import journal_principal_id
-from mindroom.event_journal.turn_rows import Accepted, Answered, Refused
+from mindroom.event_journal.turn_rows import Answered, PendingTurn, Refused
 from mindroom.history.types import HistoryScope
 from mindroom.message_target import MessageTarget
 from mindroom.turn_record import (
@@ -89,7 +89,7 @@ async def pending(store: EventJournalStore, record: TurnRecord, room_id: str = R
 async def accepted(store: EventJournalStore, record: TurnRecord, room_id: str = ROOM) -> TurnRecord:
     """Record one pending turn and return it, requiring the write to land."""
     result = await pending(store, record, room_id)
-    assert isinstance(result, Accepted), result
+    assert isinstance(result, PendingTurn), result
     return result.record
 
 
@@ -337,7 +337,7 @@ class TestAliases:
         assert await pending(store, turn(["$o"])) == Refused()
         # Waiting in a batch beside a fresh source, the original refuses the batch so each source retries alone.
         assert await pending(store, turn(["$o", "$fresh"])) == Refused()
-        assert isinstance(await pending(store, turn(["$fresh"])), Accepted)
+        assert isinstance(await pending(store, turn(["$fresh"])), PendingTurn)
 
     async def test_a_relay_handed_to_its_final_delivery_also_refuses_a_batch_naming_its_original(
         self,
@@ -492,7 +492,7 @@ class TestRedactionGuard:
         await redact(store, "$e1")
         # Nothing newer is selected now, so only the redaction refuses a late write carrying E1.
         late = turn(["$s"], prompts={"$s": "E1 text"}, revisions={"$s": (10, "$e1")})
-        assert isinstance(await pending(store, late), Accepted)
+        assert isinstance(await pending(store, late), PendingTurn)
         await write(
             store,
             turn_rows.record_edit,
@@ -512,7 +512,7 @@ class TestRedactionGuard:
             prompt="E2 text",
             revision=(20, "$e2"),
         )
-        assert isinstance(await pending(store, late), Accepted)
+        assert isinstance(await pending(store, late), PendingTurn)
         await write(
             store,
             turn_rows.record_edit,

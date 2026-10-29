@@ -128,7 +128,6 @@ from mindroom.turn_store import (
     TurnClaim,
     TurnStore,
     TurnStoreDeps,
-    _record_pending_turn,
 )
 from mindroom.turns.dispatch import TurnDispatchDeps, TurnDispatcher
 from mindroom.turns.ingress import TurnIngress, TurnIngressDeps
@@ -3692,13 +3691,19 @@ async def test_response_waits_for_pending_context_persistence_before_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Session-backed generation must not start before its cleanup context is durable."""
+    """Session-backed generation must not start before its cleanup context is durable.
+
+    Edit and redaction cleanup and a replay after a crash find the generated run through the turn row, so the
+    row and its response context have committed by the time the runner starts generating.
+    """
     harness = _build_harness(config, tmp_path)
     room = _room_with_members(config, "general")
     event = _text_event("persist my response context first")
     real_write = TurnRecordStore.write
     pending_write_started = asyncio.Event()
     release_pending_write = asyncio.Event()
+    committed_at_generation: list[TurnRecord | None] = []
+    generate_response = harness.runner.generate_response
 
     async def write_with_barrier(
         records: TurnRecordStore,
@@ -3711,7 +3716,12 @@ async def test_response_waits_for_pending_context_persistence_before_generation(
             await release_pending_write.wait()
         return await real_write(records, operation, *args, **kwargs)
 
+    async def generate_after_reading_the_turn(request: ResponseRequest) -> str | None:
+        committed_at_generation.append(await harness.turn_store.get_turn_record(event.event_id))
+        return await generate_response(request)
+
     monkeypatch.setattr(TurnRecordStore, "write", write_with_barrier)
+    monkeypatch.setattr(harness.runner, "generate_response", generate_after_reading_the_turn)
     delivery = asyncio.create_task(harness.deliver(room, event))
     try:
         await asyncio.wait_for(pending_write_started.wait(), timeout=5)
@@ -3720,8 +3730,15 @@ async def test_response_waits_for_pending_context_persistence_before_generation(
         release_pending_write.set()
 
     await asyncio.wait_for(delivery, timeout=5)
+    await harness.runner.settle_inbox_responses()
 
     assert len(harness.runner.requests) == 1
+    (pending,) = committed_at_generation
+    assert pending is not None
+    assert pending.completed is False
+    assert pending.response_owner == "general"
+    assert pending.history_scope is not None
+    assert pending.conversation_target == harness.runner.requests[0].response_envelope.target
     persisted = await harness.turn_store.get_turn_record(event.event_id)
     assert persisted is not None
     assert persisted.completed is True
@@ -3729,7 +3746,7 @@ async def test_response_waits_for_pending_context_persistence_before_generation(
 
 def _is_pending_write_for(operation: object, args: tuple[object, ...], event_id: str) -> bool:
     """Return whether one turn-row write is the pending write of a turn that indexes this event."""
-    if operation is not _record_pending_turn:
+    if operation is not turn_rows.record_pending_turn:
         return False
     record = args[0]
     assert isinstance(record, TurnRecord)

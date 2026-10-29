@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, cast
 import certifi
 from openai import AsyncOpenAI
 from openai.types.realtime import RealtimeErrorEvent, ResponseAudioDeltaEvent, ResponseDoneEvent
-from websockets.exceptions import WebSocketException
+from websockets.exceptions import InvalidStatus, WebSocketException
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -42,7 +42,11 @@ _READER_INSTRUCTIONS = (
 
 
 class RealtimeSpeechError(RuntimeError):
-    """The Realtime API did not finish speaking the text."""
+    """The Realtime API did not finish speaking the text; ``status_code`` is the HTTP status of a refused connection."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def is_realtime_speech_model(model: str) -> bool:
@@ -75,6 +79,10 @@ async def stream_realtime_speech(
     try:
         async for chunk in _realtime_speech_chunks(text, model=model, voice=voice, api_key=api_key, base_url=base_url):
             yield chunk
+    except InvalidStatus as error:
+        status_code = error.response.status_code
+        msg = f"Realtime connection refused: HTTP {status_code}"
+        raise RealtimeSpeechError(msg, status_code=status_code) from error
     except (WebSocketException, OSError) as error:
         msg = f"Realtime connection failed: {error}"
         raise RealtimeSpeechError(msg) from error
@@ -92,8 +100,6 @@ async def _realtime_speech_chunks(
         connection_manager = client.realtime.connect(
             model=model,
             websocket_connection_options=_websocket_options(client.base_url),
-            # A reconnect would drop the response being spoken, so a dropped connection fails the synthesis instead.
-            max_retries=0,
         )
         async with connection_manager as connection:
             await connection.session.update(

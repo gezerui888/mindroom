@@ -15,7 +15,9 @@ import pytest
 from openai.types.realtime import RealtimeErrorEvent, ResponseAudioDeltaEvent, ResponseDoneEvent
 from openai.types.realtime.realtime_error import RealtimeError
 from openai.types.realtime.realtime_response import RealtimeResponse
-from websockets.exceptions import ConnectionClosedError
+from websockets.datastructures import Headers
+from websockets.exceptions import ConnectionClosedError, InvalidStatus
+from websockets.http11 import Response
 
 from mindroom.voice import openai_realtime_speech
 from mindroom.voice.openai_realtime_speech import (
@@ -133,7 +135,6 @@ async def test_session_and_response_follow_the_reader_contract(fake_client: type
     client = fake_client.instances[0]
     assert client.kwargs == {"api_key": "sk-test", "base_url": None}
     assert client.connect_kwargs["model"] == "gpt-realtime-2.1-mini"
-    assert client.connect_kwargs["max_retries"] == 0
     assert isinstance(client.connect_kwargs["websocket_connection_options"]["ssl"], ssl.SSLContext)
     assert client.connection.session_updates == [
         {
@@ -229,6 +230,17 @@ async def test_failed_connect_raises(fake_client: type[_FakeClient]) -> None:
 
     with pytest.raises(RealtimeSpeechError, match="refused"):
         await _synthesize()
+
+
+@pytest.mark.asyncio
+async def test_refused_handshake_keeps_its_http_status(fake_client: type[_FakeClient]) -> None:
+    """A refused connection keeps the HTTP status, so a call can say the credential was rejected."""
+    fake_client.connect_error = InvalidStatus(Response(401, "Unauthorized", Headers(), b""))
+
+    with pytest.raises(RealtimeSpeechError, match="401") as raised:
+        await _synthesize()
+
+    assert raised.value.status_code == 401
 
 
 @pytest.mark.asyncio

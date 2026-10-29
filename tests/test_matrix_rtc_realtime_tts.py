@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
-from livekit.agents import APIConnectOptions, APIError
+from livekit.agents import APIConnectOptions, APIError, APIStatusError
 
 from mindroom.matrix_rtc import realtime_tts
 from mindroom.matrix_rtc.realtime_tts import RealtimeTTS
@@ -43,47 +43,47 @@ async def test_realtime_tts_pushes_pcm_frames(monkeypatch: pytest.MonkeyPatch) -
 
 
 @pytest.mark.asyncio
-async def test_realtime_tts_retries_a_segment_that_never_started(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failure before any audio is retried, as a failed speech-endpoint request is."""
+async def test_realtime_tts_failure_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Realtime failure ends the segment with an error instead of trying it again."""
     attempts: list[str] = []
 
     async def stream(text: str, **_kwargs: object) -> AsyncIterator[bytes]:
         attempts.append(text)
-        msg = "connection refused"
+        msg = "bad voice"
         raise RealtimeSpeechError(msg)
         yield b""
 
     monkeypatch.setattr(realtime_tts, "stream_realtime_speech", stream)
     tts = RealtimeTTS(model="gpt-realtime-2.1-mini", api_key="sk-test")
 
-    with pytest.raises(APIError, match="connection refused"):
-        [
-            event
-            async for event in tts.synthesize("Hello.", conn_options=APIConnectOptions(max_retry=1, retry_interval=0))
-        ]
-    assert attempts == ["Hello.", "Hello."]
-
-
-@pytest.mark.asyncio
-async def test_realtime_tts_does_not_respeak_a_started_segment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A failure after audio played ends the segment with an error instead of speaking it again."""
-    attempts: list[str] = []
-
-    async def stream(text: str, **_kwargs: object) -> AsyncIterator[bytes]:
-        attempts.append(text)
-        yield b"\x01\x00" * 240
-        msg = "connection closed"
-        raise RealtimeSpeechError(msg)
-
-    monkeypatch.setattr(realtime_tts, "stream_realtime_speech", stream)
-    tts = RealtimeTTS(model="gpt-realtime-2.1-mini", api_key="sk-test")
-
-    with pytest.raises(APIError, match="connection closed"):
+    with pytest.raises(APIError, match="bad voice") as raised:
         [
             event
             async for event in tts.synthesize("Hello.", conn_options=APIConnectOptions(max_retry=1, retry_interval=0))
         ]
     assert attempts == ["Hello."]
+    assert not isinstance(raised.value, APIStatusError)
+
+
+@pytest.mark.asyncio
+async def test_realtime_tts_refusal_keeps_its_http_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A refused connection reaches the call as an HTTP status, so the call says the credential was rejected."""
+
+    async def stream(_text: str, **_kwargs: object) -> AsyncIterator[bytes]:
+        msg = "Realtime connection refused: HTTP 401"
+        raise RealtimeSpeechError(msg, status_code=401)
+        yield b""
+
+    monkeypatch.setattr(realtime_tts, "stream_realtime_speech", stream)
+    tts = RealtimeTTS(model="gpt-realtime-2.1-mini", api_key="sk-test")
+
+    with pytest.raises(APIStatusError) as raised:
+        [
+            event
+            async for event in tts.synthesize("Hello.", conn_options=APIConnectOptions(max_retry=1, retry_interval=0))
+        ]
+    assert raised.value.status_code == 401
+    assert raised.value.retryable is False
 
 
 def test_realtime_tts_rejects_unknown_options() -> None:

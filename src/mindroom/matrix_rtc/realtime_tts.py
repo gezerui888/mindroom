@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions, APIError, tts
+from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions, APIError, APIStatusError, tts
 
 from mindroom.voice.openai_realtime_speech import (
     REALTIME_SPEECH_SAMPLE_RATE,
@@ -64,7 +64,6 @@ class _RealtimeChunkedStream(tts.ChunkedStream):
             num_channels=1,
             mime_type="audio/pcm",
         )
-        spoke = False
         try:
             async for chunk in stream_realtime_speech(
                 self.input_text,
@@ -74,8 +73,10 @@ class _RealtimeChunkedStream(tts.ChunkedStream):
                 base_url=self._realtime_tts._base_url,
             ):
                 output_emitter.push(chunk)
-                spoke = True
         except RealtimeSpeechError as error:
-            # Speech already played cannot be taken back, so only a segment that never started is retried.
-            raise APIError(str(error), retryable=not spoke) from error
+            # A refused key or voice fails every attempt, and played speech cannot be taken back, so a failed segment is
+            # not retried; a refusal keeps its HTTP status, which the call's error notice explains.
+            if error.status_code is not None:
+                raise APIStatusError(str(error), status_code=error.status_code, retryable=False) from error
+            raise APIError(str(error), retryable=False) from error
         output_emitter.flush()

@@ -272,7 +272,7 @@ async def test_worker_openai_media_preserves_typed_result_without_primary_secret
     assert len(worker_requests) == 1
     assert _MODEL_KEY not in json.dumps(worker_requests)
     if media_kind == "audio":
-        assert worker_requests[0]["kwargs"].get("agent") is None
+        assert "agent" not in worker_requests[0]["kwargs"]
     media = response.images if media_kind == "image" else response.audios
     assert len(media) == 1
     assert media[0].content == (content if media_kind == "image" else pcm_to_wav(content))

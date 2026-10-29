@@ -46,7 +46,7 @@ if TYPE_CHECKING:
             type="url",
             required=False,
             default=None,
-            description="OpenAI-compatible speech endpoint (e.g. a local Kokoro server); leave empty to use OpenAI or OpenRouter based on the model ID.",
+            description="OpenAI-compatible speech endpoint (e.g. a local Kokoro server, with the model set to one it serves); leave empty to use OpenAI or OpenRouter based on the model ID.",
         ),
         ConfigField(
             name="voice",

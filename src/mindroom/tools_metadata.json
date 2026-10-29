@@ -317,7 +317,7 @@
         {
           "authored_override": true,
           "default": null,
-          "description": "OpenAI-compatible speech endpoint (e.g. a local Kokoro server); leave empty to use OpenAI or OpenRouter based on the model ID.",
+          "description": "OpenAI-compatible speech endpoint (e.g. a local Kokoro server, with the model set to one it serves); leave empty to use OpenAI or OpenRouter based on the model ID.",
           "label": "OpenAI-Compatible TTS Base URL",
           "name": "base_url",
           "options": null,

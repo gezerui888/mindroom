@@ -12,7 +12,7 @@ LiveKit's `openai.TTS` (checked through `livekit-plugins-openai` 1.8.10) speaks 
 - A model whose ID starts with `gpt-realtime` takes the Realtime path; every other model keeps `/v1/audio/speech`, so OpenRouter models and local OpenAI-compatible servers are unchanged.
 - Each synthesis is one out-of-band response (`conversation: "none"`) on a fresh WebSocket, with session instructions that make the model a reader and the text sent as the user message.
 - The WebSocket trusts the system store plus certifi's roots unless `SSL_CERT_FILE` or `SSL_CERT_DIR` is set, as Matrix connections do, because the SDK's WebSocket path uses only Python's default store, which some interpreters ship empty (seen with uv's Python on NixOS: `CERTIFICATE_VERIFY_FAILED`).
-- Any connect, socket, or Realtime failure is one error type, so each caller reports it the way it reports a failed speech request; a call retries a segment only while none of its audio has played, because played speech cannot be taken back.
+- Any connect, socket, or Realtime failure is one error type that keeps a refused connection's HTTP status, so each caller reports it the way it reports a failed speech request; a call does not retry a failed segment, because a refused key or voice fails every attempt and played speech cannot be taken back.
 
 ## Evidence: prompt shape
 

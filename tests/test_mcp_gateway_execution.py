@@ -273,8 +273,8 @@ async def test_cancelled_worker_proxy_call_keeps_capacity_until_proxy_thread_exi
         # As get_tool_by_name routes a worker-routed toolkit, every function sends its calls through the async proxy.
         return configure_toolkit_functions(
             Toolkit(name="calculator", tools=[work]),
-            route=partial(
-                sandbox_proxy._routed_entrypoint,
+            to_worker=partial(
+                sandbox_proxy._worker_stand_in,
                 tool_name="calculator",
                 runtime_paths=context.runtime_paths,
                 credentials_manager=None,
@@ -388,8 +388,8 @@ def _routed(toolkit: Toolkit, context: AgentToolContext) -> Toolkit:  # noqa: F8
     """Return ``toolkit`` with every function sending its calls through the async worker proxy, as a routed one does."""
     return configure_toolkit_functions(
         toolkit,
-        route=partial(
-            sandbox_proxy._routed_entrypoint,
+        to_worker=partial(
+            sandbox_proxy._worker_stand_in,
             tool_name=toolkit.name,
             runtime_paths=context.runtime_paths,
             credentials_manager=None,

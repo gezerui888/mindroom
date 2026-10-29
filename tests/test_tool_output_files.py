@@ -234,14 +234,14 @@ def test_outer_functools_wraps_keeps_wrapped_entrypoint_validation(tmp_path: Pat
     """Outer wrappers such as the sandbox proxy still coerce model arguments like "28"."""
     seen: list[object] = []
 
-    def route(_name: str, inner: Callable[..., object]) -> Callable[..., object]:
+    def to_worker(_name: str, inner: Callable[..., object]) -> Callable[..., object]:
         @functools.wraps(inner)
         def outer(*args: object, **kwargs: object) -> object:
             return inner(*args, **kwargs)
 
         return outer
 
-    toolkit = configure_toolkit_functions(_LineToolkit(seen), output_files=_policy(tmp_path), route=route)
+    toolkit = configure_toolkit_functions(_LineToolkit(seen), output_files=_policy(tmp_path), to_worker=to_worker)
     result = _execute(_first_function(toolkit), {"start_line": "28"})
 
     assert result.status == "success"

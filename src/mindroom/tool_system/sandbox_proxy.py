@@ -852,7 +852,7 @@ async def _run_in_worker_proxy_executor(call: Callable[[], object]) -> object:
     return await run_async_entrypoint_blocking_call(call, executor=WORKER_PROXY_CALL_EXECUTOR)
 
 
-def _routed_entrypoint(
+def _worker_stand_in(
     function_name: str,
     local: Callable[..., object],
     *,
@@ -915,7 +915,7 @@ def _routed_entrypoint(
     return proxy_entrypoint
 
 
-def worker_route(
+def worker_stand_ins(
     tool_name: str,
     toolkit: object,
     *,
@@ -927,13 +927,13 @@ def worker_route(
     worker_target: ResolvedWorkerTarget | None = None,
     runtime_config: Config | None = None,
 ) -> Callable[[str, Callable[..., object]], Callable[..., object]]:
-    """Return how each function of ``toolkit``, built for ``tool_name`` to run in a worker, sends its calls there.
+    """Return the factory of the stand-ins that send the calls of ``toolkit``, built to run in a worker, there.
 
-    Given a function's name and entrypoint, the route returns the entrypoint that sends its calls to the worker.
+    Given a function's name and entrypoint, the factory returns the stand-in that sends the function's calls there.
     ``runtime_config`` is the config the toolkit was built from; each call carries the parts runners need from it.
     """
     return functools.partial(
-        _routed_entrypoint,
+        _worker_stand_in,
         tool_name=tool_name,
         runtime_paths=runtime_paths,
         credentials_manager=credentials_manager,
@@ -947,6 +947,6 @@ def worker_route(
         extra_env_passthrough=extra_env_passthrough,
         worker_target=worker_target,
         runtime_config=runtime_config,
-        # Weak, because the toolkit keeps this route as long as it lives; a strong reference would keep it forever.
+        # Weak, because the toolkit keeps this factory as long as it lives; a strong reference would keep it forever.
         primary_placement=weakref.ref(toolkit) if isinstance(toolkit, SupportsPrimaryCallPlacement) else None,
     )

@@ -75,11 +75,11 @@ AnyToolkit = Toolkit | authoring.Toolkit
 
 @dataclass(frozen=True, slots=True)
 class _Finishing:
-    """How one built toolkit's functions are offered: which ones, with output files, and through a worker route."""
+    """How one built toolkit's functions are offered: which ones, with output files, and through worker stand-ins."""
 
     offered: frozenset[str] | None = None
     output_files: ToolOutputFilePolicy | None = None
-    route: Callable[[str, Callable[..., object]], Callable[..., object]] | None = None
+    to_worker: Callable[[str, Callable[..., object]], Callable[..., object]] | None = None
 
     def entrypoint(
         self,
@@ -98,8 +98,8 @@ class _Finishing:
             else output_file_entrypoint(entrypoint, self.output_files, tool_name=name, parameters=parameters)
         )
         entrypoint = wrapped or entrypoint
-        if self.route is not None:
-            entrypoint = self.route(name, entrypoint)
+        if self.to_worker is not None:
+            entrypoint = self.to_worker(name, entrypoint)
         return entrypoint, wrapped is not None
 
 
@@ -112,15 +112,15 @@ def configure_toolkit_functions[T: AnyToolkit](
     *,
     offered: Collection[str] | None = None,
     output_files: ToolOutputFilePolicy | None = None,
-    route: Callable[[str, Callable[..., object]], Callable[..., object]] | None = None,
+    to_worker: Callable[[str, Callable[..., object]], Callable[..., object]] | None = None,
 ) -> T:
     """Record how whoever built ``toolkit`` offers its functions; every adaptation of the toolkit applies it.
 
     ``offered`` names the functions an agent is offered, None every one, as ``get_tool_by_name``'s function filters
-    leave them. With ``output_files``, each function takes ``mindroom_output_path`` too, and ``route``, given a
-    function's name and entrypoint, returns the entrypoint that sends its calls to a worker.
+    leave them. With ``output_files``, each function takes ``mindroom_output_path`` too, and ``to_worker``, given
+    a function's name and entrypoint, returns its stand-in that sends its calls to a worker.
     """
-    _FINISHING[toolkit] = _Finishing(None if offered is None else frozenset(offered), output_files, route)
+    _FINISHING[toolkit] = _Finishing(None if offered is None else frozenset(offered), output_files, to_worker)
     return toolkit
 
 

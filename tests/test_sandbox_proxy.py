@@ -1807,7 +1807,7 @@ async def test_sync_function_placed_on_the_primary_runs_locally_through_its_asyn
     placed = PlacedTools()
     toolkit = configure_toolkit_functions(
         placed,
-        route=sandbox_proxy_module.worker_route(
+        to_worker=sandbox_proxy_module.worker_stand_ins(
             "calculator",
             placed,
             runtime_paths=runtime_paths,
@@ -1864,7 +1864,7 @@ async def test_stopped_sync_tool_call_keeps_its_completion_owner_waiting(
     placed = PlacedTools()
     toolkit = configure_toolkit_functions(
         placed,
-        route=sandbox_proxy_module.worker_route(
+        to_worker=sandbox_proxy_module.worker_stand_ins(
             "calculator",
             placed,
             runtime_paths=runtime_paths,

@@ -47,7 +47,7 @@ from mindroom.tool_system.registry_state import (
     scoped_plugin_registration_owner,
     scoped_plugin_registration_store,
 )
-from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings, tool_placement, worker_route
+from mindroom.tool_system.sandbox_proxy import primary_owns_tool_settings, tool_placement, worker_stand_ins
 from mindroom.tool_system.worker_routing import (
     ResolvedWorkerTarget,
     supports_tool_name_for_worker_scope,
@@ -795,7 +795,7 @@ def get_tool_by_name(
             toolkit,
             offered=offered,
             output_files=output_file_policy,
-            route=worker_route(
+            to_worker=worker_stand_ins(
                 tool_name,
                 toolkit,
                 runtime_paths=runtime_paths,

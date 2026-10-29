@@ -66,7 +66,7 @@ Each agent, requester, and room combination may send six voice messages per 30 s
 |-------|---------|---------|
 | `api_key` | none | Speech API key; when empty, OpenAI models use `OPENAI_API_KEY` (or `OPENAI_API_KEY_FILE`, or a stored credential) and OpenRouter models use `OPENROUTER_API_KEY` |
 | `model` | `gpt-realtime-2.1-mini` | `gpt-realtime` IDs use the OpenAI Realtime API, other plain IDs an OpenAI-compatible `/audio/speech` endpoint, and provider-prefixed IDs such as `hexgrad/kokoro-82m` route through OpenRouter |
-| `base_url` | none | Any OpenAI-compatible speech endpoint, such as a local Kokoro server; also settable through the `TTS_URL` secret |
+| `base_url` | none | Any OpenAI-compatible speech endpoint, such as a local Kokoro server, with `model` set to one it serves; also settable through the `TTS_URL` secret |
 | `voice` | `alloy` | Voice name; `gpt-realtime` models offer `alloy`, `ash`, `ballad`, `coral`, `echo`, `sage`, `shimmer`, `verse`, `marin`, and `cedar` |
 | `response_format` | `opus` | Format the endpoint returns: `aac`, `flac`, `mp3`, `opus`, or `wav`; OpenRouter always uses `mp3`, and `gpt-realtime` models ignore it |
 

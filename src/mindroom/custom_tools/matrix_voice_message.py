@@ -26,7 +26,12 @@ from mindroom.matrix.client_delivery import send_audio_message
 from mindroom.matrix.voice_message import prepare_voice_audio_bytes
 from mindroom.model_defaults import LOCAL_OPENAI_API_KEY_DEFAULT, OPENAI_TTS, OPENROUTER_BASE_URL_DEFAULT
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, get_tool_runtime_context
-from mindroom.voice.openai_realtime_speech import is_realtime_speech_model, pcm_to_wav, synthesize_realtime_speech
+from mindroom.voice.openai_realtime_speech import (
+    RealtimeSpeechError,
+    is_realtime_speech_model,
+    pcm_to_wav,
+    synthesize_realtime_speech,
+)
 
 _OPUS_FILENAME = "voice-message.opus"
 _DEFAULT_RESPONSE_FORMAT = "opus"
@@ -414,7 +419,7 @@ class MatrixVoiceMessageTools(Toolkit):
         try:
             audio_bytes = await self._speech_audio(preflight)
         except Exception as error:
-            status_code = error.status_code if isinstance(error, APIStatusError) else None
+            status_code = error.status_code if isinstance(error, (APIStatusError, RealtimeSpeechError)) else None
             logger.error(  # noqa: TRY400 - avoid traceback logging for provider errors that may include secrets.
                 "matrix_voice_tts_generation_failed",
                 room_id=preflight.room_id,

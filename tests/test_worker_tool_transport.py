@@ -231,7 +231,7 @@ async def test_routing_preserves_sql_memory_database_across_calls(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("media_kind", ["image", "audio"])
+@pytest.mark.parametrize("media_kind", ["image", "audio", "speech_endpoint_audio"])
 async def test_worker_openai_media_preserves_typed_result_without_primary_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -257,7 +257,13 @@ async def test_worker_openai_media_preserves_typed_result_without_primary_secret
             "MINDROOM_SANDBOX_PROXY_TOKEN": "dummy-worker-token",
             "OPENAI_API_KEY": _TOOL_KEY,
         },
-        agent_settings={"tools": ["openai"]},
+        agent_settings={
+            "tools": [
+                {"openai": {"text_to_speech_model": "gpt-4o-mini-tts", "text_to_speech_format": "mp3"}}
+                if media_kind == "speech_endpoint_audio"
+                else "openai",
+            ],
+        },
     )
     name, arguments = (
         ("generate_image", {"prompt": "Offline image"})
@@ -272,10 +278,13 @@ async def test_worker_openai_media_preserves_typed_result_without_primary_secret
     assert len(worker_requests) == 1
     assert _MODEL_KEY not in json.dumps(worker_requests)
     if media_kind == "audio":
+        # A Realtime model's speech takes no agent.
         assert "agent" not in worker_requests[0]["kwargs"]
+    if media_kind == "speech_endpoint_audio":
+        assert worker_requests[0]["kwargs"]["agent"] is None
     media = response.images if media_kind == "image" else response.audios
     assert len(media) == 1
-    assert media[0].content == (content if media_kind == "image" else pcm_to_wav(content))
+    assert media[0].content == (pcm_to_wav(content) if media_kind == "audio" else content)
 
 
 @pytest.mark.parametrize("shape", ["value", "nested", "key", "nonfinite", "positional", "actor", "context"])

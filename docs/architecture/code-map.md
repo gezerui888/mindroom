@@ -32,6 +32,7 @@ Matrix sync callback
 | Module | Purpose |
 |--------|---------|
 | `failure_text.py` | The text a caught exception reports: its text, or its type name when it has none |
+| `tls_trust.py` | Shared TLS trust (system store plus certifi's roots, unless the operator sets `SSL_CERT_FILE` or `SSL_CERT_DIR`) for Matrix, the egress broker's upstream connections, and Realtime speech |
 | `bounded_bytes.py` | Shared asynchronous and synchronous byte collection that rejects overflowing chunks before buffering them |
 | `origins.py` | Shared browser-origin normalization and allowlist validation for dashboard auth, CORS, Connections same-origin checks, the Computers and Connections MindRoom Chat allowlists, and MCP gateway origins |
 | `matrix_openid.py` | Matrix OpenID verification at the configured homeserver and audience binding, shared by Computers and the Connections portal |

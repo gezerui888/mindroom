@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import os
@@ -19,6 +20,7 @@ from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 from websockets.http11 import Response
 
+from mindroom import tls_trust
 from mindroom.voice import openai_realtime_speech
 from mindroom.voice.openai_realtime_speech import (
     RealtimeSpeechError,
@@ -29,6 +31,10 @@ from mindroom.voice.openai_realtime_speech import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+
+# A scripted event that never arrives, as from a server that keeps the socket open but stops responding.
+_STALL = object()
 
 
 class _FakeConnection:
@@ -47,6 +53,8 @@ class _FakeConnection:
 
     async def __aiter__(self) -> AsyncIterator[object]:
         for event in self.events:
+            if event is _STALL:
+                await asyncio.Event().wait()
             if isinstance(event, BaseException):
                 raise event
             yield event
@@ -224,6 +232,16 @@ async def test_dropped_connection_raises(fake_client: type[_FakeClient]) -> None
 
 
 @pytest.mark.asyncio
+async def test_silent_server_raises(fake_client: type[_FakeClient], monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server that stops sending events fails the synthesis instead of leaving the caller waiting."""
+    monkeypatch.setattr(openai_realtime_speech, "_EVENT_TIMEOUT_SECONDS", 0.01)
+    fake_client.events = [_delta(b"ab"), _STALL]
+
+    with pytest.raises(RealtimeSpeechError, match="nothing"):
+        await _synthesize()
+
+
+@pytest.mark.asyncio
 async def test_failed_connect_raises(fake_client: type[_FakeClient]) -> None:
     """A connection that cannot open fails the synthesis like any other Realtime failure."""
     fake_client.connect_error = ConnectionRefusedError("refused")
@@ -264,7 +282,7 @@ async def test_operator_trust_store_is_left_to_openssl(
 ) -> None:
     """An explicit ``SSL_CERT_FILE`` is the operator's trust choice, so certifi's roots are not added to it."""
     loaded: list[str] = []
-    monkeypatch.setattr(openai_realtime_speech.certifi, "where", lambda: loaded.append("certifi") or "/missing")
+    monkeypatch.setattr(tls_trust.certifi, "where", lambda: loaded.append("certifi") or "/missing")
     monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
     fake_client.events = [_done()]
 
@@ -281,8 +299,8 @@ async def test_certifi_roots_join_the_system_store(
 ) -> None:
     """Without operator trust settings, certifi's roots are added, since some interpreters ship an empty store."""
     loaded: list[str] = []
-    real_where = openai_realtime_speech.certifi.where
-    monkeypatch.setattr(openai_realtime_speech.certifi, "where", lambda: loaded.append("certifi") or real_where())
+    real_where = tls_trust.certifi.where
+    monkeypatch.setattr(tls_trust.certifi, "where", lambda: loaded.append("certifi") or real_where())
     monkeypatch.delenv("SSL_CERT_FILE", raising=False)
     monkeypatch.delenv("SSL_CERT_DIR", raising=False)
     fake_client.events = [_done()]
@@ -307,7 +325,6 @@ def test_pcm_to_wav_round_trips() -> None:
     ("model", "expected"),
     [
         ("gpt-realtime-2.1-mini", True),
-        (" GPT-Realtime-2.1 ", True),
         ("gpt-4o-mini-tts", False),
         ("hexgrad/kokoro-82m", False),
         ("openai/gpt-realtime-2.1-mini", False),

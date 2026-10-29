@@ -4223,7 +4223,7 @@ visibility = ["mindroom.response_runner", "mindroom.approval.execution"]
 
 [[modules]]
 path = "mindroom.matrix.client_session"
-depends_on = ["mindroom.constants", "mindroom.failure_text"]
+depends_on = ["mindroom.constants", "mindroom.failure_text", "mindroom.tls_trust"]
 visibility = [
     "mindroom.bot",
     "mindroom.cli.doctor",
@@ -4912,6 +4912,10 @@ depends_on = [
     "mindroom.logging_config",
     "mindroom.matrix_rtc.events",
 ]
+
+[[modules]]
+path = "mindroom.tls_trust"
+depends_on = []
 
 [[modules]]
 path = "mindroom.matrix_rtc.realtime_tts"
@@ -5749,6 +5753,7 @@ depends_on = [
     "mindroom.worker_computer.browser_proxy",
     "mindroom.origins",
     "mindroom.tool_system.agent_tools",
+    "mindroom.tls_trust",
 ]
 # The broker's wiring points: every module outside the feature that may import it.
 visibility = [

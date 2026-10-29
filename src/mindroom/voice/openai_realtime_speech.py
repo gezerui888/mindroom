@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import os
-import ssl
 import wave
 from typing import TYPE_CHECKING, cast
 
-import certifi
 from openai import AsyncOpenAI
 from openai.types.realtime import RealtimeErrorEvent, ResponseAudioDeltaEvent, ResponseDoneEvent
 from websockets.exceptions import InvalidStatus, WebSocketException
+
+from mindroom.tls_trust import verifying_ssl_context
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -32,6 +33,9 @@ __all__ = [
 # Realtime speech is mono 16-bit little-endian PCM at this rate.
 REALTIME_SPEECH_SAMPLE_RATE = 24_000
 _SAMPLE_WIDTH_BYTES = 2
+# A server that keeps the socket open but stops sending events fails the synthesis after this long, as the speech
+# endpoint's read timeout does.
+_EVENT_TIMEOUT_SECONDS = 30.0
 # A Realtime model is a conversational model, so it is told to read rather than reply; the text goes in as the user's
 # message, because text placed in the response instructions is obeyed (docs/dev/2026-10-29-openai-realtime-speech.md).
 _READER_INSTRUCTIONS = (
@@ -51,20 +55,16 @@ class RealtimeSpeechError(RuntimeError):
 
 def is_realtime_speech_model(model: str) -> bool:
     """Return whether a speech model ID names an OpenAI Realtime model."""
-    return model.strip().casefold().startswith("gpt-realtime")
+    return model.startswith("gpt-realtime")
 
 
 def _websocket_options(base_url: URL) -> WebSocketConnectionOptions:
     # A plain-HTTP server gets a plain WebSocket, which refuses a TLS context.
     if base_url.scheme != "https":
         return {}
-    # The SDK's WebSocket trusts only Python's default store, which some interpreters ship empty, so certifi's roots
-    # join it, as for Matrix connections; an explicit SSL_CERT_FILE or SSL_CERT_DIR is the operator's choice and is
-    # left to OpenSSL, which reads both from the process environment.
-    context = ssl.create_default_context()
-    if not any(name in os.environ for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")):
-        context.load_verify_locations(cafile=certifi.where())
-    return cast("WebSocketConnectionOptions", {"ssl": context})
+    # The SDK's WebSocket trusts only Python's default store; OpenSSL reads SSL_CERT_FILE and SSL_CERT_DIR from the
+    # process environment.
+    return cast("WebSocketConnectionOptions", {"ssl": verifying_ssl_context(os.environ)})
 
 
 async def stream_realtime_speech(
@@ -123,7 +123,16 @@ async def _realtime_speech_chunks(
                     ],
                 },
             )
-            async for event in connection:
+            events = aiter(connection)
+            while True:
+                try:
+                    async with asyncio.timeout(_EVENT_TIMEOUT_SECONDS):
+                        event = await anext(events, None)
+                except TimeoutError as error:
+                    msg = f"Realtime sent nothing for {_EVENT_TIMEOUT_SECONDS:g} s."
+                    raise RealtimeSpeechError(msg) from error
+                if event is None:
+                    break
                 if isinstance(event, ResponseAudioDeltaEvent):
                     yield base64.b64decode(event.delta)
                 elif isinstance(event, ResponseDoneEvent):

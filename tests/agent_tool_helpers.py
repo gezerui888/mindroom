@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,17 @@ def toolkit_offers(toolkit: AnyToolkit, name: str) -> ToolFunction:
     if function is None:
         pytest.fail(f"The toolkit does not offer {name}")
     return function
+
+
+def blocking_entrypoint(toolkit: AnyToolkit, name: str) -> Callable[..., Any]:
+    """Return the entrypoint ``toolkit`` offers for ``name`` as a blocking call, which runs an async one to its end."""
+    entrypoint = toolkit_offers(toolkit, name).entrypoint
+
+    def call(*args: object, **kwargs: object) -> object:
+        result = entrypoint(*args, **kwargs)
+        return asyncio.run(result) if inspect.iscoroutine(result) else result
+
+    return call
 
 
 def offered_agno_function(function: Function) -> ToolFunction:

@@ -55,7 +55,7 @@ def install_scripted_shell(monkeypatch: pytest.MonkeyPatch, run_shell_command: C
         if name != "shell":
             return original(name, *args, **kwargs)
         # The scripted body runs here, so no call of it is sent to a worker.
-        toolkit = original(name, *args, **{**kwargs, "disable_sandbox_proxy": True})
+        toolkit = original(name, *args, **{**kwargs, "runs_in_worker": False})
         if "run_shell_command" in toolkit.functions:
             toolkit.functions["run_shell_command"] = run_shell_command
         return toolkit

@@ -427,7 +427,10 @@ async def _in_call[T](context: ToolCallContext, call: Awaitable[T]) -> T:
         parameters={"type": "object", "properties": {}, "required": []},
         entrypoint=entrypoint,
     )
-    return cast("T", await run_tool_call(function, {}, context, middleware=()))
+    result = await run_tool_call(function, {}, context, middleware=())
+    if result.error is not None:
+        raise result.error
+    return cast("T", result.value)
 
 
 @pytest.fixture

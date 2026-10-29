@@ -84,7 +84,7 @@ async def test_retained_tool_constructor_grants_gate_nested_execution_and_result
         tool_config_overrides=entry.overrides,
         tool_init_overrides={"base_dir": str(tmp_path)},
         worker_target=None,
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
     )
     tools = toolkit_job_tools(toolkit, authored_name=toolkit_name, snapshot=authority_snapshot(config, "lead"))
     tool = tools[function_name]
@@ -125,7 +125,7 @@ async def test_retained_tool_constructor_grants_gate_nested_execution_and_result
                         paths,
                         tool_config_overrides=entry.overrides,
                         worker_target=None,
-                        disable_sandbox_proxy=True,
+                        runs_in_worker=False,
                     )
                     assert function_name not in toolkit_function_names(current)
                 release.set()

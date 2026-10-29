@@ -1381,8 +1381,9 @@ def record_pending_turn(
 ) -> ReshapeResult:
     """Persist a turn's response context before generation starts.
 
-    The result is assembled from the rows this transaction read and wrote, so
-    the write reads each of them once.
+    Every reply awaits this write on the journal's single writer before it
+    starts, so the result is assembled from the rows this transaction read and
+    wrote rather than read again.
     """
     owners = _owners(transaction, agent_name, record.source_event_ids)
     rows = _reshape(transaction, agent_name, record, room_id=room_id, owners=owners)

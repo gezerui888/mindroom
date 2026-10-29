@@ -354,6 +354,9 @@ def _forget_statistics(transaction: Transaction, inspector: SchemaInspector, tab
         return
     placeholders = ", ".join("?" for _ in tables)
     transaction.execute(f"DELETE FROM sqlite_stat1 WHERE tbl IN ({placeholders})", tuple(tables))  # noqa: S608
+    # A SQLite built with STAT4 also keeps index samples, which later connections would load.
+    if transaction.fetchone("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_stat4'"):
+        transaction.execute(f"DELETE FROM sqlite_stat4 WHERE tbl IN ({placeholders})", tuple(tables))  # noqa: S608
 
 
 def _agent_logins(transaction: Transaction) -> dict[str, tuple[str, ...]]:
@@ -369,7 +372,7 @@ def _agent_logins(transaction: Transaction) -> dict[str, tuple[str, ...]]:
 # LEGACY_COMPAT: Turn-source indexes that hold every source's NULL selected revision and discovery alias.
 # Legacy format: turn_sources_selected_revision and turn_sources_discovery, full indexes on (agent_name, selected_rev_id)
 # and (agent_name, discovery_event_id).
-# Last legacy release: v2026.10.693; replacement: the next release keeps only the sources that hold a value, in
+# Last legacy release: v2026.10.696; replacement: the next release keeps only the sources that hold a value, in
 # turn_sources_selected_revision_set and turn_sources_discovery_set.
 # Handling: the schema upgrade drops both, found in this journal's own schema, before the current schema creates their
 # replacements.

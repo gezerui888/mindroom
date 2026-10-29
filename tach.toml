@@ -1743,8 +1743,6 @@ depends_on = [
     "mindroom.llm",
     "mindroom.response_turn",
     "mindroom.run_storage",
-    "mindroom.runtime_resolution",
-    "mindroom.approval.tool_approval",
     "mindroom.tool_system",
     "mindroom.tool_system.agno_toolkits",
     "mindroom.tool_system.authoring",
@@ -1763,7 +1761,6 @@ depends_on = [
     "mindroom.constants",
     "mindroom.credentials.manager",
     "mindroom.custom_tools.tool_payloads",
-    "mindroom.custom_tools.toolkit_functions",
     "mindroom.desktop.client",
     "mindroom.desktop.configuration",
     "mindroom.desktop.credentials",
@@ -5608,8 +5605,6 @@ depends_on = [
     "mindroom.tool_system.registry_state",
     "mindroom.tool_system.sandbox_proxy",
     "mindroom.tool_system.worker_routing",
-    "mindroom.config.legacy_fields",
-    "mindroom.egress_broker",
     "mindroom.tool_system.agent_tools",
 ]
 
@@ -5716,7 +5711,6 @@ depends_on = [
     "mindroom.atomic_file",
     "mindroom.constants",
     "mindroom.logging_config",
-    "mindroom.tool_system.declarations",
     "mindroom.workspaces",
     "mindroom.tool_system.agno_toolkits",
 ]
@@ -5874,7 +5868,6 @@ depends_on = [
     "mindroom.llm",
     "mindroom.logging_config",
     "mindroom.tool_system.authoring",
-    "mindroom.tool_system.declarations",
     "mindroom.tool_system.output_files",
     "mindroom.tool_system.tool_function",
     "mindroom.tool_system.tool_schema",
@@ -5978,7 +5971,6 @@ depends_on = [
     "mindroom.path_confinement",
     "mindroom.tool_system.agno_toolkits",
     "mindroom.tool_system.authoring",
-    "mindroom.tool_system.output_files",
     "mindroom.tool_system.skill_usage",
     "mindroom.tool_system.worker_routing",
 ]
@@ -5991,7 +5983,6 @@ visibility = ["mindroom.tool_system.skills", "mindroom.skill_learning.library"]
 [[modules]]
 path = "mindroom.tool_system.google_workspaces"
 depends_on = [
-    "mindroom.tool_system",
     "mindroom.tool_system.agno_toolkits",
     "mindroom.tool_system.catalog",
     "mindroom.tool_system.registration",
@@ -7276,10 +7267,6 @@ expose = [
     "ToolMetadata",
     "ToolStatus",
     "ToolValidationInfo",
-    "declare_tool_schema_finisher",
-    "declare_tool_schema_source",
-    "finished_tool_schema",
-    "tool_schema_source",
 ]
 from = ["mindroom.tool_system.declarations"]
 
@@ -9349,8 +9336,6 @@ depends_on = [
     "mindroom.tool_jobs.runtime",
     "mindroom.tool_system.agno_toolkits",
     "mindroom.tool_system.authoring",
-    "mindroom.tool_system.declarations",
-    "mindroom.tool_system.output_files",
     "mindroom.tool_system.runtime_context",
     "mindroom.tool_system.tool_function",
 ]

@@ -26,6 +26,7 @@ from mindroom.matrix.client_delivery import send_audio_message
 from mindroom.matrix.voice_message import prepare_voice_audio_bytes
 from mindroom.model_defaults import LOCAL_OPENAI_API_KEY_DEFAULT, OPENAI_TTS, OPENROUTER_BASE_URL_DEFAULT
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, get_tool_runtime_context
+from mindroom.voice.openai_realtime_speech import is_realtime_speech_model, pcm_to_wav, synthesize_realtime_speech
 
 _OPUS_FILENAME = "voice-message.opus"
 _DEFAULT_RESPONSE_FORMAT = "opus"
@@ -33,6 +34,8 @@ _SpeechResponseFormat = Literal["aac", "flac", "mp3", "opus", "wav"]
 _ALLOWED_RESPONSE_FORMATS = frozenset(get_args(_SpeechResponseFormat))
 # OpenRouter's /audio/speech endpoint only returns mp3 or pcm; mp3 is the one we can turn into a Matrix voice message.
 _OPENROUTER_RESPONSE_FORMAT = "mp3"
+# A Realtime model speaks PCM, which the tool wraps as WAV for transcoding into the voice note.
+_REALTIME_RESPONSE_FORMAT = "wav"
 logger = get_logger(__name__)
 
 
@@ -164,6 +167,8 @@ class MatrixVoiceMessageTools(Toolkit):
         return get_secret_from_env("OPENAI_API_KEY", context.runtime_paths)
 
     def _response_format_for_target(self, base_url: str | None) -> str:
+        if is_realtime_speech_model(self._model):
+            return _REALTIME_RESPONSE_FORMAT
         if _is_openrouter_base_url(base_url) and self._response_format != _OPENROUTER_RESPONSE_FORMAT:
             logger.info(
                 "matrix_voice_response_format_coerced",
@@ -188,6 +193,24 @@ class MatrixVoiceMessageTools(Toolkit):
             msg = "Speech response did not include audio bytes."
             raise TypeError(msg)
         return audio_content
+
+    async def _speech_audio(self, preflight: _VoiceMessagePreflight) -> bytes:
+        if is_realtime_speech_model(self._model):
+            pcm = await synthesize_realtime_speech(
+                preflight.text,
+                model=self._model,
+                voice=self._voice,
+                api_key=preflight.api_key,
+                base_url=preflight.base_url,
+            )
+            return pcm_to_wav(pcm)
+        return await asyncio.to_thread(
+            self._generate_speech_bytes,
+            api_key=preflight.api_key,
+            base_url=preflight.base_url,
+            text=preflight.text,
+            response_format=preflight.response_format,
+        )
 
     async def _send_companion_message(
         self,
@@ -389,13 +412,7 @@ class MatrixVoiceMessageTools(Toolkit):
             return thread_error
 
         try:
-            audio_bytes = await asyncio.to_thread(
-                self._generate_speech_bytes,
-                api_key=preflight.api_key,
-                base_url=preflight.base_url,
-                text=preflight.text,
-                response_format=preflight.response_format,
-            )
+            audio_bytes = await self._speech_audio(preflight)
         except Exception as error:
             status_code = error.status_code if isinstance(error, APIStatusError) else None
             logger.error(  # noqa: TRY400 - avoid traceback logging for provider errors that may include secrets.

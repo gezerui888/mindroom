@@ -18,6 +18,7 @@ from mindroom.matrix.state import MatrixState, _load_matrix_state_file_cached
 from mindroom.matrix.voice_message import PreparedVoiceAudio
 from mindroom.message_target import MessageTarget
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
+from mindroom.voice.openai_realtime_speech import RealtimeSpeechError, pcm_to_wav
 from tests.authorization_helpers import (
     make_test_tool_runtime_context,
 )
@@ -229,7 +230,7 @@ async def test_matrix_voice_message_resolves_room_alias_before_send(tmp_path: Pa
         mock_openai.return_value.audio.speech.create.return_value = SimpleNamespace(content=b"voice-bytes")
         mock_send.return_value = "$voice-event"
 
-        result = await MatrixVoiceMessageTools(api_key="sk-test").matrix_voice_message(
+        result = await MatrixVoiceMessageTools(api_key="sk-test", model="tts-test").matrix_voice_message(
             "send to ops",
             room_id="#ops:localhost",
         )
@@ -261,7 +262,7 @@ async def test_matrix_voice_message_room_sentinel_forces_room_level_send(tmp_pat
         mock_openai.return_value.audio.speech.create.return_value = SimpleNamespace(content=b"voice-bytes")
         mock_send.return_value = "$voice-event"
 
-        result = await MatrixVoiceMessageTools(api_key="sk-test").matrix_voice_message(
+        result = await MatrixVoiceMessageTools(api_key="sk-test", model="tts-test").matrix_voice_message(
             "room-level",
             thread_id="room",
         )
@@ -307,7 +308,7 @@ async def test_matrix_voice_message_companion_message_sends_to_same_thread(tmp_p
         mock_openai.return_value.audio.speech.create.return_value = SimpleNamespace(content=b"voice-bytes")
         mock_send.return_value = "$voice-event"
 
-        result = await MatrixVoiceMessageTools(api_key="sk-test").matrix_voice_message(
+        result = await MatrixVoiceMessageTools(api_key="sk-test", model="tts-test").matrix_voice_message(
             "spoken version",
             caption="Audio body",
             companion_message="Readable transcript",
@@ -373,7 +374,7 @@ async def test_matrix_voice_message_voice_failure_reports_sent_companion(tmp_pat
         mock_openai.return_value.audio.speech.create.return_value = SimpleNamespace(content=b"voice-bytes")
         mock_send.return_value = None
 
-        result = await MatrixVoiceMessageTools(api_key="sk-test").matrix_voice_message(
+        result = await MatrixVoiceMessageTools(api_key="sk-test", model="tts-test").matrix_voice_message(
             "spoken version",
             companion_message="Readable transcript",
         )
@@ -397,7 +398,7 @@ async def test_matrix_voice_message_generation_error_is_sanitized(tmp_path: Path
     ):
         mock_openai.return_value.audio.speech.create.side_effect = RuntimeError("bad key sk-secret")
 
-        result = await MatrixVoiceMessageTools(api_key="sk-test").matrix_voice_message("hello")
+        result = await MatrixVoiceMessageTools(api_key="sk-test", model="tts-test").matrix_voice_message("hello")
 
     mock_send.assert_not_awaited()
     payload = _payload(result)
@@ -418,7 +419,7 @@ async def test_matrix_voice_message_missing_thread_fallback_is_structured_error(
         patch("mindroom.custom_tools.matrix_voice_message.OpenAI") as mock_openai,
         patch("mindroom.custom_tools.matrix_voice_message.send_audio_message", new_callable=AsyncMock) as mock_send,
     ):
-        result = await MatrixVoiceMessageTools(api_key="sk-test").matrix_voice_message("hello")
+        result = await MatrixVoiceMessageTools(api_key="sk-test", model="tts-test").matrix_voice_message("hello")
 
     mock_openai.assert_not_called()
     mock_send.assert_not_awaited()
@@ -676,3 +677,62 @@ def test_matrix_voice_message_parameter_descriptions_are_exposed() -> None:
     assert "Matrix event body" in properties["caption"]["description"]
     assert "Normal text message" in properties["companion_message"]["description"]
     assert 'thread_id="room"' in properties["thread_id"]["description"]
+
+
+@pytest.mark.asyncio
+async def test_matrix_voice_message_realtime_model_sends_wav_through_voice_preparation(tmp_path: Path) -> None:
+    """The default Realtime model reads the text aloud and its WAV becomes the voice note."""
+    context = _context(tmp_path, thread_id="$thread-root")
+
+    with (
+        tool_runtime_context(context),
+        patch("mindroom.custom_tools.matrix_voice_message.OpenAI") as mock_openai,
+        patch(
+            "mindroom.custom_tools.matrix_voice_message.synthesize_realtime_speech",
+            new_callable=AsyncMock,
+            return_value=b"\x00\x00",
+        ) as mock_synthesize,
+        patch(
+            "mindroom.custom_tools.matrix_voice_message.prepare_voice_audio_bytes",
+            new_callable=AsyncMock,
+            return_value=_prepared_voice_audio(),
+        ) as mock_voice_payload,
+        patch("mindroom.custom_tools.matrix_voice_message.send_audio_message", new_callable=AsyncMock) as mock_send,
+    ):
+        mock_send.return_value = "$voice-event"
+
+        result = await MatrixVoiceMessageTools(api_key="sk-test").matrix_voice_message("Read this aloud")
+
+    assert _payload(result)["status"] == "ok"
+    mock_synthesize.assert_awaited_once_with(
+        "Read this aloud",
+        model="gpt-realtime-2.1-mini",
+        voice="alloy",
+        api_key="sk-test",
+        base_url=None,
+    )
+    mock_voice_payload.assert_awaited_once_with(pcm_to_wav(b"\x00\x00"), response_format="wav")
+    mock_openai.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_matrix_voice_message_realtime_failure_is_sanitized(tmp_path: Path) -> None:
+    """A Realtime failure reports a generic error and sends nothing."""
+    context = _context(tmp_path, thread_id="$thread-root")
+
+    with (
+        tool_runtime_context(context),
+        patch(
+            "mindroom.custom_tools.matrix_voice_message.synthesize_realtime_speech",
+            new_callable=AsyncMock,
+            side_effect=RealtimeSpeechError("boom sk-secret"),
+        ),
+        patch("mindroom.custom_tools.matrix_voice_message.send_audio_message", new_callable=AsyncMock) as mock_send,
+    ):
+        result = await MatrixVoiceMessageTools(api_key="sk-test").matrix_voice_message("hello")
+
+    mock_send.assert_not_awaited()
+    payload = _payload(result)
+    assert payload["status"] == "error"
+    assert payload["message"] == "Failed to generate speech."
+    assert "sk-secret" not in result

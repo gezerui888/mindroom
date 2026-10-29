@@ -39,6 +39,7 @@ from mindroom.turn_record import (
 
 from . import journal, turn_rows
 from .identity import agent_of_principal
+from .schema import SQLITE_DIALECT
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -270,9 +271,13 @@ def upgrade_turn_records_to_rows(transaction: Transaction, inspector: SchemaInsp
     existing_tables = inspector.tables()
     if "turn_records" not in existing_tables and "redaction_tombstones" not in existing_tables:
         return
+    # The redactions below look replies and questions up per event; with statistics, SQLite plans them through the
+    # event indexes instead of walking every span or question of a login.
+    _refresh_statistics(transaction, inspector, ("reply_spans", "reply_span_sources", "interactive_questions"))
     tombstones = _record_redaction_tombstones(transaction) if "redaction_tombstones" in existing_tables else ()
     if "turn_records" in existing_tables:
         deliveries = _outstanding_final_deliveries(transaction)
+        logins = _agent_logins(transaction)
         agents = transaction.fetchall("SELECT agent_name FROM turn_records ORDER BY agent_name/*bytes*/")
         for agent_name in dict.fromkeys(str(row["agent_name"]) for row in agents):
             entries = transaction.fetchall(
@@ -290,8 +295,11 @@ def upgrade_turn_records_to_rows(transaction: Transaction, inspector: SchemaInsp
                 groups,
                 occupied=frozenset(),
                 final_deliveries=deliveries.get(agent_name, {}),
+                logins=logins.get(agent_name, ()),
             )
             logger.info("turn_records_converted", agent=agent_name, row_count=len(entries), turn_count=converted)
+    # The turn rows were all written in this transaction, so the planner learns their shape only now.
+    _refresh_statistics(transaction, inspector, ("turns", "turn_sources"))
     for agent_name, room_id, event_id in tombstones:
         _apply_redaction(transaction, agent_name, room_id, event_id)
     transaction.execute("DROP TABLE IF EXISTS turn_records")
@@ -319,6 +327,38 @@ def _record_redaction_tombstones(transaction: Transaction) -> tuple[tuple[str, s
             turn_rows.record_redaction(transaction, agent_name, room_id=room_id, event_id=event_id)
             redactions.append((agent_name, room_id, event_id))
     return tuple(redactions)
+
+
+def _refresh_statistics(transaction: Transaction, inspector: SchemaInspector, tables: Sequence[str]) -> None:
+    """Record row statistics for ``tables``, sampling each SQLite index instead of reading the whole journal."""
+    if inspector.dialect is SQLITE_DIALECT:
+        transaction.execute("PRAGMA analysis_limit=400")
+    for table in tables:
+        transaction.execute(f"ANALYZE {table}")
+
+
+def _agent_logins(transaction: Transaction) -> dict[str, tuple[str, ...]]:
+    """Return each agent's logins that admitted journal events, read once for every agent the upgrade converts."""
+    logins: dict[str, list[str]] = {}
+    for row in transaction.fetchall("SELECT DISTINCT principal_id FROM journal_events"):
+        principal_id = str(row["principal_id"])
+        if agent_name := agent_of_principal(principal_id):
+            logins.setdefault(agent_name, []).append(principal_id)
+    return {agent_name: tuple(principal_ids) for agent_name, principal_ids in logins.items()}
+
+
+# LEGACY_COMPAT: Turn-source indexes that hold every source's NULL selected revision and discovery alias.
+# Legacy format: turn_sources_selected_revision and turn_sources_discovery, full indexes on (agent_name, selected_rev_id)
+# and (agent_name, discovery_event_id).
+# Last legacy release: v2026.10.683; replacement: the next release keeps only the sources that hold a value, in
+# turn_sources_selected_revision_set and turn_sources_discovery_set.
+# Handling: the schema upgrade drops both before the current schema creates their replacements.
+# Coverage: tests/test_turn_rows_conversion.py::test_the_upgrade_replaces_the_dense_turn_source_indexes.
+def drop_dense_turn_source_indexes(transaction: Transaction, inspector: SchemaInspector) -> None:
+    """Drop the full turn-source indexes the partial ones replace, inside the schema transaction."""
+    del inspector
+    transaction.execute("DROP INDEX IF EXISTS turn_sources_selected_revision")
+    transaction.execute("DROP INDEX IF EXISTS turn_sources_discovery")
 
 
 def _apply_redaction(transaction: Transaction, agent_name: str, room_id: str, event_id: str) -> None:
@@ -357,17 +397,19 @@ def _convert(
     *,
     occupied: frozenset[str],
     final_deliveries: Mapping[str, str],
+    logins: Sequence[str],
 ) -> int:
     """Write the turns these blob groups own between recording and applying their redactions; return the count written.
 
     ``occupied`` names events the row store already indexes, which keep their
     owner. ``final_deliveries`` maps an outstanding non-AI FINAL delivery to its room.
+    ``logins`` are the agent's principals whose admitted events place a turn in its room.
     """
     redactions = _extract_redactions(transaction, agent_name, groups)
     owned, evidence = _owned_members(groups, occupied)
     rooms = _admitted_rooms(
         transaction,
-        agent_name,
+        logins,
         {
             source
             for group, physical, _aliases in owned
@@ -521,18 +563,22 @@ def _owned_members(
     return owned, evidence
 
 
-def _admitted_rooms(transaction: Transaction, agent_name: str, event_ids: set[str]) -> dict[str, set[str]]:
-    """Return the rooms each event was admitted in under any login of this agent."""
+def _admitted_rooms(transaction: Transaction, logins: Sequence[str], event_ids: set[str]) -> dict[str, set[str]]:
+    """Return the rooms each event was admitted in under any of these logins of one agent.
+
+    Each login's events are looked up through the journal's (principal, event) key; a lookup by event alone reads
+    every admitted event of every login once per batch.
+    """
     rooms: dict[str, set[str]] = {}
     ordered = sorted(event_ids)
-    for start in range(0, len(ordered), 500):
-        batch = ordered[start : start + 500]
-        placeholders = ", ".join("?" for _ in batch)
-        for row in transaction.fetchall(
-            f"SELECT principal_id, event_id, room_id FROM journal_events WHERE event_id IN ({placeholders})",  # noqa: S608
-            tuple(batch),
-        ):
-            if agent_of_principal(str(row["principal_id"])) == agent_name:
+    for principal_id in logins:
+        for start in range(0, len(ordered), 500):
+            batch = ordered[start : start + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            for row in transaction.fetchall(
+                f"SELECT event_id, room_id FROM journal_events WHERE principal_id = ? AND event_id IN ({placeholders})",  # noqa: S608
+                (principal_id, *batch),
+            ):
                 rooms.setdefault(str(row["event_id"]), set()).add(str(row["room_id"]))
     return rooms
 
@@ -681,7 +727,14 @@ def _import_legacy_ledger_rows(transaction: Transaction, agent_name: str, raw_le
         event_id for event_id in candidates if turn_rows.get_turn_record(transaction, agent_name, event_id) is not None
     )
     deliveries = _outstanding_final_deliveries(transaction).get(agent_name, {})
-    return _convert(transaction, agent_name, groups, occupied=occupied, final_deliveries=deliveries)
+    return _convert(
+        transaction,
+        agent_name,
+        groups,
+        occupied=occupied,
+        final_deliveries=deliveries,
+        logins=_agent_logins(transaction).get(agent_name, ()),
+    )
 
 
 async def import_legacy_ledger_file(records: turn_rows.TurnRecordStore, *, path: Path | None) -> int:
@@ -701,6 +754,7 @@ async def import_legacy_ledger_file(records: turn_rows.TurnRecordStore, *, path:
 
 
 __all__ = [
+    "drop_dense_turn_source_indexes",
     "import_legacy_ledger_file",
     "legacy_responses_file_path",
     "legacy_summary_sources",

@@ -881,3 +881,56 @@ async def test_a_released_journal_without_reply_tables_converts(
         assert await legacy_tables(store) is None
     finally:
         await store.close()
+
+
+async def _index_names(store: EventJournalStore, table: str, *, postgres: bool) -> set[str]:
+    sql = (
+        "SELECT indexname AS name FROM pg_indexes WHERE schemaname = current_schema() AND tablename = ?"
+        if postgres
+        else "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?"
+    )
+    rows = await store.backend.read(lambda transaction: transaction.fetchall(sql, (table,)))
+    return {str(row["name"]) for row in rows}
+
+
+async def test_the_upgrade_replaces_the_dense_turn_source_indexes(journal: Journal) -> None:
+    """A journal holding the full turn-source indexes keeps only their partial replacements after the upgrade."""
+    store = await journal.legacy()
+
+    def dense(transaction: Transaction) -> None:
+        transaction.execute("CREATE INDEX turn_sources_selected_revision ON turn_sources (agent_name, selected_rev_id)")
+        transaction.execute("CREATE INDEX turn_sources_discovery ON turn_sources (agent_name, discovery_event_id)")
+
+    await store.backend.write(dense)
+    await store.close()
+    journal.opened.remove(store)
+
+    names = await _index_names(journal.upgraded(), "turn_sources", postgres=journal.postgres)
+
+    assert {"turn_sources_selected_revision_set", "turn_sources_discovery_set"} <= names
+    assert not names & {"turn_sources_selected_revision", "turn_sources_discovery"}
+
+
+async def test_the_upgrade_gives_redaction_lookups_statistics_and_an_event_index(tmp_path: Path) -> None:
+    """The conversion records planner statistics, and a redaction deletes its questions through their revision."""
+    path = tmp_path / "journal.db"
+    journal = Journal(lambda: EventJournalStore.open_sqlite(path), postgres=False, opened=[])
+    store = await journal.legacy()
+    await seed_rows(store, every_index(blob(["$m"], response="$r")))
+    await store.close()
+    journal.opened.remove(store)
+    await journal.upgraded().close()
+
+    with closing(sqlite3.connect(path)) as database:
+        analyzed = {str(row[0]) for row in database.execute("SELECT tbl FROM sqlite_stat1")}
+        plan = " | ".join(
+            str(row[-1])
+            for row in database.execute(
+                "EXPLAIN QUERY PLAN DELETE FROM interactive_questions "
+                "WHERE principal_id = ? AND room_id = ? AND revision_event_id = ?",
+                ("x", "x", "x"),
+            )
+        )
+
+    assert {"turns", "turn_sources"} <= analyzed
+    assert "interactive_questions_revision" in plan

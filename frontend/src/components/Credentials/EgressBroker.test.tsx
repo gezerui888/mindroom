@@ -345,7 +345,7 @@ describe("egress broker panel", () => {
 
     const note = screen.getByText(/Services you add here are offered/);
     expect(note.textContent).toBe(
-      "Services you add here are offered to every user and to every agent that uses Agent Keys. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page.",
+      "Services you add here are offered to every user and to every agent that uses Agent Keys, unless you limit them to some agents. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page. A service with one key for every agent gets that key here, for all of its agents.",
     );
     expect(
       within(note).getByRole("link", { name: "Agent Keys page" }),
@@ -365,7 +365,7 @@ describe("egress broker panel", () => {
 
     const note = screen.getByText(/Services you add here are offered/);
     expect(note.textContent).toBe(
-      "Services you add here are offered to every user and to every agent that uses Agent Keys. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page, which nobody can sign in to while sign-in from MindRoom Chat is off and trusted upstream JWT auth is not set. Give such agents a shared worker scope to set their keys here.",
+      "Services you add here are offered to every user and to every agent that uses Agent Keys, unless you limit them to some agents. Agents with a user or user_agent worker scope and private agents are not listed: each user sets their keys on the Connections page's Agent Keys page, which nobody can sign in to while sign-in from MindRoom Chat is off and trusted upstream JWT auth is not set. Give such agents a shared worker scope to set their keys here. A service with one key for every agent gets that key here, for all of its agents.",
     );
     expect(within(note).queryByRole("link")).toBeNull();
   });

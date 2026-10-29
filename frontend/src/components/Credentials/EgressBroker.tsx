@@ -354,9 +354,10 @@ function ServiceSection({
       </div>
       <p className="text-xs text-muted-foreground">
         Services you add here are offered to every user and to every agent that
-        uses Agent Keys. Agents with a <code>user</code> or{" "}
-        <code>user_agent</code> worker scope and private agents are not listed:
-        each user sets their keys on the Connections page&apos;s{" "}
+        uses Agent Keys, unless you limit them to some agents. Agents with a{" "}
+        <code>user</code> or <code>user_agent</code> worker scope and private
+        agents are not listed: each user sets their keys on the Connections
+        page&apos;s{" "}
         {personalPage ? (
           <>
             <a
@@ -373,7 +374,9 @@ function ServiceSection({
             MindRoom Chat is off and trusted upstream JWT auth is not set. Give
             such agents a shared worker scope to set their keys here.
           </>
-        )}
+        )}{" "}
+        A service with one key for every agent gets that key here, for all of
+        its agents.
       </p>
       {keysUnused && (
         <p className="text-xs text-muted-foreground">

@@ -137,9 +137,11 @@ class Toolkit:
 
     A subclass sets ``name`` and ``instructions`` as class attributes or passes them to the constructor. Its
     functions are its ``@tool`` methods, in the order the class defines them, then the callables passed as ``tools``;
-    ``functions`` holds them by the name the model calls each by. An override without ``@tool`` is no function, so a
-    subclass stops offering an inherited one by overriding it plainly. Each function's annotations, its return annotation
-    included, must resolve when an agent is built with the toolkit, so the types they name are imported at runtime.
+    ``functions`` holds them by the name the model calls each by, as definitions: calling one there skips the
+    argument validation, output files, and worker routing a call gets through ``toolkit_functions``. An override
+    without ``@tool`` is no function, so a subclass stops offering an inherited one by overriding it plainly. Each
+    function's annotations, its return annotation included, must resolve when an agent is built with the toolkit, so
+    the types they name are imported at runtime.
     """
 
     name: str = "toolkit"

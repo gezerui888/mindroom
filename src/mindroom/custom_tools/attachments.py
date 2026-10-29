@@ -49,7 +49,6 @@ from mindroom.tool_system.sandbox_proxy import (
     view_file_from_worker,
 )
 from mindroom.tool_system.tool_function import ToolValue
-from mindroom.tool_system.tool_schema import closed_parameters
 
 if TYPE_CHECKING:
     from mindroom.config.models import FileAccess
@@ -537,15 +536,15 @@ class AttachmentTools(Toolkit):
         )
 
     def offered_function(self, function: ToolFunction) -> ToolFunction:
-        """Offer ``get_attachment`` its own ``mindroom_output_path`` and a described attachment ID."""
+        """Offer ``get_attachment``'s output path as every tool offers one, and describe its attachment ID."""
         if function.name != "get_attachment":
             return function
-        # TODO(simplify): the schema offers neither the attachment ID's type nor the view argument the method takes.
-        parameters = with_optional_output_path({"type": "object", "properties": {}, "required": []})
+        parameters = with_optional_output_path(function.parameters)
         parameters["properties"]["attachment_id"] = {
+            **parameters["properties"]["attachment_id"],
             "description": "Context-scoped attachment ID returned by list_attachments.",
         }
-        return replace(function, parameters=closed_parameters(self.get_attachment, parameters))
+        return replace(function, parameters=parameters)
 
     async def list_attachments(self, target: str | None = None) -> str:
         """List attachment metadata for current tool context."""

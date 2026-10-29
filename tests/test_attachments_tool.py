@@ -268,6 +268,31 @@ async def test_get_attachment_view_returns_other_media(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "payload_bytes", "media_field"),
+    [("document.pdf", b"%PDF-1.4 document bytes", "files"), ("recording.mp3", b"ID3 audio bytes", "audios")],
+)
+async def test_the_offered_get_attachment_sends_a_pdf_or_audio_file_it_is_asked_to_view(
+    tmp_path: Path,
+    filename: str,
+    payload_bytes: bytes,
+    media_field: str,
+) -> None:
+    """The model, offered ``view``, can ask for an attached PDF or audio file as media."""
+    (tmp_path / filename).write_bytes(payload_bytes)
+    tool = AttachmentTools(tool_output_workspace_root=tmp_path)
+    get_attachment = toolkit_offers(tool, "get_attachment")
+    assert "view" in get_attachment.parameters["properties"]
+    with tool_runtime_context(_tool_context(tmp_path)):
+        registered = json.loads(await tool.register_attachment(filename))
+        result = await get_attachment.entrypoint(attachment_id=registered["attachment_id"], view=True)
+
+    assert isinstance(result, ToolValue)
+    media = {"audios": result.audios, "files": result.files}[media_field]
+    assert [item.content for item in media] == [payload_bytes]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(("filename", "data"), [("empty.pdf", b""), ("archive.tar", b"tar archive bytes")])
 async def test_get_attachment_view_rejects_unusable_documents(tmp_path: Path, filename: str, data: bytes) -> None:
     """Empty and unsupported documents give a recoverable tool error, not an exception."""
@@ -391,7 +416,12 @@ async def test_attachments_tool_get_attachment_schema_describes_output_path(
     parameters = toolkit_offers(tool, "get_attachment").parameters
     schema = parameters["properties"]
 
-    assert schema["attachment_id"]["description"] == "Context-scoped attachment ID returned by list_attachments."
+    assert schema["attachment_id"] == {
+        "type": "string",
+        "description": "Context-scoped attachment ID returned by list_attachments.",
+    }
+    assert schema["view"]["type"] == "boolean"
+    assert "view" not in parameters["required"]
     assert schema["mindroom_output_path"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
     assert schema["mindroom_output_path"]["default"] is None
     assert "Use this for large output" in schema["mindroom_output_path"]["description"]

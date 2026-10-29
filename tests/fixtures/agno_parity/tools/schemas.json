@@ -1051,6 +1051,10 @@
         "parameters": {
           "type": "object",
           "properties": {
+            "attachment_id": {
+              "type": "string",
+              "description": "Context-scoped attachment ID returned by list_attachments."
+            },
             "mindroom_output_path": {
               "anyOf": [
                 {
@@ -1063,14 +1067,14 @@
               "default": null,
               "description": "Optional MindRoom-managed workspace-relative path. If set, the full supported tool output is written to this file in your workspace and the tool returns only a compact receipt. Use this for large output you plan to inspect later with file, coding, python, or shell tools."
             },
-            "attachment_id": {
-              "description": "Context-scoped attachment ID returned by list_attachments."
+            "view": {
+              "type": "boolean",
+              "description": "Send image, audio, video, or document content (including PDF) to the model; up to 20 MiB.\nImages use the same preparation, limits, and replay behavior as view_file.\nRequires a model that supports the media type. If inline media is unavailable, use\nget_attachment without view to get metadata or save the file, then use other available tools.\nCannot be combined with mindroom_output_path."
             }
           },
           "required": [
             "attachment_id"
-          ],
-          "additionalProperties": false
+          ]
         },
         "strict": null,
         "requires_confirmation": false,

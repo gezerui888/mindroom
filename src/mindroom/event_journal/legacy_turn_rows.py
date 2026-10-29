@@ -273,7 +273,7 @@ def upgrade_turn_records_to_rows(transaction: Transaction, inspector: SchemaInsp
         return
     # The redactions below look replies and questions up per event; with statistics, SQLite plans them through the
     # event indexes instead of walking every span or question of a login.
-    _refresh_statistics(transaction, inspector, ("reply_spans", "reply_span_sources", "interactive_questions"))
+    _refresh_statistics(transaction, inspector, _STATISTICS_BEFORE_CONVERSION)
     tombstones = _record_redaction_tombstones(transaction) if "redaction_tombstones" in existing_tables else ()
     if "turn_records" in existing_tables:
         deliveries = _outstanding_final_deliveries(transaction)
@@ -299,11 +299,12 @@ def upgrade_turn_records_to_rows(transaction: Transaction, inspector: SchemaInsp
             )
             logger.info("turn_records_converted", agent=agent_name, row_count=len(entries), turn_count=converted)
     # The turn rows were all written in this transaction, so the planner learns their shape only now.
-    _refresh_statistics(transaction, inspector, ("turns", "turn_sources"))
+    _refresh_statistics(transaction, inspector, _STATISTICS_AFTER_CONVERSION)
     for agent_name, room_id, event_id in tombstones:
         _apply_redaction(transaction, agent_name, room_id, event_id)
     transaction.execute("DROP TABLE IF EXISTS turn_records")
     transaction.execute("DROP TABLE IF EXISTS redaction_tombstones")
+    _forget_statistics(transaction, inspector, (*_STATISTICS_BEFORE_CONVERSION, *_STATISTICS_AFTER_CONVERSION))
 
 
 # LEGACY_COMPAT: Redaction tombstones scoped to one journal principal.
@@ -329,12 +330,31 @@ def _record_redaction_tombstones(transaction: Transaction) -> tuple[tuple[str, s
     return tuple(redactions)
 
 
+# The tables the conversion's per-event lookups read: replies and questions before it, the turn rows it writes after.
+_STATISTICS_BEFORE_CONVERSION = ("reply_spans", "reply_span_sources", "interactive_questions")
+_STATISTICS_AFTER_CONVERSION = ("turns", "turn_sources")
+
+
 def _refresh_statistics(transaction: Transaction, inspector: SchemaInspector, tables: Sequence[str]) -> None:
     """Record row statistics for ``tables``, sampling each SQLite index instead of reading the whole journal."""
     if inspector.dialect is SQLITE_DIALECT:
         transaction.execute("PRAGMA analysis_limit=400")
     for table in tables:
         transaction.execute(f"ANALYZE {table}")
+
+
+def _forget_statistics(transaction: Transaction, inspector: SchemaInspector, tables: Sequence[str]) -> None:
+    """Drop the SQLite statistics the conversion took, so the runtime plans as it did before the upgrade.
+
+    SQLite never refreshes them on its own, and the counts of a journal that grows after a small upgrade would steer
+    later plans into scans. PostgreSQL refreshes its statistics itself, so they stay.
+    """
+    if inspector.dialect is not SQLITE_DIALECT:
+        return
+    placeholders = ", ".join("?" for _ in tables)
+    transaction.execute(f"DELETE FROM sqlite_stat1 WHERE tbl IN ({placeholders})", tuple(tables))  # noqa: S608
+    # The planner keeps the statistics it loaded until told to read them again.
+    transaction.execute("ANALYZE sqlite_schema")
 
 
 def _agent_logins(transaction: Transaction) -> dict[str, tuple[str, ...]]:
@@ -350,15 +370,22 @@ def _agent_logins(transaction: Transaction) -> dict[str, tuple[str, ...]]:
 # LEGACY_COMPAT: Turn-source indexes that hold every source's NULL selected revision and discovery alias.
 # Legacy format: turn_sources_selected_revision and turn_sources_discovery, full indexes on (agent_name, selected_rev_id)
 # and (agent_name, discovery_event_id).
-# Last legacy release: v2026.10.683; replacement: the next release keeps only the sources that hold a value, in
+# Last legacy release: v2026.10.693; replacement: the next release keeps only the sources that hold a value, in
 # turn_sources_selected_revision_set and turn_sources_discovery_set.
-# Handling: the schema upgrade drops both before the current schema creates their replacements.
+# Handling: the schema upgrade drops both, found in this journal's own schema, before the current schema creates their
+# replacements.
 # Coverage: tests/test_turn_rows_conversion.py::test_the_upgrade_replaces_the_dense_turn_source_indexes.
 def drop_dense_turn_source_indexes(transaction: Transaction, inspector: SchemaInspector) -> None:
     """Drop the full turn-source indexes the partial ones replace, inside the schema transaction."""
-    del inspector
-    transaction.execute("DROP INDEX IF EXISTS turn_sources_selected_revision")
-    transaction.execute("DROP INDEX IF EXISTS turn_sources_discovery")
+    for name in ("turn_sources_selected_revision", "turn_sources_discovery"):
+        if inspector.dialect is SQLITE_DIALECT:
+            transaction.execute(f"DROP INDEX IF EXISTS {name}")
+        # A PostgreSQL name resolves through the search path, which can reach another journal's schema.
+        elif transaction.fetchone(
+            "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND indexname = ?",
+            (name,),
+        ):
+            transaction.execute(f"DROP INDEX {name}")
 
 
 def _apply_redaction(transaction: Transaction, agent_name: str, room_id: str, event_id: str) -> None:

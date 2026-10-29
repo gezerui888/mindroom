@@ -803,9 +803,9 @@ _INDEXES = (
     CREATE INDEX IF NOT EXISTS turns_final_delivery ON turns (agent_name, final_delivery_id)
     """,
     """
-    -- Partial: few sources hold a selected revision or a discovery alias, and an
-    -- index full of NULLs reads as unselective, so a redaction's lookup by them
-    -- would walk every source of the agent instead.
+    -- Partial: few sources hold a selected revision or a discovery alias, and
+    -- with statistics an index full of NULLs still reads as unselective, so the
+    -- turn-rows upgrade's redactions would walk every source of the agent.
     CREATE INDEX IF NOT EXISTS turn_sources_selected_revision_set ON turn_sources (agent_name, selected_rev_id)
     WHERE selected_rev_id IS NOT NULL
     """,

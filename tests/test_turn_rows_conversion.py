@@ -23,6 +23,7 @@ from mindroom.event_journal import (
     ApprovalFailure,
     DeliveryStage,
     EventJournalStore,
+    legacy_turn_rows,
     turn_rows,
     upgrades,
 )
@@ -911,26 +912,55 @@ async def test_the_upgrade_replaces_the_dense_turn_source_indexes(journal: Journ
     assert not names & {"turn_sources_selected_revision", "turn_sources_discovery"}
 
 
-async def test_the_upgrade_gives_redaction_lookups_statistics_and_an_event_index(tmp_path: Path) -> None:
-    """The conversion records planner statistics, and a redaction deletes its questions through their revision."""
+async def test_the_conversion_plans_with_statistics_it_then_forgets(tmp_path: Path) -> None:
+    """The redactions run with SQLite statistics for the turn rows, which the upgrade drops once they are applied."""
     path = tmp_path / "journal.db"
     journal = Journal(lambda: EventJournalStore.open_sqlite(path), postgres=False, opened=[])
     store = await journal.legacy()
+    await admit(store.principal(PRINCIPAL), "$m", room_id=ROOM)
+    await seed_rows(store, every_index(blob(["$m"], response="$r")))
+
+    def tombstone(transaction: Transaction) -> None:
+        transaction.execute(
+            "INSERT INTO redaction_tombstones (principal_id, room_id, redacted_event_id) VALUES (?, ?, ?)",
+            (PRINCIPAL, ROOM, "$m"),
+        )
+
+    await store.backend.write(tombstone)
+    await store.close()
+    journal.opened.remove(store)
+    analyzed_during_redaction: list[set[str]] = []
+    apply_redaction = legacy_turn_rows._apply_redaction
+
+    def recording(transaction: Transaction, *args: str) -> None:
+        rows = transaction.fetchall("SELECT tbl FROM sqlite_stat1")
+        analyzed_during_redaction.append({str(row["tbl"]) for row in rows})
+        apply_redaction(transaction, *args)
+
+    with patch.object(legacy_turn_rows, "_apply_redaction", recording):
+        await journal.upgraded().close()
+
+    with closing(sqlite3.connect(path)) as database:
+        remaining = {str(row[0]) for row in database.execute("SELECT tbl FROM sqlite_stat1")}
+    assert analyzed_during_redaction
+    assert {"turns", "turn_sources"} <= analyzed_during_redaction[-1]
+    assert not remaining & {"turns", "turn_sources", "reply_spans", "reply_span_sources", "interactive_questions"}
+
+
+async def test_a_turn_finds_its_room_through_an_earlier_login(journal: Journal) -> None:
+    """A source only an earlier login of the agent admitted still places its turn in that room."""
+    store = await journal.legacy()
+    # The current login admitted something else, so the agent has two logins to look the source up under.
+    await admit(store.principal(PRINCIPAL), "$other", room_id=ROOMS["b"])
+    await admit(store.principal(EARLIER_LOGIN), "$m", room_id=ROOM)
     await seed_rows(store, every_index(blob(["$m"], response="$r")))
     await store.close()
     journal.opened.remove(store)
-    await journal.upgraded().close()
 
-    with closing(sqlite3.connect(path)) as database:
-        analyzed = {str(row[0]) for row in database.execute("SELECT tbl FROM sqlite_stat1")}
-        plan = " | ".join(
-            str(row[-1])
-            for row in database.execute(
-                "EXPLAIN QUERY PLAN DELETE FROM interactive_questions "
-                "WHERE principal_id = ? AND room_id = ? AND revision_event_id = ?",
-                ("x", "x", "x"),
-            )
-        )
+    upgraded = journal.upgraded()
+    row = await upgraded.backend.read(
+        lambda transaction: transaction.fetchone("SELECT room_id FROM turns WHERE anchor_event_id = '$m'"),
+    )
 
-    assert {"turns", "turn_sources"} <= analyzed
-    assert "interactive_questions_revision" in plan
+    assert row is not None
+    assert row["room_id"] == ROOM

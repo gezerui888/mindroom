@@ -443,7 +443,7 @@ class MatrixVoiceMessageTools(Toolkit):
                 room_id=preflight.room_id,
                 thread_id=effective_thread_id,
                 companion_event_id=companion_event_id,
-                message="Failed to prepare generated audio as a Matrix voice message; non-opus response formats require ffmpeg and ffprobe.",
+                message="Failed to prepare generated audio as a Matrix voice message; gpt-realtime models and non-opus response formats require ffmpeg and ffprobe.",
             )
         event_id = await send_audio_message(
             context.client,

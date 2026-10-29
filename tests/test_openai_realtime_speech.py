@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import ssl
 import wave
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Self
+from urllib.parse import urlsplit
 
 import pytest
 from openai.types.realtime import RealtimeErrorEvent, ResponseAudioDeltaEvent, ResponseDoneEvent
 from openai.types.realtime.realtime_error import RealtimeError
 from openai.types.realtime.realtime_response import RealtimeResponse
+from websockets.exceptions import ConnectionClosedError
 
 from mindroom.voice import openai_realtime_speech
 from mindroom.voice.openai_realtime_speech import (
@@ -42,14 +45,19 @@ class _FakeConnection:
 
     async def __aiter__(self) -> AsyncIterator[object]:
         for event in self.events:
+            if isinstance(event, BaseException):
+                raise event
             yield event
 
 
 class _FakeConnectionManager:
-    def __init__(self, connection: _FakeConnection) -> None:
+    def __init__(self, connection: _FakeConnection, error: BaseException | None) -> None:
         self.connection = connection
+        self.error = error
 
     async def __aenter__(self) -> _FakeConnection:
+        if self.error is not None:
+            raise self.error
         return self.connection
 
     async def __aexit__(self, *_exc: object) -> None:
@@ -61,9 +69,13 @@ class _FakeClient:
 
     instances: list[_FakeClient] = []  # noqa: RUF012 - per-test record, reset by the fixture
     events: list[object] = []  # noqa: RUF012 - per-test script, set by each test
+    connect_error: BaseException | None = None
 
     def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
+        # The SDK falls back to OPENAI_BASE_URL, then to OpenAI's API.
+        base_url = kwargs.get("base_url") or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        self.base_url = SimpleNamespace(scheme=urlsplit(str(base_url)).scheme)
         self.connect_kwargs: dict[str, Any] = {}
         self.connection = _FakeConnection(list(self.events))
         self.realtime = SimpleNamespace(connect=self._connect)
@@ -72,7 +84,7 @@ class _FakeClient:
 
     def _connect(self, **kwargs: object) -> _FakeConnectionManager:
         self.connect_kwargs = kwargs
-        return _FakeConnectionManager(self.connection)
+        return _FakeConnectionManager(self.connection, self.connect_error)
 
     async def __aenter__(self) -> Self:
         return self
@@ -86,6 +98,8 @@ def fake_client(monkeypatch: pytest.MonkeyPatch) -> type[_FakeClient]:
     """Replace ``AsyncOpenAI`` with a client whose connection plays each test's scripted events."""
     _FakeClient.instances = []
     _FakeClient.events = []
+    _FakeClient.connect_error = None
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setattr(openai_realtime_speech, "AsyncOpenAI", _FakeClient)
     return _FakeClient
 
@@ -197,6 +211,73 @@ async def test_plain_http_base_url_skips_tls_context(fake_client: type[_FakeClie
     client = fake_client.instances[0]
     assert client.kwargs["base_url"] == "http://localhost:9000/v1"
     assert "ssl" not in client.connect_kwargs["websocket_connection_options"]
+
+
+@pytest.mark.asyncio
+async def test_dropped_connection_raises(fake_client: type[_FakeClient]) -> None:
+    """A connection that drops mid-response fails the synthesis like any other Realtime failure."""
+    fake_client.events = [_delta(b"ab"), ConnectionClosedError(None, None)]
+
+    with pytest.raises(RealtimeSpeechError, match="connection"):
+        await _synthesize()
+
+
+@pytest.mark.asyncio
+async def test_failed_connect_raises(fake_client: type[_FakeClient]) -> None:
+    """A connection that cannot open fails the synthesis like any other Realtime failure."""
+    fake_client.connect_error = ConnectionRefusedError("refused")
+
+    with pytest.raises(RealtimeSpeechError, match="refused"):
+        await _synthesize()
+
+
+@pytest.mark.asyncio
+async def test_openai_base_url_variable_decides_tls(
+    fake_client: type[_FakeClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The client's own base URL, including ``OPENAI_BASE_URL``, decides whether the WebSocket uses TLS."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:4000/v1")
+    fake_client.events = [_done()]
+
+    await _synthesize()
+
+    assert "ssl" not in fake_client.instances[0].connect_kwargs["websocket_connection_options"]
+
+
+@pytest.mark.asyncio
+async def test_operator_trust_store_is_left_to_openssl(
+    fake_client: type[_FakeClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``SSL_CERT_FILE`` is the operator's trust choice, so certifi's roots are not added to it."""
+    loaded: list[str] = []
+    monkeypatch.setattr(openai_realtime_speech.certifi, "where", lambda: loaded.append("certifi") or "/missing")
+    monkeypatch.setenv("SSL_CERT_FILE", "/etc/ssl/certs/ca-certificates.crt")
+    fake_client.events = [_done()]
+
+    await _synthesize()
+
+    assert loaded == []
+    assert isinstance(fake_client.instances[0].connect_kwargs["websocket_connection_options"]["ssl"], ssl.SSLContext)
+
+
+@pytest.mark.asyncio
+async def test_certifi_roots_join_the_system_store(
+    fake_client: type[_FakeClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without operator trust settings, certifi's roots are added, since some interpreters ship an empty store."""
+    loaded: list[str] = []
+    real_where = openai_realtime_speech.certifi.where
+    monkeypatch.setattr(openai_realtime_speech.certifi, "where", lambda: loaded.append("certifi") or real_where())
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    fake_client.events = [_done()]
+
+    await _synthesize()
+
+    assert loaded == ["certifi"]
 
 
 def test_pcm_to_wav_round_trips() -> None:

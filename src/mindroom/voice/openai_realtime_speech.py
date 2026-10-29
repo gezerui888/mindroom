@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import io
+import os
 import ssl
 import wave
 from typing import TYPE_CHECKING, cast
@@ -11,10 +12,12 @@ from typing import TYPE_CHECKING, cast
 import certifi
 from openai import AsyncOpenAI
 from openai.types.realtime import RealtimeErrorEvent, ResponseAudioDeltaEvent, ResponseDoneEvent
+from websockets.exceptions import WebSocketException
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
+    from httpx2 import URL
     from openai.types.websocket_connection_options import WebSocketConnectionOptions
 
 __all__ = [
@@ -47,12 +50,17 @@ def is_realtime_speech_model(model: str) -> bool:
     return model.strip().casefold().startswith("gpt-realtime")
 
 
-def _websocket_options(base_url: str | None) -> WebSocketConnectionOptions:
-    # The SDK's WebSocket uses Python's default trust store, which some interpreters ship empty, while its HTTP client
-    # trusts certifi's bundle; a plain-HTTP server gets a plain WebSocket, which refuses a TLS context.
-    if base_url is not None and not base_url.startswith("https://"):
+def _websocket_options(base_url: URL) -> WebSocketConnectionOptions:
+    # A plain-HTTP server gets a plain WebSocket, which refuses a TLS context.
+    if base_url.scheme != "https":
         return {}
-    return cast("WebSocketConnectionOptions", {"ssl": ssl.create_default_context(cafile=certifi.where())})
+    # The SDK's WebSocket trusts only Python's default store, which some interpreters ship empty, so certifi's roots
+    # join it, as for Matrix connections; an explicit SSL_CERT_FILE or SSL_CERT_DIR is the operator's choice and is
+    # left to OpenSSL, which reads both from the process environment.
+    context = ssl.create_default_context()
+    if not any(name in os.environ for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")):
+        context.load_verify_locations(cafile=certifi.where())
+    return cast("WebSocketConnectionOptions", {"ssl": context})
 
 
 async def stream_realtime_speech(
@@ -64,10 +72,26 @@ async def stream_realtime_speech(
     base_url: str | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield the PCM audio of ``text`` read aloud, chunk by chunk as the Realtime API sends it."""
+    try:
+        async for chunk in _realtime_speech_chunks(text, model=model, voice=voice, api_key=api_key, base_url=base_url):
+            yield chunk
+    except (WebSocketException, OSError) as error:
+        msg = f"Realtime connection failed: {error}"
+        raise RealtimeSpeechError(msg) from error
+
+
+async def _realtime_speech_chunks(
+    text: str,
+    *,
+    model: str,
+    voice: str,
+    api_key: str,
+    base_url: str | None,
+) -> AsyncIterator[bytes]:
     async with AsyncOpenAI(api_key=api_key, base_url=base_url) as client:
         connection_manager = client.realtime.connect(
             model=model,
-            websocket_connection_options=_websocket_options(base_url),
+            websocket_connection_options=_websocket_options(client.base_url),
             # A reconnect would drop the response being spoken, so a dropped connection fails the synthesis instead.
             max_retries=0,
         )

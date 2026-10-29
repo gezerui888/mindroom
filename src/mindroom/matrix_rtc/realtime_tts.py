@@ -64,6 +64,7 @@ class _RealtimeChunkedStream(tts.ChunkedStream):
             num_channels=1,
             mime_type="audio/pcm",
         )
+        spoke = False
         try:
             async for chunk in stream_realtime_speech(
                 self.input_text,
@@ -73,7 +74,8 @@ class _RealtimeChunkedStream(tts.ChunkedStream):
                 base_url=self._realtime_tts._base_url,
             ):
                 output_emitter.push(chunk)
+                spoke = True
         except RealtimeSpeechError as error:
-            # Speech already played cannot be taken back, so a failed segment is not spoken again.
-            raise APIError(str(error), retryable=False) from error
+            # Speech already played cannot be taken back, so only a segment that never started is retried.
+            raise APIError(str(error), retryable=not spoke) from error
         output_emitter.flush()

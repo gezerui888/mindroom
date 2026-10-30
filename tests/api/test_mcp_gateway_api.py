@@ -257,6 +257,9 @@ def test_gateway_uses_browser_origin_for_oauth_and_transport(
         token = _exchange(client, *_code(client, signed_headers("alice"))).json()["access_token"]
         response = _list(client, token)
         assert response.status_code == 200, response.text
+        explicit_port = _list(client, token, Host="assistant.example.org:443")
+        assert explicit_port.status_code == 200, explicit_port.text
+        assert _list(client, token, Host="assistant.example.org:444").status_code == 421
 
 
 @pytest.mark.parametrize(

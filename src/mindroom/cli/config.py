@@ -11,7 +11,7 @@ import shlex
 import shutil
 import subprocess
 import textwrap
-from pathlib import Path
+from pathlib import Path  # noqa: TC003
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import typer
@@ -707,7 +707,9 @@ def _write_starter_setup(
 
 def _agent_template_block(template: str, agent_name: str) -> str:
     """Return one built-in agent template's config block for one agent name."""
-    source = Path(__file__).resolve().parent / "templates" / f"{template}_agent.yaml"
+    from mindroom.workspaces import BUILTIN_TEMPLATES_DIR  # noqa: PLC0415
+
+    source = BUILTIN_TEMPLATES_DIR / f"{template}_agent.yaml"
     return source.read_text(encoding="utf-8").replace("__AGENT_NAME__", agent_name)
 
 
@@ -740,6 +742,9 @@ def config_new_agent(
     if not constants.AGENT_NAME_PATTERN.fullmatch(name):
         console.print("[red]Agent names may contain only letters, digits, and underscores.[/red]")
         raise typer.Exit(1)
+    if name in constants.RESERVED_ENTITY_NAMES:
+        console.print(f"[red]{escape(name)} is reserved for MindRoom itself; choose another agent name.[/red]")
+        raise typer.Exit(1)
     target = _resolve_config_path(path)
     if template == "project":
         storage_root = constants.resolve_runtime_paths(config_path=target).storage_root
@@ -747,16 +752,16 @@ def config_new_agent(
     else:
         destination = target.parent / "templates" / name
 
-    existed = destination.exists()
-    written = ensure_workspace_template(destination, template=template)
+    try:
+        written = ensure_workspace_template(destination, template=template)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Could not create the template files:[/red] {escape(str(exc))}")
+        raise typer.Exit(1) from None
     if not written:
         console.print(f"[green]Nothing to create:[/green] {escape(str(destination))} already has every template file.")
     else:
         files = f"{len(written)} file{'s' if len(written) != 1 else ''}"
-        kept = "; existing files were kept" if existed else ""
-        console.print(f"[green]Created {files} in[/green] {escape(str(destination))}{kept}.")
-    if template == "work":
-        console.print("Each person gets a private copy of this template the first time they talk to the agent.")
+        console.print(f"[green]Created {files} in[/green] {escape(str(destination))}.")
     validate = (
         "mindroom config validate" if path is None else f"mindroom config validate --path {shlex.quote(str(target))}"
     )

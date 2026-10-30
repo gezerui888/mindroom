@@ -1,11 +1,11 @@
 agents:
-  __AGENT_NAME__:
+  "__AGENT_NAME__":
     display_name: Project Agent
     role: Shared assistant for one project that keeps its sources, decisions, questions, actions, risks, and milestones current
     model: default
     # MindRoom creates this room; members of it may talk to the agent.
     rooms:
-      - __AGENT_NAME__
+      - "__AGENT_NAME__"
     worker_scope: shared
     memory_backend: file
     context_files:
@@ -13,9 +13,8 @@ agents:
       - SOUL.md
       - IDENTITY.md
       - TOOLS.md
-    file_access: workspace
     delegate_to:
-      - __AGENT_NAME__
+      - "__AGENT_NAME__"
     skill_learning:
       enabled: true
     tools:

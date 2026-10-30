@@ -44,8 +44,8 @@ def test_project_template_seeds_the_shared_workspace_and_keeps_edits(tmp_path: P
     assert (workspace / "memory" / "decisions.md").is_file()
     assert (workspace / "skills" / "status-report" / "SKILL.md").is_file()
     assert "Created 14 files" in output
-    assert "apollo:" in output
-    assert "- apollo" in output
+    assert '"apollo":' in output
+    assert '- "apollo"' in output
 
     (workspace / "AGENTS.md").write_text("edited\n", encoding="utf-8")
     (workspace / "SOUL.md").unlink()
@@ -53,8 +53,7 @@ def test_project_template_seeds_the_shared_workspace_and_keeps_edits(tmp_path: P
 
     assert (workspace / "AGENTS.md").read_text(encoding="utf-8") == "edited\n"
     assert (workspace / "SOUL.md").is_file()
-    assert "Created 1 file" in output
-    assert "existing files were kept" in output
+    assert "Created 1 file in" in output
 
 
 def test_work_template_writes_a_template_dir_the_printed_block_points_at(tmp_path: Path) -> None:
@@ -74,30 +73,58 @@ def test_work_template_writes_a_template_dir_the_printed_block_points_at(tmp_pat
 
 
 @pytest.mark.parametrize("template", ["project", "work"])
-def test_agent_block_validates_in_the_starter_config(tmp_path: Path, template: str) -> None:
-    """Each printed block is valid config once pasted into the starter config."""
+@pytest.mark.parametrize("name", ["apollo", "on", "123", "null"])
+def test_agent_block_validates_in_the_starter_config(tmp_path: Path, template: str, name: str) -> None:
+    """Each printed block is valid config once pasted into the starter config, and its context files exist."""
     config_path = tmp_path / "config.yaml"
     init = runner.invoke(app, ["config", "init", "--path", str(config_path), "--provider", "anthropic", "--no-input"])
     assert init.exit_code == 0, init.output
     data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    _new_agent(config_path, "apollo", template)
+    _new_agent(config_path, name, template)
 
-    block = yaml.safe_load(config_cli._agent_template_block(template, "apollo"))
+    block = yaml.safe_load(config_cli._agent_template_block(template, name))
     data["agents"].update(block["agents"])
 
     config = Config.validate_with_runtime(data, resolve_runtime_paths(config_path=config_path))
-    agent = config.agents["apollo"]
-    assert agent.delegate_to == ["apollo"]
+    agent = config.agents[name]
+    assert agent.delegate_to == [name]
+    if agent.private is None:
+        written, context_files = tmp_path / "mindroom_data" / "agents" / name / "workspace", agent.context_files
+    else:
+        written, context_files = tmp_path / "templates" / name, agent.private.context_files or []
+    assert context_files
+    assert all((written / context_file).is_file() for context_file in context_files)
     assert (agent.private is None) == (template == "project")
 
 
-def test_rejects_an_invalid_agent_name(tmp_path: Path) -> None:
-    """A name outside the agent naming rules exits before writing anything."""
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [("my-agent", "letters, digits, and underscores"), ("router", "reserved"), ("_shared", "reserved")],
+)
+def test_rejects_an_unusable_agent_name(tmp_path: Path, name: str, message: str) -> None:
+    """A name config validation would reject exits before writing anything."""
     result = runner.invoke(
         app,
-        ["config", "new-agent", "my-agent", "--template", "project", "--path", str(tmp_path / "config.yaml")],
+        ["config", "new-agent", name, "--template", "project", "--path", str(tmp_path / "config.yaml")],
     )
 
     assert result.exit_code == 1
-    assert "letters, digits, and underscores" in result.output
+    assert message in result.output
     assert not (tmp_path / "mindroom_data").exists()
+
+
+def test_reports_a_planted_symlink_without_following_it(tmp_path: Path) -> None:
+    """A workspace entry that points outside it fails with one line and writes nothing there."""
+    config_path = tmp_path / "config.yaml"
+    workspace = tmp_path / "mindroom_data" / "agents" / "apollo" / "workspace"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    workspace.mkdir(parents=True)
+    (workspace / "skills").symlink_to(outside)
+
+    result = runner.invoke(app, ["config", "new-agent", "apollo", "--template", "project", "--path", str(config_path)])
+
+    assert result.exit_code == 1
+    assert "Could not create the template files" in result.output
+    assert "Traceback" not in result.output
+    assert list(outside.iterdir()) == []

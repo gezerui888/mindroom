@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
     from mindroom.config.main import Config
 
-_TEMPLATES_DIR = Path(__file__).resolve().parent / "cli" / "templates"
+BUILTIN_TEMPLATES_DIR = Path(__file__).resolve().parent / "cli" / "templates"
 _WORKSPACE_TEMPLATES = ("mind", "project", "work")
 
 # Agent builds now run on worker threads (#1260), so concurrent scaffolding of
@@ -253,7 +253,11 @@ def ensure_workspace_template(
     if template not in _WORKSPACE_TEMPLATES:
         msg = f"Unsupported workspace template: {template}"
         raise ValueError(msg)
-    written = _copy_workspace_template(workspace_path, template_dir=_TEMPLATES_DIR / f"{template}_data", force=force)
+    written = _copy_workspace_template(
+        workspace_path,
+        template_dir=BUILTIN_TEMPLATES_DIR / f"{template}_data",
+        force=force,
+    )
     (workspace_path / "memory").mkdir(parents=True, exist_ok=True)
     return written
 

@@ -24,8 +24,9 @@ mindroom config new-agent assistant --template work
 3. Run `mindroom config validate`.
 4. Talk to the agent: a `project` agent joins the room named after it, which MindRoom creates, and a `work` agent answers direct messages and invites.
 
-On its first conversation the agent works through `BOOTSTRAP.md`: a `project` agent asks the room for its operators, scope, and sources, and a `work` agent asks the person about their role and priorities.
-It records the answers in its own files and then deletes `BOOTSTRAP.md`.
+On its first conversation the agent works through `BOOTSTRAP.md` and records the answers in its own files.
+A `project` agent asks the room for its operators, scope, and sources, then deletes `BOOTSTRAP.md`.
+A `work` agent asks the person about their role and priorities and fills in `USER.md`; its `BOOTSTRAP.md` stays, because MindRoom restores missing template files before every reply, and the agent ignores it once `USER.md` is filled in.
 
 The `work` block admits only MindRoom's administrators until you uncomment its `access.users` line, for example `"@*:example.org"` for everyone on your homeserver.
 The `project` block admits members of the agent's room, the [default](../authorization.md#responder-access) when `access` is omitted.
@@ -44,19 +45,16 @@ The `project` block admits members of the agent's room, the [default](../authori
 | `BOOTSTRAP.md` | First-run checklist | Read while setup is unfinished |
 | `skills/` | `project`: `status-report` and `meeting-notes-to-updates`; `work`: `meeting-prep` and `weekly-review` | Name and description every turn, full text when used ([Skills](../skills.md)) |
 
-Edits to context files apply from the agent's next reply.
 `MEMORY.md` is not listed in `context_files`, because file memory already loads it and listing it would load it twice.
 
 ## Updating and Rerunning
 
 Running the command again restores files that are missing and keeps every existing file.
-A restored `BOOTSTRAP.md` is harmless: the agent sees that setup already happened, deletes it, and carries on.
-For `work`, MindRoom copies template files that a person's private copy is missing on later runs too, so edits to `templates/<name>/` reach existing people only as new files.
-See [Private Instances](agents.md#private-instances) for where each person's copy lives.
+A `project` agent that finds a restored `BOOTSTRAP.md` after setup deletes it without starting over.
+For `work`, edits to `templates/<name>/` reach existing people only as new files, because MindRoom never overwrites a person's copy; see [Private Instances](agents.md#private-instances).
 
 ## Notes
 
 - A `project` agent has one workspace, so its direct chats write to the same files as its room.
-- `file_access: workspace` confines the `file` tool but not `shell`; when people you do not fully trust can reach the agent, run `shell` in a worker with `worker_tools`.
-- Use [personal agents](../personal-agents.md) instead of `work` when each person needs an agent of their own that others can mention or add to a team.
+- The `file` tool stays inside the workspace, but `shell` does not; with a [worker backend](../deployment/sandbox-proxy.md), list `shell` in `worker_tools` when people you do not fully trust can reach the agent.
 - The `project` command must run where the storage root lives, because it writes the workspace directly.

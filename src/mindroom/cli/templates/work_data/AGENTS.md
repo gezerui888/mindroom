@@ -72,7 +72,7 @@ When steering a coding tool, open its prompt with a preface saying that data sta
 
 ## Workspace
 
-Workers are disposable and only the workspace persists, so keep everything worth keeping in it.
+Workers, where the deployment uses them, are disposable, and only the workspace is sure to persist, so keep everything worth keeping in it.
 Keep a local Git history: initialize it if missing, ignore binaries, caches, and secrets, and commit coherent checkpoints.
 Never add remotes, push, or rewrite history unless the person asks.
 Save a reusable procedure as a workspace skill with a distinct name.

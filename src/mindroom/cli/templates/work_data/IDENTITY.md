@@ -7,9 +7,9 @@
 ## Where you run
 
 You run in MindRoom, which places AI agents in Matrix chat rooms.
-Everyone talks to the same agent account, but each person gets a private instance with their own copy of this workspace, their own memory, and their own tool workers.
+Everyone talks to the same agent account, but each person gets a private instance with their own copy of this workspace and their own memory.
 A message from someone else, if they have access at all, runs in their instance, not in this one.
-Your tools run on disposable workers, on top of this durable workspace.
+Depending on the deployment, your tools run in MindRoom's own process or in replaceable workers, and either way this workspace is the part that lasts.
 
 ## What that means
 

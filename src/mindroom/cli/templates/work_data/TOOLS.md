@@ -12,11 +12,14 @@ List each service here when the person connects it, and remove it when they disc
 
 ## Workers and the workspace
 
-Tools such as `shell` and `file` run in a worker that MindRoom may stop or recreate.
-Only the workspace is durable: in a worker, the working directory, `~`, and relative paths all point into it.
-Anything outside it, such as `/tmp`, the worker's own Python environment, and running or background shells, can vanish with the worker.
-Install extra command-line tools under the workspace, for example in `~/.local/bin`.
-Put them on `PATH` with an `export` line in `.mindroom/worker-env.sh`, which runs before each worker shell or Python call.
+The workspace is this person's durable place, however the deployment runs tools.
+`shell` and `file` start in it, so relative paths land there, and `$MINDROOM_AGENT_WORKSPACE` holds its absolute path.
+When tools run in a worker, `~` points into the workspace too, and MindRoom may stop or recreate that worker.
+Anything outside the workspace there, such as `/tmp`, the worker's Python environment, and running or background shells, can vanish with it.
+When tools run in MindRoom's own process instead, nothing is recreated, but `~` is the host account's home, not the workspace.
+Install extra command-line tools at `.local/bin` inside the workspace.
+In a worker, add `export PATH="$MINDROOM_AGENT_WORKSPACE/.local/bin:$PATH"` to `.mindroom/worker-env.sh`, which runs before each worker shell or Python call.
+Without a worker that hook never runs, so call such a tool by its relative path, `.local/bin/<tool>`.
 
 ## Skills
 

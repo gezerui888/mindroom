@@ -1,5 +1,5 @@
 agents:
-  __AGENT_NAME__:
+  "__AGENT_NAME__":
     display_name: Assistant
     role: Private work assistant for one person, helping them think, recall, write, research, plan, and follow up.
     model: default
@@ -15,10 +15,9 @@ agents:
         - USER.md
         - TOOLS.md
     delegate_to:
-      - __AGENT_NAME__
+      - "__AGENT_NAME__"
     skill_learning:
       enabled: true
-    accept_invites: true
     tools:
       - file
       - shell

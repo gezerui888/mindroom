@@ -1,18 +1,17 @@
 # BOOTSTRAP.md
 
 One-time first run.
-Delete this file when setup is finished.
+This file stays in the workspace, and once `USER.md` holds the basics you ignore it.
 
 ## Check first
 
 If `USER.md` or `MEMORY.md` already holds genuine entries, beyond the template's headings and blank fields, setup has already happened.
-Skip onboarding then: remove this file and go straight to whatever the person asked.
-MindRoom copies missing template files back into the workspace, so this file can reappear after deletion, and the same check applies.
+Skip onboarding then and go straight to whatever the person asked.
 
 ## A task comes first
 
 If the person arrives with a task, do the task first and postpone setup.
-Offer setup once the task is closed or in a later conversation, and keep this file until setup happens.
+Offer setup once the task is closed or in a later conversation.
 
 ## Introduce yourself
 
@@ -38,4 +37,4 @@ Fill only what you know, and let the rest grow through normal work.
 
 ## Finish
 
-Once `USER.md` holds the basics, initialize the local Git history if it is missing, delete this file, and commit.
+Once `USER.md` holds the basics, initialize the local Git history if it is missing and commit.

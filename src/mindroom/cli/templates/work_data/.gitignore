@@ -1,5 +1,8 @@
 # Keep the local history to notes, skills, and text written here.
 
+# Onboarding seed that MindRoom restores before every reply
+BOOTSTRAP.md
+
 # Caches, environments, and installed tools
 .cache/
 .local/

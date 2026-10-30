@@ -250,6 +250,9 @@ def test_gateway_uses_browser_origin_for_oauth_and_transport(
         assert metadata.status_code == 200, metadata.text
         assert metadata.json()["resource"] == RESOURCE
         assert metadata.json()["authorization_servers"] == [ORIGIN + "/mcp/oauth"]
+        original_token = _exchange(client, *_code(client, signed_headers("alice"))).json()["access_token"]
+        original_response = _list(client, original_token)
+        assert original_response.status_code == 200, original_response.text
         snapshot.runtime_paths = replace(
             snapshot.runtime_paths,
             process_env={**snapshot.runtime_paths.process_env, "MINDROOM_PUBLIC_URL": ORIGIN},

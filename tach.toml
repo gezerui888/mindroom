@@ -526,6 +526,7 @@ expose = [
 [[modules]]
 path = "mindroom.event_journal"
 depends_on = [
+    "mindroom.background_tasks",
     "mindroom.constants",
     "mindroom.event_journal.history_recovery",
     "mindroom.event_journal.legacy_response_attempts",
@@ -7823,6 +7824,7 @@ depends_on = []
 path = "mindroom.mcp_gateway.toolkits"
 depends_on = [
     "mindroom.agents",
+    "mindroom.background_tasks",
     "mindroom.credentials.manager",
     "mindroom.logging_config",
     "mindroom.mcp.toolkit",

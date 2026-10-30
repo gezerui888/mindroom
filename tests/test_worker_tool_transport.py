@@ -35,7 +35,6 @@ from mindroom.tool_system.runtime_context import (
     get_tool_runtime_context,
     tool_runtime_context,
 )
-from mindroom.tool_system.worker_routing import descriptive_worker_id_for_key, resolve_worker_key
 from mindroom.tools import agno_compat_openai
 from mindroom.voice.openai_realtime_speech import pcm_to_wav
 from tests.agent_tool_helpers import offered_function, run_offered, source_toolkit
@@ -383,7 +382,6 @@ def _context_agent(
     *,
     routing: str = "url",
     tool_config: dict[str, object] | None = None,
-    extra_env: dict[str, str] | None = None,
     roomless: bool = False,
     require_approval: bool = False,
 ) -> tuple[AgentBuild, ToolRuntimeContext]:
@@ -391,7 +389,6 @@ def _context_agent(
     process_env = {
         "MINDROOM_SANDBOX_PROXY_URL": "http://sandbox.invalid",
         "MINDROOM_SANDBOX_PROXY_TOKEN": "dummy-worker-token",
-        **(extra_env or {}),
     }
     if routing != "url":
         process_env["MINDROOM_SANDBOX_EXECUTION_MODE"] = "off" if routing == "explicit" else "all"
@@ -524,54 +521,6 @@ async def test_config_manager_remains_available_for_roomless_inspection(tmp_path
 
     assert not response.is_error
     assert "Routing" in response.content
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("forbid_worker_lease")
-@pytest.mark.parametrize("routing", ["url", "all", "explicit"])
-async def test_vault_access_uses_primary_owner_token_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    routing: str,
-) -> None:
-    """Self-service grants keep the primary-mounted owner token and requester worker identity."""
-    token_file = tmp_path / "owner-token"
-    token_file.write_text("owner-token-value\n")
-    requests: list[httpx.Request] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(201, json={})
-
-    client_type = httpx.AsyncClient
-    transport = httpx.MockTransport(handle)
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_type(transport=transport, **kwargs))
-    agent, context = _context_agent(
-        tmp_path,
-        "agent_vault_access",
-        routing=routing,
-        extra_env={
-            "MATRIX_HOMESERVER": "https://example.test",
-            "MINDROOM_AGENT_VAULT_ACCESS_API_URL": "https://vault.example.test",
-            "MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN_FILE": str(token_file),
-            "MINDROOM_AGENT_VAULT_ACCESS_UI_BASE_URL": "https://vault.example.test/ui",
-            "MINDROOM_AGENT_VAULT_ACCESS_EMAIL_DOMAIN": "example.test",
-        },
-    )
-    with tool_runtime_context(context):
-        response = await run_offered(agent, "request_vault_access")
-
-    assert not response.is_error
-    payload = json.loads(response.content)
-    assert payload["access"] == "granted"
-    identity = context.execution_identity
-    worker_key = resolve_worker_key("user_agent", identity)
-    assert worker_key is not None
-    assert payload["vault"] == descriptive_worker_id_for_key(worker_key, prefix="agent-vault")
-    assert requests
-    assert {request.headers["authorization"] for request in requests} == {"Bearer owner-token-value"}
-    grants = [json.loads(request.content) for request in requests if request.url.path.endswith("/users")]
-    assert grants == [{"email": "alice@example.test", "role": "admin"}]
 
 
 @pytest.mark.asyncio

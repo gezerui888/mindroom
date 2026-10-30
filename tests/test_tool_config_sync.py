@@ -35,7 +35,6 @@ from tests.agent_tool_helpers import blocking_entrypoint, offered_agno_function
 _BUILTINS = builtin_tool_registry()
 
 SKIP_CONFIG_FIELD_VALIDATION = {
-    "agent_vault_access",
     "homeassistant",
     "gmail",
     "google_calendar",

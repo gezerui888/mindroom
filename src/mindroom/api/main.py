@@ -73,6 +73,7 @@ from mindroom.legacy_state_root_records import migrate_state_root_records
 from mindroom.logging_config import get_logger
 from mindroom.matrix.decrypt_failure import e2ee_stats
 from mindroom.matrix.health import get_matrix_sync_health_snapshot
+from mindroom.memory.legacy_team_memory import migrate_team_memory
 from mindroom.orchestration.runtime import matrix_ingestion_grace_seconds, matrix_sync_startup_timeout_seconds
 from mindroom.origins import allowed_client_origins
 from mindroom.personal_agents import read_personal_agent_user_ids
@@ -513,6 +514,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
             await migrate_state_root_records(runtime_paths)
             await migrate_subagent_sessions(runtime_paths)
             await migrate_conversation_storage(runtime_paths)
+            await migrate_team_memory(runtime_paths)
             await migrate_tool_credential_defaults(runtime_paths)
             await asyncio.to_thread(
                 constants.ensure_writable_config_path,

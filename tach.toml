@@ -2115,6 +2115,7 @@ depends_on = [
     "mindroom.knowledge.refresh_scheduler",
     "mindroom.private_storage.legacy_private_storage",
     "mindroom.legacy_state_root_records",
+    "mindroom.memory.legacy_team_memory",
     "mindroom.delegation.legacy_snapshots",
     "mindroom.credentials.legacy_tool_credentials",
     "mindroom.session_storage.legacy_agno3_conversion",
@@ -3368,6 +3369,7 @@ depends_on = [
     "mindroom.mcp.manager",
     "mindroom.mcp.toolkit",
     "mindroom.memory",
+    "mindroom.memory.legacy_team_memory",
     "mindroom.orchestration.config_lifecycle",
     "mindroom.orchestration.external_trigger_runtime",
     "mindroom.orchestration.rooms",
@@ -3779,22 +3781,32 @@ visibility = [
     "mindroom.knowledge.file_memory_knowledge",
     "mindroom.memory._file_backend",
     "mindroom.memory._mem0_backend",
-    "mindroom.memory._policy",
 ]
 
 [[modules]]
 path = "mindroom.memory._policy"
-depends_on = [
-    "mindroom.memory._shared",
-    "mindroom.memory_scope_ids",
-    "mindroom.runtime_resolution",
-    "mindroom.config.resolution",
-]
+depends_on = ["mindroom.config.resolution"]
 visibility = [
     "mindroom.memory._backend",
     "mindroom.memory._file_backend",
     "mindroom.memory._mem0_backend",
+    "mindroom.memory.legacy_team_memory",
 ]
+
+[[modules]]
+path = "mindroom.memory.legacy_team_memory"
+depends_on = [
+    "mindroom.background_tasks",
+    "mindroom.constants",
+    "mindroom.durable_write",
+    "mindroom.logging_config",
+    "mindroom.memory._file_backend",
+    "mindroom.memory._policy",
+    "mindroom.memory._shared",
+    "mindroom.path_confinement",
+    "mindroom.tool_system.dependencies",
+]
+visibility = ["mindroom.api.main", "mindroom.orchestrator"]
 
 [[modules]]
 path = "mindroom.memory._backend"
@@ -3859,10 +3871,10 @@ visibility = [
     "mindroom.memory",
     "mindroom.memory._file_backend",
     "mindroom.memory._mem0_backend",
-    "mindroom.memory._policy",
     "mindroom.memory._prompting",
     "mindroom.memory._semantic_file_search",
     "mindroom.memory.functions",
+    "mindroom.memory.legacy_team_memory",
 ]
 
 [[modules]]
@@ -3892,7 +3904,6 @@ visibility = ["mindroom.memory._mem0_backend", "mindroom.memory.config"]
 path = "mindroom.memory._file_backend"
 depends_on = [
     "mindroom.atomic_file",
-    "mindroom.constants",
     "mindroom.embeddings.errors",
     "mindroom.logging_config",
     "mindroom.memory._policy",
@@ -3901,11 +3912,17 @@ depends_on = [
     "mindroom.memory._semantic_file_search",
     "mindroom.memory_scope_ids",
     "mindroom.path_confinement",
+    "mindroom.runtime_resolution",
     "mindroom.timing",
     "mindroom.token_budget",
     "mindroom.config.resolution",
 ]
-visibility = ["mindroom.memory", "mindroom.memory._backend", "mindroom.memory.functions"]
+visibility = [
+    "mindroom.memory",
+    "mindroom.memory._backend",
+    "mindroom.memory.functions",
+    "mindroom.memory.legacy_team_memory",
+]
 
 [[modules]]
 path = "mindroom.memory._semantic_file_search"
@@ -3936,6 +3953,7 @@ depends_on = [
     "mindroom.memory._shared",
     "mindroom.memory.config",
     "mindroom.memory_scope_ids",
+    "mindroom.runtime_resolution",
     "mindroom.session_storage.agent_storage",
     "mindroom.timing",
 ]

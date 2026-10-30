@@ -1431,7 +1431,6 @@ class TestMemoryConfig:
         memory = MemoryConfig.model_validate(
             {
                 "backend": "file",
-                "team_reads_member_memory": True,
                 "auto_flush": {
                     "enabled": True,
                     "batch": {
@@ -1446,7 +1445,6 @@ class TestMemoryConfig:
             },
         )
         assert memory.backend == "file"
-        assert memory.team_reads_member_memory is True
         assert memory.auto_flush.enabled is True
         assert memory.auto_flush.batch.max_sessions_per_cycle == 7
         assert memory.auto_flush.batch.max_sessions_per_agent_per_cycle == 2
@@ -1478,6 +1476,23 @@ class TestMemoryConfig:
             MemoryConfig.model_validate({"auto_flush": {"max_dirty_age": 600}})
         assert config_validation_issues(exc_info.value) == [
             (("auto_flush", "max_dirty_age"), "Unknown key 'max_dirty_age': remove it or correct its spelling"),
+        ]
+
+    def test_retired_team_memory_fields_still_load(self) -> None:
+        """A config the dashboard saved with the retired team-read switch and file fallback root loads, and a save drops them."""
+        memory = MemoryConfig.model_validate(
+            {
+                "backend": "file",
+                "team_reads_member_memory": True,
+                "file": {"path": "team_memory", "max_entrypoint_lines": 9},
+            },
+        )
+        assert memory.model_dump(exclude_unset=True) == {"backend": "file", "file": {"max_entrypoint_lines": 9}}
+
+        with pytest.raises(ValidationError) as exc_info:
+            MemoryConfig.model_validate({"file": {"paths": "team_memory"}})
+        assert config_validation_issues(exc_info.value) == [
+            (("file", "paths"), "Unknown key 'paths': remove it or correct its spelling"),
         ]
 
     def test_misspelled_embedder_field_fails_config_load(self) -> None:

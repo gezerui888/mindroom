@@ -1,0 +1,291 @@
+"""One-time merge of the team memory copies kept in every member's storage into one store per team."""
+
+# LEGACY_COMPAT: Team memory copied into every member's storage root.
+# Legacy format: each team turn's memories in every member's `agents/<member>/chroma` Mem0 store, one Mem0 extraction
+#   per member under user_id `team_<sorted members>` with metadata `mindroom_replica_key` naming the turn, and in every
+#   member's `agents/<member>/memory_files/team_<sorted members>/MEMORY.md`, each entry under one shared `[id=...]`.
+# Last legacy release: v2026.10.696; replacement: unreleased; writes each team scope once, to
+#   `team_memory/<team scope>/`.
+# Handling: before serving, once per storage root, the copies merge into their team's store and leave the members.
+#   File entries union by id; a copy holding anything MindRoom did not write stays where it was, with a warning. Each
+#   member's Mem0 extraction of a turn shares the turn's replica key, so a turn keeps the first member's extraction
+#   (by name), as one extraction per team turn now writes; a turn one member alone holds stays. Records move with
+#   their ids, embeddings, and metadata, so nothing is embedded or extracted again. Every step is idempotent, so a start
+#   interrupted anywhere finishes on the next; a receipt stops later starts from opening every store, and is withheld
+#   while Chroma cannot be installed, so the merge runs once it is.
+# Coverage: tests/test_legacy_team_memory.py.
+
+from __future__ import annotations
+
+import os
+import stat
+from contextlib import suppress
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from mindroom.background_tasks import run_blocking_until_complete
+from mindroom.constants import tracking_dir
+from mindroom.durable_write import write_json_file_durable
+from mindroom.logging_config import get_logger
+from mindroom.path_confinement import open_directory_within_root, open_regular_file_at
+from mindroom.tool_system.dependencies import ensure_optional_deps, optional_dependency_environment
+
+from ._file_backend import write_scope_markdown_file
+from ._policy import TEAM_MEMORY_DIRNAME, scope_dir_name
+from ._shared import FILE_MEMORY_ENTRY_PATTERN, FILE_MEMORY_ENTRYPOINT
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from mindroom.constants import RuntimePaths
+
+logger = get_logger(__name__)
+
+_RECEIPT = "team_memory_merged.json"
+_TEAM_SCOPE_PREFIX = "team_"
+_REPLICA_KEY = "mindroom_replica_key"
+_MEM0_COLLECTION_PREFIX = "mindroom_memories_"
+_MEM0_ENTITY_SUFFIX = "_entities"
+_ENTRYPOINT_HEADER = "# Memory"
+_MAX_COPY_BYTES = 64 << 20
+
+
+async def migrate_team_memory(runtime_paths: RuntimePaths) -> None:
+    """Finish the one-time merge before any reply reads or writes team memory."""
+    await run_blocking_until_complete(_migrate, runtime_paths)
+
+
+def _migrate(runtime_paths: RuntimePaths) -> None:
+    receipt = tracking_dir(runtime_paths) / _RECEIPT
+    if receipt.exists():
+        return
+    storage_root = runtime_paths.storage_root
+    members = _subdirectories(storage_root, Path("agents"))
+    _merge_file_copies(storage_root, members)
+    if _merge_mem0_copies(storage_root, runtime_paths, members):
+        write_json_file_durable(receipt, {"version": 1}, strict_atomic_replace=True)
+
+
+def _subdirectories(storage_root: Path, relative: Path) -> list[str]:
+    """Return the sorted names of the directories in one directory below the storage root, reached without links."""
+    try:
+        with open_directory_within_root(storage_root, relative) as directory, os.scandir(directory) as entries:
+            return sorted(entry.name for entry in entries if entry.is_dir(follow_symlinks=False))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as error:
+        logger.warning("Skipped an unusable directory while merging team memory", path=str(relative), error=str(error))
+        return []
+
+
+def _merge_file_copies(storage_root: Path, members: list[str]) -> None:
+    copies: dict[str, list[tuple[Path, str]]] = {}
+    for member in members:
+        member_files = Path("agents", member, "memory_files")
+        for name in _subdirectories(storage_root, member_files):
+            if name.startswith(_TEAM_SCOPE_PREFIX) and (text := _recognized_copy(storage_root, member_files / name)):
+                copies.setdefault(name, []).append((member_files / name, text))
+    for scope_dir, team_copies in copies.items():
+        target = storage_root / TEAM_MEMORY_DIRNAME / scope_dir_name(scope_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        merged = _merged_entrypoint(_existing_entrypoint(target), [text for _, text in team_copies])
+        write_scope_markdown_file(target, Path(FILE_MEMORY_ENTRYPOINT), merged.encode())
+        for copy, _ in team_copies:
+            _remove_copy(storage_root, copy)
+
+
+def _recognized_copy(storage_root: Path, copy: Path) -> str | None:
+    """Return a copy's `MEMORY.md` when the copy holds only what the runtime wrote there, else leave it with a warning."""
+    try:
+        with open_directory_within_root(storage_root, copy) as directory:
+            text = _read_lone_entrypoint(directory)
+    except (OSError, ValueError) as error:
+        logger.warning("Left a team memory copy that MindRoom cannot merge", path=str(copy), error=str(error))
+        return None
+    if not all(_is_runtime_line(line) for line in text.splitlines()):
+        logger.warning("Left a team memory copy with lines MindRoom did not write", path=str(copy))
+        return None
+    return text
+
+
+def _read_lone_entrypoint(directory: int) -> str:
+    """Read the `MEMORY.md` of a directory that holds nothing else."""
+    with os.scandir(directory) as entries:
+        if sorted(entry.name for entry in entries) != [FILE_MEMORY_ENTRYPOINT]:
+            msg = "it holds more than MEMORY.md"
+            raise ValueError(msg)
+    return _read_entrypoint(directory)
+
+
+def _read_entrypoint(directory: int) -> str:
+    descriptor = open_regular_file_at(directory, FILE_MEMORY_ENTRYPOINT)
+    try:
+        if os.fstat(descriptor).st_size > _MAX_COPY_BYTES:
+            msg = "MEMORY.md exceeds the merge size limit"
+            raise ValueError(msg)
+        chunks: list[bytes] = []
+        while chunk := os.read(descriptor, 1 << 16):
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks).decode("utf-8")
+
+
+def _is_runtime_line(line: str) -> bool:
+    return not line.strip() or line == _ENTRYPOINT_HEADER or FILE_MEMORY_ENTRY_PATTERN.match(line) is not None
+
+
+def _existing_entrypoint(target: Path) -> str | None:
+    """Return the team's `MEMORY.md` an interrupted earlier start published, if any."""
+    try:
+        with open_directory_within_root(target) as directory:
+            return _read_entrypoint(directory)
+    except FileNotFoundError:
+        return None
+
+
+def _merged_entrypoint(existing: str | None, copies: list[str]) -> str:
+    """Return the first text plus, in order, every entry of the later ones whose id it lacks."""
+    first, *rest = copies if existing is None else [existing, *copies]
+    lines = first.splitlines()
+    ids = {match.group("id") for line in lines if (match := FILE_MEMORY_ENTRY_PATTERN.match(line))}
+    for copy in rest:
+        for line in copy.splitlines():
+            if (match := FILE_MEMORY_ENTRY_PATTERN.match(line)) is not None and match.group("id") not in ids:
+                ids.add(match.group("id"))
+                lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+def _remove_copy(storage_root: Path, copy: Path) -> None:
+    with open_directory_within_root(storage_root, copy.parent) as parent:
+        with open_directory_within_root(parent, copy.name) as directory:
+            os.unlink(FILE_MEMORY_ENTRYPOINT, dir_fd=directory)
+        os.rmdir(copy.name, dir_fd=parent)
+    # The member's `memory_files/` held only team copies, so it goes once it is empty.
+    with suppress(OSError), open_directory_within_root(storage_root, copy.parent.parent) as member:
+        os.rmdir(copy.parent.name, dir_fd=member)
+
+
+def _merge_mem0_copies(storage_root: Path, runtime_paths: RuntimePaths, members: list[str]) -> bool:
+    """Merge every member's Mem0 team records into their teams' stores; False while Chroma cannot be installed."""
+    stores = [
+        storage_root / store
+        for member in members
+        if _holds_only_plain_files(storage_root, store := Path("agents", member, "chroma"))
+    ]
+    if not stores:
+        return True
+    try:
+        # Mem0's first use would install it too; installing now keeps old team memories visible from the first reply.
+        ensure_optional_deps(["chromadb"], "chromadb", runtime_paths)
+    except ImportError as error:
+        logger.warning("Left Mem0 team memory in member stores until Chroma is installed", error=str(error))
+        return False
+    kept, copies = _team_records([_chroma_client(store) for store in stores])
+    for (scope, collection_name), records in sorted(kept.items()):
+        target = _chroma_client(storage_root / TEAM_MEMORY_DIRNAME / scope_dir_name(scope) / "chroma")
+        collection = target.get_or_create_collection(collection_name, embedding_function=None)
+        # Records keep their IDs, so moving one again after an interrupted start changes nothing.
+        for batch in _batches(records, target.get_max_batch_size()):
+            collection.upsert(
+                ids=[record["id"] for record in batch],
+                embeddings=[record["embedding"] for record in batch],
+                metadatas=[record["metadata"] for record in batch],
+            )
+    # Only after every team's store holds its records do the member copies go, the dropped extractions first: a start
+    # interrupted meanwhile still finds each kept extraction where it was, so it keeps the same one.
+    kept_ids = {record["id"] for records in kept.values() for record in records}
+    for keep in (False, True):
+        for client, collection, record_ids in copies:
+            removed = [record_id for record_id in record_ids if (record_id in kept_ids) is keep]
+            for batch in _batches(removed, client.get_max_batch_size()):
+                collection.delete(ids=batch)
+    return True
+
+
+def _batches[Item](items: list[Item], size: int) -> Iterator[list[Item]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def _holds_only_plain_files(storage_root: Path, store: Path) -> bool:
+    """Return whether a member's Chroma store is a directory tree of directories and singly linked regular files.
+
+    Chroma opens a store's files by path, so a link planted in the store could send its reads and writes elsewhere.
+    """
+    try:
+        with open_directory_within_root(storage_root, store) as directory:
+            if _plain_tree(directory):
+                return True
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError) as error:
+        logger.warning("Left an unusable Mem0 store while merging team memory", path=str(store), error=str(error))
+        return False
+    logger.warning("Left a Mem0 store holding links or special files while merging team memory", path=str(store))
+    return False
+
+
+def _plain_tree(directory: int) -> bool:
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            status = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(status.st_mode):
+                with open_directory_within_root(directory, entry.name) as child:
+                    if not _plain_tree(child):
+                        return False
+            elif not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+                return False
+    return True
+
+
+def _team_records(
+    clients: list[Any],
+) -> tuple[dict[tuple[str, str], list[dict[str, Any]]], list[tuple[Any, Any, list[str]]]]:
+    """Return the records each team's store keeps, by team scope and collection, and every member copy to delete.
+
+    Each member extracted a team turn on its own, so a turn several members hold keeps the extraction of the first
+    member by name, which the clients' order gives, as if the team had extracted the turn once.
+    """
+    holders: dict[tuple[str, str, str], object] = {}
+    kept: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    copies: list[tuple[Any, Any, list[str]]] = []
+    for client in clients:
+        for collection in client.list_collections():
+            name = collection.name
+            if not name.startswith(_MEM0_COLLECTION_PREFIX) or name.endswith(_MEM0_ENTITY_SUFFIX):
+                continue
+            team_records = [
+                record
+                for record in _records(collection.get(include=["embeddings", "metadatas"]))
+                if str(record["metadata"].get("user_id", "")).startswith(_TEAM_SCOPE_PREFIX)
+            ]
+            for record in team_records:
+                team = (record["metadata"]["user_id"], name)
+                # A record without a replica key is its own turn.
+                turn = record["metadata"].get(_REPLICA_KEY) or record["id"]
+                if holders.setdefault((*team, turn), client) is client:
+                    kept.setdefault(team, []).append(record)
+            if team_records:
+                copies.append((client, collection, [record["id"] for record in team_records]))
+    return kept, copies
+
+
+def _chroma_client(path: Path) -> Any:  # noqa: ANN401 - chromadb is an optional dependency
+    """Open one Chroma store with the settings Mem0 uses, so Mem0 later reuses the same cached system."""
+    with optional_dependency_environment():
+        import chromadb  # noqa: PLC0415
+        from chromadb.config import Settings  # noqa: PLC0415
+
+    return chromadb.Client(Settings(anonymized_telemetry=False, persist_directory=str(path), is_persistent=True))
+
+
+def _records(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
+    embeddings = payload.get("embeddings")
+    for index, record_id in enumerate(payload["ids"]):
+        yield {
+            "id": record_id,
+            "metadata": payload["metadatas"][index] or {},
+            "embedding": embeddings[index] if embeddings is not None else None,
+        }

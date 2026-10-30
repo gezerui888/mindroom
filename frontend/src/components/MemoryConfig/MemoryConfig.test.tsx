@@ -151,22 +151,30 @@ describe("MemoryConfig", () => {
     });
   });
 
-  it("updates team reads member memory toggle", async () => {
+  it("neither shows nor writes the retired team-read switch and file memory path", async () => {
+    (useConfigStore as any).mockReturnValue({
+      config: { memory: { ...mockConfig.memory, backend: "file" } },
+      updateMemoryConfig: mockUpdateMemoryConfig,
+      saveConfig: mockSaveConfig,
+      isDirty: false,
+    });
     render(<MemoryConfig />);
 
-    const toggle = document.getElementById("team-reads-member-memory");
-    expect(toggle).toBeInTheDocument();
-    fireEvent.click(toggle!);
+    expect(
+      document.getElementById("team-reads-member-memory"),
+    ).not.toBeInTheDocument();
+    expect(document.getElementById("file-memory-path")).not.toBeInTheDocument();
+    expect(screen.queryByText("Team Reads Members:")).not.toBeInTheDocument();
 
-    const enabledOption = await screen.findByText("Enabled");
-    fireEvent.click(enabledOption);
+    fireEvent.change(document.getElementById("model") as HTMLInputElement, {
+      target: { value: "text-embedding-3-large" },
+    });
 
     await waitFor(() => {
-      expect(mockUpdateMemoryConfig).toHaveBeenCalledWith(
-        expect.objectContaining({
-          team_reads_member_memory: true,
-        }),
-      );
+      const calls = mockUpdateMemoryConfig.mock.calls;
+      const nextConfig = calls[calls.length - 1]?.[0];
+      expect(nextConfig).not.toHaveProperty("team_reads_member_memory");
+      expect(nextConfig.file).not.toHaveProperty("path");
     });
   });
 
@@ -436,7 +444,6 @@ describe("MemoryConfig", () => {
           backend: "file",
           embedder: mockConfig.memory!.embedder,
           file: {
-            path: "./memory_files",
             max_entrypoint_lines: 120,
             max_entrypoint_tokens: 30000,
           },
@@ -458,7 +465,6 @@ describe("MemoryConfig", () => {
       expect(mockUpdateMemoryConfig).toHaveBeenCalledWith(
         expect.objectContaining({
           file: {
-            path: "./memory_files",
             max_entrypoint_lines: 120,
             max_entrypoint_tokens: 20000,
           },

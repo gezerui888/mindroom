@@ -83,6 +83,7 @@ from mindroom.matrix_rtc.call_manager import preload_matrix_call_dependencies
 from mindroom.mcp.manager import MCPServerManager
 from mindroom.mcp.toolkit import bind_mcp_server_manager
 from mindroom.memory import MemoryAutoFlushService
+from mindroom.memory.legacy_team_memory import migrate_team_memory
 from mindroom.private_storage.legacy_private_storage import migrate_private_storage
 from mindroom.providers.model_http_client import aclose_model_http_client
 from mindroom.response_activity import ActiveResponseIdentity
@@ -2348,6 +2349,7 @@ async def _run_runtime(  # noqa: PLR0915
         probes = serve_startup_probes(api_host, api_port, detail="Converting conversation storage") if api else None
         with probes or nullcontext():
             await migrate_conversation_storage(runtime_paths)
+            await migrate_team_memory(runtime_paths)
             # Before the API serves and before the homeserver answers, so the dashboard has this one load meanwhile.
             startup_config = await load_startup_config(runtime_paths, api_enabled=api)
 

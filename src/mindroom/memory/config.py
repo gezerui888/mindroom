@@ -40,6 +40,7 @@ _T = TypeVar("_T")
 
 logger = get_logger(__name__)
 _MEMORY_COLLECTION_PREFIX = "mindroom_memories"
+_CHROMA_DIRNAME = "chroma"
 # The calls into one Chroma store take turns, from building a memory on. Chroma publishes each store's shared system
 # before starting it, so a build that overlaps the first build of the same store can reach the unstarted system, and
 # both builds fail. A query that overlaps a new collection's first write can fail with "Error creating hnsw segment
@@ -175,6 +176,11 @@ def _memory_collection_name(config: Config) -> str:
     return f"{_MEMORY_COLLECTION_PREFIX}_{digest}"
 
 
+def mem0_store_exists(store_root: Path) -> bool:
+    """Return whether a Mem0 store was ever built under ``store_root``, without building one."""
+    return (store_root / _CHROMA_DIRNAME).is_dir()
+
+
 def mem0_ollama_host(config: Config, runtime_paths: RuntimePaths) -> str:
     """Return the server the Ollama memory LLM, configured or default, reaches.
 
@@ -232,11 +238,11 @@ def _mem0_llm_config(config: Config, runtime_paths: RuntimePaths) -> dict[str, A
     }
 
 
-def _get_memory_config(storage_path: Path, config: Config, runtime_paths: RuntimePaths) -> dict:
-    """Get Mem0 configuration with a ChromaDB backend and history database under ``storage_path``.
+def _get_memory_config(store_root: Path, config: Config, runtime_paths: RuntimePaths) -> dict:
+    """Get Mem0 configuration with a ChromaDB backend and history database under ``store_root``.
 
     Args:
-        storage_path: Base directory for memory storage
+        store_root: The root of one memory scope's store: an agent's state root or a team's memory root
         config: Application configuration
         runtime_paths: Explicit runtime context for credential-backed provider settings.
 
@@ -246,14 +252,14 @@ def _get_memory_config(storage_path: Path, config: Config, runtime_paths: Runtim
     """
     app_config = config
     # Canonicalize once so Chroma path is independent of runtime cwd changes.
-    resolved_storage_path = storage_path.expanduser().resolve()
+    resolved_store_root = store_root.expanduser().resolve()
 
     # Ensure storage directories exist
-    chroma_path = resolved_storage_path / "chroma"
+    chroma_path = resolved_store_root / _CHROMA_DIRNAME
     chroma_path.mkdir(parents=True, exist_ok=True)
     # Mem0's history database keeps the text of changed and deleted memories, and the latest messages it adds to the
-    # next extraction prompt under keys that do not name the requester, so each storage root needs its own.
-    history_dir = resolved_storage_path / "mem0"
+    # next extraction prompt under keys that do not name the requester, so each store root needs its own.
+    history_dir = resolved_store_root / "mem0"
     history_dir.mkdir(exist_ok=True)
     resolved_embedder = resolve_embedder_settings(app_config, runtime_paths)
     embedder_provider = resolved_embedder.provider
@@ -294,14 +300,14 @@ def _get_memory_config(storage_path: Path, config: Config, runtime_paths: Runtim
 
 @timed("system_prompt_assembly.memory_search.mem0.async_memory_from_config")
 async def create_memory_instance(
-    storage_path: Path,
+    store_root: Path,
     config: Config,
     runtime_paths: RuntimePaths,
 ) -> AsyncMemory:
     """Create a Mem0 memory instance with ChromaDB backend.
 
     Args:
-        storage_path: Base directory for memory storage
+        store_root: The root of one memory scope's store: an agent's state root or a team's memory root
         config: Application configuration
         runtime_paths: Explicit runtime context for credential-backed provider settings.
 
@@ -309,7 +315,7 @@ async def create_memory_instance(
         Configured AsyncMemory instance
 
     """
-    config_dict = _get_memory_config(storage_path, config, runtime_paths)
+    config_dict = _get_memory_config(store_root, config, runtime_paths)
     store_path = config_dict["vector_store"]["config"]["path"]
     store_lock = _STORE_LOCKS.setdefault(store_path, threading.Lock())
 

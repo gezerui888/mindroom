@@ -26,11 +26,12 @@ if TYPE_CHECKING:
 
 @dataclass
 class BackendEnv:
-    """One adapter under test plus the config and storage it operates on."""
+    """One adapter under test plus the config and storage it operates on, and the Mem0 stores it opened."""
 
     backend: ResolvedMemoryBackend
     config: Config
     storage_path: Path
+    stores: dict[Path, FakeMem0ScopedMemory]
 
 
 def _contract_config(tmp_path: Path, memory_backend: str) -> Config:
@@ -53,109 +54,156 @@ def _contract_config(tmp_path: Path, memory_backend: str) -> Config:
 def backend_env(request: pytest.FixtureRequest, tmp_path: Path) -> BackendEnv:
     config = _contract_config(tmp_path, request.param)
     runtime_paths = runtime_paths_for(config)
+    stores: dict[Path, FakeMem0ScopedMemory] = {}
     backend: ResolvedMemoryBackend
     if request.param == "file":
         backend = FileMemoryBackend(runtime_paths=runtime_paths)
     else:
-        stores: dict[Path, FakeMem0ScopedMemory] = {}
 
-        async def create_fake_memory(
-            scope_storage_path: Path,
-            _config: Config,
-            *,
-            timing_scope: str | None = None,
-        ) -> FakeMem0ScopedMemory:
-            del timing_scope
-            return stores.setdefault(scope_storage_path, FakeMem0ScopedMemory())
+        async def create_fake_memory(store_root: Path, _config: Config) -> FakeMem0ScopedMemory:
+            # A real store leaves its Chroma directory behind, which tells reads the store exists.
+            (store_root / "chroma").mkdir(parents=True, exist_ok=True)
+            return stores.setdefault(store_root, FakeMem0ScopedMemory(id_prefix=f"mem{len(stores)}"))
 
         backend = Mem0MemoryBackend(runtime_paths=runtime_paths, create_memory=create_fake_memory)
-    return BackendEnv(backend=backend, config=config, storage_path=tmp_path)
+    return BackendEnv(backend=backend, config=config, storage_path=tmp_path, stores=stores)
 
 
 @pytest.mark.asyncio
 async def test_add_search_get_update_delete_roundtrip(backend_env: BackendEnv) -> None:
-    backend, config, storage_path = backend_env.backend, backend_env.config, backend_env.storage_path
+    backend, config = backend_env.backend, backend_env.config
 
-    await backend.add("Prefers green tea in the morning", "alpha", storage_path, config)
-    results = (await backend.search("green tea", "alpha", storage_path, config, limit=5)).results
+    await backend.add("Prefers green tea in the morning", "alpha", config)
+    results = (await backend.search("green tea", "alpha", config, limit=5)).results
     assert [result["memory"] for result in results] == ["Prefers green tea in the morning"]
     memory_id = results[0]["id"]
 
-    loaded = await backend.get(memory_id, "alpha", storage_path, config)
+    loaded = await backend.get(memory_id, "alpha", config)
     assert loaded is not None
     assert loaded["memory"] == "Prefers green tea in the morning"
 
-    await backend.update(memory_id, "Prefers black coffee instead", "alpha", storage_path, config)
-    updated = await backend.get(memory_id, "alpha", storage_path, config)
+    await backend.update(memory_id, "Prefers black coffee instead", "alpha", config)
+    updated = await backend.get(memory_id, "alpha", config)
     assert updated is not None
     assert updated["memory"] == "Prefers black coffee instead"
 
-    await backend.delete(memory_id, "alpha", storage_path, config)
-    assert await backend.get(memory_id, "alpha", storage_path, config) is None
-    assert (await backend.search("black coffee", "alpha", storage_path, config, limit=5)).results == []
+    await backend.delete(memory_id, "alpha", config)
+    assert await backend.get(memory_id, "alpha", config) is None
+    assert (await backend.search("black coffee", "alpha", config, limit=5)).results == []
     with pytest.raises(MemoryNotFoundError):
-        await backend.delete(memory_id, "alpha", storage_path, config)
+        await backend.delete(memory_id, "alpha", config)
 
 
 @pytest.mark.asyncio
 async def test_list_all_returns_only_agent_scope(backend_env: BackendEnv) -> None:
-    backend, config, storage_path = backend_env.backend, backend_env.config, backend_env.storage_path
+    backend, config = backend_env.backend, backend_env.config
 
-    await backend.add("Alpha fact one", "alpha", storage_path, config)
-    await backend.add("Alpha fact two", "alpha", storage_path, config)
-    await backend.add("Beta fact", "beta", storage_path, config)
+    await backend.add("Alpha fact one", "alpha", config)
+    await backend.add("Alpha fact two", "alpha", config)
+    await backend.add("Beta fact", "beta", config)
 
-    alpha_memories = await backend.list_all("alpha", storage_path, config, limit=10)
+    alpha_memories = await backend.list_all("alpha", config, limit=10)
     assert sorted(memory["memory"] for memory in alpha_memories) == ["Alpha fact one", "Alpha fact two"]
-    beta_memories = await backend.list_all("beta", storage_path, config, limit=10)
+    beta_memories = await backend.list_all("beta", config, limit=10)
     assert [memory["memory"] for memory in beta_memories] == ["Beta fact"]
 
 
 @pytest.mark.asyncio
 async def test_agent_scope_memories_invisible_to_other_agents(backend_env: BackendEnv) -> None:
-    backend, config, storage_path = backend_env.backend, backend_env.config, backend_env.storage_path
+    backend, config = backend_env.backend, backend_env.config
 
-    await backend.add("Alpha secret preference", "alpha", storage_path, config)
-    assert (await backend.search("Alpha secret", "beta", storage_path, config, limit=5)).results == []
+    await backend.add("Alpha secret preference", "alpha", config)
+    assert (await backend.search("Alpha secret", "beta", config, limit=5)).results == []
 
-    alpha_results = (await backend.search("Alpha secret", "alpha", storage_path, config, limit=5)).results
+    alpha_results = (await backend.search("Alpha secret", "alpha", config, limit=5)).results
     assert len(alpha_results) == 1
     memory_id = alpha_results[0]["id"]
-    assert await backend.get(memory_id, "beta", storage_path, config) is None
+    assert await backend.get(memory_id, "beta", config) is None
     with pytest.raises(MemoryNotFoundError):
-        await backend.update(memory_id, "Hijacked by beta", "beta", storage_path, config)
+        await backend.update(memory_id, "Hijacked by beta", "beta", config)
 
 
 @pytest.mark.asyncio
 async def test_team_conversation_memory_visible_to_members_but_not_member_scoped(backend_env: BackendEnv) -> None:
-    backend, config, storage_path = backend_env.backend, backend_env.config, backend_env.storage_path
+    backend, config = backend_env.backend, backend_env.config
 
     await backend.store_conversation(
         "Quarterly metrics reviewed by the pair team",
         ["alpha", "beta"],
-        storage_path,
         "session-team",
         config,
     )
 
     for member in ("alpha", "beta"):
-        results = (await backend.search("Quarterly metrics", member, storage_path, config, limit=5)).results
+        results = (await backend.search("Quarterly metrics", member, config, limit=5)).results
         assert [result["user_id"] for result in results] == ["team_alpha+beta"]
         assert results[0]["memory"] == "Quarterly metrics reviewed by the pair team"
 
     for member in ("alpha", "beta"):
-        assert await backend.list_all(member, storage_path, config, limit=10) == []
+        assert await backend.list_all(member, config, limit=10) == []
 
 
 @pytest.mark.asyncio
 async def test_single_agent_conversation_memory_stays_member_scoped(backend_env: BackendEnv) -> None:
+    backend, config = backend_env.backend, backend_env.config
+
+    await backend.store_conversation("Alpha solo reflection", "alpha", "session-solo", config)
+
+    alpha_results = (await backend.search("Alpha solo", "alpha", config, limit=5)).results
+    assert [result["user_id"] for result in alpha_results] == ["agent_alpha"]
+    assert (await backend.search("Alpha solo", "beta", config, limit=5)).results == []
+
+
+@pytest.mark.asyncio
+async def test_a_team_turn_writes_once_to_the_one_store_every_member_reads_and_edits(backend_env: BackendEnv) -> None:
     backend, config, storage_path = backend_env.backend, backend_env.config, backend_env.storage_path
 
-    await backend.store_conversation("Alpha solo reflection", "alpha", storage_path, "session-solo", config)
+    for turn in ("Quarterly metrics reviewed", "Quarterly budget approved", "Quarterly hiring paused"):
+        await backend.store_conversation(turn, ["alpha", "beta"], "session-team", config)
+    found = {
+        result["memory"]: result["id"]
+        for result in (await backend.search("Quarterly", "alpha", config, limit=5)).results
+    }
 
-    alpha_results = (await backend.search("Alpha solo", "alpha", storage_path, config, limit=5)).results
-    assert [result["user_id"] for result in alpha_results] == ["agent_alpha"]
-    assert (await backend.search("Alpha solo", "beta", storage_path, config, limit=5)).results == []
+    await backend.update(found["Quarterly metrics reviewed"], "Quarterly metrics reviewed twice", "alpha", config)
+    await backend.delete(found["Quarterly budget approved"], "beta", config)
+
+    for member in ("alpha", "beta"):
+        results = (await backend.search("Quarterly", member, config, limit=5)).results
+        assert sorted(result["memory"] for result in results) == [
+            "Quarterly hiring paused",
+            "Quarterly metrics reviewed twice",
+        ]
+        assert {result["user_id"] for result in results} == {"team_alpha+beta"}
+    team_root = storage_path / "team_memory" / "team_alpha+beta"
+    assert team_root.is_dir()
+    assert not any((storage_path / "agents").glob("*/memory_files"))
+    holding = {root for root, store in backend_env.stores.items() if (await store.get_all())["results"]}
+    assert holding == ({team_root} if isinstance(backend, Mem0MemoryBackend) else set())
+
+
+@pytest.mark.asyncio
+async def test_reads_create_no_team_store(backend_env: BackendEnv) -> None:
+    backend, config, storage_path = backend_env.backend, backend_env.config, backend_env.storage_path
+
+    await backend.add("Alpha keeps notes", "alpha", config)
+    assert [result["memory"] for result in (await backend.search("Alpha", "alpha", config, limit=5)).results] == [
+        "Alpha keeps notes",
+    ]
+    assert await backend.get("unknown-id", "alpha", config) is None
+
+    assert not (storage_path / "team_memory").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_member_still_reads_its_teams_store_after_a_teammate_turns_memory_off(backend_env: BackendEnv) -> None:
+    backend, config = backend_env.backend, backend_env.config
+    await backend.store_conversation("Quarterly metrics reviewed", ["alpha", "beta"], "session-team", config)
+
+    config.agents["beta"].memory_backend = "none"
+
+    results = (await backend.search("Quarterly", "alpha", config, limit=5)).results
+    assert [result["memory"] for result in results] == ["Quarterly metrics reviewed"]
 
 
 def test_resolve_memory_backend_maps_scopes_to_adapters(tmp_path: Path) -> None:

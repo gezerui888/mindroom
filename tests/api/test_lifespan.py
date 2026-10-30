@@ -76,6 +76,7 @@ _STARTUP_MIGRATIONS = (
     "migrate_private_storage",
     "migrate_state_root_records",
     "migrate_conversation_storage",
+    "migrate_team_memory",
     "migrate_tool_credential_defaults",
 )
 

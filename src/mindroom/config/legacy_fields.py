@@ -123,6 +123,36 @@ def drop_retired_auto_flush_fields(value: object) -> object:
     return value
 
 
+# LEGACY_COMPAT: Retired memory.team_reads_member_memory switch.
+# Legacy format: memory.team_reads_member_memory, which the dashboard wrote on every save, let memory reads made for a
+#   whole team also read its members' agent scopes; nothing made such reads, so it changed nothing.
+# Last legacy release: v2026.10.696; replacement: unreleased; each team scope has its own store and a team turn only
+#   writes to it, so the field is removed.
+# Handling: Drop it before validation, so a config that still sets it loads unchanged and the next dashboard save
+#   removes it.
+# Coverage: tests/test_memory_config.py::TestMemoryConfig::test_retired_team_memory_fields_still_load.
+def drop_retired_memory_fields(value: object) -> object:
+    """Return memory settings without the retired team-read switch."""
+    if isinstance(value, dict):
+        return {key: item for key, item in value.items() if key != "team_reads_member_memory"}
+    return value
+
+
+# LEGACY_COMPAT: Retired memory.file.path fallback root.
+# Legacy format: memory.file.path, which the dashboard wrote on every save, was documented as the root of team file
+#   memory, but team and agent file memory always lived in their canonical roots, so it changed nothing.
+# Last legacy release: v2026.10.696; replacement: unreleased; team file memory lives in its team's own store, and the
+#   field is removed.
+# Handling: Drop it before validation, so a config that still sets it loads unchanged and the next dashboard save
+#   removes it.
+# Coverage: tests/test_memory_config.py::TestMemoryConfig::test_retired_team_memory_fields_still_load.
+def drop_retired_memory_file_fields(value: object) -> object:
+    """Return file-memory settings without the retired fallback root."""
+    if isinstance(value, dict):
+        return {key: item for key, item in value.items() if key != "path"}
+    return value
+
+
 # LEGACY_COMPAT: Retired per-tool restrict_to_base_dir override.
 # Legacy format: file, coding, and python tool entries accepted an authored boolean restrict_to_base_dir.
 # Last legacy release: v2026.9.279; replacement: v2026.9.280 removed the field for the agents.<name>.file_access and

@@ -929,7 +929,6 @@ class ResponseRunner:
                 store_conversation_memory(
                     prompt,
                     agent_name,
-                    self.deps.storage_path,
                     session_id,
                     self.deps.runtime.config,
                     self.deps.runtime_paths,

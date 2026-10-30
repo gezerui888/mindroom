@@ -44,7 +44,6 @@ type MemorySettings = MindRoomConfig["memory"];
 /** MemoryConfig keys this page renders by hand; More settings shows the rest. */
 const MEMORY_EDITOR_FIELDS = [
   "backend",
-  "team_reads_member_memory",
   "embedder",
   "file",
   "search",
@@ -59,7 +58,6 @@ const EMBEDDER_EDITOR_FIELDS = [
 
 const DEFAULT_MEMORY_SETTINGS: MemorySettings = {
   backend: "mem0",
-  team_reads_member_memory: false,
   embedder: {
     provider: "openai",
     config: {
@@ -68,7 +66,6 @@ const DEFAULT_MEMORY_SETTINGS: MemorySettings = {
     },
   },
   file: {
-    path: "",
     max_entrypoint_lines: 200,
     max_entrypoint_tokens: 50000,
   },
@@ -266,16 +263,6 @@ export function MemoryConfig() {
     });
   };
 
-  const handleFilePathChange = (path: string) => {
-    applyMemoryConfig({
-      ...localConfig,
-      file: {
-        ...localConfig.file,
-        path,
-      },
-    });
-  };
-
   const handleSearchModeChange = (mode: "keyword" | "semantic") => {
     applyMemoryConfig({
       ...localConfig,
@@ -425,33 +412,6 @@ export function MemoryConfig() {
           </FieldGroup>
 
           <FieldGroup
-            label="Team Reads Member Memory"
-            helperText="Allow team-context memory reads to include member agent memories."
-            htmlFor="team-reads-member-memory"
-          >
-            <Select
-              value={String(localConfig.team_reads_member_memory ?? false)}
-              onValueChange={(value) =>
-                applyMemoryConfig({
-                  ...localConfig,
-                  team_reads_member_memory: parseBoolean(value),
-                })
-              }
-            >
-              <SelectTrigger
-                id="team-reads-member-memory"
-                className="transition-colors hover:border-ring"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="true">Enabled</SelectItem>
-                <SelectItem value="false">Disabled</SelectItem>
-              </SelectContent>
-            </Select>
-          </FieldGroup>
-
-          <FieldGroup
             label="Embedder Provider"
             helperText={providerHelperText(localConfig.embedder.provider)}
             required
@@ -556,21 +516,6 @@ export function MemoryConfig() {
 
           {localConfig.backend === "file" && (
             <>
-              <FieldGroup
-                label="File Memory Path"
-                helperText="Directory containing MEMORY.md and daily files under memory/YYYY-MM-DD.md."
-                htmlFor="file-memory-path"
-              >
-                <Input
-                  id="file-memory-path"
-                  type="text"
-                  value={localConfig.file?.path || ""}
-                  onChange={(e) => handleFilePathChange(e.target.value)}
-                  placeholder="./mindroom_data/memory_files"
-                  className="transition-colors hover:border-ring focus:border-ring"
-                />
-              </FieldGroup>
-
               <FieldGroup
                 label="Entrypoint Max Lines"
                 helperText="Maximum lines preloaded from the entrypoint file."
@@ -1023,12 +968,6 @@ export function MemoryConfig() {
               <span className="text-muted-foreground">Provider:</span>
               <span className="font-mono text-foreground">
                 {localConfig.embedder.provider}
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Team Reads Members:</span>
-              <span className="font-mono text-foreground">
-                {localConfig.team_reads_member_memory ? "enabled" : "disabled"}
               </span>
             </div>
             <div className="flex justify-between">

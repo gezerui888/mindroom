@@ -41,14 +41,12 @@ if TYPE_CHECKING:
 async def add_agent_memory(
     content: str,
     agent_name: str,
-    storage_path: Path,
     config: Config,
     metadata: dict | None = None,
 ) -> None:
     await public_add_agent_memory(
         content,
         agent_name,
-        storage_path,
         config,
         runtime_paths_for(config),
         metadata,
@@ -58,14 +56,12 @@ async def add_agent_memory(
 async def search_agent_memories(
     query: str,
     agent_name: str,
-    storage_path: Path,
     config: Config,
     limit: int = 3,
 ) -> list[MemoryResult]:
     outcome = await public_search_agent_memories(
         query,
         agent_name,
-        storage_path,
         config,
         runtime_paths_for(config),
         limit,
@@ -76,13 +72,11 @@ async def search_agent_memories(
 
 async def list_all_agent_memories(
     agent_name: str,
-    storage_path: Path,
     config: Config,
     limit: int = 100,
 ) -> list[MemoryResult]:
     return await public_list_all_agent_memories(
         agent_name,
-        storage_path,
         config,
         runtime_paths_for(config),
         limit,
@@ -91,14 +85,12 @@ async def list_all_agent_memories(
 
 async def get_agent_memory(
     memory_id: str,
-    caller_context: str | list[str],
-    storage_path: Path,
+    agent_name: str,
     config: Config,
 ) -> MemoryResult | None:
     return await public_get_agent_memory(
         memory_id,
-        caller_context,
-        storage_path,
+        agent_name,
         config,
         runtime_paths_for(config),
     )
@@ -107,15 +99,13 @@ async def get_agent_memory(
 async def update_agent_memory(
     memory_id: str,
     content: str,
-    caller_context: str | list[str],
-    storage_path: Path,
+    agent_name: str,
     config: Config,
 ) -> None:
     await public_update_agent_memory(
         memory_id,
         content,
-        caller_context,
-        storage_path,
+        agent_name,
         config,
         runtime_paths_for(config),
     )
@@ -123,14 +113,12 @@ async def update_agent_memory(
 
 async def delete_agent_memory(
     memory_id: str,
-    caller_context: str | list[str],
-    storage_path: Path,
+    agent_name: str,
     config: Config,
 ) -> None:
     await public_delete_agent_memory(
         memory_id,
-        caller_context,
-        storage_path,
+        agent_name,
         config,
         runtime_paths_for(config),
     )
@@ -139,13 +127,11 @@ async def delete_agent_memory(
 async def build_memory_prompt_parts(
     prompt: str,
     agent_name: str,
-    storage_path: Path,
     config: Config,
 ) -> MemoryPromptParts:
     return await public_build_memory_prompt_parts(
         prompt,
         agent_name,
-        storage_path,
         config,
         runtime_paths_for(config),
     )
@@ -154,7 +140,6 @@ async def build_memory_prompt_parts(
 async def store_conversation_memory(
     prompt: str,
     agent_name: str | list[str],
-    storage_path: Path,
     session_id: str,
     config: Config,
     **kwargs: object,
@@ -162,7 +147,6 @@ async def store_conversation_memory(
     await public_store_conversation_memory(
         prompt,
         agent_name,
-        storage_path,
         session_id,
         config,
         runtime_paths_for(config),
@@ -195,6 +179,16 @@ def _test_config(storage_path: Path) -> Config:
     )
 
 
+def _team_store_root(config: Config, scope_user_id: str) -> Path:
+    return runtime_paths_for(config).storage_root / "team_memory" / scope_user_id
+
+
+def _create_team_stores(config: Config, *scope_user_ids: str) -> None:
+    """Create the Mem0 team stores a team turn would have written, since reads never create one."""
+    for scope_user_id in scope_user_ids:
+        (_team_store_root(config, scope_user_id) / "chroma").mkdir(parents=True)
+
+
 class TestMemoryFacade:
     @pytest.fixture
     def mock_memory(self) -> AsyncMock:
@@ -214,19 +208,18 @@ class TestMemoryFacade:
     @pytest.mark.asyncio
     async def test_memory_instance_creation(self, mock_memory: AsyncMock, storage_path: Path, config: Config) -> None:
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
-            await add_agent_memory("Test content", "test_agent", storage_path, config)
+            await add_agent_memory("Test content", "test_agent", config)
             assert mock_create.call_args[0][0] == agent_state_root_path(storage_path, "test_agent")
 
-            await search_agent_memories("query", "test_agent", storage_path, config)
+            await search_agent_memories("query", "test_agent", config)
             assert mock_create.call_args[0][0] == agent_state_root_path(storage_path, "test_agent")
 
     @pytest.mark.asyncio
-    async def test_add_agent_memory(self, mock_memory: AsyncMock, storage_path: Path, config: Config) -> None:
+    async def test_add_agent_memory(self, mock_memory: AsyncMock, config: Config) -> None:
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             await add_agent_memory(
                 "Test memory content",
                 "test_agent",
-                storage_path,
                 config,
                 metadata={"test": "value"},
             )
@@ -241,7 +234,6 @@ class TestMemoryFacade:
     @pytest.mark.asyncio
     async def test_add_agent_memory_surfaces_embedding_failure_swallowed_by_mem0(
         self,
-        storage_path: Path,
         config: Config,
     ) -> None:
         """An empty normal return from Mem0 cannot turn a failed write into success."""
@@ -279,7 +271,7 @@ class TestMemoryFacade:
                 patch("mindroom.memory._backend.create_memory_instance", return_value=SwallowingMemory()),
                 pytest.raises(EmbedderRequestError, match="embedder authentication failed"),
             ):
-                await add_agent_memory("Never stored", "test_agent", storage_path, config)
+                await add_agent_memory("Never stored", "test_agent", config)
 
             assert get_embedder_failure() == "embedder authentication failed (HTTP 401)"
         finally:
@@ -289,7 +281,6 @@ class TestMemoryFacade:
     async def test_add_agent_memory_error_handling(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.add.side_effect = Exception("Memory error")
@@ -298,17 +289,17 @@ class TestMemoryFacade:
             patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory),
             pytest.raises(Exception, match="Memory error"),
         ):
-            await add_agent_memory("Test content", "test_agent", storage_path, config)
+            await add_agent_memory("Test content", "test_agent", config)
 
     @pytest.mark.asyncio
-    async def test_search_agent_memories(self, mock_memory: AsyncMock, storage_path: Path, config: Config) -> None:
+    async def test_search_agent_memories(self, mock_memory: AsyncMock, config: Config) -> None:
         mock_results = [
             {"id": "1", "memory": "Previous calculation: 2+2=4", "score": 0.9, "metadata": {"agent": "calculator"}},
         ]
         mock_memory.search.return_value = {"results": mock_results}
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            results = await search_agent_memories("calculation", "calculator", storage_path, config, limit=5)
+            results = await search_agent_memories("calculation", "calculator", config, limit=5)
 
             mock_memory.search.assert_called_once_with(
                 "calculation",
@@ -322,33 +313,30 @@ class TestMemoryFacade:
     async def test_search_agent_memories_handles_dict_response(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.search.return_value = {"results": [{"memory": "test"}]}
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            results = await search_agent_memories("query", "agent", storage_path, config)
+            results = await search_agent_memories("query", "agent", config)
             assert results == [{"memory": "test"}]
 
     @pytest.mark.asyncio
     async def test_search_agent_memories_handles_list_response(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.search.return_value = [{"memory": "test"}]
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            results = await search_agent_memories("query", "agent", storage_path, config)
+            results = await search_agent_memories("query", "agent", config)
             assert results == []
 
     @pytest.mark.asyncio
     async def test_mem0_search_classifies_propagated_auth_error(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
@@ -362,7 +350,6 @@ class TestMemoryFacade:
                 outcome = await public_search_agent_memories(
                     "query",
                     "agent",
-                    storage_path,
                     config,
                     runtime_paths_for(config),
                 )
@@ -378,7 +365,6 @@ class TestMemoryFacade:
     @pytest.mark.asyncio
     async def test_mem0_search_classifies_provider_failure_during_initialization(
         self,
-        storage_path: Path,
         config: Config,
     ) -> None:
         """An embedder failure while Mem0 is built, which the build raises typed, degrades instead of aborting the turn."""
@@ -390,7 +376,6 @@ class TestMemoryFacade:
             outcome = await public_search_agent_memories(
                 "query",
                 "agent",
-                storage_path,
                 config,
                 runtime_paths_for(config),
             )
@@ -400,78 +385,54 @@ class TestMemoryFacade:
         capture_embedder_health_recorder().record(None)
 
     @pytest.mark.asyncio
-    async def test_mem0_team_scope_failure_preserves_agent_scope_results(
+    @pytest.mark.parametrize(
+        ("failing_scope", "kept_ids"),
+        [
+            ("team_agent+calculator", ["personal"]),
+            ("agent_agent", []),
+        ],
+    )
+    async def test_mem0_store_failure_ends_the_search_with_the_earlier_stores_hits(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
+        failing_scope: str,
+        kept_ids: list[str],
     ) -> None:
-        """A later team outage keeps already-retrieved personal memories."""
-        config.teams = {"helpers": MockTeamConfig(agents=["agent", "calculator"])}
-        request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
-        response = httpx.Response(401, request=request, json={"error": {"message": "bad key"}})
-        mock_memory.search.side_effect = [
-            {"results": [{"id": "personal", "memory": "available personal memory"}]},
-            openai_embedder_error(AuthenticationError("Error code: 401", response=response, body=None)),
-        ]
-
-        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            outcome = await public_search_agent_memories(
-                "query",
-                "agent",
-                storage_path,
-                config,
-                runtime_paths_for(config),
-            )
-
-        assert [result["id"] for result in outcome.results] == ["personal"]
-        assert outcome.degraded_reason == "embedder authentication failed (HTTP 401)"
-        capture_embedder_health_recorder().record(None)
-
-    @pytest.mark.asyncio
-    async def test_mem0_later_scope_success_clears_earlier_scope_failure(
-        self,
-        mock_memory: AsyncMock,
-        storage_path: Path,
-        config: Config,
-    ) -> None:
-        """Outcome stays partial while process health follows the latest real request."""
+        """Every store embeds with one embedder, so its outage in one store ends the search and keeps what came before."""
         config.teams = {
             "first": MockTeamConfig(agents=["agent", "calculator"]),
             "second": MockTeamConfig(agents=["agent", "finance"]),
         }
+        _create_team_stores(config, "team_agent+calculator", "team_agent+finance")
         request = httpx.Request("POST", "http://embeddings.local/v1/embeddings")
         response = httpx.Response(401, request=request, json={"error": {"message": "bad key"}})
-        auth_error_message = "Error code: 401"
-        calls = 0
+        hits = {
+            "agent_agent": {"id": "personal", "memory": "personal", "score": 0.9},
+            "team_agent+calculator": {"id": "first team", "memory": "first team", "score": 0.8},
+            "team_agent+finance": {"id": "second team", "memory": "second team", "score": 0.7},
+        }
+        searched: list[str] = []
 
-        async def search(*_args: object, **_kwargs: object) -> dict[str, list[dict]]:
-            nonlocal calls
-            calls += 1
-            if calls == 1:
-                return {"results": [{"id": "personal", "memory": "personal"}]}
-            if calls == 2:
-                raise openai_embedder_error(AuthenticationError(auth_error_message, response=response, body=None))
-            # A real successful Mem0 request clears health inside
-            # OpenAIEmbedder; this fake must model that side effect.
-            capture_embedder_health_recorder().record(None)
-            return {"results": [{"id": "team", "memory": "team"}]}
+        async def search(_query: str, *, filters: dict[str, str], **_kwargs: object) -> dict[str, list[dict]]:
+            searched.append(filters["user_id"])
+            if filters["user_id"] == failing_scope:
+                raise openai_embedder_error(AuthenticationError("Error code: 401", response=response, body=None))
+            return {"results": [hits[filters["user_id"]]]}
 
         mock_memory.search.side_effect = search
-        capture_embedder_health_recorder().record("embedder authentication failed (HTTP 401)")
         try:
             with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
                 outcome = await public_search_agent_memories(
                     "query",
                     "agent",
-                    storage_path,
                     config,
                     runtime_paths_for(config),
                 )
 
-            assert [result["id"] for result in outcome.results] == ["personal", "team"]
+            assert [result["id"] for result in outcome.results] == kept_ids
+            assert searched[-1] == failing_scope
             assert outcome.degraded_reason == "embedder authentication failed (HTTP 401)"
-            assert get_embedder_failure() is None
         finally:
             capture_embedder_health_recorder().record(None)
 
@@ -479,7 +440,6 @@ class TestMemoryFacade:
     async def test_mem0_search_success_clears_recorded_failure(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         """A completed mem0 search (even empty) proves recovery and clears stale health."""
@@ -490,7 +450,6 @@ class TestMemoryFacade:
                 outcome = await public_search_agent_memories(
                     "query",
                     "agent",
-                    storage_path,
                     config,
                     runtime_paths_for(config),
                 )
@@ -505,7 +464,6 @@ class TestMemoryFacade:
     async def test_mem0_search_non_provider_error_raises(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.search.side_effect = RuntimeError("sqlite corrupt")
@@ -517,7 +475,6 @@ class TestMemoryFacade:
             await public_search_agent_memories(
                 "query",
                 "agent",
-                storage_path,
                 config,
                 runtime_paths_for(config),
             )
@@ -526,13 +483,12 @@ class TestMemoryFacade:
     async def test_get_agent_memory_allows_agent_scope(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.get.return_value = {"id": "mem-1", "memory": "Own memory", "user_id": "agent_test_agent"}
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            result = await get_agent_memory("mem-1", "test_agent", storage_path, config)
+            result = await get_agent_memory("mem-1", "test_agent", config)
 
         assert result is not None
         assert result["id"] == "mem-1"
@@ -542,13 +498,12 @@ class TestMemoryFacade:
     async def test_get_agent_memory_rejects_other_agent_scope(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.get.return_value = {"id": "mem-1", "memory": "Other memory", "user_id": "agent_other_agent"}
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            result = await get_agent_memory("mem-1", "test_agent", storage_path, config)
+            result = await get_agent_memory("mem-1", "test_agent", config)
 
         assert result is None
         mock_memory.get.assert_called_once_with("mem-1")
@@ -561,53 +516,60 @@ class TestMemoryFacade:
         config: Config,
     ) -> None:
         config.teams = {"test_team": MockTeamConfig(agents=["helper", "test_agent"])}
+        _create_team_stores(config, "team_helper+test_agent")
         mock_memory.get.return_value = {"id": "mem-team", "memory": "Team memory", "user_id": "team_helper+test_agent"}
 
-        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            result = await get_agent_memory("mem-team", "test_agent", storage_path, config)
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
+            result = await get_agent_memory("mem-team", "test_agent", config)
 
         assert result is not None
         assert result["id"] == "mem-team"
-        mock_memory.get.assert_called_once_with("mem-team")
+        # The agent's own store holds no such scope, so the team's one store answers.
+        assert [call.args[0] for call in mock_create.call_args_list] == [
+            agent_state_root_path(storage_path, "test_agent"),
+            _team_store_root(config, "team_helper+test_agent"),
+        ]
 
     @pytest.mark.asyncio
-    async def test_get_agent_memory_team_context_rejects_member_scope_by_default(
+    async def test_get_agent_memory_rejects_teammate_agent_scope(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
+        """A shared team never exposes one member's own memories to another member."""
+        config.teams = {"test_team": MockTeamConfig(agents=["helper", "test_agent"])}
+        _create_team_stores(config, "team_helper+test_agent")
         mock_memory.get.return_value = {"id": "mem-member", "memory": "Member memory", "user_id": "agent_helper"}
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            result = await get_agent_memory("mem-member", ["helper", "test_agent"], storage_path, config)
+            result = await get_agent_memory("mem-member", "test_agent", config)
 
         assert result is None
         assert mock_memory.get.call_count == 2
-        assert all(call.args == ("mem-member",) for call in mock_memory.get.call_args_list)
 
     @pytest.mark.asyncio
-    async def test_get_agent_memory_team_context_allows_member_scope_when_enabled(
+    async def test_get_agent_memory_does_not_create_missing_team_store(
         self,
         mock_memory: AsyncMock,
         storage_path: Path,
         config: Config,
     ) -> None:
-        config.memory.team_reads_member_memory = True
-        mock_memory.get.return_value = {"id": "mem-member", "memory": "Member memory", "user_id": "agent_helper"}
+        """A team that never stored a memory has no store, and reading through a member does not create one."""
+        config.teams = {"test_team": MockTeamConfig(agents=["helper", "test_agent"])}
+        mock_memory.get.return_value = None
 
-        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            result = await get_agent_memory("mem-member", ["helper", "test_agent"], storage_path, config)
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
+            result = await get_agent_memory("mem-team", "test_agent", config)
 
-        assert result is not None
-        assert result["id"] == "mem-member"
-        mock_memory.get.assert_called_once_with("mem-member")
+        assert result is None
+        mock_create.assert_called_once()
+        assert mock_create.call_args.args[0] == agent_state_root_path(storage_path, "test_agent")
+        assert not _team_store_root(config, "team_helper+test_agent").exists()
 
     @pytest.mark.asyncio
     async def test_update_agent_memory_rejects_other_agent_scope(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.get.return_value = {"id": "mem-1", "memory": "Other memory", "user_id": "agent_other_agent"}
@@ -616,7 +578,7 @@ class TestMemoryFacade:
             patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory),
             pytest.raises(ValueError, match="No memory found with id=mem-1"),
         ):
-            await update_agent_memory("mem-1", "Updated content", "test_agent", storage_path, config)
+            await update_agent_memory("mem-1", "Updated content", "test_agent", config)
 
         mock_memory.update.assert_not_called()
 
@@ -624,7 +586,6 @@ class TestMemoryFacade:
     async def test_delete_agent_memory_rejects_other_agent_scope(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.get.return_value = {"id": "mem-1", "memory": "Other memory", "user_id": "agent_other_agent"}
@@ -633,7 +594,7 @@ class TestMemoryFacade:
             patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory),
             pytest.raises(ValueError, match="No memory found with id=mem-1"),
         ):
-            await delete_agent_memory("mem-1", "test_agent", storage_path, config)
+            await delete_agent_memory("mem-1", "test_agent", config)
 
         mock_memory.delete.assert_not_called()
 
@@ -663,7 +624,6 @@ class TestMemoryFacade:
     async def test_build_memory_prompt_parts(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         agent_memories = [{"memory": "I previously calculated 2+2=4", "id": "1"}]
@@ -673,7 +633,6 @@ class TestMemoryFacade:
             prompt_parts = await build_memory_prompt_parts(
                 "What is 3+3?",
                 "calculator",
-                storage_path,
                 config,
             )
 
@@ -687,13 +646,12 @@ class TestMemoryFacade:
     async def test_build_memory_prompt_parts_no_memories(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         mock_memory.search.return_value = {"results": []}
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", storage_path, config)
+            prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", config)
 
         assert prompt_parts == MemoryPromptParts()
 
@@ -701,7 +659,6 @@ class TestMemoryFacade:
     async def test_build_memory_prompt_parts_surfaces_degradation_without_matches(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         """The automatic per-turn path carries the degradation notice, not silence."""
@@ -713,7 +670,7 @@ class TestMemoryFacade:
 
         try:
             with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-                prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", storage_path, config)
+                prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", config)
         finally:
             capture_embedder_health_recorder().record(None)
 
@@ -724,7 +681,6 @@ class TestMemoryFacade:
     @pytest.mark.asyncio
     async def test_disabled_backend_build_memory_prompt_parts_skips_mem0(
         self,
-        storage_path: Path,
         config: Config,
     ) -> None:
         config.memory.backend = "none"
@@ -733,18 +689,17 @@ class TestMemoryFacade:
             "mindroom.memory._backend.create_memory_instance",
             side_effect=AssertionError("disabled memory must not create Mem0"),
         ) as mock_create:
-            prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", storage_path, config)
+            prompt_parts = await build_memory_prompt_parts("Original prompt", "agent", config)
 
         assert prompt_parts == MemoryPromptParts()
         mock_create.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_store_conversation_memory(self, mock_memory: AsyncMock, storage_path: Path, config: Config) -> None:
+    async def test_store_conversation_memory(self, mock_memory: AsyncMock, config: Config) -> None:
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
             await store_conversation_memory(
                 "What is 2+2?",
                 "calculator",
-                storage_path,
                 "session123",
                 config,
             )
@@ -759,11 +714,10 @@ class TestMemoryFacade:
     async def test_store_conversation_memory_no_prompt(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            await store_conversation_memory("", "agent", storage_path, "session123", config)
+            await store_conversation_memory("", "agent", "session123", config)
 
         mock_memory.add.assert_not_called()
 
@@ -779,11 +733,10 @@ class TestMemoryFacade:
             "mindroom.memory._backend.create_memory_instance",
             side_effect=AssertionError("disabled memory must not create Mem0"),
         ) as mock_create:
-            await store_conversation_memory("Remember this", "calculator", storage_path, "session123", config)
+            await store_conversation_memory("Remember this", "calculator", "session123", config)
             await store_conversation_memory(
                 "Team should also stay stateless",
                 ["calculator", "finance"],
-                storage_path,
                 "session-team",
                 config,
             )
@@ -795,11 +748,10 @@ class TestMemoryFacade:
     async def test_store_conversation_memory_with_empty_response(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            await store_conversation_memory("What is 2+2?", "calculator", storage_path, "session123", config)
+            await store_conversation_memory("What is 2+2?", "calculator", "session123", config)
 
         assert mock_memory.add.call_count == 1
         agent_call = mock_memory.add.call_args_list[0]
@@ -809,7 +761,6 @@ class TestMemoryFacade:
     async def test_store_conversation_memory_with_thread_history(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         thread_history = [
@@ -822,7 +773,6 @@ class TestMemoryFacade:
             await store_conversation_memory(
                 "What is 2+2?",
                 "calculator",
-                storage_path,
                 "session123",
                 config,
                 thread_history=thread_history,
@@ -841,27 +791,33 @@ class TestMemoryFacade:
     async def test_store_conversation_memory_for_team(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         team_agents = ["calculator", "data_analyst", "finance"]
 
-        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
+        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
             await store_conversation_memory(
                 "Analyze our Q4 financial data",
                 team_agents,
-                storage_path,
                 "session123",
                 config,
             )
 
-        assert mock_memory.add.call_count == len(team_agents)
-        for team_call in mock_memory.add.call_args_list:
-            assert team_call[1]["user_id"] == "team_calculator+data_analyst+finance"
-            metadata = team_call[1]["metadata"]
-            assert metadata["type"] == "conversation"
-            assert metadata["is_team"] is True
-            assert metadata["team_members"] == team_agents
+        # A team turn runs one extraction into the team's one store, not one per member.
+        mock_create.assert_called_once_with(
+            _team_store_root(config, "team_calculator+data_analyst+finance"),
+            config,
+            runtime_paths=runtime_paths_for(config),
+        )
+        mock_memory.add.assert_called_once()
+        team_call = mock_memory.add.call_args
+        assert team_call.kwargs["user_id"] == "team_calculator+data_analyst+finance"
+        assert team_call.kwargs["metadata"] == {
+            "type": "conversation",
+            "session_id": "session123",
+            "is_team": True,
+            "team_members": team_agents,
+        }
 
     @pytest.mark.asyncio
     async def test_store_conversation_memory_respects_agent_backend_override(
@@ -874,7 +830,7 @@ class TestMemoryFacade:
         config.agents["calculator"].memory_backend = "mem0"
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
-            await store_conversation_memory("What is 2+2?", "calculator", storage_path, "session123", config)
+            await store_conversation_memory("What is 2+2?", "calculator", "session123", config)
 
         mock_create.assert_called_once_with(
             agent_state_root_path(storage_path, "calculator"),
@@ -887,37 +843,23 @@ class TestMemoryFacade:
     async def test_store_conversation_memory_team_uses_mem0_when_any_member_overrides(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         config.memory.backend = "file"
-        config.memory.file.path = str(storage_path / "memory-files")
         config.agents["calculator"].memory_backend = "mem0"
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
             await store_conversation_memory(
                 "Analyze our quarterly metrics",
                 ["calculator", "finance"],
-                storage_path,
                 "session-team",
                 config,
             )
 
-        assert mock_create.call_count == 2
-        expected_runtime_paths = runtime_paths_for(config)
-        assert [(call.args, call.kwargs) for call in mock_create.call_args_list] == [
-            (
-                (agent_state_root_path(storage_path, "calculator"), config),
-                {"runtime_paths": expected_runtime_paths},
-            ),
-            (
-                (agent_state_root_path(storage_path, "finance"), config),
-                {"runtime_paths": expected_runtime_paths},
-            ),
-        ]
-        assert mock_memory.add.call_count == 2
-        team_memory_file = storage_path / "memory-files" / "team_calculator+finance" / "MEMORY.md"
-        assert not team_memory_file.exists()
+        team_root = _team_store_root(config, "team_calculator+finance")
+        mock_create.assert_called_once_with(team_root, config, runtime_paths=runtime_paths_for(config))
+        mock_memory.add.assert_called_once()
+        assert not (team_root / "MEMORY.md").exists()
 
     @pytest.mark.asyncio
     async def test_disabled_backend_crud_facade_does_not_fall_through_to_mem0(
@@ -931,12 +873,12 @@ class TestMemoryFacade:
             "mindroom.memory._backend.create_memory_instance",
             side_effect=AssertionError("disabled memory must not create Mem0"),
         ) as mock_create:
-            await add_agent_memory("Remember this", "general", storage_path, config)
-            search_results = await search_agent_memories("Remember", "general", storage_path, config)
-            list_results = await list_all_agent_memories("general", storage_path, config)
-            get_result = await get_agent_memory("memory-1", "general", storage_path, config)
-            await update_agent_memory("memory-1", "Updated", "general", storage_path, config)
-            await delete_agent_memory("memory-1", "general", storage_path, config)
+            await add_agent_memory("Remember this", "general", config)
+            search_results = await search_agent_memories("Remember", "general", config)
+            list_results = await list_all_agent_memories("general", config)
+            get_result = await get_agent_memory("memory-1", "general", config)
+            await update_agent_memory("memory-1", "Updated", "general", config)
+            await delete_agent_memory("memory-1", "general", config)
 
         assert search_results == []
         assert list_results == []
@@ -948,10 +890,10 @@ class TestMemoryFacade:
     async def test_search_agent_memories_with_teams(
         self,
         mock_memory: AsyncMock,
-        storage_path: Path,
         config: Config,
     ) -> None:
         config.teams = {"finance_team": MockTeamConfig(agents=["calculator", "data_analyst", "finance"])}
+        _create_team_stores(config, "team_calculator+data_analyst+finance")
         thresholds: dict[str, float] = {}
 
         def search_side_effect(query: str, *, filters: dict[str, str], top_k: int, threshold: float) -> dict:  # noqa: ARG001
@@ -967,7 +909,7 @@ class TestMemoryFacade:
         mock_memory.search = AsyncMock(side_effect=search_side_effect)
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory):
-            results = await search_agent_memories("test query", "calculator", storage_path, config, limit=5)
+            results = await search_agent_memories("test query", "calculator", config, limit=5)
 
         assert len(results) == 2
         assert results[0]["memory"] == "Individual fact"
@@ -987,11 +929,10 @@ class TestMemoryFacade:
         config: Config,
     ) -> None:
         config.memory.backend = "mem0"
-        config.memory.file.path = str(storage_path / "memory-files")
         config.agents["general"].memory_backend = "file"
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
-            await add_agent_memory("Remember this", "general", storage_path, config)
+            await add_agent_memory("Remember this", "general", config)
 
         mock_create.assert_not_called()
         memory_file = agent_workspace_root_path(storage_path, "general") / "MEMORY.md"
@@ -1009,7 +950,7 @@ class TestMemoryFacade:
         config.agents["general"].memory_backend = "mem0"
 
         with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
-            await add_agent_memory("Remember this", "general", storage_path, config)
+            await add_agent_memory("Remember this", "general", config)
 
         mock_create.assert_called_once_with(
             agent_state_root_path(storage_path, "general"),
@@ -1019,34 +960,33 @@ class TestMemoryFacade:
         mock_memory.add.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_team_context_resolves_file_backend_from_agent_overrides(
+    async def test_team_turn_resolves_file_backend_from_agent_overrides(
         self,
-        storage_path: Path,
         config: Config,
     ) -> None:
+        """A team whose members all use file memory writes one team `MEMORY.md`, which every member reads."""
         config.memory.backend = "mem0"
-        config.memory.file.path = str(storage_path / "memory-files")
-        config.memory.team_reads_member_memory = True
         config.agents["calculator"].memory_backend = "file"
         config.agents["general"].memory_backend = "file"
-
-        await add_agent_memory("Calculator private memory", "calculator", storage_path, config)
-        calculator_memories = await list_all_agent_memories("calculator", storage_path, config)
-        calculator_memory_id = calculator_memories[0]["id"]
+        config.teams = {"pair": MockTeamConfig(agents=["general", "calculator"])}
 
         with patch(
             "mindroom.memory._backend.create_memory_instance",
-            side_effect=AssertionError("Mem0 should not be used for file-backed team context"),
+            side_effect=AssertionError("Mem0 should not be used for a file-backed team"),
         ):
-            allowed = await get_agent_memory(
-                calculator_memory_id,
-                ["calculator", "general"],
-                storage_path,
+            await store_conversation_memory(
+                "Quarterly numbers are due Friday",
+                ["general", "calculator"],
+                "session-team",
                 config,
             )
+            [team_memory] = await search_agent_memories("Quarterly", "calculator", config)
+            from_general = await get_agent_memory(team_memory["id"], "general", config)
 
-        assert allowed is not None
-        assert allowed["memory"] == "Calculator private memory"
+        team_file = _team_store_root(config, "team_calculator+general") / "MEMORY.md"
+        assert "Quarterly numbers are due Friday" in team_file.read_text(encoding="utf-8")
+        assert from_general is not None
+        assert from_general["memory"] == "Quarterly numbers are due Friday"
 
     def test_memory_result_typed_dict(self) -> None:
         result: MemoryResult = {

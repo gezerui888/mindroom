@@ -2330,3 +2330,42 @@ def test_semantic_memory_scores_keep_the_hybrid_rank_order() -> None:
 
     assert [result["memory"] for result in results] == ["keyword match", "close vector", "far vector"]
     assert [result["score"] for result in results] == pytest.approx([0.8, 0.8, 0.5])
+
+
+@pytest.mark.asyncio
+async def test_only_edits_of_the_agents_own_memory_refresh_its_semantic_index(
+    config: Config,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Semantic search indexes the agent's own scope, so editing a team memory schedules no re-index."""
+    config.memory.backend = "file"
+    config.memory.search.mode = "semantic"
+    config.teams = {"pair": MockTeamConfig(agents=["general", "calculator"])}
+    refreshed: list[str] = []
+    monkeypatch.setattr(
+        "mindroom.memory._file_backend.schedule_semantic_file_memory_refresh",
+        lambda **kwargs: refreshed.append(str(kwargs["scope_user_id"])),
+    )
+    await store_conversation_memory("Quarterly metrics reviewed", ["general", "calculator"], "session", config)
+    await add_agent_memory("Quarterly notes kept", "general", config)
+    refreshed.clear()
+    # An editable search matches by keyword, so it finds both memories before the semantic index is built.
+    outcome = await public_search_agent_memories(
+        "Quarterly",
+        "general",
+        config,
+        runtime_paths_for(config),
+        limit=5,
+        editable=True,
+    )
+    entries = {entry["memory"]: entry["id"] for entry in outcome.results}
+
+    await update_agent_memory(
+        entries["Quarterly metrics reviewed"],
+        "Quarterly metrics reviewed twice",
+        "general",
+        config,
+    )
+    assert refreshed == []
+    await update_agent_memory(entries["Quarterly notes kept"], "Quarterly notes kept twice", "general", config)
+    assert refreshed == ["agent_general"]

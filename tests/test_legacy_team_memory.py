@@ -34,7 +34,7 @@ from mindroom.memory.config import create_memory_instance
 from tests.conftest import bind_runtime_paths, runtime_paths_for
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from mindroom.embeddings.base import EmbeddingPurpose
 
@@ -139,7 +139,7 @@ def _assert_merged(storage: Path) -> None:
         "- [id=m_20261029233607_a14b4cf2] Standup is at 9am.\n"
     )
     for member in ("general", "calculator"):
-        assert not (storage / "agents" / member / "memory_files" / _TEAM).exists()
+        assert not (storage / "agents" / member / "memory_files").exists()
     assert (storage / "agents" / "general" / "workspace" / "MEMORY.md").read_text() == (
         _FIXTURES / "agents" / "general" / "workspace" / "MEMORY.md"
     ).read_text()
@@ -257,11 +257,15 @@ async def test_copies_holding_what_mindroom_did_not_write_stay_where_they_are(st
 
 
 @pytest.mark.asyncio
-async def test_a_member_store_holding_a_link_is_left_unopened(storage: Path) -> None:
+@pytest.mark.parametrize("link", [Path.symlink_to, Path.hardlink_to], ids=["symlink", "hard link"])
+async def test_a_member_store_holding_a_link_is_left_unopened(
+    storage: Path,
+    link: Callable[[Path, Path], None],
+) -> None:
     """Chroma opens a store's files by path, so a store with a planted link stays as it is and only the others merge."""
     outside = storage / "outside.sqlite3"
     outside.write_bytes(b"")
-    (storage / "agents" / "calculator" / "chroma" / "planted.sqlite3").symlink_to(outside)
+    link(storage / "agents" / "calculator" / "chroma" / "planted.sqlite3", outside)
 
     await _migrate(storage)
 

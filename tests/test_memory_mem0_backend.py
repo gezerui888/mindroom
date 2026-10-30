@@ -1215,3 +1215,21 @@ async def test_a_team_store_s_embedder_failure_degrades_search_but_keeps_the_age
     ]
     assert outcome.results == [agent_hit]
     assert outcome.degraded_reason == failure_detail
+
+
+@pytest.mark.asyncio
+async def test_a_record_of_another_scope_in_an_agents_store_is_not_that_agents_memory(
+    storage_path: Path,
+    config: Config,
+) -> None:
+    """A store answers for its own scope only: a team record an unmerged store still holds is not editable as the agent's."""
+    stores, create_memory = _fake_mem0_stores()
+    backend = Mem0MemoryBackend(runtime_paths=runtime_paths_for(config), create_memory=create_memory)
+    agent_store = await create_memory(agent_state_root_path(storage_path, "general"), config)
+    await agent_store.add([{"role": "user", "content": "Left team copy"}], user_id=_TEAM_ID, metadata={})
+    (left,) = (await agent_store.get_all(filters={"user_id": _TEAM_ID}))["results"]
+
+    assert await backend.get(left["id"], "general", config) is None
+    with pytest.raises(MemoryNotFoundError):
+        await backend.update(left["id"], "Edited", "general", config)
+    assert await _scope_entries(stores[agent_state_root_path(storage_path, "general")], _TEAM_ID) == ["Left team copy"]

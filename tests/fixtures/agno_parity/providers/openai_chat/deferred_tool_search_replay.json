@@ -171,8 +171,7 @@
         "mindroom_model": {
           "id": "gpt-6-astra",
           "provider": "OpenAI"
-        },
-        "system_fingerprint": "fp_parity"
+        }
       },
       "role": "assistant"
     },

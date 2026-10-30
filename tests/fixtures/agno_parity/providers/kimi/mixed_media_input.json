@@ -93,8 +93,7 @@
         "mindroom_model": {
           "id": "k3",
           "provider": "Kimi"
-        },
-        "system_fingerprint": "fp_parity"
+        }
       },
       "role": "assistant"
     },

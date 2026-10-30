@@ -287,12 +287,11 @@ def _execution_identity(
 
 
 def test_reply_usage_publishes_its_keys_in_order_with_fractions_as_decimal_strings() -> None:
-    """The ``usage`` object lists the counters, then cost and timing, then the uncached input, zero included."""
+    """The ``usage`` object lists the counters, then the timings, then the uncached input, zero included."""
     counts = TokenCounts(**{name: index for index, name in enumerate(TokenCounts().to_dict(), start=1)})
 
     payload = ReplyUsage(
         tokens=counts,
-        cost=0.5,
         time_to_first_token=0.25,
         duration=1 / 3,
         uncached_input_tokens=0,
@@ -308,19 +307,22 @@ def test_reply_usage_publishes_its_keys_in_order_with_fractions_as_decimal_strin
         ("cache_read_tokens", 4),
         ("cache_write_tokens", 5),
         ("reasoning_tokens", 6),
-        ("cost", "0.5"),
         ("time_to_first_token", "0.25"),
         ("duration", "0.333333333333"),
         ("uncached_input_tokens", 0),
     ]
-    nothing_reported = ReplyUsage(
-        tokens=TokenCounts(),
-        cost=None,
-        time_to_first_token=None,
-        duration=None,
-        uncached_input_tokens=5,
-    )
+    nothing_reported = ReplyUsage.of(RunMetrics(), provider="OpenAI Chat", configured_provider="openai", model_id="m")
     assert nothing_reported.to_wire() == {}
+
+
+def test_reply_usage_publishes_no_uncached_input_when_the_provider_reported_no_usage() -> None:
+    """A request whose provider reported no usage still counts under its model, timed, but splits no input."""
+    metrics = RunMetrics(duration=1.5)
+    metrics.add(MessageMetrics(duration=1.5), model_id="m", provider="OpenAI Chat")
+
+    usage = ReplyUsage.of(metrics, provider="OpenAI Chat", configured_provider="openai", model_id="m")
+
+    assert usage.to_wire() == {"duration": "1.5"}
 
 
 def test_reply_usage_publishes_a_counter_its_order_omits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -333,20 +335,18 @@ def test_reply_usage_publishes_a_counter_its_order_omits(monkeypatch: pytest.Mon
 
     payload = ReplyUsage(
         tokens=TokenCounts(input_tokens=5, output_tokens=2),
-        cost=0.5,
-        time_to_first_token=None,
+        time_to_first_token=0.5,
         duration=None,
         uncached_input_tokens=None,
     ).to_wire()
 
-    assert list(payload.items()) == [("output_tokens", 2), ("input_tokens", 5), ("cost", "0.5")]
+    assert list(payload.items()) == [("output_tokens", 2), ("input_tokens", 5), ("time_to_first_token", "0.5")]
 
 
 def test_reply_usage_leaves_out_zero_counters() -> None:
     """A zero counter is left out of the published usage."""
     payload = ReplyUsage(
         tokens=TokenCounts(input_tokens=6, output_tokens=0, cache_read_tokens=46449),
-        cost=None,
         time_to_first_token=None,
         duration=None,
         uncached_input_tokens=None,
@@ -1380,7 +1380,6 @@ class TestUserIdPassthrough:
             },
             "reply_to_event_id": "e1",
             "correlation_id": "e1",
-            "model_params": {},
             "matrix_event_id": "e1",
             "matrix_seen_event_ids": ["e1"],
             "mindroom_original_status": "cancelled",
@@ -2133,7 +2132,6 @@ class TestUserIdPassthrough:
 
         assert metadata == {
             "reply_to_event_id": "$primary",
-            "model_params": {},
             MATRIX_EVENT_ID_METADATA_KEY: "$primary",
             MATRIX_SEEN_EVENT_IDS_METADATA_KEY: ["$primary", "$first", "$selection", "$unseen"],
             MATRIX_SOURCE_EVENT_IDS_METADATA_KEY: ["$first", "$primary"],
@@ -2152,7 +2150,6 @@ class TestUserIdPassthrough:
                 "reply_to_event_id": "$reply",
                 "requester_id": "@alice:localhost",
                 "correlation_id": "corr-existing",
-                "model_params": {"temperature": 0.3},
             },
         )
 
@@ -2162,7 +2159,6 @@ class TestUserIdPassthrough:
         assert metadata["reply_to_event_id"] == "$reply"
         assert metadata["requester_id"] == "@alice:localhost"
         assert metadata["correlation_id"] == "corr-existing"
-        assert metadata["model_params"] == {"temperature": 0.3}
 
     def test_stream_completed_without_visible_output_accepts_final_body_only_completion(self) -> None:
         """A run that completed with only a final body still produced visible text."""
@@ -2617,9 +2613,7 @@ class TestUserIdPassthrough:
         first = usage(3000, 50, cache_read_tokens=20_000)
         compacted = MessageMetrics(
             tokens=TokenCounts(input_tokens=5000, output_tokens=40, total_tokens=5040, cache_read_tokens=30_000),
-            provider_metrics={
-                "context_usage": {"input_tokens": 400, "cache_read_tokens": 1200, "cache_write_tokens": 0},
-            },
+            context=TokenCounts(input_tokens=400, cache_read_tokens=1200),
         )
         model = _scripted_like(
             config,

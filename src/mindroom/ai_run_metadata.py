@@ -46,9 +46,9 @@ class ReplyUsage:
     """
 
     tokens: TokenCounts
-    cost: float | None
     time_to_first_token: float | None
     duration: float | None
+    # None when the provider reported no usage, whose input then has no split to publish.
     uncached_input_tokens: int | None
 
     @classmethod
@@ -61,19 +61,22 @@ class ReplyUsage:
         model_id: str | None,
     ) -> ReplyUsage:
         """Return the usage a run's metrics publish, for the model that answered when ``metrics`` has no breakdown."""
-        uncached_input_tokens = _uncached_input_tokens(
-            metrics,
-            provider=provider,
-            configured_provider=configured_provider,
-            model_id=model_id,
+        uncached_input_tokens = (
+            _uncached_input_tokens(
+                metrics,
+                provider=provider,
+                configured_provider=configured_provider,
+                model_id=model_id,
+            )
+            if metrics.reported
+            else None
         )
-        return cls(metrics.tokens, metrics.cost, metrics.time_to_first_token, metrics.duration, uncached_input_tokens)
+        return cls(metrics.tokens, metrics.time_to_first_token, metrics.duration, uncached_input_tokens)
 
     def to_wire(self) -> dict[str, Any]:
-        """Return the published object, empty when nothing was reported; the uncached input is published as given."""
+        """Return the published object; the uncached input is published as given, zero included."""
         values = {
             **self.tokens.to_dict(first=_PUBLISHED_COUNTERS),
-            "cost": self.cost,
             "time_to_first_token": self.time_to_first_token,
             "duration": self.duration,
         }
@@ -82,7 +85,7 @@ class ReplyUsage:
             for key, value in values.items()
             if isinstance(value, (float, str)) or (isinstance(value, int) and value != 0)
         }
-        if wire and self.uncached_input_tokens is not None:
+        if self.uncached_input_tokens is not None:
             wire["uncached_input_tokens"] = self.uncached_input_tokens
         return wire
 
@@ -214,7 +217,7 @@ def turn_usage(prior_usage: Sequence[RunMetrics], metrics: RunMetrics | None) ->
     """Return the usage of a turn: its spent attempts' ``prior_usage``, then ``metrics``, the final attempt's.
 
     A reply and a delegated child's record both report their turn's usage so. A turn of one attempt reports that
-    attempt's usage as it is. Otherwise counters, costs, durations, and per-model details add up, and the turn's first
+    attempt's usage as it is. Otherwise counters, durations, and per-model details add up, and the turn's first
     token is its first attempt's that reported one, as a run's is its first request's.
     """
     if not prior_usage:

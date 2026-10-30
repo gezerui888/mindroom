@@ -182,13 +182,13 @@ async def test_transient_failure_before_output_is_retried_and_its_usage_carried(
 
 
 @pytest.mark.asyncio
-async def test_a_retried_turn_keeps_the_answering_attempt_s_context_usage() -> None:
+async def test_a_retried_turn_keeps_the_answering_attempt_s_context() -> None:
     """Counters sum across attempts, but the context the model saw is the answering attempt's, not the failed one's."""
 
     def usage(input_tokens: int) -> MessageMetrics:
         return MessageMetrics(
             tokens=TokenCounts(input_tokens=input_tokens, total_tokens=input_tokens),
-            provider_metrics={"context_usage": {"input_tokens": input_tokens}, "server_tool_requests": 1},
+            context=TokenCounts(input_tokens=input_tokens),
         )
 
     inner = _ScriptedProvider([[UsageReported(usage(40)), _transient()], [TextDelta("done"), _turn(usage=usage(90))]])
@@ -197,10 +197,7 @@ async def test_a_retried_turn_keeps_the_answering_attempt_s_context_usage() -> N
     finished = (await _drain(provider, ModelRequest(messages=[_user()])))[-1]
 
     assert isinstance(finished, TurnCompleted)
-    assert finished.message.metrics.provider_metrics == {
-        "context_usage": {"input_tokens": 90},
-        "server_tool_requests": 2,
-    }
+    assert finished.message.metrics.context == TokenCounts(input_tokens=90)
     assert finished.message.metrics.tokens.input_tokens == 130
 
 
@@ -1261,9 +1258,7 @@ async def test_usage_telemetry_logs_a_compacted_claude_request_s_final_iteration
     """After a native compaction the context fields read the final iteration, while the billed counters sum them all."""
     usage = MessageMetrics(
         tokens=TokenCounts(input_tokens=30_000, output_tokens=900, cache_read_tokens=5_000),
-        provider_metrics={
-            "context_usage": {"input_tokens": 1_200, "cache_read_tokens": 300, "cache_write_tokens": 100},
-        },
+        context=TokenCounts(input_tokens=1_200, cache_read_tokens=300, cache_write_tokens=100),
     )
     identity = replace(_IDENTITY, provider="Anthropic")
     inner = _ScriptedProvider([[UsageReported(usage), _turn(usage=usage)]], identity=identity)
@@ -1324,9 +1319,15 @@ async def test_usage_telemetry_bounds_over_reported_cache_reads_to_the_context(t
 
 
 @pytest.mark.asyncio
-async def test_a_request_without_usage_is_reported_and_writes_no_response_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize("zero_report", [False, True], ids=["no-report", "all-zero-report"])
+async def test_a_request_without_usage_is_reported_and_writes_no_response_record(
+    tmp_path: Path,
+    zero_report: bool,
+) -> None:
+    """A report whose counters are all zero, as some OpenAI-compatible servers send, is no usage either."""
     served = Message(role="assistant", content="ok", provider_data={"model_extra": {"provider": "OpenInference"}})
-    inner = _ScriptedProvider([[TurnCompleted(message=served, stop_reason="end")]])
+    reports = [UsageReported(MessageMetrics(duration=0.2), final=False)] if zero_report else []
+    inner = _ScriptedProvider([[*reports, TurnCompleted(message=served, stop_reason="end")]])
 
     with capture_logs() as logs:
         await _drain(
@@ -1336,6 +1337,7 @@ async def test_a_request_without_usage_is_reported_and_writes_no_response_record
 
     [usage_log] = [entry for entry in logs if entry["event"] == "LLM usage"]
     assert (usage_log["usage_available"], usage_log["served_provider"]) == (False, "OpenInference")
+    assert "input_tokens" not in usage_log
     assert [record.get("record") for record in _log_records(tmp_path)] == [None]
 
 

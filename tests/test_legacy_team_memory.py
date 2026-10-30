@@ -3,7 +3,6 @@
 `fixtures/legacy_team_memory/` holds what that release's real Mem0 2.2.1 and Chroma stores and file backend kept for
 the team of `general` and `calculator` after three turns: both members extracted the first turn differently, only
 `general` stored the second, and only `calculator` the third; `general` also holds one memory of its own.
-The members' extractions of the first turn differ, as separate extractions of one turn do.
 """
 
 from __future__ import annotations
@@ -31,6 +30,7 @@ from mindroom.memory import legacy_team_memory
 from mindroom.memory._file_backend import FileMemoryBackend
 from mindroom.memory._mem0_backend import Mem0MemoryBackend
 from mindroom.memory.config import create_memory_instance
+from mindroom.orchestrator import main
 from tests.conftest import bind_runtime_paths, runtime_paths_for
 
 if TYPE_CHECKING:
@@ -46,6 +46,10 @@ _COLLECTION = "mindroom_memories_8f334045"
 
 def _client(path: Path) -> chromadb.ClientAPI:
     return chromadb.Client(Settings(anonymized_telemetry=False, persist_directory=str(path), is_persistent=True))
+
+
+def _as_stored(*rows: dict) -> dict[str, dict]:
+    return {row["id"]: {"metadata": row["metadata"], "embedding": row["embedding"]} for row in rows}
 
 
 def _recorded(member: str, text: str) -> dict:
@@ -112,7 +116,7 @@ def _expected_team_records() -> dict[str, dict]:
         _recorded("calculator", "The team retro is on the last Thursday"),
         _recorded("general", "The team standup is at 9am"),
     ]
-    return {row["id"]: {"metadata": row["metadata"], "embedding": row["embedding"]} for row in kept}
+    return _as_stored(*kept)
 
 
 class _StartStoppedError(Exception):
@@ -126,10 +130,7 @@ async def _migrate(storage: Path) -> None:
 def _assert_merged(storage: Path) -> None:
     team_root = storage / "team_memory" / _TEAM
     assert _stored(team_root / "chroma") == _expected_team_records()
-    general_own = _recorded("general", "General likes tea")
-    assert _stored(storage / "agents" / "general" / "chroma") == {
-        general_own["id"]: {"metadata": general_own["metadata"], "embedding": general_own["embedding"]},
-    }
+    assert _stored(storage / "agents" / "general" / "chroma") == _as_stored(_recorded("general", "General likes tea"))
     assert _stored(storage / "agents" / "calculator" / "chroma") == {}
     assert (team_root / "MEMORY.md").read_text() == (
         "# Memory\n"
@@ -270,11 +271,9 @@ async def test_a_member_store_holding_a_link_is_left_unopened(
     await _migrate(storage)
 
     general_turns = {"The team reviews PRs in pairs", "The team standup is at 9am", "The team ships on Fridays"}
-    expected = {
-        row["id"]: {"metadata": row["metadata"], "embedding": row["embedding"]}
-        for row in _RECORDED["general"][_COLLECTION]
-        if row["metadata"]["data"] in general_turns
-    }
+    expected = _as_stored(
+        *(row for row in _RECORDED["general"][_COLLECTION] if row["metadata"]["data"] in general_turns),
+    )
     assert _stored(storage / "team_memory" / _TEAM / "chroma") == expected
     calculator = {row["id"] for row in _RECORDED["calculator"][_COLLECTION]}
     assert set(_stored(storage / "agents" / "calculator" / "chroma")) == calculator
@@ -376,3 +375,26 @@ async def test_both_file_members_find_the_merged_team_entries(storage: Path) -> 
             "Standup is at 9am.",
             "We ship on Fridays.",
         ]
+
+
+@pytest.mark.asyncio
+async def test_the_runtime_merges_team_memory_before_it_loads_config_or_serves(tmp_path: Path) -> None:
+    """No reply can read a team's store before the copies its members hold have merged into it."""
+
+    class _NextStartupStepError(Exception):
+        pass
+
+    steps: list[str] = []
+    runtime_paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path, process_env={})
+    with (
+        patch("mindroom.orchestrator.setup_logging"),
+        patch("mindroom.orchestrator.sync_env_to_credentials"),
+        patch("mindroom.orchestrator.retire_state_root_worker_mounts"),
+        patch("mindroom.orchestrator.migrate_conversation_storage"),
+        patch("mindroom.orchestrator.migrate_team_memory", side_effect=lambda _paths: steps.append("merge")),
+        patch("mindroom.orchestrator.load_startup_config", side_effect=_NextStartupStepError),
+        pytest.raises(_NextStartupStepError),
+    ):
+        await main(log_level="INFO", runtime_paths=runtime_paths, api=False)
+
+    assert steps == ["merge"]

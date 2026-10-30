@@ -53,7 +53,7 @@ from mindroom.tool_system.worker_routing import (
     tool_execution_identity,
 )
 from tests.conftest import bind_runtime_paths, runtime_paths_for
-from tests.memory_test_support import FakeMem0ScopedMemory, MockTeamConfig
+from tests.memory_test_support import FakeMem0ScopedMemory, MockTeamConfig, fake_mem0_stores
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -102,31 +102,7 @@ async def test_store_conversation_memory_uses_explicit_execution_identity_for_de
     config.memory.backend = "mem0"
     config.agents["general"].worker_scope = "user"
 
-    captured_calls: list[tuple[Path, str | None, dict[str, object]]] = []
-
-    class FakeScopedMemory:
-        def __init__(self, scope_storage_path: Path) -> None:
-            self.scope_storage_path = scope_storage_path
-
-        async def add(
-            self,
-            messages: list[dict],
-            *,
-            user_id: str | None = None,
-            metadata: dict[str, object] | None = None,
-        ) -> None:
-            del messages
-            captured_calls.append((self.scope_storage_path, user_id, metadata or {}))
-
-    async def create_fake_memory_instance(
-        scope_storage_path: Path,
-        _config: Config,
-        *,
-        runtime_paths: object,
-        timing_scope: str | None = None,
-    ) -> FakeScopedMemory:
-        del runtime_paths, timing_scope
-        return FakeScopedMemory(scope_storage_path)
+    stores, create_fake_memory_instance = fake_mem0_stores()
 
     execution_identity = ToolExecutionIdentity(
         channel="matrix",
@@ -148,13 +124,10 @@ async def test_store_conversation_memory_uses_explicit_execution_identity_for_de
             execution_identity=execution_identity,
         )
 
-    expected_storage_path = agent_state_root_path(storage_path, "general")
-    assert captured_calls == [
-        (
-            expected_storage_path,
-            "agent_general",
-            {"type": "conversation", "session_id": "session-alice", "agent": "general"},
-        ),
+    general_root = agent_state_root_path(storage_path, "general")
+    assert list(stores) == [general_root]
+    assert [(entry["user_id"], entry["metadata"]) for entry in (await stores[general_root].get_all())["results"]] == [
+        ("agent_general", {"type": "conversation", "session_id": "session-alice", "agent": "general"}),
     ]
 
 
@@ -370,17 +343,7 @@ async def test_private_agent_explicit_mem0_uses_private_instance_storage(
     config.memory.backend = "mem0"
     config.agents["general"].private = AgentPrivateConfig(per="user", root="mind_data")
 
-    memories_by_path: dict[Path, FakeMem0ScopedMemory] = {}
-
-    async def create_fake_memory_instance(
-        scope_storage_path: Path,
-        _config: Config,
-        *,
-        runtime_paths: object,
-        timing_scope: str | None = None,
-    ) -> FakeMem0ScopedMemory:
-        del runtime_paths, timing_scope
-        return memories_by_path.setdefault(scope_storage_path, FakeMem0ScopedMemory(id_prefix=scope_storage_path.name))
+    memories_by_path, create_fake_memory_instance = fake_mem0_stores()
 
     execution_identity = ToolExecutionIdentity(
         channel="matrix",
@@ -473,18 +436,6 @@ async def test_private_agent_explicit_mem0_uses_private_instance_storage(
     assert any(result.get("memory") == "Private note" for result in search_results)
 
 
-def _fake_mem0_stores() -> tuple[dict[Path, FakeMem0ScopedMemory], Callable[..., Awaitable[FakeMem0ScopedMemory]]]:
-    """Return fake Mem0 stores by root, in opening order, and a factory that opens them like the real one."""
-    stores: dict[Path, FakeMem0ScopedMemory] = {}
-
-    async def create_memory(store_root: Path, _config: Config, **_kwargs: object) -> FakeMem0ScopedMemory:
-        # A real store leaves its Chroma directory behind, which tells reads the store exists.
-        (store_root / "chroma").mkdir(parents=True, exist_ok=True)
-        return stores.setdefault(store_root, FakeMem0ScopedMemory(id_prefix=f"mem{len(stores)}"))
-
-    return stores, create_memory
-
-
 async def _scope_entries(store: FakeMem0ScopedMemory, scope_user_id: str) -> list[str]:
     return [str(entry["memory"]) for entry in (await store.get_all(filters={"user_id": scope_user_id}))["results"]]
 
@@ -522,7 +473,7 @@ async def test_mem0_team_conversation_memory_is_one_store_every_requester_and_me
         session_id="session-bob",
     )
     team_root = storage_path / "team_memory" / _TEAM_ID
-    stores, create_memory = _fake_mem0_stores()
+    stores, create_memory = fake_mem0_stores()
 
     with patch("mindroom.memory._backend.create_memory_instance", side_effect=create_memory):
         with tool_execution_identity(alice_identity):
@@ -587,7 +538,7 @@ async def test_mixed_private_team_mem0_member_crud_is_rejected(storage_path: Pat
     config.memory.backend = "mem0"
     config.agents["general"].private = AgentPrivateConfig(per="user", root="mind_data")
     config.teams = {"mixed_team": MockTeamConfig(agents=["general", "calculator"])}
-    stores, create_memory = _fake_mem0_stores()
+    stores, create_memory = fake_mem0_stores()
     rejection = "private agents are only supported in explicit Matrix ad hoc teams with requester identity"
 
     with patch("mindroom.memory._backend.create_memory_instance", side_effect=create_memory):
@@ -616,16 +567,16 @@ async def test_reads_never_create_a_team_store_no_turn_has_written(storage_path:
     config.memory.backend = "mem0"
     config.teams = {"pair": MockTeamConfig(agents=["general", "calculator"])}
     runtime_paths = runtime_paths_for(config)
-    stores, create_memory = _fake_mem0_stores()
+    stores, create_memory = fake_mem0_stores()
 
     with patch("mindroom.memory._backend.create_memory_instance", side_effect=create_memory):
         await add_agent_memory("General note", "general", config, runtime_paths)
         [hit] = await _search_memory_results("General note", "general", config, runtime_paths, limit=5)
-        assert await get_agent_memory("mem9-1", "general", config, runtime_paths) is None
+        assert await get_agent_memory("unknown-id", "general", config, runtime_paths) is None
         with pytest.raises(MemoryNotFoundError):
-            await update_agent_memory("mem9-1", "Edited", "general", config, runtime_paths)
+            await update_agent_memory("unknown-id", "Edited", "general", config, runtime_paths)
         with pytest.raises(MemoryNotFoundError):
-            await delete_agent_memory("mem9-1", "general", config, runtime_paths)
+            await delete_agent_memory("unknown-id", "general", config, runtime_paths)
 
     assert hit["memory"] == "General note"
     assert list(stores) == [agent_state_root_path(storage_path, "general")]
@@ -641,7 +592,7 @@ async def test_a_team_memory_is_one_record_every_member_edits_alone(storage_path
     config.teams = {"gc": MockTeamConfig(agents=["general", "calculator"])}
     runtime_paths = runtime_paths_for(config)
     team_root = storage_path / "team_memory" / _TEAM_ID
-    stores, create_memory = _fake_mem0_stores()
+    stores, create_memory = fake_mem0_stores()
 
     execution_identity = ToolExecutionIdentity(
         channel="matrix",
@@ -1223,7 +1174,7 @@ async def test_a_record_of_another_scope_in_an_agents_store_is_not_that_agents_m
     config: Config,
 ) -> None:
     """A store answers for its own scope only: a team record an unmerged store still holds is not editable as the agent's."""
-    stores, create_memory = _fake_mem0_stores()
+    stores, create_memory = fake_mem0_stores()
     backend = Mem0MemoryBackend(runtime_paths=runtime_paths_for(config), create_memory=create_memory)
     agent_store = await create_memory(agent_state_root_path(storage_path, "general"), config)
     await agent_store.add([{"role": "user", "content": "Left team copy"}], user_id=_TEAM_ID, metadata={})

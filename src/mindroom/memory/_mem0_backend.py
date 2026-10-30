@@ -135,29 +135,6 @@ async def _search_mem0_scope(
     )
 
 
-async def _add_mem0_scope_messages(
-    *,
-    memory: ScopedMemoryWriter,
-    messages: list[dict],
-    user_id: str,
-    metadata: dict[str, object],
-    failure_log: str,
-    failure_context: dict[str, object],
-    health_recorder: EmbedderHealthRecorder,
-) -> bool:
-    """Write one conversation turn to its scope and report whether it actually succeeded."""
-    try:
-        await _strict_mem0_add(memory, messages, user_id=user_id, metadata=metadata)
-    except Exception as error:
-        if (detail := _record_classified_embedder_failure(error, health_recorder)) is not None:
-            logger.warning(failure_log, error=detail, **failure_context)
-            return False
-        logger.exception(failure_log, error_type=type(error).__name__, **failure_context)
-        return False
-    health_recorder.record(None)
-    return True
-
-
 @dataclass(frozen=True)
 class Mem0MemoryBackend:
     """Mem0-backed adapter implementing the shared memory backend surface."""
@@ -408,20 +385,19 @@ class Mem0MemoryBackend:
             return
         with counted_mem0_usage() as calls:
             try:
-                stored = await _add_mem0_scope_messages(
-                    memory=memory,
-                    messages=messages,
-                    user_id=scope.user_id,
-                    metadata=metadata,
-                    failure_log="Failed to add memory",
-                    failure_context=log_context,
-                    health_recorder=health_recorder,
-                )
+                await _strict_mem0_add(memory, messages, user_id=scope.user_id, metadata=metadata)
+            except Exception as error:
+                if (detail := _record_classified_embedder_failure(error, health_recorder)) is None:
+                    logger.exception("Failed to add memory", error_type=type(error).__name__, **log_context)
+                else:
+                    logger.warning("Failed to add memory", error=detail, **log_context)
+                return
+            else:
+                health_recorder.record(None)
             finally:
                 # Extraction tokens are spent even when storing the extracted facts fails afterwards.
                 await self._record_extraction_usage(calls, owner, user_id)
-        if stored:
-            logger.info("Memory added", **log_context)
+        logger.info("Memory added", **log_context)
 
     def load_entrypoint_context(
         self,

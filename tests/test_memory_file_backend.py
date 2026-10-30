@@ -2369,3 +2369,20 @@ async def test_only_edits_of_the_agents_own_memory_refresh_its_semantic_index(
     assert refreshed == []
     await update_agent_memory(entries["Quarterly notes kept"], "Quarterly notes kept twice", "general", config)
     assert refreshed == ["agent_general"]
+
+
+@pytest.mark.asyncio
+async def test_agent_and_team_matches_rank_together_within_the_limit(config: Config) -> None:
+    """A full team match outranks the agent's partial matches, and the limit cuts across both scopes."""
+    config.memory.backend = "file"
+    config.teams = {"pair": MockTeamConfig(agents=["general", "calculator"])}
+    await add_agent_memory("Quarterly notes kept", "general", config)
+    await add_agent_memory("Budget notes kept", "general", config)
+    await store_conversation_memory("Quarterly budget approved", ["general", "calculator"], "session", config)
+
+    results = await search_agent_memories("quarterly budget", "general", config, 2)
+
+    assert [(result["memory"], result["user_id"]) for result in results] == [
+        ("Quarterly budget approved", "team_calculator+general"),
+        ("Quarterly notes kept", "agent_general"),
+    ]

@@ -16,7 +16,7 @@ from mindroom.memory._file_backend import FileMemoryBackend
 from mindroom.memory._mem0_backend import Mem0MemoryBackend
 from mindroom.memory._shared import MemoryNotFoundError
 from tests.conftest import bind_runtime_paths, runtime_paths_for
-from tests.memory_test_support import FakeMem0ScopedMemory, MockTeamConfig
+from tests.memory_test_support import FakeMem0ScopedMemory, MockTeamConfig, fake_mem0_stores
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -54,18 +54,12 @@ def _contract_config(tmp_path: Path, memory_backend: str) -> Config:
 def backend_env(request: pytest.FixtureRequest, tmp_path: Path) -> BackendEnv:
     config = _contract_config(tmp_path, request.param)
     runtime_paths = runtime_paths_for(config)
-    stores: dict[Path, FakeMem0ScopedMemory] = {}
+    stores, create_memory = fake_mem0_stores()
     backend: ResolvedMemoryBackend
     if request.param == "file":
         backend = FileMemoryBackend(runtime_paths=runtime_paths)
     else:
-
-        async def create_fake_memory(store_root: Path, _config: Config) -> FakeMem0ScopedMemory:
-            # A real store leaves its Chroma directory behind, which tells reads the store exists.
-            (store_root / "chroma").mkdir(parents=True, exist_ok=True)
-            return stores.setdefault(store_root, FakeMem0ScopedMemory(id_prefix=f"mem{len(stores)}"))
-
-        backend = Mem0MemoryBackend(runtime_paths=runtime_paths, create_memory=create_fake_memory)
+        backend = Mem0MemoryBackend(runtime_paths=runtime_paths, create_memory=create_memory)
     return BackendEnv(backend=backend, config=config, storage_path=tmp_path, stores=stores)
 
 

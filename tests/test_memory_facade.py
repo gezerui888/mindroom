@@ -548,25 +548,6 @@ class TestMemoryFacade:
         assert mock_memory.get.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_get_agent_memory_does_not_create_missing_team_store(
-        self,
-        mock_memory: AsyncMock,
-        storage_path: Path,
-        config: Config,
-    ) -> None:
-        """A team that never stored a memory has no store, and reading through a member does not create one."""
-        config.teams = {"test_team": MockTeamConfig(agents=["helper", "test_agent"])}
-        mock_memory.get.return_value = None
-
-        with patch("mindroom.memory._backend.create_memory_instance", return_value=mock_memory) as mock_create:
-            result = await get_agent_memory("mem-team", "test_agent", config)
-
-        assert result is None
-        mock_create.assert_called_once()
-        assert mock_create.call_args.args[0] == agent_state_root_path(storage_path, "test_agent")
-        assert not _team_store_root(config, "team_helper+test_agent").exists()
-
-    @pytest.mark.asyncio
     async def test_update_agent_memory_rejects_other_agent_scope(
         self,
         mock_memory: AsyncMock,

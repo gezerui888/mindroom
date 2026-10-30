@@ -101,10 +101,6 @@ def _tag_keyword_mode(result: MemoryResult) -> None:
     )
 
 
-def _scope_entrypoint_path(scope_path: Path) -> Path:
-    return scope_path / FILE_MEMORY_ENTRYPOINT
-
-
 def _scope_relative_markdown_path(relative_path: str) -> Path | None:
     """Return the lexically in-scope markdown path, never resolving a link."""
     candidate = Path(relative_path)
@@ -386,9 +382,6 @@ def _iter_scope_unstructured_lines(scope_path: Path) -> Iterator[tuple[str, int,
 
 
 def _load_scope_unstructured_entries(scope: MemoryScope, existing_memory_text: set[str]) -> list[MemoryResult]:
-    if not scope.root.exists():
-        return []
-
     results: list[MemoryResult] = []
     seen_memory_text = set(existing_memory_text)
     for relative_path, line_no, snippet in _iter_scope_unstructured_lines(scope.root):
@@ -461,7 +454,7 @@ def _visible_scopes(
     ]
 
 
-def _schedule_semantic_refresh_at(
+def _schedule_semantic_refresh(
     agent_name: str,
     scope: MemoryScope,
     config: Config,
@@ -492,7 +485,7 @@ def refresh_agent_memory_search(
 
     A private agent's memory is one requester's, so ``execution_identity`` names that requester.
     """
-    _schedule_semantic_refresh_at(
+    _schedule_semantic_refresh(
         agent_name,
         MemoryScope(agent_scope_user_id(agent_name), root),
         config,
@@ -561,7 +554,7 @@ def _search_scope_memory_entries(scope: MemoryScope, query: str, *, limit: int) 
     scored_entries.sort(key=lambda item: cast("float", item.get("score", 0.0)), reverse=True)
     scored_entries = scored_entries[:limit]
 
-    if not scope.root.exists() or limit <= len(scored_entries):
+    if limit <= len(scored_entries):
         return scored_entries
 
     remaining_limit = limit - len(scored_entries)
@@ -763,7 +756,7 @@ def _load_scope_entrypoint_context(scope: MemoryScope, config: Config) -> Memory
     payload = _read_scope_entrypoint_payload(scope.root)
     if payload is None:
         return MemoryEntrypointContext()
-    entrypoint_path = _scope_entrypoint_path(scope.root)
+    entrypoint_path = scope.root / FILE_MEMORY_ENTRYPOINT
     max_lines = config.memory.file.max_entrypoint_lines
     max_tokens = config.memory.file.max_entrypoint_tokens
     lines = _decode_capped_text(payload).splitlines()
@@ -801,12 +794,14 @@ def _read_scope_entrypoint_payload(scope_path: Path) -> _CappedPayload | None:
         return None
 
 
-def _owning_scope(scopes: list[MemoryScope], memory_id: str) -> tuple[MemoryScope, MemoryResult] | None:
-    """Return the first scope holding one memory, with that memory."""
-    for scope in scopes:
-        if result := _get_scope_memory_by_id(scope, memory_id):
-            return scope, result
-    return None
+def _first_scope_memory(scopes: list[MemoryScope], memory_id: str) -> MemoryResult | None:
+    """Return one memory from the first scope holding it."""
+    return next(filter(None, (_get_scope_memory_by_id(scope, memory_id) for scope in scopes)), None)
+
+
+def _replace_in_first_scope(scopes: list[MemoryScope], memory_id: str, content: str | None) -> MemoryScope | None:
+    """Rewrite one memory in the first scope holding it, or remove it when ``content`` is None; return that scope."""
+    return next((scope for scope in scopes if _replace_scope_memory_entry(scope, memory_id, content)), None)
 
 
 def append_agent_daily_file_memory(
@@ -824,7 +819,7 @@ def append_agent_daily_file_memory(
         content,
         target_relative_path=f"{FILE_MEMORY_DAILY_DIR}/{current_date}.md",
     )
-    _schedule_semantic_refresh_at(agent_name, scope, config, runtime_paths, execution_identity)
+    _schedule_semantic_refresh(agent_name, scope, config, runtime_paths, execution_identity)
     logger.info("File daily memory added", agent=agent_name, date=current_date)
     return result
 
@@ -866,7 +861,7 @@ class FileMemoryBackend:
         del metadata  # File memory entries persist plain text only.
         scope = await asyncio.to_thread(_agent_scope, agent_name, config, self.runtime_paths, execution_identity)
         await asyncio.to_thread(_append_scope_memory_entry, scope, content)
-        _schedule_semantic_refresh_at(agent_name, scope, config, self.runtime_paths, execution_identity)
+        _schedule_semantic_refresh(agent_name, scope, config, self.runtime_paths, execution_identity)
         logger.info("File memory added", agent=agent_name)
 
     @timed("system_prompt_assembly.memory_search.file_backend")
@@ -966,8 +961,7 @@ class FileMemoryBackend:
     ) -> MemoryResult | None:
         """Return one file-backed memory of a scope the agent reads."""
         scopes = await asyncio.to_thread(_visible_scopes, agent_name, config, self.runtime_paths, execution_identity)
-        owned = await asyncio.to_thread(_owning_scope, scopes, memory_id)
-        return owned[1] if owned is not None else None
+        return await asyncio.to_thread(_first_scope_memory, scopes, memory_id)
 
     async def update(
         self,
@@ -1004,18 +998,11 @@ class FileMemoryBackend:
     ) -> None:
         """Rewrite one memory of the first scope holding it, or remove it when ``content`` is None."""
         scopes = await asyncio.to_thread(_visible_scopes, agent_name, config, self.runtime_paths, execution_identity)
-
-        def replace() -> MemoryScope | None:
-            if (owned := _owning_scope(scopes, memory_id)) is None:
-                return None
-            scope = owned[0]
-            return scope if _replace_scope_memory_entry(scope, memory_id, content) else None
-
-        if (scope := await asyncio.to_thread(replace)) is None:
+        if (scope := await asyncio.to_thread(_replace_in_first_scope, scopes, memory_id, content)) is None:
             raise MemoryNotFoundError(memory_id)
         if scope == scopes[0]:
             # Semantic search indexes the agent's own scope only.
-            _schedule_semantic_refresh_at(agent_name, scope, config, self.runtime_paths, execution_identity)
+            _schedule_semantic_refresh(agent_name, scope, config, self.runtime_paths, execution_identity)
 
     async def store_conversation(
         self,
@@ -1034,11 +1021,7 @@ class FileMemoryBackend:
         if not condensed_prompt:
             return
         if isinstance(caller, str):
-            scope = await asyncio.to_thread(_agent_scope, caller, config, self.runtime_paths, execution_identity)
-            await asyncio.to_thread(_append_scope_memory_entry, scope, condensed_prompt)
-            # Semantic refresh scheduling creates loop tasks, so it stays on the loop.
-            _schedule_semantic_refresh_at(caller, scope, config, self.runtime_paths, execution_identity)
-            logger.info("File memory added", agent=caller)
+            await self.add(condensed_prompt, caller, config, execution_identity=execution_identity)
             return
         scope = team_scope(team_user_id(caller), self.runtime_paths)
         await asyncio.to_thread(_append_scope_memory_entry, scope, condensed_prompt)

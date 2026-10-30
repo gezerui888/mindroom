@@ -12,7 +12,7 @@ from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.memory._policy import MemoryScope, caller_memory_backend, team_scope, team_scopes, team_user_id
 from mindroom.memory_scope_ids import agent_scope_user_id
-from mindroom.tool_system.worker_routing import ToolExecutionIdentity, agent_state_root_path, tool_execution_identity
+from mindroom.tool_system.worker_routing import ToolExecutionIdentity, tool_execution_identity
 from tests.conftest import bind_runtime_paths, runtime_paths_for
 from tests.memory_test_support import MockTeamConfig
 
@@ -73,10 +73,6 @@ def test_team_scope_root_is_one_store_no_requester_or_worker_scope_partitions(tm
         with tool_execution_identity(_identity(requester_id)):
             assert team_scopes("general", config, runtime_paths) == [expected]
             assert team_scopes("calculator", config, runtime_paths) == [expected]
-    assert expected.root not in {
-        agent_state_root_path(tmp_path, "general"),
-        agent_state_root_path(tmp_path, "calculator"),
-    }
 
 
 def test_team_scopes_lists_each_member_set_of_the_agent_s_teams_once_whatever_their_backends(

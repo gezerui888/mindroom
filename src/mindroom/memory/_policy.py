@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from mindroom.config.memory import MemoryBackend
     from mindroom.constants import RuntimePaths
 
-TEAM_MEMORY_DIRNAME = "team_memory"
+_TEAM_MEMORY_DIRNAME = "team_memory"
 
 
 @dataclass(frozen=True)
@@ -32,14 +32,17 @@ def team_user_id(member_names: Sequence[str]) -> str:
     return f"team_{'+'.join(sorted(member_names))}"
 
 
-def scope_dir_name(scope_user_id: str) -> str:
+def _scope_dir_name(scope_user_id: str) -> str:
     """Return the filesystem-safe directory name of one memory scope."""
     return re.sub(r"[^a-zA-Z0-9._+-]+", "_", scope_user_id).strip("_") or "default"
 
 
 def team_scope(scope_user_id: str, runtime_paths: RuntimePaths) -> MemoryScope:
     """Return one team scope with its own store root, which no requester or member partitions."""
-    return MemoryScope(scope_user_id, runtime_paths.storage_root / TEAM_MEMORY_DIRNAME / scope_dir_name(scope_user_id))
+    return MemoryScope(
+        scope_user_id,
+        runtime_paths.storage_root / _TEAM_MEMORY_DIRNAME / _scope_dir_name(scope_user_id),
+    )
 
 
 def caller_memory_backend(config: Config, caller: str | Sequence[str]) -> MemoryBackend:
@@ -48,11 +51,7 @@ def caller_memory_backend(config: Config, caller: str | Sequence[str]) -> Memory
         return memory_backend(config, caller)
     config.assert_team_agents_supported(list(caller))
     backends = {memory_backend(config, agent_name) for agent_name in caller}
-    if backends == {"file"}:
-        return "file"
-    if backends == {"none"}:
-        return "none"
-    return "mem0"
+    return backends.pop() if len(backends) == 1 else "mem0"
 
 
 def team_scopes(agent_name: str, config: Config, runtime_paths: RuntimePaths) -> list[MemoryScope]:

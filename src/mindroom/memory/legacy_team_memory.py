@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import stat
 from contextlib import suppress
+from itertools import batched
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -27,11 +28,11 @@ from mindroom.background_tasks import run_blocking_until_complete
 from mindroom.constants import tracking_dir
 from mindroom.durable_write import write_json_file_durable
 from mindroom.logging_config import get_logger
-from mindroom.path_confinement import open_directory_within_root, open_regular_file_at
+from mindroom.path_confinement import open_directory_within_root, read_regular_file_within_root
 from mindroom.tool_system.dependencies import ensure_optional_deps, optional_dependency_environment
 
 from ._file_backend import write_scope_markdown_file
-from ._policy import TEAM_MEMORY_DIRNAME, scope_dir_name
+from ._policy import team_scope
 from ._shared import FILE_MEMORY_ENTRY_PATTERN, FILE_MEMORY_ENTRYPOINT
 
 if TYPE_CHECKING:
@@ -59,10 +60,9 @@ def _migrate(runtime_paths: RuntimePaths) -> None:
     receipt = tracking_dir(runtime_paths) / _RECEIPT
     if receipt.exists():
         return
-    storage_root = runtime_paths.storage_root
-    members = _subdirectories(storage_root, Path("agents"))
-    _merge_file_copies(storage_root, members)
-    if _merge_mem0_copies(storage_root, runtime_paths, members):
+    members = _subdirectories(runtime_paths.storage_root, Path("agents"))
+    _merge_file_copies(runtime_paths, members)
+    if _merge_mem0_copies(runtime_paths, members):
         write_json_file_durable(receipt, {"version": 1}, strict_atomic_replace=True)
 
 
@@ -78,7 +78,8 @@ def _subdirectories(storage_root: Path, relative: Path) -> list[str]:
         return []
 
 
-def _merge_file_copies(storage_root: Path, members: list[str]) -> None:
+def _merge_file_copies(runtime_paths: RuntimePaths, members: list[str]) -> None:
+    storage_root = runtime_paths.storage_root
     copies: dict[str, list[tuple[Path, str]]] = {}
     for member in members:
         member_files = Path("agents", member, "memory_files")
@@ -86,7 +87,7 @@ def _merge_file_copies(storage_root: Path, members: list[str]) -> None:
             if name.startswith(_TEAM_SCOPE_PREFIX) and (text := _recognized_copy(storage_root, member_files / name)):
                 copies.setdefault(name, []).append((member_files / name, text))
     for scope_dir, team_copies in copies.items():
-        target = storage_root / TEAM_MEMORY_DIRNAME / scope_dir_name(scope_dir)
+        target = team_scope(scope_dir, runtime_paths).root
         target.mkdir(parents=True, exist_ok=True)
         merged = _merged_entrypoint(_existing_entrypoint(target), [text for _, text in team_copies])
         write_scope_markdown_file(target, Path(FILE_MEMORY_ENTRYPOINT), merged.encode())
@@ -117,18 +118,8 @@ def _read_lone_entrypoint(directory: int) -> str:
     return _read_entrypoint(directory)
 
 
-def _read_entrypoint(directory: int) -> str:
-    descriptor = open_regular_file_at(directory, FILE_MEMORY_ENTRYPOINT)
-    try:
-        if os.fstat(descriptor).st_size > _MAX_COPY_BYTES:
-            msg = "MEMORY.md exceeds the merge size limit"
-            raise ValueError(msg)
-        chunks: list[bytes] = []
-        while chunk := os.read(descriptor, 1 << 16):
-            chunks.append(chunk)
-    finally:
-        os.close(descriptor)
-    return b"".join(chunks).decode("utf-8")
+def _read_entrypoint(directory: Path | int) -> str:
+    return read_regular_file_within_root(directory, FILE_MEMORY_ENTRYPOINT, max_bytes=_MAX_COPY_BYTES).decode()
 
 
 def _is_runtime_line(line: str) -> bool:
@@ -138,8 +129,7 @@ def _is_runtime_line(line: str) -> bool:
 def _existing_entrypoint(target: Path) -> str | None:
     """Return the team's `MEMORY.md` an interrupted earlier start published, if any."""
     try:
-        with open_directory_within_root(target) as directory:
-            return _read_entrypoint(directory)
+        return _read_entrypoint(target)
     except FileNotFoundError:
         return None
 
@@ -167,8 +157,9 @@ def _remove_copy(storage_root: Path, copy: Path) -> None:
         os.rmdir(copy.parent.name, dir_fd=member)
 
 
-def _merge_mem0_copies(storage_root: Path, runtime_paths: RuntimePaths, members: list[str]) -> bool:
+def _merge_mem0_copies(runtime_paths: RuntimePaths, members: list[str]) -> bool:
     """Merge every member's Mem0 team records into their teams' stores; False while Chroma cannot be installed."""
+    storage_root = runtime_paths.storage_root
     stores = [
         storage_root / store
         for member in members
@@ -184,10 +175,10 @@ def _merge_mem0_copies(storage_root: Path, runtime_paths: RuntimePaths, members:
         return False
     kept, copies = _team_records([_chroma_client(store) for store in stores])
     for (scope, collection_name), records in sorted(kept.items()):
-        target = _chroma_client(storage_root / TEAM_MEMORY_DIRNAME / scope_dir_name(scope) / "chroma")
+        target = _chroma_client(team_scope(scope, runtime_paths).root / "chroma")
         collection = target.get_or_create_collection(collection_name, embedding_function=None)
         # Records keep their IDs, so moving one again after an interrupted start changes nothing.
-        for batch in _batches(records, target.get_max_batch_size()):
+        for batch in batched(records, target.get_max_batch_size()):
             collection.upsert(
                 ids=[record["id"] for record in batch],
                 embeddings=[record["embedding"] for record in batch],
@@ -199,14 +190,9 @@ def _merge_mem0_copies(storage_root: Path, runtime_paths: RuntimePaths, members:
     for keep in (False, True):
         for client, collection, record_ids in copies:
             removed = [record_id for record_id in record_ids if (record_id in kept_ids) is keep]
-            for batch in _batches(removed, client.get_max_batch_size()):
-                collection.delete(ids=batch)
+            for batch in batched(removed, client.get_max_batch_size()):
+                collection.delete(ids=list(batch))
     return True
-
-
-def _batches[Item](items: list[Item], size: int) -> Iterator[list[Item]]:
-    for start in range(0, len(items), size):
-        yield items[start : start + size]
 
 
 def _holds_only_plain_files(storage_root: Path, store: Path) -> bool:
@@ -282,10 +268,5 @@ def _chroma_client(path: Path) -> Any:  # noqa: ANN401 - chromadb is an optional
 
 
 def _records(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
-    embeddings = payload.get("embeddings")
-    for index, record_id in enumerate(payload["ids"]):
-        yield {
-            "id": record_id,
-            "metadata": payload["metadatas"][index] or {},
-            "embedding": embeddings[index] if embeddings is not None else None,
-        }
+    for record_id, metadata, embedding in zip(payload["ids"], payload["metadatas"], payload["embeddings"], strict=True):
+        yield {"id": record_id, "metadata": metadata or {}, "embedding": embedding}

@@ -336,7 +336,7 @@ async def test_completed_team_reply_saves_the_conversation_to_its_team_memory(
     tmp_path: Path,
     edited: bool,
 ) -> None:
-    """A configured team's reply, first or after an edit, saves the conversation once to its members' team memory."""
+    """A configured team's reply, first or after an edit, saves the conversation once to the team's memory."""
     store_calls = await _team_memory_saves(config_with_team, tmp_path, edited=edited)
 
     [(args, kwargs)] = store_calls

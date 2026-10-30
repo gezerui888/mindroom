@@ -316,7 +316,7 @@ async def build_memory_prompt_parts(
 
 async def store_conversation_memory(
     prompt: str,
-    agent_name: str | Sequence[str],
+    caller: str | Sequence[str],
     session_id: str,
     config: Config,
     runtime_paths: RuntimePaths,
@@ -324,14 +324,14 @@ async def store_conversation_memory(
     user_id: str | None = None,
     execution_identity: ToolExecutionIdentity | None = None,
 ) -> None:
-    """Store one conversation turn of an agent, or of the team ``agent_name`` lists, for future recall."""
+    """Store one conversation turn of an agent, or of the team the members in ``caller`` form, for future recall."""
     if not prompt:
         return
-    if (backend := resolve_memory_backend(agent_name, config, runtime_paths)) is None:
+    if (backend := resolve_memory_backend(caller, config, runtime_paths)) is None:
         return
     await backend.store_conversation(
         prompt,
-        agent_name,
+        caller,
         session_id,
         config,
         thread_history=thread_history,

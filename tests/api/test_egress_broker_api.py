@@ -1194,12 +1194,13 @@ def test_an_administrator_key_is_one_key_whichever_scope_sets_it(egress_config_f
     put = client.put("/api/egress-broker/services/search/secret?agent_name=test_agent", json={"secret": "admin-key"})
 
     assert put.status_code == 204, put.text
-    assert secrets.load_secret(manager, None, "search") == "admin-key"
+    assert secrets.load_secret(manager, None, "search", admin_key=True) == "admin-key"
+    assert secrets.load_secret(manager, None, "search") is None
     for agent_name in (None, "test_agent"):
         row = _service(client, "search", agent_name)
         assert (row["configured"], row["admin_key"], row["agents"]) == (True, True, ["test_agent"])
     assert client.delete("/api/egress-broker/services/search/secret?agent_name=test_agent").status_code == 204
-    assert secrets.load_secret(manager, None, "search") is None
+    assert secrets.load_secret(manager, None, "search", admin_key=True) is None
 
 
 def test_the_dashboard_lists_a_service_for_agents_its_list_leaves_out(egress_config_file: Path) -> None:

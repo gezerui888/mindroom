@@ -35,7 +35,6 @@ from mindroom.egress_broker.secrets import (
     SecretNotForAgent,
     SecretResult,
     SecretServiceChanged,
-    key_target,
     load_secret,
     service_status,
 )
@@ -260,16 +259,17 @@ def _routed_key(
 ) -> Secret | SecretServiceChanged | None:
     """Return the scope's key for `name` if, once it is read, the effective config still defines `name` as `routed`.
 
-    An `admin_key` service's key is the global store's (`key_target`). None without a key, and for a service with its
-    own account (`oauth_separate_account`), which uses only that account. Under `consistent_read` no user-service write lands during the read and the check. A config change does
-    not take that lock, so the check reads the current config after the key: a key saved after the config moved `name`
-    to other hosts is only read once the new config is current, and the check then refuses it.
+    An `admin_key` service's key is its administrator key. None without a key, and for a service with its own account
+    (`oauth_separate_account`), which uses only that account. Under `consistent_read` no user-service write lands
+    during the read and the check. A config change does not take that lock, so the check reads the current config
+    after the key: a key saved after the config moved `name` to other hosts is only read once the new config is
+    current, and the check then refuses it.
     """
     with consistent_read():
         key = (
             None
             if routed.oauth_separate_account
-            else load_secret(credentials_manager, key_target(routed, target), name)
+            else load_secret(credentials_manager, target, name, admin_key=routed.admin_key)
         )
         current = config.current()
         effective = None if current is None else effective_config(current.egress_broker, credentials_manager, target)

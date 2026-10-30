@@ -862,7 +862,7 @@ def test_a_service_with_its_own_account_is_marked_and_the_note_names_the_header(
 def test_an_administrator_key_is_listed_as_set_and_marked_as_the_administrators(tmp_path: Path) -> None:
     """A personal scope reads the administrator's key from the global store, and the entry says nobody else sets it."""
     runtime_paths = _runtime_paths(tmp_path)
-    save_secret(get_runtime_credentials_manager(runtime_paths), None, "openai", _SECRET)
+    save_secret(get_runtime_credentials_manager(runtime_paths), None, "openai", _SECRET, admin_key=True)
     services = {**_SERVICES, "openai": {**_SERVICES["openai"], "admin_key": True}}
 
     payload = _list(_tool(runtime_paths), _context(runtime_paths, services))

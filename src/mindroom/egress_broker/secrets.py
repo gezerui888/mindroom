@@ -34,7 +34,6 @@ __all__ = [
     "delete_egress_document",
     "delete_secret",
     "is_personal_target",
-    "key_target",
     "load_egress_document",
     "load_secret",
     "save_egress_document",
@@ -43,6 +42,9 @@ __all__ = [
 ]
 
 _MAX_SECRET_SIZE = 16 * 1024  # 16 KiB
+# An administrator key's slot in the global store. Service names start with `[a-z0-9]`, so no scope's own key, which
+# is stored as `egress_<name>`, can take an `egress__` name.
+_ADMIN_KEY_SERVICE_PREFIX = "egress__admin_key_"
 # Worker scopes whose sandbox and egress store belong to one requester.
 PERSONAL_WORKER_SCOPES: frozenset[str] = frozenset({"user", "user_agent"})
 
@@ -56,12 +58,20 @@ def is_personal_target(target: ResolvedWorkerTarget | None) -> bool:
     return target is not None and target.worker_scope in PERSONAL_WORKER_SCOPES
 
 
-def key_target(service: EgressService, target: ResolvedWorkerTarget | None) -> ResolvedWorkerTarget | None:
-    """Return whose store holds `service`'s key for `target`: the global store for an `admin_key` service, else its own.
+def _key_location(
+    target: ResolvedWorkerTarget | None,
+    name: str,
+    *,
+    admin_key: bool,
+) -> tuple[ResolvedWorkerTarget | None, str]:
+    """Return the store and credential service that hold service `name`'s key for `target`.
 
-    An administrator's key is one key for every scope, so every read and write of it resolves here.
+    That is the scope's own `egress_<name>`, or for an `admin_key` service one slot of the global store that no scope
+    writes, so the key that agents without a worker scope share never becomes the administrator's.
     """
-    return None if service.admin_key else target
+    if admin_key:
+        return None, f"{_ADMIN_KEY_SERVICE_PREFIX}{name}"
+    return target, egress_credential_service(name)
 
 
 def load_egress_document(
@@ -134,6 +144,8 @@ def load_secret(
     manager: CredentialsManager,
     target: ResolvedWorkerTarget | None,
     name: str,
+    *,
+    admin_key: bool = False,
 ) -> str | None:
     """Load an egress secret for a worker target or the global store.
 
@@ -141,12 +153,13 @@ def load_secret(
         manager: Credentials manager
         target: Worker target, or None for the global (unscoped) store
         name: Service name
+        admin_key: Read the service's administrator key instead, which is the same for every target
 
     Returns the secret string, or None if not configured.
     Requester-scoped targets (user, user_agent) do not fall back to shared/global.
 
     """
-    credentials = load_egress_document(manager, target, egress_credential_service(name))
+    credentials = load_egress_document(manager, *_key_location(target, name, admin_key=admin_key))
     if credentials is None:
         return None
     return credentials.get("secret")
@@ -157,6 +170,8 @@ def save_secret(
     target: ResolvedWorkerTarget | None,
     name: str,
     secret: str,
+    *,
+    admin_key: bool = False,
 ) -> None:
     """Save an egress secret for a worker target or the global store.
 
@@ -165,6 +180,7 @@ def save_secret(
         target: Worker target, or None for the global (unscoped) store
         name: Service name
         secret: Secret value to store
+        admin_key: Save the service's administrator key instead, which is the same for every target
 
     Raises ValueError if the secret is empty/whitespace, over 16 KiB,
     or contains ASCII control characters.
@@ -191,13 +207,15 @@ def save_secret(
         "secret": secret,
         "_updated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     }
-    save_egress_document(manager, target, egress_credential_service(name), credentials)
+    save_egress_document(manager, *_key_location(target, name, admin_key=admin_key), credentials)
 
 
 def delete_secret(
     manager: CredentialsManager,
     target: ResolvedWorkerTarget | None,
     name: str,
+    *,
+    admin_key: bool = False,
 ) -> None:
     """Delete an egress secret for a worker target or the global store.
 
@@ -205,9 +223,10 @@ def delete_secret(
         manager: Credentials manager
         target: Worker target, or None for the global (unscoped) store
         name: Service name
+        admin_key: Delete the service's administrator key instead, which is the same for every target
 
     """
-    delete_egress_document(manager, target, egress_credential_service(name))
+    delete_egress_document(manager, *_key_location(target, name, admin_key=admin_key))
 
 
 @dataclass(frozen=True)
@@ -359,13 +378,13 @@ def service_status(
 
     `oauth_status(provider_id, target)` reports the service's OAuth provider for the same target; it is not
     called for services without one. A service with its own account (`oauth_separate_account`) has no key, as the
-    broker never uses one for it, and an `admin_key` service's key is read from the global store (`key_target`).
+    broker never uses one for it, and an `admin_key` service's key is its administrator key (`_key_location`).
     Never returns a secret or token.
     """
     key = (
         None
         if service.oauth_separate_account
-        else load_egress_document(manager, key_target(service, target), egress_credential_service(name))
+        else load_egress_document(manager, *_key_location(target, name, admin_key=service.admin_key))
     )
     oauth = oauth_status(service.oauth_provider, target) if service.oauth_provider is not None else None
     active_source: Literal["key", "oauth"] | None = None

@@ -60,7 +60,7 @@ _RESERVED_CA_VARS = {*RUNNER_CA_BUNDLE_ENV, "NODE_EXTRA_CA_CERTS"}
 RESERVED_PLACEHOLDER_NAMES = frozenset(_RESERVED_EXACT | _RESERVED_PROXY_VARS | _RESERVED_CA_VARS)
 # EgressService fields that only matter for a service that sends a credential; restrict_only services cannot set them.
 _CREDENTIAL_FIELDS = ("oauth_provider", "placeholder_env", "oauth_on_shared_workers", "read_only")
-# EgressService fields that only matter for a connected account; admin_key services, which use only a key, cannot set them.
+# EgressService fields that only matter for a connected account; admin_key services use only a key, so cannot set them.
 _ACCOUNT_FIELDS = ("oauth_provider", "read_only", "oauth_on_shared_workers")
 
 
@@ -323,8 +323,8 @@ class EgressService(BaseModel):
         so every existing validator runs on the resolved service.
         Afterwards only the authored fields stay in `model_fields_set`,
         so `Config.authored_model_dump()` keeps `{preset: github}` as written and later preset updates still apply.
-        A `restrict_only` service takes no login, placeholders, or `read_only` from its preset, since it never sends a credential,
-        and an `admin_key` service no login or `read_only`, since it uses only its key.
+        A `restrict_only` service takes no login, placeholders, or `read_only` from its preset, since it never sends a
+        credential, and an `admin_key` service no login or `read_only`, since it uses only its key.
         """
         authored = cast("dict[str, object]", data) if isinstance(data, dict) else {}
         name = authored.get("preset")

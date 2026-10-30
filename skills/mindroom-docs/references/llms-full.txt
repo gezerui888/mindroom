@@ -20371,7 +20371,7 @@ egress_broker:
 ```
 
 Set the key in the service's row on the dashboard's **Agent Keys** panel, whichever agent **Keys for** selects, or with `PUT /api/egress-broker/services/search/secret` from a script.
-Users see on their egress page that their administrator set the key, but nobody can read it, and only administrators on the dashboard can replace or remove it, so credential managers and users cannot.
+Users see on their egress page that their administrator set the key, but nobody can read it, and only administrators on the dashboard can replace or remove it.
 The service uses no connected account: a preset's account login is left out, and setting `oauth_provider` or `read_only` next to `admin_key` is an error.
 Keys stored for the service in an agent's own scope are not used while `admin_key` is set.
 Until the key is set, requests to the service get 403 `credential_not_configured` with a message that only an administrator can set it.

@@ -12,7 +12,7 @@ The administrator also wanted to limit such a key to some agents instead of ever
 ## Decisions
 
 - **`admin_key: true` on a config service means one key, set only by an administrator.**
-  The key lives in the global store under the service's usual name, and every scope reads it there for that service instead of its own store.
+  The key lives in the global store under a name of its own that no scope's key can take, and every scope reads it there for that service instead of its own store, so the key that agents without a worker scope share never becomes the administrator's when `admin_key` is turned on.
   The dashboard's key routes write it whichever scope is selected; the Connections page's key routes refuse it with 403 for everyone, credential managers and administrators included, so changing it stays a dashboard action.
   The service takes no connected account, so a preset's `oauth_provider` and `read_only` are dropped like a `restrict_only` service drops them, and authoring either next to `admin_key` is an error.
 - **`agents: [...]` on a config service limits which agents get its credential.**

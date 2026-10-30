@@ -192,10 +192,10 @@ def save_user_service(
     holds the ids of the registry's providers (`oauth.registry.load_oauth_providers`).
 
     Raises UserServiceConflictError when `config_services` has the name, and ValueError for an invalid name, a
-    service that sets `oauth_on_shared_workers`, `admin_key`, or `agents`, an OAuth provider (a preset's included) that the registry does not
-    know, that a shared or unscoped agent would use, or whose token a rule would send off its provider's preset hosts, a
-    placeholder user services may not set, a service with more than 50 rules or over 16 KiB, a 51st service in the
-    scope, or a scope document over 256 KiB.
+    service that sets `oauth_on_shared_workers`, `admin_key`, or `agents`, an OAuth provider (a preset's included)
+    that the registry does not know, that a shared or unscoped agent would use, or whose token a rule would send off
+    its provider's preset hosts, a placeholder user services may not set, a service with more than 50 rules or over
+    16 KiB, a 51st service in the scope, or a scope document over 256 KiB.
     """
     validate_egress_service_name(name)
     if name in config_services:
@@ -294,7 +294,7 @@ def effective_config(
 
 
 def services_for_agent(services: Mapping[str, EgressService], agent_name: str | None) -> dict[str, EgressService]:
-    """Return the services whose credential `agent_name` may get, in order: those whose `agents` list does not leave it out.
+    """Return, in order, the services whose credential `agent_name` may get: those whose `agents` does not leave it out.
 
     The broker still routes the others for the agent and refuses them; listings and placeholders leave them out.
     """

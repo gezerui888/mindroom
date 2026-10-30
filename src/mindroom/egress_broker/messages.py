@@ -169,7 +169,7 @@ class ScopeInfo:
     personal_page: bool
 
 
-def _template(  # noqa: C901, PLR0911 - one text per case, checked in order
+def _template(  # noqa: C901, PLR0911, PLR0912 - one text per case, checked in order
     code: str,
     *,
     path: str | None,
@@ -182,7 +182,10 @@ def _template(  # noqa: C901, PLR0911 - one text per case, checked in order
     requester_owned: bool,
     own_account: bool,
     service_header: bool,
+    admin_key: bool,
 ) -> str:
+    if code == "credential_not_configured" and admin_key:
+        return _ADMIN_KEY_MISSING
     without_page = not (shared or personal_page)
     if code == "credential_not_configured" and own_account and not without_page:
         return _OWN_ACCOUNT_OFF if reuse_off else _OWN_ACCOUNT_MISSING
@@ -271,9 +274,9 @@ def refusal_body(
     requester's own (`requester_owned`). A `read_only` (the `provider` account may only read) says who may allow
     writes the same way. `own_account` (the service's own account is not connected, or with `reuse_off` not allowed)
     asks the user to connect it, or to connect and allow it, at `manage_url`. A `credential_not_configured` for an
-    `admin_key` service names an administrator and the dashboard, whatever the scope, and links no page. An `oauth_connection_required` without a
-    connect link names only `manage_url`, and on a `shared` agent its `managers` (or an administrator) as the ones who
-    can reconnect, unless the account is `requester_owned`.
+    `admin_key` service names an administrator and the dashboard, whatever the scope, and links no page. An
+    `oauth_connection_required` without a connect link names only `manage_url`, and on a `shared` agent its `managers`
+    (or an administrator) as the ones who can reconnect, unless the account is `requester_owned`.
     A personal scope without the personal page (`personal_page` false) has no page that sets its keys, accounts, or
     services: its texts say so and offer only a connect link, for `oauth_connection_required` too where `connectable`
     says the body carries one, and the body leaves out `manage_url`, which would be the dashboard.
@@ -281,22 +284,19 @@ def refusal_body(
     that names no service once; without either, the request itself was malformed.
     Raises ValueError for a code without a text and KeyError when the text needs a value that was not given.
     """
-    template = (
-        _ADMIN_KEY_MISSING
-        if code == "credential_not_configured" and admin_key
-        else _template(
-            code,
-            path=path,
-            managers=managers or (),
-            shared=shared,
-            personal_page=personal_page,
-            connectable=connectable,
-            by_operator=by_operator,
-            reuse_off=reuse_off,
-            requester_owned=requester_owned,
-            own_account=own_account,
-            service_header=service_header,
-        )
+    template = _template(
+        code,
+        path=path,
+        managers=managers or (),
+        shared=shared,
+        personal_page=personal_page,
+        connectable=connectable,
+        by_operator=by_operator,
+        reuse_off=reuse_off,
+        requester_owned=requester_owned,
+        own_account=own_account,
+        service_header=service_header,
+        admin_key=admin_key,
     )
     if "manage_url" not in template:
         # A body carries the manage link only where its text names it.

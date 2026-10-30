@@ -381,7 +381,9 @@ function ServiceSection({
       {keysUnused && (
         <p className="text-xs text-muted-foreground">
           {personalAgents
-            ? "Only agents whose keys each user sets use the broker, so no keys are set here."
+            ? services?.some((service) => service.admin_key)
+              ? "Only agents whose keys each user sets use the broker, so only services with one key for every agent take a key here."
+              : "Only agents whose keys each user sets use the broker, so no keys are set here."
             : "No agent uses these keys. An agent uses them once it has the egress_credentials tool and shell or python running in a worker."}
         </p>
       )}

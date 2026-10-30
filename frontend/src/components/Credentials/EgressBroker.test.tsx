@@ -635,6 +635,34 @@ describe("egress broker key target", () => {
     await expectNoAction("Set key for GitHub");
   });
 
+  it("says that only administrator keys are set here when only agents with per-user keys use the broker", async () => {
+    keyAgents = {
+      shared_agents: [],
+      has_unscoped_agents: false,
+      has_personal_agents: true,
+    };
+    storeState = {
+      agents: [agent("mine", ["shell"], { worker_scope: "user" })],
+      config: { defaults: {} },
+    };
+    services = [
+      { ...openai, admin_key: true, configured: false, key_configured: false },
+      github,
+    ];
+    render(<EgressBroker />);
+    await screen.findByText("GitHub");
+
+    expect(
+      screen.getByText(
+        "Only agents whose keys each user sets use the broker, so only services with one key for every agent take a key here.",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Set key for openai" }),
+    ).toBeVisible();
+    await expectNoAction("Set key for GitHub");
+  });
+
   it("loads the services of the selected target", async () => {
     sharedCoder();
     render(<EgressBroker />);

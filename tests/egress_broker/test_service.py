@@ -1803,7 +1803,7 @@ async def test_an_administrator_key_serves_every_scope_and_a_scopes_own_key_neve
     config = _config(github={**_GITHUB, "admin_key": True})
     alice = _routable_target("@alice:example.org")
     shared = _routable_target("@bob:example.org", scope="shared")
-    save_secret(manager, None, "github", "admin-s3cret")
+    save_secret(manager, None, "github", "admin-s3cret", admin_key=True)
     save_secret(manager, alice, "github", "alices-own")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         envs = [execution_env_for_worker(runtime_paths, config=config, worker_target=t) for t in (alice, shared)]
@@ -1824,6 +1824,8 @@ async def test_an_unset_administrator_key_is_refused_naming_an_administrator(
     config = _config(github={**_GITHUB, "admin_key": True})
     alice = _routable_target("@alice:example.org")
     save_secret(manager, alice, "github", "alices-own")
+    # The key that agents without a worker scope share is theirs, never the administrator's.
+    save_secret(manager, None, "github", "unscoped-key")
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         env = execution_env_for_worker(runtime_paths, config=config, worker_target=alice)
         response = await get_through(env)
@@ -1849,7 +1851,7 @@ async def test_a_service_limited_to_some_agents_refuses_the_others(
     config = _agents_config(github={**_GITHUB, "admin_key": True, "agents": ["code"]})
     code = _routable_target("@alice:example.org", "code")
     general = _routable_target("@alice:example.org", "general")
-    save_secret(manager, None, "github", "admin-s3cret")
+    save_secret(manager, None, "github", "admin-s3cret", admin_key=True)
     async with serve_egress_broker(runtime_paths, config_provider=lambda: config, credentials_manager=manager):
         code_env = execution_env_for_worker(runtime_paths, config=config, worker_target=code)
         general_env = execution_env_for_worker(runtime_paths, config=config, worker_target=general)

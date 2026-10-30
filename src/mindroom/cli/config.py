@@ -11,7 +11,7 @@ import shlex
 import shutil
 import subprocess
 import textwrap
-from pathlib import Path  # noqa: TC003
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import typer
@@ -703,6 +703,65 @@ def _write_starter_setup(
     else:
         console.print(f"[green]Config created:[/green] {target}")
     return env_changed
+
+
+def _agent_template_block(template: str, agent_name: str) -> str:
+    """Return one built-in agent template's config block for one agent name."""
+    source = Path(__file__).resolve().parent / "templates" / f"{template}_agent.yaml"
+    return source.read_text(encoding="utf-8").replace("__AGENT_NAME__", agent_name)
+
+
+@config_app.command(
+    "new-agent",
+    rich_help_panel="Create and edit",
+    epilog=examples(
+        ("mindroom config new-agent apollo --template project", "Shared agent for one project's team"),
+        ("mindroom config new-agent assistant --template work", "Private work assistant for each person"),
+    ),
+)
+def config_new_agent(
+    name: str = typer.Argument(..., help="Agent name: letters, digits, and underscores."),
+    template: Literal["project", "work"] = typer.Option(
+        ...,
+        "--template",
+        "-t",
+        help="project: one shared workspace for a team. work: a private copy for each person.",
+    ),
+    path: Path | None = CONFIG_PATH_OPTION,
+) -> None:
+    """Create an agent's starter files from a built-in template and print its config block.
+
+    Existing files are never overwritten, so rerunning only restores missing ones.
+    """
+    from mindroom.tool_system.worker_routing import agent_workspace_root_path  # noqa: PLC0415
+    from mindroom.workspaces import ensure_workspace_template  # noqa: PLC0415
+
+    if not constants.AGENT_NAME_PATTERN.fullmatch(name):
+        console.print("[red]Agent names may contain only letters, digits, and underscores.[/red]")
+        raise typer.Exit(1)
+    target = _resolve_config_path(path)
+    if template == "project":
+        storage_root = constants.resolve_runtime_paths(config_path=target).storage_root
+        destination = agent_workspace_root_path(storage_root, name)
+    else:
+        destination = target.parent / "templates" / name
+
+    existed = destination.exists()
+    written = ensure_workspace_template(destination, template=template)
+    if not written:
+        console.print(f"[green]Nothing to create:[/green] {escape(str(destination))} already has every template file.")
+    else:
+        files = f"{len(written)} file{'s' if len(written) != 1 else ''}"
+        kept = "; existing files were kept" if existed else ""
+        console.print(f"[green]Created {files} in[/green] {escape(str(destination))}{kept}.")
+    if template == "work":
+        console.print("Each person gets a private copy of this template the first time they talk to the agent.")
+    validate = (
+        "mindroom config validate" if path is None else f"mindroom config validate --path {shlex.quote(str(target))}"
+    )
+    console.print(f"\nAdd this agent to the agents: section of {escape(str(target))}, then run `{escape(validate)}`:\n")
+    # Plain and unwrapped, so the block pastes into config.yaml exactly as printed.
+    console.print(_agent_template_block(template, name), markup=False, highlight=False, soft_wrap=True)
 
 
 @config_app.command("show", rich_help_panel="Inspect")

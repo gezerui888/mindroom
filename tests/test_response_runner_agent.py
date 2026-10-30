@@ -192,7 +192,7 @@ def test_cached_room_display_name_uses_synced_matrix_room() -> None:
 
 
 class TestAgentBot(AgentBotTestBase):
-    """Bot behavior tests moved verbatim from tests/test_multi_agent_bot.py."""
+    """Agent replies a bot runs through its response runner, from preparation to delivery."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -211,7 +211,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """Only silent scheduled turns receive nonpersistent quiet-delivery guidance."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         target = MessageTarget.resolve("!test:localhost", None, "$event")
         envelope = request_envelope(
             room_id=target.room_id,
@@ -302,7 +302,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
@@ -359,7 +359,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """The immutable response source alone controls first-empty acceptance."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         # The placeholder is the first event the reply sends, and the answer edits it.
@@ -420,7 +420,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
@@ -479,7 +479,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
         room.name = "Engineering"
@@ -546,7 +546,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
@@ -608,7 +608,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         room = nio.MatrixRoom("!test:localhost", mock_agent_user.matrix_id.full_id)
@@ -671,7 +671,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         bot.client.rooms = {}
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
@@ -727,7 +727,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         bot._knowledge_access_support.resolve_for_agent_async = AsyncMock(
             side_effect=asyncio.CancelledError("cancelled"),
@@ -765,7 +765,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """Non-streaming responses should persist attachment IDs in message metadata."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         # The placeholder is the first event the reply sends, and the answer edits it.
@@ -813,7 +813,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """Streaming responses should persist attachment IDs in message metadata."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         bot.client.rooms = {}
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
@@ -903,7 +903,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """Metadata populated during generator iteration must appear in extra_content via mutable reference."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         bot.client.rooms = {}
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
@@ -964,7 +964,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """CancelledError during streaming must still carry io.mindroom.ai_run in extra_content."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         bot.client.rooms = {}
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
@@ -1040,7 +1040,7 @@ class TestAgentBot(AgentBotTestBase):
             yield "chunk"
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         # The reply's placeholder is the event its stream writes into.
         unique_room_send_responses(bot.client, prefix="$terminal")
@@ -1093,7 +1093,7 @@ class TestAgentBot(AgentBotTestBase):
             yield "chunk"
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         # The reply's placeholder is the event its stream writes into.
         unique_room_send_responses(bot.client, prefix="$terminal")
@@ -1166,13 +1166,15 @@ class TestAgentBot(AgentBotTestBase):
 
         config = self._config_for_storage(tmp_path)
         config.defaults.show_stop_button = False
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         # The placeholder is the first event the reply sends, and the answer edits it.
         unique_room_send_responses(bot.client, prefix="$response")
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
-        bot.hook_registry = HookRegistry.from_plugins([_hook_plugin("hooked", [before_hook, after_hook])])
+        bot.orchestrator.hook_registry_state.registry = HookRegistry.from_plugins(
+            [_hook_plugin("hooked", [before_hook, after_hook])],
+        )
         mock_ai = AsyncMock(return_value="Handled")
         with patch_response_runner_module(
             typing_indicator=_noop_typing_indicator,
@@ -1204,7 +1206,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """Non-streaming AI calls should receive the events of the room's replies whose span runs here."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         # The placeholder is the first event the reply sends, and the answer edits it.
@@ -1272,11 +1274,13 @@ class TestAgentBot(AgentBotTestBase):
 
         config = self._config_for_storage(tmp_path)
         config.defaults.show_stop_button = False
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         bot.client.rooms = {}
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
-        bot.hook_registry = HookRegistry.from_plugins([_hook_plugin("hooked", [before_hook, after_hook])])
+        bot.orchestrator.hook_registry_state.registry = HookRegistry.from_plugins(
+            [_hook_plugin("hooked", [before_hook, after_hook])],
+        )
         mock_stream_agent_response = MagicMock(return_value=mock_streaming_response())
         with (
             patch(
@@ -1324,7 +1328,7 @@ class TestAgentBot(AgentBotTestBase):
             yield "chunk"
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         bot.client.rooms = {}
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
@@ -1371,7 +1375,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """Suppressing a placeholder-backed response should redact the provisional event."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = MagicMock()
         response_envelope = _hook_envelope(body="hello", source_event_id="$event123")
         redact_message_event = AsyncMock(return_value=True)
@@ -1437,7 +1441,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """Suppressing a non-placeholder edit should keep the prior visible event retryable."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = MagicMock()
         response_envelope = _hook_envelope(body="hello", source_event_id="$event123")
         redact_message_event = AsyncMock()
@@ -1509,9 +1513,11 @@ class TestAgentBot(AgentBotTestBase):
                 ctx.draft.suppress = True
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = MagicMock()
-        bot.hook_registry = HookRegistry.from_plugins([_hook_plugin("hooked", [before_hook])])
+        bot.orchestrator.hook_registry_state.registry = HookRegistry.from_plugins(
+            [_hook_plugin("hooked", [before_hook])],
+        )
         response_envelope = _hook_envelope(body="hello", source_event_id="$event123")
         redact_message_event = AsyncMock(return_value=True)
         gateway = replace_delivery_gateway_deps(bot, redact_message_event=redact_message_event)
@@ -1557,7 +1563,7 @@ class TestAgentBot(AgentBotTestBase):
         """A no-op streamed regeneration should keep the prior visible reply linked."""
         config = self._config_for_storage(tmp_path)
         config.defaults.show_stop_button = False
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         runner = unwrap_extracted_collaborator(bot._response_runner)
         request = replace(
@@ -1648,7 +1654,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         # The placeholder is the first event the reply sends, and the answer edits it.
@@ -1710,7 +1716,7 @@ class TestAgentBot(AgentBotTestBase):
             ),
             tmp_path,
         )
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         # The placeholder is the first event the reply sends, and the answer edits it.
@@ -1791,7 +1797,7 @@ class TestAgentBot(AgentBotTestBase):
 
         config = self._config_for_storage(tmp_path)
         config.timezone = "America/Los_Angeles"
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
 
         prior_user_time = datetime(2026, 3, 10, 8, 10, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -1898,7 +1904,7 @@ class TestAgentBot(AgentBotTestBase):
         config = self._config_for_storage(tmp_path)
         config.memory.backend = "mem0"
         config.timezone = "America/Los_Angeles"
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
 
         bob_time = datetime(2026, 3, 10, 8, 10, tzinfo=ZoneInfo("America/Los_Angeles"))
@@ -2007,7 +2013,7 @@ class TestAgentBot(AgentBotTestBase):
             return existing_event_id
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
         deliver = delivered_turn(
@@ -2083,7 +2089,7 @@ class TestAgentBot(AgentBotTestBase):
         assert config.defaults.enable_streaming is True
         assert config.defaults.show_stop_button is True
         assert config.defaults.show_tool_calls is True
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
         redact_message_event = AsyncMock(return_value=True)
@@ -2165,7 +2171,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """A locked-preparation failure must leave machine-readable evidence that the silent run started."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         receipt_path = (
             runtime_paths_for(config).storage_root
@@ -2241,7 +2247,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """A source rejected by the locked terminal gate never claims that execution started."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
 
         event_id = await bot._response_runner.generate_response(
@@ -2321,7 +2327,7 @@ class TestAgentBot(AgentBotTestBase):
         ]
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         unique_room_send_responses(bot.client, prefix="$response")
 
@@ -2390,7 +2396,7 @@ class TestAgentBot(AgentBotTestBase):
         config = self._config_for_storage(tmp_path)
         config.timezone = "UTC"
         config.agents[mock_agent_user.agent_name].timezone = "America/Los_Angeles"
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         # 2026-03-20 15:00 UTC.
         history = [_visible_message(sender="@alice:localhost", body="older text", timestamp=1_774_018_800_000)]
@@ -2468,7 +2474,7 @@ class TestAgentBot(AgentBotTestBase):
             return delivered_matrix_event("$thinking", content)
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         envelope = MessageEnvelope(
             source_event_id="$reply_plain:localhost",
@@ -2559,7 +2565,7 @@ class TestAgentBot(AgentBotTestBase):
 
         config = self._config_for_storage(tmp_path)
         config.defaults.thread_summary_first_threshold = 1
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         bot._knowledge_access_support.resolve_for_agent_async = AsyncMock(
@@ -2689,7 +2695,7 @@ class TestAgentBot(AgentBotTestBase):
 
         config = self._config_for_storage(tmp_path)
         config.defaults.thread_summary_first_threshold = 1
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         bot._knowledge_access_support.resolve_for_agent_async = AsyncMock(
@@ -2793,7 +2799,7 @@ class TestAgentBot(AgentBotTestBase):
             captured_outcomes.append(outcome)
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
         install_direct_response_admission(bot)
@@ -2855,7 +2861,7 @@ class TestAgentBot(AgentBotTestBase):
             captured_outcomes.append(outcome)
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
 
@@ -2913,7 +2919,7 @@ class TestAgentBot(AgentBotTestBase):
             await release.wait()
 
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
 
         with (
@@ -2977,7 +2983,7 @@ class TestAgentBot(AgentBotTestBase):
         """A suppressed reply settles its source through its own records; the no-reply callback stays unused."""
         config = self._config_for_storage(tmp_path)
         config.defaults.show_stop_button = False
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         events: list[str] = []
 
@@ -3049,7 +3055,7 @@ class TestAgentBot(AgentBotTestBase):
     ) -> None:
         """A persisted approval pause must finish the live lifecycle instead of holding its lock."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         bot.client = _make_matrix_client_mock()
         _set_knowledge_for_agent(bot, MagicMock(return_value=None))
         target = request_envelope(
@@ -3156,7 +3162,7 @@ class TestAdaptiveResponse(AgentBotTestBase):
         # The llm judgment backend decides on its own model.
         config.models["judge"] = config.models["default"]
         paths = replace(runtime_paths_for(config), process_env=process_env or {})
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=paths)
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=paths)
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         unique_room_send_responses(bot.client, prefix="$response")
@@ -3364,7 +3370,7 @@ class TestAdaptiveResponse(AgentBotTestBase):
     ) -> None:
         """Early owned preparation failures settle the source without a visible error."""
         config = self._config_for_storage(tmp_path)
-        bot = make_test_agent_bot(mock_agent_user, tmp_path, config=config, runtime_paths=runtime_paths_for(config))
+        bot = make_test_agent_bot(mock_agent_user, config=config, runtime_paths=runtime_paths_for(config))
         install_direct_response_admission(bot)
         bot.client = _make_matrix_client_mock()
         runner = bot._response_runner

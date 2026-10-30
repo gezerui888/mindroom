@@ -715,8 +715,8 @@ def _agent_template_block(template: str, agent_name: str) -> str:
     "new-agent",
     rich_help_panel="Create and edit",
     epilog=examples(
-        ("mindroom config new-agent apollo --template project", "Shared agent for one project's team"),
-        ("mindroom config new-agent assistant --template work", "Private work assistant for each person"),
+        ("mindroom config new-agent apollo --template project", "Shared agent for a team"),
+        ("mindroom config new-agent assistant --template work", "Assistant for each person"),
     ),
 )
 def config_new_agent(
@@ -729,8 +729,9 @@ def config_new_agent(
     ),
     path: Path | None = CONFIG_PATH_OPTION,
 ) -> None:
-    """Create an agent's starter files from a built-in template and print its config block.
+    """Create an agent's starter files from a built-in template.
 
+    Prints the agent's config block to paste into config.yaml.
     Existing files are never overwritten, so rerunning only restores missing ones.
     """
     from mindroom.tool_system.worker_routing import agent_workspace_root_path  # noqa: PLC0415

@@ -22393,8 +22393,7 @@ Create, view, edit, and validate `config.yaml`.
 ╰────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Create and edit ──────────────────────────────────────────────────────────────────────╮
 │ init              Create a starter config.yaml with a personal agent and model.        │
-│ new-agent         Create an agent's starter files from a built-in template and print   │
-│                   its config block.                                                    │
+│ new-agent         Create an agent's starter files from a built-in template.            │
 │ edit              Open config.yaml in your default editor.                             │
 │ use-local-model   Make a local model the default, keeping agents' explicit model       │
 │                   choices.                                                             │

@@ -220,6 +220,7 @@ describe("serializing a service", () => {
     const custom: AuthoredEgressService = {
       rules: [bearerRule],
       oauth_provider: "github",
+      oauth_on_shared_workers: true,
     };
     const form = {
       ...formFromService("svc", custom),

@@ -4031,6 +4031,20 @@ describe("the administrator's choices on the dashboard", () => {
     { id: "research", label: "Research" },
   ];
 
+  it("offers no account once a service has one key for every agent", async () => {
+    await renderEditor({ context: "operator", agentOptions });
+    type("Name", "svc");
+    type("Website", "a.example.com");
+    openMoreOptions();
+    expect(screen.getByLabelText("Account login (optional)")).toBeVisible();
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "One key for every agent, set only by an administrator",
+      }),
+    );
+    expect(screen.queryByLabelText("Account login (optional)")).toBeNull();
+  });
+
   it("saves one key for every agent and the agents the service serves", async () => {
     const { onSave } = await renderEditor({
       context: "operator",

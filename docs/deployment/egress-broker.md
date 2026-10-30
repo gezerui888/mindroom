@@ -383,6 +383,7 @@ egress_broker:
 
 Requests from any other agent that the service matches get 403 `agent_not_allowed`, its egress page and the [`egress_credentials` tool](#agent-tool) leave the service out for that agent, and its placeholder variables are not set.
 The dashboard lists the service in every scope with the agents it is limited to.
+A user's own service on the same hosts and paths loses the tie to it, so for another agent a request uses that service only by naming it with the `X-Agent-Keys-Service` header (see [A service's own account](#a-services-own-account)).
 Every name must be an existing agent.
 Where agents share a sandbox, the list decides which agents get the key but not which code can reach it: the static runner runs every agent's calls in one process, and a requester's `user` agents share one worker, so code there can use a listed agent's proxy token (see [Personal accounts and shared sandboxes](#personal-accounts-and-shared-sandboxes)).
 

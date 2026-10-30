@@ -278,20 +278,21 @@ export function serializeService(
   else if (form.explicitlyEmpty.placeholders) authored.placeholder_env = {};
   const operator = options.context === "operator";
   const adminKey = operator && form.adminKey;
-  if (adminKey) {
-    // The server drops a preset's login itself and refuses one written next to the key.
-  } else if (form.preset === "") {
-    if (!options.sharedTarget && form.oauthProvider.trim())
-      authored.oauth_provider = form.oauthProvider.trim();
-  } else if (options.sharedTarget && presetHasLogin(form.preset, options)) {
-    // A shared agent cannot use personal accounts, so the preset's login is dropped.
-    authored.oauth_provider = null;
-  } else if (
-    initial?.oauth_provider !== undefined &&
-    form.preset === (initial.preset ?? "")
-  ) {
-    // An override written for this preset; another preset has its own login.
-    authored.oauth_provider = initial.oauth_provider;
+  // The server drops a preset's login itself for an admin key, and refuses one written next to it.
+  if (!adminKey) {
+    if (form.preset === "") {
+      if (!options.sharedTarget && form.oauthProvider.trim())
+        authored.oauth_provider = form.oauthProvider.trim();
+    } else if (options.sharedTarget && presetHasLogin(form.preset, options)) {
+      // A shared agent cannot use personal accounts, so the preset's login is dropped.
+      authored.oauth_provider = null;
+    } else if (
+      initial?.oauth_provider !== undefined &&
+      form.preset === (initial.preset ?? "")
+    ) {
+      // An override written for this preset; another preset has its own login.
+      authored.oauth_provider = initial.oauth_provider;
+    }
   }
   // As the form holds it: the server refuses a combination it cannot serve, and an unchanged save keeps it.
   if (form.separateAccount) authored.oauth_separate_account = true;

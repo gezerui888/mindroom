@@ -19,7 +19,7 @@ import pytest
 from agno.tools import Toolkit
 from structlog.testing import capture_logs
 
-from mindroom import agents, ai, ai_runtime, loop_hooks, response_turn
+from mindroom import ai, ai_runtime, loop_hooks, response_turn
 from mindroom.agent_loop.output_limit import CUT_OFF_TOOL_CALL_RESULT
 from mindroom.ai import ai_response, stream_agent_response
 from mindroom.ai_runtime import queued_message_signal_context
@@ -44,6 +44,8 @@ from mindroom.history.types import CompactionOutcome, HistoryScope
 from mindroom.hooks import (
     EVENT_TOOL_AFTER_CALL,
     EVENT_TOOL_BEFORE_CALL,
+    HookBindings,
+    HookRegistry,
     MessageEnvelope,
     ToolAfterCallContext,
     ToolBeforeCallContext,
@@ -75,7 +77,7 @@ from mindroom.session_storage.types import ConversationSession
 from mindroom.skill_learning.capture import SkillReviewCapture
 from mindroom.tool_system.call_record import recording_tool_calls
 from mindroom.tool_system.events import FailedReply
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, tool_runtime_context
+from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY
 from tests.access_schema_support import with_current_room_member_access
 from tests.approval_continuation_helpers import RECEIPT_CALLS, RECEIPT_TEXT
@@ -171,7 +173,7 @@ class _ExternalProbeToolkit(_ProbeToolkit):
 
 @pytest.fixture
 def probe() -> Iterator[type[_ProbeToolkit]]:
-    """Register the probe toolkits for the test and restore the registries afterwards."""
+    """Register the probe toolkits for the test and restore the built-in tools afterwards."""
     _ProbeToolkit.calls.clear()
     with registered_toolkit(PROBE_TOOL, _ProbeToolkit), registered_toolkit(EXTERNAL_PROBE_TOOL, _ExternalProbeToolkit):
         yield _ProbeToolkit
@@ -225,8 +227,6 @@ def _reply(
         config.tool_approval = ToolApprovalConfig(rules=list(approval_rules))
     model = ScriptedModel([list(turn) for turn in turns])
     install_model_providers(monkeypatch, {"default": model})
-    if plugins:
-        monkeypatch.setattr(agents, "_load_agent_plugins", lambda *_args, **_kwargs: list(plugins))
     runtime = make_test_tool_runtime_context(
         agent_name="assistant",
         target=MessageTarget(
@@ -244,8 +244,10 @@ def _reply(
         conversation_reader=make_conversation_reader_mock(),
         correlation_id="correlation-1",
         membership_turn_id=EVENT_ID,
+        # The turn's bot binds its plugins' hooks into the turn's context.
+        hooks=HookBindings(registry=HookRegistry.from_plugins(plugins)),
     )
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     storage = create_session_storage("assistant", config, runtime_paths, execution_identity=identity)
     return _Reply(config, runtime_paths, model, TurnRecorder(user_message="Hello"), storage, identity, runtime)
 

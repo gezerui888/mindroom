@@ -365,7 +365,6 @@ class _CallAgentCache:
     config: Config
     runtime_paths: RuntimePaths
     context: ToolRuntimeContext
-    execution_identity: ToolExecutionIdentity
     active_model_name: str | None
     build: AgentBuild | None = None
     knowledge_identity: tuple[int, ...] = ()
@@ -382,7 +381,7 @@ class _CallAgentCache:
             self.config,
             self.runtime_paths,
             refresh_scheduler=scheduler,
-            execution_identity=self.execution_identity,
+            execution_identity=self.context.execution_identity,
         )
 
         async def render(build: AgentBuild) -> str:
@@ -439,9 +438,9 @@ class _CallAgentCache:
             self.agent_name,
             self.config,
             self.runtime_paths,
-            execution_identity=self.execution_identity,
-            hook_registry=self.context.hook_registry,
+            execution_identity=self.context.execution_identity,
             knowledge=knowledge,
+            plugins=self.context.plugins,
             model=resolve_turn_model(
                 self.config,
                 self.runtime_paths,
@@ -508,11 +507,7 @@ async def build_call_tools(
             agent_name=agent_name,
         ),
     )
-    execution_identity = tool_support.build_execution_identity(
-        target=target,
-        user_id=requester_id,
-        agent_name=agent_name,
-    )
+    execution_identity = context.execution_identity
     if enable_responder:
         voice_enrichment_items: tuple[EnrichmentItem, ...] = ()
         if voice_instructions:
@@ -533,7 +528,6 @@ async def build_call_tools(
             config=config,
             runtime_paths=runtime_paths,
             context=context,
-            execution_identity=execution_identity,
             active_model_name=active_model_name,
         )
         responder = functools.partial(
@@ -541,9 +535,7 @@ async def build_call_tools(
             agent_name=agent_name,
             config=config,
             runtime_paths=runtime_paths,
-            tool_support=tool_support,
             context=context,
-            execution_identity=execution_identity,
             room_id=room_id,
             requester_id=requester_id,
             session_id=session_id,
@@ -580,8 +572,8 @@ async def build_call_tools(
                 config,
                 runtime_paths,
                 execution_identity,
-                hook_registry=context.hook_registry,
                 knowledge=knowledge_resolution.knowledge,
+                plugins=context.plugins,
                 include_interactive_questions=False,
                 tool_function_filter=context.tool_function_filter,
                 refresh_scheduler=refresh_scheduler,
@@ -668,9 +660,7 @@ async def _run_call_agent(
     agent_name: str,
     config: Config,
     runtime_paths: RuntimePaths,
-    tool_support: ToolRuntimeSupport,
     context: ToolRuntimeContext,
-    execution_identity: ToolExecutionIdentity,
     room_id: str,
     requester_id: str,
     session_id: str,
@@ -692,9 +682,7 @@ async def _run_call_agent(
             agent_name=agent_name,
             config=config,
             runtime_paths=runtime_paths,
-            tool_support=tool_support,
             context=context,
-            execution_identity=execution_identity,
             room_id=room_id,
             requester_id=requester_id,
             session_id=session_id,
@@ -713,9 +701,7 @@ async def _run_authorized_call_agent(
     agent_name: str,
     config: Config,
     runtime_paths: RuntimePaths,
-    tool_support: ToolRuntimeSupport,
     context: ToolRuntimeContext,
-    execution_identity: ToolExecutionIdentity,
     room_id: str,
     requester_id: str,
     session_id: str,
@@ -750,7 +736,7 @@ async def _run_authorized_call_agent(
             config,
             runtime_paths,
             refresh_scheduler=refresh_scheduler,
-            execution_identity=execution_identity,
+            execution_identity=context.execution_identity,
         )
         transient_enrichment_items = append_knowledge_availability_enrichment(
             (),
@@ -772,7 +758,7 @@ async def _run_authorized_call_agent(
             inline_tools=True,
             prompt=transcript,
             show_tool_calls=False,
-            execution_identity=execution_identity,
+            execution_identity=context.execution_identity,
             refresh_scheduler=refresh_scheduler,
             knowledge=knowledge_resolution.knowledge,
             eager_deferred_tools=True,
@@ -788,10 +774,8 @@ async def _run_authorized_call_agent(
             )
 
         async def _run_with_build(build: AgentBuild) -> TurnResult:
-            return await tool_support.run_in_context(
-                tool_context=context,
-                operation=functools.partial(_respond, build),
-            )
+            with tool_runtime_context(context):
+                return await _respond(build)
 
         result = await agent_cache.run(
             knowledge=knowledge_resolution.knowledge,

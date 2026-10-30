@@ -50,6 +50,7 @@ from mindroom.tool_jobs.consumption import finalize_consumption, set_consumption
 from mindroom.tool_jobs.execution_scope import owned_tool_execution
 from mindroom.tool_jobs.settings import background_tool_jobs_enabled
 from mindroom.tool_system.context_bound_streams import closing_async_stream
+from mindroom.tool_system.runtime_context import current_plugins
 from mindroom.turn_model import ModelScope, resolve_team_turn_models
 
 if TYPE_CHECKING:
@@ -318,6 +319,7 @@ async def continue_paused_team_run(
         persisted = _stored_paused_team_run(scope, run_id)
         delegated = has_delegation_state(persisted)
         decided = approval_decisions(approval_calls)
+        tools = current_plugins(config, runtime_paths).tools
         async with asyncio.TaskGroup() as recovery:
             required_tool_tasks = {
                 name: recovery.create_task(
@@ -326,6 +328,7 @@ async def continue_paused_team_run(
                         tuple(call for call in decided.approved if call.invoking_agent == name),
                         config=config,
                         runtime_paths=runtime_paths,
+                        tools=tools,
                         execution_identity=execution_identity,
                         delegation_depth=0,
                     ),

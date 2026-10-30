@@ -102,11 +102,13 @@ from mindroom.tool_system.output_files import (
     finalize_tool_output_file,
     prepare_tool_output_file,
 )
-from mindroom.tool_system.runtime_context import current_budget_monitor, get_tool_runtime_context, tool_runtime_context
-from mindroom.tool_system.tool_function import ToolOutcome
-from mindroom.tool_system.worker_routing import (
-    run_with_tool_execution_identity,
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.runtime_context import (
+    current_budget_monitor,
+    get_tool_runtime_context,
+    tool_runtime_context,
 )
+from mindroom.tool_system.tool_function import ToolOutcome
 from mindroom.turn_continuation import continuation_decision_from_tools, stopped_calls
 from mindroom.turn_model import ModelScope, resolve_turn_model
 from mindroom.workspaces import resolve_agent_workspace_from_state_path
@@ -278,18 +280,15 @@ async def _run_child(
     await reserve_child_turn(child, owner=caller_identity, runtime_paths=runtime_paths)
     async with child_run_context(child, config=config, runtime_paths=runtime_paths) as observation:
         with approval_receipt_call_ids(partial(child_call_id, child.delegation_id)):
-            response = await run_with_tool_execution_identity(
-                child_execution_identity(child),
-                operation=lambda: _execute_child(
-                    child,
-                    observation=observation,
-                    run_child=run_child,
-                    config=config,
-                    runtime_paths=runtime_paths,
-                    refresh_scheduler=refresh_scheduler,
-                    approval_calls=approval_calls,
-                    fresh=fresh,
-                ),
+            response = await _execute_child(
+                child,
+                observation=observation,
+                run_child=run_child,
+                config=config,
+                runtime_paths=runtime_paths,
+                refresh_scheduler=refresh_scheduler,
+                approval_calls=approval_calls,
+                fresh=fresh,
             )
         # The child's latest record: the one its run's stream ended with, or, for a child that did not run, the one
         # retained for it.
@@ -341,6 +340,7 @@ async def _execute_child(
         approved_calls,
         config=config,
         runtime_paths=runtime_paths,
+        tools=context.plugins.tools,
         execution_identity=identity,
         delegation_depth=child.depth,
     )
@@ -379,6 +379,7 @@ async def _execute_child(
             None,
         ),
         knowledge=knowledge.knowledge,
+        plugins=context.plugins,
         refresh_scheduler=refresh_scheduler,
         delegation_depth=child.depth,
         supports_native_tool_approval=True,
@@ -897,10 +898,12 @@ async def _resolve_follow_up_target(
     if previous_child.subagent_id != subagent_id:
         msg = "Subagent ID no longer matches its retained requirement"
         raise RuntimeError(msg)
+    live_config = live_delegation_config(config)
     refusal = retained is None and follow_up_refusal(
         previous_child.persona,
         caller_identity.agent_name,
-        live_delegation_config(config),
+        live_config,
+        config_plugins(live_config, runtime_paths).tools,
         delegation_depth=depth,
     )
     if refusal:
@@ -952,7 +955,8 @@ def _resolve_fresh_target(
         # The copy runs one level deeper, where delegate may no longer be offered.
         available_toolkits=lambda: caller_toolkit_names(
             caller_identity.agent_name,
-            live_delegation_config(config),
+            (live_config := live_delegation_config(config)),
+            config_plugins(live_config, runtime_paths).tools,
             delegation_depth=depth + 1,
         ),
         available_skills=lambda: caller_skill_names(

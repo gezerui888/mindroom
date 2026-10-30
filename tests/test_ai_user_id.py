@@ -86,18 +86,19 @@ from mindroom.response_turn import (
 )
 from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.session_storage.types import ConversationSession
+from mindroom.tool_system.context_bound_streams import context_bound_async_stream
 from mindroom.tool_system.events import CollectedStreamPresentation, FailedReply
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import (
-    LiveToolDispatchContext,
     ToolRuntimeContext,
+    current_execution_identity,
+    detached_tool_scope,
     get_tool_runtime_context,
     tool_runtime_context,
 )
 from mindroom.tool_system.worker_routing import (
+    bind_detached_execution_identity,
     build_tool_execution_identity,
-    get_tool_execution_identity,
-    stream_with_tool_execution_identity,
-    tool_execution_identity,
 )
 from mindroom.turn_continuation import TURN_CONTINUATION_LIMIT
 from tests.ai_user_id_helpers import (
@@ -260,6 +261,7 @@ def _model_runtime_context(
         client=AsyncMock(),
         config=config,
         runtime_paths=runtime_paths,
+        plugins=config_plugins(config, runtime_paths),
         conversation_reader=MagicMock(),
         relations=MagicMock(),
         active_model_name=active_model_name,
@@ -904,16 +906,16 @@ class TestUserIdPassthrough:
         async def source() -> AsyncIterator[str]:
             try:
                 assert get_tool_runtime_context() is tool_context
-                assert get_tool_execution_identity() == execution_identity
+                assert current_execution_identity() == execution_identity
                 yield "chunk"
                 await asyncio.Future()
             finally:
                 observed_final_contexts.append(
-                    (get_tool_runtime_context(), get_tool_execution_identity()),
+                    (get_tool_runtime_context(), current_execution_identity()),
                 )
 
-        stream = coordinator._stream_in_tool_context(
-            tool_dispatch=LiveToolDispatchContext.from_runtime_context(tool_context),
+        stream = coordinator.deps.tool_runtime.stream_in_context(
+            tool_context=tool_context,
             stream_factory=source,
         )
 
@@ -923,9 +925,10 @@ class TestUserIdPassthrough:
         assert observed_final_contexts == [(tool_context, execution_identity)]
 
     @pytest.mark.asyncio
-    async def test_execution_identity_stream_factory_masks_outer_context(self, tmp_path: Path) -> None:
-        """Factory setup should not inherit an outer execution identity when None is explicit."""
+    async def test_a_detached_stream_factory_masks_the_outer_context_and_identity(self, tmp_path: Path) -> None:
+        """Factory setup inherits neither an outer tool runtime context nor an outer execution identity."""
         runtime_paths = _runtime_paths(tmp_path)
+        outer_context = _model_runtime_context(_config(), runtime_paths, active_model_name="default")
         outer_identity = build_tool_execution_identity(
             channel="matrix",
             agent_name="outer",
@@ -936,46 +939,22 @@ class TestUserIdPassthrough:
             resolved_thread_id=None,
             session_id="outer-session",
         )
-        observed_identity: list[object | None] = []
+        observed: list[tuple[object | None, object | None]] = []
 
         def factory() -> AsyncIterator[str]:
-            observed_identity.append(get_tool_execution_identity())
+            observed.append((get_tool_runtime_context(), current_execution_identity()))
             msg = "factory boom"
             raise RuntimeError(msg)
 
-        with tool_execution_identity(outer_identity):
-            stream = stream_with_tool_execution_identity(None, stream_factory=factory)
-            with pytest.raises(RuntimeError, match="factory boom"):
-                await anext(stream)
-
-        assert observed_identity == [None]
-
-    @pytest.mark.asyncio
-    async def test_tool_runtime_stream_factory_masks_outer_context(self, tmp_path: Path) -> None:
-        """Factory setup should not inherit an outer tool runtime context when None is explicit."""
-        coordinator = unwrap_extracted_collaborator(_bot(tmp_path)._response_runner)
-        target = _target()
-        outer_context = coordinator.deps.tool_runtime.build_context(
-            target,
-            user_id="@outer:localhost",
-        )
-        assert outer_context is not None
-        observed_context: list[object | None] = []
-
-        def factory() -> AsyncIterator[str]:
-            observed_context.append(get_tool_runtime_context())
-            msg = "factory boom"
-            raise RuntimeError(msg)
-
-        with tool_runtime_context(outer_context):
-            stream = coordinator.deps.tool_runtime.stream_in_context(
-                tool_context=None,
+        with tool_runtime_context(outer_context), bind_detached_execution_identity(outer_identity):
+            stream = context_bound_async_stream(
+                context_factory=lambda: detached_tool_scope(None),
                 stream_factory=factory,
             )
             with pytest.raises(RuntimeError, match="factory boom"):
                 await anext(stream)
 
-        assert observed_context == [None]
+        assert observed == [(None, None)]
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("probe")

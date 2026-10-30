@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+import mindroom.approval.execution as approval_execution_module
+from mindroom.agents import create_agent
 from mindroom.ai import ai_response, stream_agent_response
 from mindroom.ai_run_metadata import prior_usage_of, with_prior_usage
 from mindroom.ai_runtime import queued_message_signal_context
@@ -19,6 +21,7 @@ from mindroom.approval.execution import (
     _stream_continuation_turn,
 )
 from mindroom.approval.receipt_readers import approval_receipt_context
+from mindroom.approval.tool_owners import required_approval_tool_names
 from mindroom.config.main import Config
 from mindroom.constants import AI_RUN_METADATA_KEY, PRIOR_USAGE_RUN_METADATA_KEY, resolve_runtime_paths
 from mindroom.custom_tools.calculator import CalculatorTools
@@ -49,17 +52,20 @@ from mindroom.tool_system.events import (
     StructuredStreamChunk,
     ToolTraceEntry,
 )
-from mindroom.tool_system.runtime_context import LiveToolDispatchContext, ToolDispatchContext
-from mindroom.tool_system.worker_routing import ToolExecutionIdentity, get_tool_execution_identity
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.runtime_context import current_execution_identity
+from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY
 from tests.approval_continuation_helpers import RECEIPT_CALLS, approval_continuation, carries_approval_receipt
 from tests.conftest import (
     bind_runtime_paths,
     install_model_providers,
     make_turn_context,
+    publish_test_plugins,
     record_store_threads,
     unwrap_extracted_collaborator,
 )
+from tests.delegation_helpers import turn_tool_context
 from tests.fakes.scripted_model import Await, ScriptedModel, ScriptStep, answer, calls, tool_call, usage
 from tests.response_runner_helpers import _bot
 from tests.scripted_agent_helpers import stop_turn, stored_runs
@@ -70,6 +76,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
+    from mindroom.event_journal import ApprovalContinuation
     from mindroom.llm.events import RunEvent
     from mindroom.llm.provider import ModelRequest, StreamEvent
     from mindroom.response_turn import ResponseTurnContext
@@ -119,6 +126,7 @@ def _identity(session_id: str) -> ToolExecutionIdentity:
         thread_id="$thread",
         resolved_thread_id="$thread",
         session_id=session_id,
+        transport_agent_name="general",
     )
 
 
@@ -301,12 +309,12 @@ async def test_approved_run_continues_after_a_same_turn_continuation(  # noqa: C
     original_sleep = SleepTools.sleep
 
     def add(self: CalculatorTools, a: float, b: float) -> str:
-        assert get_tool_execution_identity() == identity
+        assert current_execution_identity() == identity
         executed.append("add")
         return original_add(self, a, b)
 
     async def sleep(self: SleepTools, seconds: int) -> str:
-        assert get_tool_execution_identity() == identity
+        assert current_execution_identity() == identity
         executed.append("sleep")
         return await original_sleep(self, seconds)
 
@@ -338,8 +346,9 @@ async def test_approved_run_continues_after_a_same_turn_continuation(  # noqa: C
         show_tool_calls=show_tool_calls,
         continuation_count=2 if outcome == "immediate_pause" else 0,
     )
-    execution = _approval_execution(tmp_path, config, paths)
-    context = execution.tool_runtime.build_context(
+    runner = unwrap_extracted_collaborator(_bot(tmp_path / "runner")._response_runner)
+    execution = replace(runner.approvals._approval_execution, config=lambda: config, runtime_paths=paths)
+    context = runner.deps.tool_runtime.build_context(
         MessageTarget(
             identity.room_id,
             identity.thread_id,
@@ -351,10 +360,7 @@ async def test_approved_run_continues_after_a_same_turn_continuation(  # noqa: C
         active_model_name="default",
     )
     assert context is not None
-    dispatch = LiveToolDispatchContext(
-        execution_identity=identity,
-        runtime_context=replace(context, config=config, config_provider=None, runtime_paths=paths),
-    )
+    tool_context = replace(context, config=config, config_provider=None, runtime_paths=paths)
     trace: list[ToolTraceEntry] = []
     run_ids: list[str] = []
 
@@ -379,7 +385,7 @@ async def test_approved_run_continues_after_a_same_turn_continuation(  # noqa: C
             return await execution.continue_run(
                 continuation,
                 paused_answer=paused_answer,
-                tool_dispatch=dispatch,
+                tool_context=tool_context,
                 tool_trace_collector=trace,
                 typing_log_context={},
                 progress=None,
@@ -538,7 +544,7 @@ async def test_approval_settlement_preserves_tool_boundary(
         knowledge=None,
         refresh_scheduler=None,
         tool_trace_collector=trace,
-        tool_dispatch=ToolDispatchContext(execution_identity=identity),
+        tool_context=turn_tool_context(config, paths, identity),
         progress=None,
     )
     assert isinstance(result, CompletedApprovalRun)
@@ -588,7 +594,7 @@ async def test_approval_settlement_uses_typed_status(
         knowledge=None,
         refresh_scheduler=None,
         tool_trace_collector=[],
-        tool_dispatch=ToolDispatchContext(execution_identity=identity),
+        tool_context=turn_tool_context(config, paths, identity),
         progress=None,
     )
     if status is RunStatus.error:
@@ -718,7 +724,7 @@ async def test_approved_run_streams_progress_from_its_saved_presentation(
     result = await execution.continue_run(
         continuation,
         paused_answer=PausedAnswer(text=saved.response_text, tool_trace=tuple(saved.tool_trace)),
-        tool_dispatch=ToolDispatchContext(execution_identity=identity),
+        tool_context=turn_tool_context(config, paths, identity),
         tool_trace_collector=[],
         typing_log_context={},
         progress=progress,
@@ -740,6 +746,36 @@ async def test_approved_run_streams_progress_from_its_saved_presentation(
     assert "🔧 `subtract` [2] ⏳" in resumed[1]
     assert contents[-1] == result.response_text
     assert result.response_text.endswith("Both results are ready.")
+
+
+def _approved_add_continuation(
+    paused: PausedAttempt,
+    identity: ToolExecutionIdentity,
+    approval_id: str,
+) -> ApprovalContinuation:
+    """Return the claimed continuation of ``paused`` whose one call, the calculator's ``add`` of 2 and 3, is approved."""
+    return approval_continuation(
+        approval_id=approval_id,
+        run_id=paused.run_id,
+        session_id=identity.session_id,
+        room_id=identity.room_id,
+        thread_id=identity.thread_id,
+        requester_id=identity.requester_id,
+        state="claimed",
+        calls=(
+            ApprovalCall(
+                "approved",
+                "add",
+                "general",
+                2**62,
+                decision=ApprovalDecision.APPROVED,
+                toolkit_name="calculator",
+                arguments_digest=approval_arguments_digest({"a": 2, "b": 3}),
+            ),
+        ),
+        request_body="Add them.",
+        show_tool_calls=False,
+    )
 
 
 @pytest.mark.asyncio
@@ -779,35 +815,14 @@ async def test_an_approved_run_that_answers_without_text_shows_its_earlier_text_
     model = _CheckedModel([calls(tool_call("add", "approved", a=2, b=3), content=before), answer("")])
     install_model_providers(monkeypatch, {"default": model})
     paused = await _paused_turn(config, paths, identity, "Add them.", show_tool_calls=False)
-    continuation = approval_continuation(
-        approval_id="approval-silent",
-        run_id=paused.run_id,
-        session_id=identity.session_id,
-        room_id=identity.room_id,
-        thread_id=identity.thread_id,
-        requester_id=identity.requester_id,
-        state="claimed",
-        calls=(
-            ApprovalCall(
-                "approved",
-                "add",
-                "general",
-                2**62,
-                decision=ApprovalDecision.APPROVED,
-                toolkit_name="calculator",
-                arguments_digest=approval_arguments_digest({"a": 2, "b": 3}),
-            ),
-        ),
-        request_body="Add them.",
-        show_tool_calls=False,
-    )
+    continuation = _approved_add_continuation(paused, identity, "approval-silent")
     execution = _approval_execution(tmp_path, config, paths)
     threads = record_store_threads(monkeypatch, "load_session", "get_run")
 
     result = await execution.continue_run(
         continuation,
         paused_answer=PausedAnswer(text=paused.response_text, tool_trace=paused.tool_trace),
-        tool_dispatch=ToolDispatchContext(execution_identity=identity),
+        tool_context=turn_tool_context(config, paths, identity),
         tool_trace_collector=[],
         typing_log_context={},
         progress=None,
@@ -942,7 +957,7 @@ async def _approve_add(
     return await _approval_execution(tmp_path / call_id, config, paths).continue_run(
         continuation,
         paused_answer=PausedAnswer(text=paused.response_text, tool_trace=paused.tool_trace),
-        tool_dispatch=ToolDispatchContext(execution_identity=identity),
+        tool_context=turn_tool_context(config, paths, identity),
         tool_trace_collector=[],
         typing_log_context={},
         progress=None,
@@ -955,6 +970,68 @@ def _published_tokens(result: CompletedApprovalRun | PausedAttempt) -> tuple[int
     assert result.response_text.endswith("Done.")
     published = result.metadata_content[AI_RUN_METADATA_KEY]["usage"]
     return published["input_tokens"], published["output_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_an_approved_run_rebuilds_from_the_plugins_its_turn_captured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plugin publication after the continuation's turn captured its plugins reaches neither its tools nor its hooks.
+
+    The resumed build and its required-tool check both read the turn's capture, whose hooks the turn's context holds.
+    """
+    paths = resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path / "storage")
+    config = bind_runtime_paths(
+        Config.model_validate(
+            {
+                "defaults": {"tools": []},
+                "memory": {"backend": "none"},
+                "agents": {"general": {"display_name": "General", "tools": ["calculator"]}},
+                "models": {"default": {"provider": "synthetic", "id": "synthetic"}},
+                "tool_approval": {"rules": [{"match": "add", "action": "require_approval"}]},
+            },
+        ),
+        paths,
+    )
+    identity = _identity("captured-plugins-session")
+    install_model_providers(
+        monkeypatch,
+        {"default": _CheckedModel([calls(tool_call("add", "approved", a=2, b=3)), answer("Done.")])},
+    )
+    paused = await _paused_turn(config, paths, identity, "Add them.", show_tool_calls=False)
+    continuation = _approved_add_continuation(paused, identity, "approval-captured")
+    execution = _approval_execution(tmp_path, config, paths)
+    tool_context = turn_tool_context(config, paths, identity)
+    # A publication after the turn captured its plugins: the config's view is now another one.
+    publish_test_plugins(config, paths)
+    assert config_plugins(config, paths) is not tool_context.plugins
+    built: list[object] = []
+    checked: list[object] = []
+
+    def recording_create_agent(*args: object, **kwargs: object) -> object:
+        built.append(kwargs["plugins"])
+        return create_agent(*args, **kwargs)
+
+    async def recording_required_tools(*args: object, **kwargs: object) -> tuple[str, ...]:
+        checked.append(kwargs["tools"])
+        return await required_approval_tool_names(*args, **kwargs)
+
+    monkeypatch.setattr(approval_execution_module, "create_agent", recording_create_agent)
+    monkeypatch.setattr(approval_execution_module, "required_approval_tool_names", recording_required_tools)
+
+    result = await execution.continue_run(
+        continuation,
+        paused_answer=PausedAnswer(text=paused.response_text, tool_trace=paused.tool_trace),
+        tool_context=tool_context,
+        tool_trace_collector=[],
+        typing_log_context={},
+        progress=None,
+    )
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert built == [tool_context.plugins]
+    assert checked == [tool_context.plugins.tools]
 
 
 @pytest.mark.asyncio
@@ -1152,7 +1229,7 @@ async def test_a_run_that_paused_without_text_shows_no_paused_notice_in_its_paus
     result = await execution.continue_run(
         continuation,
         paused_answer=PausedAnswer(text=paused.response_text, tool_trace=paused.tool_trace),
-        tool_dispatch=ToolDispatchContext(execution_identity=identity),
+        tool_context=turn_tool_context(config, paths, identity),
         tool_trace_collector=[],
         typing_log_context={},
         progress=None,
@@ -1212,7 +1289,7 @@ async def test_an_approved_run_hands_its_session_to_queued_notice_finalization(
         result = await execution.continue_run(
             continuation,
             paused_answer=PausedAnswer(),
-            tool_dispatch=ToolDispatchContext(execution_identity=identity),
+            tool_context=turn_tool_context(config, paths, identity),
             tool_trace_collector=[],
             typing_log_context={},
             progress=None,
@@ -1265,7 +1342,7 @@ async def test_fresh_attempt_pause_publishes_its_progress_before_returning_the_p
         knowledge=None,
         refresh_scheduler=None,
         tool_trace_collector=[],
-        tool_dispatch=ToolDispatchContext(execution_identity=identity),
+        tool_context=turn_tool_context(config, paths, identity),
         progress=progress,
     )
 
@@ -1349,7 +1426,7 @@ async def test_a_call_that_failed_before_an_approval_replays_as_failed_when_the_
         await execution.continue_run(
             continuation,
             paused_answer=PausedAnswer(text=segment.text, tool_trace=segment.tool_trace),
-            tool_dispatch=ToolDispatchContext(execution_identity=identity),
+            tool_context=turn_tool_context(config, paths, identity),
             tool_trace_collector=[],
             typing_log_context={},
             progress=None,

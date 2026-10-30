@@ -233,6 +233,28 @@ def _list(client: TestClient, token: str | None = None, **headers: str) -> httpx
     )
 
 
+@pytest.mark.parametrize("public_url", ["https://Assistant.example.org", "https://assistant.example.org:443/"])
+def test_gateway_uses_browser_origin_for_oauth_and_transport(
+    gateway_app: FastAPI,
+    signed_headers: Callable[[str], dict[str, str]],
+    public_url: str,
+) -> None:
+    """Equivalent public URL spellings support discovery, consent, and authenticated MCP requests."""
+    snapshot = config_lifecycle.require_api_state(gateway_app).snapshot
+    snapshot.runtime_paths = replace(
+        snapshot.runtime_paths,
+        process_env={**snapshot.runtime_paths.process_env, "MINDROOM_PUBLIC_URL": public_url},
+    )
+    with TestClient(gateway_app, base_url=ORIGIN, follow_redirects=False) as client:
+        metadata = client.get("/.well-known/oauth-protected-resource/mcp")
+        assert metadata.status_code == 200, metadata.text
+        assert metadata.json()["resource"] == RESOURCE
+        assert metadata.json()["authorization_servers"] == [ORIGIN + "/mcp/oauth"]
+        token = _exchange(client, *_code(client, signed_headers("alice"))).json()["access_token"]
+        response = _list(client, token)
+        assert response.status_code == 200, response.text
+
+
 def test_gateway_runs_without_a_connections_agent(gateway_app: FastAPI) -> None:
     """`MINDROOM_CONNECTIONS_AGENT` only preselects an agent, so the gateway is on without it."""
     paths = config_lifecycle.require_api_state(gateway_app).snapshot.runtime_paths

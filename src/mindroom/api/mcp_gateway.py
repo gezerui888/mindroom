@@ -135,7 +135,8 @@ class GatewayRuntime:
             int(paths.env_value("MINDROOM_MCP_GATEWAY_ONBOARDING_RATE_LIMIT") or "60"),
             int(paths.env_value("MINDROOM_MCP_GATEWAY_ONBOARDING_SOURCE_RATE_LIMIT") or "10"),
         )
-        self.provider = GatewayOAuthProvider(paths, public_url=paths.env_value("MINDROOM_PUBLIC_URL") or "")
+        self.configured_public_url = (paths.env_value("MINDROOM_PUBLIC_URL") or "").rstrip("/")
+        self.provider = GatewayOAuthProvider(paths, public_url=self.configured_public_url)
         self.scim_token = self.provider.scim_token or ""
         self.accounts = GatewayAccounts(self.provider.store)
         self.selections = GatewaySelections(self.provider.store)
@@ -414,7 +415,7 @@ def _runtime(request: Request, *, paths: RuntimePaths | None = None) -> GatewayR
         runtime is None
         or runtime.external_settings != external_settings
         or not _enabled(paths)
-        or (paths.env_value("MINDROOM_PUBLIC_URL") or "").rstrip("/") != runtime.origin
+        or (paths.env_value("MINDROOM_PUBLIC_URL") or "").rstrip("/") != runtime.configured_public_url
         or (paths.env_value("MINDROOM_MCP_SCIM_TOKEN") or "") != runtime.scim_token
     ):
         raise HTTPException(404, "MCP gateway is disabled", headers=CONNECTIONS_HEADERS)

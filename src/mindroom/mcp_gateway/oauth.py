@@ -27,6 +27,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mindroom.mcp_gateway.accounts import account_is_active
 from mindroom.mcp_gateway.lifecycle import owned_grants, public_grant, touch_grant
 from mindroom.mcp_gateway.store import GatewayOAuthCapacityError, GatewayOAuthStore
+from mindroom.origins import normalized_origin
 
 if TYPE_CHECKING:
     import sqlite3
@@ -135,9 +136,10 @@ class GatewayOAuthProvider(
         public_url: str,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        origin = public_url.rstrip("/")
-        parsed = urlsplit(origin)
-        if not _valid_url(origin) or parsed.path or parsed.query:
+        configured_origin = public_url.rstrip("/")
+        origin = normalized_origin(configured_origin)
+        parsed = urlsplit(configured_origin)
+        if origin is None or not _valid_url(configured_origin) or parsed.path or parsed.query:
             msg = "MCP public URL must be an HTTPS origin or loopback HTTP origin"
             raise ValueError(msg)
         self.resource_url = origin + "/mcp"

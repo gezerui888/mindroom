@@ -250,9 +250,31 @@ def test_gateway_uses_browser_origin_for_oauth_and_transport(
         assert metadata.status_code == 200, metadata.text
         assert metadata.json()["resource"] == RESOURCE
         assert metadata.json()["authorization_servers"] == [ORIGIN + "/mcp/oauth"]
+        snapshot.runtime_paths = replace(
+            snapshot.runtime_paths,
+            process_env={**snapshot.runtime_paths.process_env, "MINDROOM_PUBLIC_URL": ORIGIN},
+        )
         token = _exchange(client, *_code(client, signed_headers("alice"))).json()["access_token"]
         response = _list(client, token)
         assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    "public_url",
+    [ORIGIN + "/path", ORIGIN + "?query=1", ORIGIN + "#fragment", "http://192.168.1.2", "https://other.example.org"],
+)
+def test_gateway_rejects_invalid_or_changed_public_origin(
+    gateway_app: FastAPI,
+    gateway_client: TestClient,
+    public_url: str,
+) -> None:
+    """Origin comparison rejects invalid configuration and a different valid origin."""
+    snapshot = config_lifecycle.require_api_state(gateway_app).snapshot
+    snapshot.runtime_paths = replace(
+        snapshot.runtime_paths,
+        process_env={**snapshot.runtime_paths.process_env, "MINDROOM_PUBLIC_URL": public_url},
+    )
+    assert gateway_client.get("/.well-known/oauth-protected-resource/mcp").status_code == 404
 
 
 def test_gateway_runs_without_a_connections_agent(gateway_app: FastAPI) -> None:
@@ -912,6 +934,7 @@ def test_token_storage_capacity_preserves_authorization_code(
     [
         ("MINDROOM_MCP_GATEWAY_ENABLED", "false"),
         ("MINDROOM_PUBLIC_URL", "https://example.org/unexpected-path"),
+        ("MINDROOM_PUBLIC_URL", "http://192.168.1.2"),
         ("MINDROOM_MCP_GATEWAY_ALLOWED_ORIGINS", "*"),
         ("MINDROOM_MCP_GATEWAY_ONBOARDING_RATE_LIMIT", "0"),
         ("MINDROOM_MCP_GATEWAY_ONBOARDING_RATE_LIMIT", "invalid"),

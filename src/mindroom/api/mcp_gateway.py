@@ -41,7 +41,7 @@ from mindroom.mcp_gateway.admission import OnboardingRateLimiter
 from mindroom.mcp_gateway.consent import render_consent_page
 from mindroom.mcp_gateway.execution import run_gateway_sync
 from mindroom.mcp_gateway.external_auth import ExternalAuth, ExternalAuthSettings
-from mindroom.mcp_gateway.oauth import GatewayOAuthProvider
+from mindroom.mcp_gateway.oauth import GatewayOAuthProvider, gateway_public_origin
 from mindroom.mcp_gateway.selection import GatewaySelections
 from mindroom.mcp_gateway.server import GatewayServer, read_gateway_body, replay_gateway_body
 from mindroom.mcp_gateway.store import GatewayOAuthCapacityError
@@ -135,8 +135,7 @@ class GatewayRuntime:
             int(paths.env_value("MINDROOM_MCP_GATEWAY_ONBOARDING_RATE_LIMIT") or "60"),
             int(paths.env_value("MINDROOM_MCP_GATEWAY_ONBOARDING_SOURCE_RATE_LIMIT") or "10"),
         )
-        self.configured_public_url = (paths.env_value("MINDROOM_PUBLIC_URL") or "").rstrip("/")
-        self.provider = GatewayOAuthProvider(paths, public_url=self.configured_public_url)
+        self.provider = GatewayOAuthProvider(paths, public_url=paths.env_value("MINDROOM_PUBLIC_URL") or "")
         self.scim_token = self.provider.scim_token or ""
         self.accounts = GatewayAccounts(self.provider.store)
         self.selections = GatewaySelections(self.provider.store)
@@ -409,13 +408,14 @@ def _runtime(request: Request, *, paths: RuntimePaths | None = None) -> GatewayR
         paths = require_api_state(request.app).snapshot.runtime_paths
     try:
         external_settings = ExternalAuthSettings.from_paths(paths)
+        public_origin = gateway_public_origin(paths.env_value("MINDROOM_PUBLIC_URL") or "")
     except ValueError as exc:
         raise HTTPException(404, "MCP gateway is disabled", headers=CONNECTIONS_HEADERS) from exc
     if (
         runtime is None
         or runtime.external_settings != external_settings
         or not _enabled(paths)
-        or (paths.env_value("MINDROOM_PUBLIC_URL") or "").rstrip("/") != runtime.configured_public_url
+        or public_origin != runtime.origin
         or (paths.env_value("MINDROOM_MCP_SCIM_TOKEN") or "") != runtime.scim_token
     ):
         raise HTTPException(404, "MCP gateway is disabled", headers=CONNECTIONS_HEADERS)

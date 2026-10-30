@@ -27,7 +27,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from mindroom.mcp_gateway.accounts import account_is_active
 from mindroom.mcp_gateway.lifecycle import owned_grants, public_grant, touch_grant
 from mindroom.mcp_gateway.store import GatewayOAuthCapacityError, GatewayOAuthStore
-from mindroom.origins import normalized_origin
+from mindroom.origins import parse_browser_origin
 
 if TYPE_CHECKING:
     import sqlite3
@@ -87,6 +87,15 @@ def _valid_url(value: str) -> bool:
         return False
 
 
+def gateway_public_origin(value: str) -> str:
+    """Normalize a browser origin while retaining the gateway's HTTPS-or-loopback rule."""
+    origin = parse_browser_origin(value.strip())
+    if not _valid_url(origin):
+        msg = "MCP public URL must be an HTTPS origin or loopback HTTP origin"
+        raise ValueError(msg)
+    return origin
+
+
 class _GatewayAuthorizationCode(AuthorizationCode):
     """Code bound to the user and grant approved in the browser."""
 
@@ -136,12 +145,7 @@ class GatewayOAuthProvider(
         public_url: str,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        configured_origin = public_url.rstrip("/")
-        origin = normalized_origin(configured_origin)
-        parsed = urlsplit(configured_origin)
-        if origin is None or not _valid_url(configured_origin) or parsed.path or parsed.query:
-            msg = "MCP public URL must be an HTTPS origin or loopback HTTP origin"
-            raise ValueError(msg)
+        origin = gateway_public_origin(public_url)
         self.resource_url = origin + "/mcp"
         self.issuer_url = origin + "/mcp/oauth"
         self.consent_url = origin + "/connections/mcp/authorize"

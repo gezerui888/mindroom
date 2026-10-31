@@ -1962,6 +1962,7 @@ depends_on = [
 [[modules]]
 path = "mindroom.api.homeassistant_integration"
 depends_on = [
+    "mindroom.api.auth",
     "mindroom.api.credentials_oauth_flows",
     "mindroom.api.credentials_target",
 ]

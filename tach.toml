@@ -7803,6 +7803,7 @@ depends_on = [
     "mindroom.tool_system.worker_proxy_client",
     "mindroom.tool_system.worker_routing",
     "mindroom.tool_system.agent_tools",
+    "mindroom.origins",
 ]
 
 [[modules]]

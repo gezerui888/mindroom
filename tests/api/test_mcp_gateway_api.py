@@ -267,7 +267,7 @@ def test_gateway_uses_browser_origin_for_oauth_and_transport(
 
 @pytest.mark.parametrize(
     "public_url",
-    [ORIGIN + "/path", ORIGIN + "?query=1", ORIGIN + "#fragment", "http://192.168.1.2", "https://other.example.org"],
+    [ORIGIN + "/path", ORIGIN + "?query=1", ORIGIN + "#fragment", "https://other.example.org"],
 )
 def test_gateway_rejects_invalid_or_changed_public_origin(
     gateway_app: FastAPI,

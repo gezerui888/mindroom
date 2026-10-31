@@ -12,8 +12,8 @@ import yaml
 from fastapi import HTTPException
 from fastapi.routing import APIRoute
 
+from mindroom.api import auth, egress_status, oauth
 from mindroom.api import egress_broker as egress_broker_api
-from mindroom.api import egress_status, oauth
 from mindroom.api.connection_agents import build_connection_agent_target
 from mindroom.config.egress_broker import EgressService
 from mindroom.constants import EXECUTION_ENV_TOOL_NAMES
@@ -38,6 +38,8 @@ from tests.api.test_egress_credentials_api import (
     _use_fake_oauth_providers,
     track_concurrent_calls,
 )
+from tests.api.test_oauth_api import _fail_connection_status
+from tests.runtime_fakes import bind_test_embedded_runtime
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
@@ -51,7 +53,7 @@ _BROKER_ON = {"MINDROOM_EGRESS_BROKER_PORT": "8768"}
 
 
 @pytest.fixture
-def egress_config_file(tmp_path: Path) -> Generator[Path, None, None]:
+def egress_config_file(tmp_path: Path) -> Generator[Path]:
     """Create a config file with egress broker services."""
     config_dir = tmp_path / "egress-test"
     config_dir.mkdir()
@@ -111,6 +113,7 @@ def _admin_client(egress_config_file: Path, *, broker_on: bool = True, **env: st
         process_env={"MINDROOM_OWNER_USER_ID": "@owner:example.org", **(_BROKER_ON if broker_on else {}), **env},
     )
     main.initialize_api_app(main.app, runtime_paths)
+    bind_test_embedded_runtime(main.app)
     config_lifecycle.load_config_into_app(main._app_runtime_paths(main.app), main.app)
     return TestClient(main.app, base_url="http://localhost")
 
@@ -402,11 +405,14 @@ def test_routes_require_dashboard_auth() -> None:
     from mindroom.api import main  # noqa: PLC0415
     from mindroom.api.auth import verify_user  # noqa: PLC0415
 
-    routes = [route for route in main.app.routes if getattr(route, "path", "").startswith("/api/egress-broker/")]
-    assert "/api/egress-broker/presets" in {route.path for route in routes}  # type: ignore[attr-defined]
+    routes = [
+        route
+        for route in main.app.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/api/egress-broker/")
+    ]
+    assert "/api/egress-broker/presets" in {route.path for route in routes}
     for route in routes:
-        dependencies = route.dependant.dependencies  # type: ignore[attr-defined]
-        assert any(dependency.call is verify_user for dependency in dependencies), route.path  # type: ignore[attr-defined]
+        assert any(dependency.call is verify_user for dependency in route.dependant.dependencies), route.path
 
 
 def test_every_route_is_a_404_while_the_broker_is_off(
@@ -693,6 +699,7 @@ def oauth_broker_client(egress_config_file: Path, monkeypatch: pytest.MonkeyPatc
     )
     _use_fake_oauth_providers(monkeypatch, runtime_paths)
     main.initialize_api_app(main.app, runtime_paths)
+    bind_test_embedded_runtime(main.app)
     config_lifecycle.load_config_into_app(main._app_runtime_paths(main.app), main.app)
     return TestClient(main.app, base_url="http://localhost")
 
@@ -1000,6 +1007,7 @@ def _enable_service_account() -> None:
     paths = main._app_runtime_paths(main.app)
     paths = replace(paths, process_env={**paths.process_env, "GOOGLE_SERVICE_ACCOUNT_FILE": "service-account.json"})
     main.initialize_api_app(main.app, paths)
+    bind_test_embedded_runtime(main.app)
     config_lifecycle.load_config_into_app(main._app_runtime_paths(main.app), main.app)
 
 
@@ -1042,14 +1050,7 @@ def test_an_unreadable_connection_state_degrades_one_service_without_failing_the
     failure: Exception,
 ) -> None:
     """Whatever fails while reading one provider's state, that service shows as not connectable and the rest stay."""
-    real = oauth.authenticated_connection_status
-
-    async def fails_for_drive(provider_id: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        if provider_id == "google_drive":
-            raise failure
-        return await real(provider_id, *args, **kwargs)
-
-    monkeypatch.setattr(oauth, "authenticated_connection_status", fails_for_drive)
+    _fail_connection_status(monkeypatch, failure, lambda provider_id: provider_id == "google_drive")
     response = oauth_broker_client.get("/api/egress-broker/services")
     assert response.status_code == 200, response.text
     assert "internal-client-secret" not in response.text
@@ -1127,17 +1128,17 @@ def test_listing_authenticates_once_not_per_service(
 ) -> None:
     """The router's dependency authenticates the request; the per-provider status does not repeat it."""
     calls: list[str] = []
-    real = oauth.verify_user
+    real = auth.authenticate_user
 
     async def counted(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
-        calls.append("verify")
+        calls.append("authenticate")
         return await real(*args, **kwargs)
 
-    monkeypatch.setattr(oauth, "verify_user", counted)
+    monkeypatch.setattr(auth, "authenticate_user", counted)
     assert oauth_broker_client.get("/api/egress-broker/services").status_code == 200
-    assert calls == []
+    assert calls == ["authenticate"]
     assert oauth_broker_client.get("/api/oauth/google_drive/status").status_code == 200
-    assert calls == ["verify"]
+    assert calls == ["authenticate", "authenticate"]
 
 
 def test_key_status_is_read_off_the_event_loop(
@@ -1151,23 +1152,63 @@ def test_key_status_is_read_off_the_event_loop(
     assert not any(on_loop)
 
 
-def test_services_load_every_status_at_once(oauth_broker_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Like the personal listing, the panel loads its services concurrently instead of one hop after another."""
-    counts = track_concurrent_calls(monkeypatch, egress_broker_api, "egress_service_status", limit=4, total=4)
-    response = oauth_broker_client.get("/api/egress-broker/services")
-    assert response.status_code == 200, response.text
-    assert [service["name"] for service in response.json()["services"]] == ["drive", "gh", "ghost", "github"]
-    assert counts == [0, 4]
-
-
-def test_services_load_at_most_the_status_load_limit_at_once(
+@pytest.mark.parametrize(("status_load_limit", "peak"), [(None, 4), (2, 2)], ids=["default-limit", "limit-2"])
+def test_services_load_their_statuses_concurrently_up_to_the_status_load_limit(
     oauth_broker_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    status_load_limit: int | None,
+    peak: int,
 ) -> None:
-    """The panel shares the personal listing's limit on service status loads running at once."""
-    monkeypatch.setattr(egress_status, "_STATUS_LOAD_LIMIT", 2)
-    counts = track_concurrent_calls(monkeypatch, egress_broker_api, "egress_service_status", limit=2, total=4)
+    """Like the personal listing, the panel loads its services concurrently, under the listing's shared load limit."""
+    if status_load_limit is not None:
+        monkeypatch.setattr(egress_status, "_STATUS_LOAD_LIMIT", status_load_limit)
+    counts = track_concurrent_calls(monkeypatch, egress_broker_api, "egress_service_status", limit=peak, total=4)
     response = oauth_broker_client.get("/api/egress-broker/services")
     assert response.status_code == 200, response.text
     assert [service["name"] for service in response.json()["services"]] == ["drive", "gh", "ghost", "github"]
-    assert counts == [0, 2]
+    assert counts == [0, peak]
+
+
+def _add_services(egress_config_file: Path, **services: dict[str, Any]) -> None:
+    """Add `services` to the config file's egress services."""
+    config_data = yaml.safe_load(egress_config_file.read_text(encoding="utf-8"))
+    config_data["egress_broker"]["services"].update(services)
+    egress_config_file.write_text(yaml.dump(config_data), encoding="utf-8")
+
+
+_SEARCH = {"rules": [{"host": "api.search.example", "auth": {"type": "bearer"}}]}
+
+
+def test_an_administrator_key_is_one_key_whichever_scope_sets_it(egress_config_file: Path) -> None:
+    """A key set while an agent's scope is selected is the global one, and every scope shows it set and removed."""
+    from mindroom.api import main  # noqa: PLC0415
+
+    _add_services(egress_config_file, search={**_SEARCH, "admin_key": True, "agents": ["test_agent"]})
+    client = _admin_client(egress_config_file)
+    manager = get_runtime_credentials_manager(main._app_runtime_paths(main.app))
+
+    put = client.put("/api/egress-broker/services/search/secret?agent_name=test_agent", json={"secret": "admin-key"})
+
+    assert put.status_code == 204, put.text
+    assert secrets.load_secret(manager, None, "search", admin_key=True) == "admin-key"
+    assert secrets.load_secret(manager, None, "search") is None
+    for agent_name in (None, "test_agent"):
+        row = _service(client, "search", agent_name)
+        assert (row["configured"], row["admin_key"], row["agents"]) == (True, True, ["test_agent"])
+    assert client.delete("/api/egress-broker/services/search/secret?agent_name=test_agent").status_code == 204
+    assert secrets.load_secret(manager, None, "search", admin_key=True) is None
+
+
+def test_the_dashboard_lists_a_service_for_agents_its_list_leaves_out(egress_config_file: Path) -> None:
+    """The administrator sees every config service in every scope, with the agents each one serves."""
+    _add_services(egress_config_file, search={**_SEARCH, "agents": ["test_agent"]})
+    client = _client_with_agents(
+        egress_config_file,
+        {
+            "test_agent": _keys_agent(["shell"], worker_scope="shared"),
+            "other": _keys_agent(["shell"], worker_scope="shared"),
+        },
+    )
+
+    assert _service(client, "search", "other")["agents"] == ["test_agent"]
+    assert (_service(client, "github", "other")["agents"], _service(client, "github")["admin_key"]) == (None, False)

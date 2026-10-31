@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,22 +10,28 @@ from typing import TYPE_CHECKING
 import pytest
 
 from mindroom.constants import (
-    MINDROOM_COMPACTION_METADATA_KEY,
+    MATRIX_EVENT_ID_METADATA_KEY,
+    MATRIX_SEEN_EVENT_IDS_METADATA_KEY,
+    MINDROOM_HISTORY_METADATA_KEY,
+)
+from mindroom.history.interrupted_replay import (
+    build_interrupted_replay_snapshot,
+    is_interrupted_replay_run,
+    persist_interrupted_replay_snapshot,
 )
 from mindroom.history.replay import scope_visible_runs
 from mindroom.history.storage import (
-    _with_scope_state,
     has_queued_force_compaction,
     read_scope_seen_event_ids,
     read_scope_state,
-    update_scope_seen_event_ids,
+    remove_runs_answering,
+    set_force_compaction,
+    with_force_compaction,
 )
 from mindroom.history.types import (
     HistoryScope,
-    HistoryScopeState,
 )
 from mindroom.llm.runs import RunRecord, RunStatus, TeamRunRecord
-from mindroom.session_storage import store as store_module
 from mindroom.session_storage.agent_storage import create_agent_state_storage, create_state_storage
 from mindroom.session_storage.types import ConversationSession
 from tests.conftest import (
@@ -34,9 +39,9 @@ from tests.conftest import (
 )
 from tests.history_helpers import (
     _completed_run,
-    _make_config,
     _session,
     _team_session,
+    trace_store_statements,
 )
 
 if TYPE_CHECKING:
@@ -45,38 +50,74 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def storage(tmp_path: Path) -> ConversationStore:
-    """Conversation storage for reading seen ids, which include the summary rows'."""
+    """The test agent's conversation storage."""
     return create_agent_state_storage("test_agent", tmp_path / "seen")
 
 
-def test_scope_seen_event_ids_survive_scope_state_writes(tmp_path: Path) -> None:
-    _config, _runtime_paths_value = _make_config(tmp_path)
-    scope = HistoryScope(kind="team", scope_id="team-123")
-    storage = create_state_storage("team_123", tmp_path / "seen", scope)
-    session = _team_session("session-1", team_id="team-123")
+def test_the_force_flag_is_set_and_cleared_beside_the_seen_ids(storage: ConversationStore) -> None:
+    """The owner's force flag and earlier releases' preserved seen ids share one value, and each field changes alone."""
+    session = seed_session(
+        storage,
+        _session(
+            "session-1",
+            runs=[_completed_run("run-1")],
+            metadata={MINDROOM_HISTORY_METADATA_KEY: {"seen_event_ids": ["$kept"]}},
+        ),
+    )
 
-    update_scope_seen_event_ids(storage, session, ["event-1"])
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
-
-    assert read_scope_seen_event_ids(storage, session) == {"event-1"}
-
-
-def test_with_scope_state_updates_only_force_flag(tmp_path: Path) -> None:
-    _config, _runtime_paths_value = _make_config(tmp_path)
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    forced = HistoryScopeState(force_compact_before_next_run=True)
-
-    forced_metadata = _with_scope_state({}, scope, forced)
-
-    assert read_scope_state(_session("session-1", metadata=forced_metadata)) == forced
-    cleared_metadata = _with_scope_state(forced_metadata, scope, HistoryScopeState())
-    assert read_scope_state(_session("session-1", metadata=cleared_metadata)) == HistoryScopeState()
-    assert cleared_metadata == {}
-    assert read_scope_state(_session("session-1", metadata=forced_metadata)) == forced
+    set_force_compaction(storage, session=session, forced=True)
+    assert session.metadata == {
+        MINDROOM_HISTORY_METADATA_KEY: {"seen_event_ids": ["$kept"], "force_compact_before_next_run": True},
+    }
+    set_force_compaction(storage, session=session, forced=False)
+    assert session.metadata == {MINDROOM_HISTORY_METADATA_KEY: {"seen_event_ids": ["$kept"]}}
+    assert with_force_compaction(None) == {MINDROOM_HISTORY_METADATA_KEY: {"force_compact_before_next_run": True}}
 
 
-def test_scope_seen_event_ids_include_persisted_response_event_ids(tmp_path: Path, storage: ConversationStore) -> None:
-    _config, _runtime_paths_value = _make_config(tmp_path)
+def test_clearing_the_force_flag_through_a_stale_session_lands_on_the_freshest_row(storage: ConversationStore) -> None:
+    """The clear applies to the stored row's latest metadata, keeps what another writer stored, and syncs the session."""
+    stale_session = seed_session(storage, _session("session-1", runs=[_completed_run("run-1")]))
+
+    concurrent_session = storage.load_session("session-1")
+    assert concurrent_session is not None
+    storage.update_metadata(concurrent_session, lambda metadata: {**with_force_compaction(metadata), "other": "kept"})
+    storage.save_run(concurrent_session, _completed_run("run-2"), record_usage=False)
+
+    set_force_compaction(storage, session=stale_session, forced=False)
+
+    persisted_session = storage.load_session("session-1")
+    assert persisted_session is not None
+    assert persisted_session.metadata == {"other": "kept"}
+    assert stale_session.metadata == persisted_session.metadata
+    assert [run.run_id for run in persisted_session.runs] == ["run-1", "run-2"]
+
+
+@pytest.mark.parametrize("forced", [True, False], ids=["already-forced", "never-forced"])
+def test_a_force_flag_update_that_changes_nothing_writes_nothing(
+    storage: ConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    forced: bool,
+) -> None:
+    """Setting the flag to what the freshest row holds writes nothing, and the session then holds that row's metadata."""
+    stale_session = seed_session(storage, _session("session-1", runs=[_completed_run("run-1")]))
+    if forced:
+        concurrent_session = storage.load_session("session-1")
+        assert concurrent_session is not None
+        storage.update_metadata(concurrent_session, with_force_compaction)
+    statements = trace_store_statements(monkeypatch)
+
+    set_force_compaction(storage, session=stale_session, forced=forced)
+
+    assert read_scope_state(stale_session).force_compact_before_next_run is forced
+    assert statements
+    assert not [statement for statement in statements if statement.lstrip().upper().startswith("UPDATE")]
+    persisted_session = storage.load_session("session-1")
+    assert persisted_session is not None
+    assert stale_session.metadata == persisted_session.metadata
+
+
+def test_scope_seen_event_ids_include_persisted_response_event_ids(storage: ConversationStore) -> None:
     run = _completed_run("run-1")
     run.metadata = {
         "matrix_seen_event_ids": ["question-1"],
@@ -119,110 +160,63 @@ def test_seen_event_ids_match_model_history_visibility(tmp_path: Path, *, is_tea
         make_run("error", RunStatus.error),
         make_run("child", RunStatus.completed, parent_run_id="completed"),
     ]
-    session: ConversationSession
-    if is_team:
-        session = ConversationSession(
-            kind="team",
-            session_id="session-1",
-            owner_id=entity_id,
-            runs=runs,
-            created_at=1,
-        )
-    else:
-        session = ConversationSession(
-            kind="agent",
-            session_id="session-1",
-            owner_id=entity_id,
-            runs=runs,
-            created_at=1,
-        )
-    update_scope_seen_event_ids(storage, session, ["preserved-event"])
+    session = ConversationSession(
+        kind=scope.kind,
+        session_id="session-1",
+        owner_id=entity_id,
+        runs=runs,
+        # Seen ids earlier releases copied onto the session row; no run or summary row holds them.
+        metadata={MINDROOM_HISTORY_METADATA_KEY: {"seen_event_ids": ["preserved-event"]}},
+        created_at=1,
+    )
 
-    assert read_scope_seen_event_ids(storage, session) == {"completed-event", "preserved-event", "running-event"}
+    assert read_scope_seen_event_ids(storage, session) == {"completed-event", "running-event"}
     assert [run.run_id for run in scope_visible_runs(session)] == ["completed", "running"]
 
 
-def test_scope_states_do_not_bleed_between_scopes(tmp_path: Path) -> None:
-    _config, _runtime_paths_value = _make_config(tmp_path)
-    agent_scope = HistoryScope(kind="agent", scope_id="test_agent")
-    metadata = _with_scope_state(None, agent_scope, HistoryScopeState(force_compact_before_next_run=True))
+def test_an_edit_cut_returns_the_messages_only_the_removed_run_read(storage: ConversationStore) -> None:
+    """The context only an edited turn's removed run read returns, although earlier releases copied it onto the row."""
+    runs = [
+        replace(
+            _completed_run(run_id),
+            metadata={MATRIX_EVENT_ID_METADATA_KEY: f"${run_id}", MATRIX_SEEN_EVENT_IDS_METADATA_KEY: seen},
+        )
+        for run_id, seen in (("t1", ["$t1"]), ("t2", ["$t2", "$context-of-t2"]))
+    ]
+    copy = {MINDROOM_HISTORY_METADATA_KEY: {"seen_event_ids": ["$t1", "$t2", "$context-of-t2"]}}
+    session = seed_session(storage, _session("session-1", runs=runs, metadata=copy))
+    assert read_scope_seen_event_ids(storage, session) == {"$t1", "$t2", "$context-of-t2"}
 
-    assert read_scope_state(_session("session-1", metadata=metadata)).force_compact_before_next_run is True
-    team_session = _team_session("session-1", team_id="team-123", metadata=metadata)
-    assert read_scope_state(team_session).force_compact_before_next_run is False
+    assert remove_runs_answering(storage, "session-1", HistoryScope(kind="agent", scope_id="test_agent"), "$t2")
+
+    stored = storage.load_session("session-1")
+    assert stored is not None
+    assert [run.run_id for run in stored.runs] == ["t1"]
+    assert read_scope_seen_event_ids(storage, stored) == {"$t1"}
 
 
 def test_queued_force_compaction_reads_the_session_row_without_its_runs(
     storage: ConversationStore,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    agent_scope = HistoryScope(kind="agent", scope_id="test_agent")
-    other_scope = HistoryScope(kind="agent", scope_id="other_agent")
-    assert has_queued_force_compaction(storage, "flagged", agent_scope) is False
+    assert has_queued_force_compaction(storage, "flagged") is False
 
     flagged = _session("flagged", runs=[_completed_run("run-1")])
-    flagged.metadata = _with_scope_state(
-        flagged.metadata,
-        agent_scope,
-        HistoryScopeState(force_compact_before_next_run=True),
-    )
+    flagged.metadata = with_force_compaction(flagged.metadata)
     for session in (flagged, _session("idle", runs=[_completed_run("run-2")])):
         seed_session(storage, session)
-    statements: list[str] = []
-    connect = store_module.connect_conversation_database
+    statements = trace_store_statements(monkeypatch)
 
-    def traced_connect(path: Path) -> sqlite3.Connection:
-        connection = connect(path)
-        connection.set_trace_callback(statements.append)
-        return connection
-
-    monkeypatch.setattr(store_module, "connect_conversation_database", traced_connect)
-
-    assert has_queued_force_compaction(storage, "flagged", agent_scope) is True
-    assert has_queued_force_compaction(storage, "flagged", other_scope) is False
-    assert has_queued_force_compaction(storage, "idle", agent_scope) is False
-    assert has_queued_force_compaction(storage, "missing", agent_scope) is False
+    assert has_queued_force_compaction(storage, "flagged") is True
+    assert has_queued_force_compaction(storage, "idle") is False
+    assert has_queued_force_compaction(storage, "missing") is False
     assert statements
     run_tables = (storage.names.log_runs, storage.names.log_messages)
     assert not any(table in statement for table in run_tables for statement in statements)
 
 
-def test_legacy_scope_state_metadata_is_ignored(tmp_path: Path) -> None:
-    _config, _runtime_paths_value = _make_config(tmp_path)
-    agent_scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session = _session(
-        "session-1",
-        metadata={
-            MINDROOM_COMPACTION_METADATA_KEY: {
-                "version": 1,
-                "force_compact_before_next_run": True,
-            },
-        },
-    )
-
-    assert read_scope_state(session).force_compact_before_next_run is False
-
-    session.metadata = _with_scope_state(
-        session.metadata,
-        agent_scope,
-        HistoryScopeState(force_compact_before_next_run=True),
-    )
-
-    assert session.metadata == {
-        MINDROOM_COMPACTION_METADATA_KEY: {
-            "version": 2,
-            "states": {
-                agent_scope.key: {
-                    "force_compact_before_next_run": True,
-                },
-            },
-        },
-    }
-
-
 def test_scope_seen_event_ids_do_not_bleed_between_scopes(tmp_path: Path) -> None:
-    """A scope's seen ids leave out the runs and preserved ids of another scope with the same id."""
-    _config, _runtime_paths_value = _make_config(tmp_path)
+    """A scope's seen ids leave out the runs of another scope with the same id."""
     team_scope = HistoryScope(kind="team", scope_id="team-123")
     storage = create_state_storage("team_123", tmp_path / "seen", team_scope)
     session = _team_session(
@@ -243,7 +237,36 @@ def test_scope_seen_event_ids_do_not_bleed_between_scopes(tmp_path: Path) -> Non
             ),
         ],
     )
-    update_scope_seen_event_ids(storage, session, ["preserved-team-event"])
 
     assert read_scope_seen_event_ids(storage, replace(session, kind="agent")) == {"agent-event"}
-    assert read_scope_seen_event_ids(storage, session) == {"team-event", "preserved-team-event"}
+    assert read_scope_seen_event_ids(storage, session) == {"team-event"}
+
+
+def test_an_interrupted_record_over_a_completed_team_run_keeps_the_events_it_read(tmp_path: Path) -> None:
+    """A team turn that failed after its terminal save keeps the events it read in the record that replaces its run."""
+    team_scope = HistoryScope(kind="team", scope_id="team-123")
+    storage = create_state_storage("team_123", tmp_path / "seen", team_scope)
+    metadata = {"matrix_event_id": "$question", "matrix_seen_event_ids": ["$question", "$context"]}
+    completed = TeamRunRecord(run_id="team-run", team_id="team-123", status=RunStatus.completed, metadata=metadata)
+    session = seed_session(storage, _team_session("session-1", team_id="team-123", runs=[completed]))
+
+    persist_interrupted_replay_snapshot(
+        storage=storage,
+        session=session,
+        run_id="team-run",
+        snapshot=build_interrupted_replay_snapshot(
+            user_message="Question",
+            user_message_is_structured=False,
+            partial_text="Partial answer",
+            completed_tools=(),
+            interrupted_tools=(),
+            run_metadata=metadata,
+        ),
+    )
+
+    stored = storage.load_session("session-1")
+    assert stored is not None
+    assert [(run.run_id, run.status, is_interrupted_replay_run(run)) for run in stored.runs] == [
+        ("team-run", RunStatus.completed, True),
+    ]
+    assert read_scope_seen_event_ids(storage, stored) == {"$question", "$context"}

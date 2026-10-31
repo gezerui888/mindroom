@@ -39,7 +39,7 @@ The exported JSON summary lists counts, agents, rooms, teams, and model configur
 
 - **Display name**, **Role description**, **Model**, **Instructions**, and **Rooms**
 - **Memory backend** - inherit the global backend or override it per agent (`mem0`, `file`, or `none`)
-- **Tools** - configured tools (green badge) and tools that need no setup
+- **Tools** - configured tools (green badge) and tools that need no setup; unchecking a tool discards its settings
 - **Deferred tools** - open a checked tool's settings and enable **Defer until searched** (`defer`) or **Send on every request** (`initial`, which requires `defer`); presets and control-plane tools such as `dynamic_tools` do not offer it (see [Dynamic Tools](tools/dynamic-tools.md))
 - **More settings** - every other agent field, such as `participation`, `mid_turn`, `accept_invites`, `access`, `memory_search`, `thread_exports`, and `room_thread_modes`
 - **Personal agents** - a read-only list of the agents generated from [`personal_agents`](personal-agents.md) templates, with each owner, Matrix ID, template, and status; edit the templates under Settings → Personal rooms
@@ -109,7 +109,7 @@ See [Knowledge Bases](knowledge.md) for configuration and sync behavior; assign 
 
 A new service named after a provider key environment variable, such as `ANTHROPIC_API_KEY`, is saved as the canonical provider service (`anthropic`) that the Models tab and runtime read.
 An existing service with an environment-variable name keeps receiving writes, because config may reference it by that exact name.
-See [Credential Storage](oauth-framework.md#credential-storage) for credentials imported from `.env`, such as `GITHUB_TOKEN`.
+See [Credentials from the Environment](oauth-framework.md#credentials-from-the-environment) for credentials read from `.env`, such as `GITHUB_TOKEN`.
 
 ### Voice
 
@@ -130,7 +130,7 @@ See [Skills](skills.md#installing-and-managing-skills).
 
 The **Settings** tab edits every top-level configuration section without a dedicated tab, grouped into Responses, History and context, Tools and workers, Router, Personal rooms, Room defaults, Tool approval, Prompts, MCP servers, Plugins, Access and identity, Matrix and runtime, and Diagnostics.
 Any option no tab claims appears under **Other**.
-**Tools and workers** also edits per-tool overrides for the default tools every agent inherits.
+**Tools and workers** also edits per-tool overrides for the default tools every agent inherits; removing a tool from the default tools discards its overrides.
 
 ## Editing and Saving
 
@@ -177,19 +177,7 @@ The dashboard uses the backend REST API under `/api/`, with the same authenticat
 | GET | `/api/config/raw` | Fetch raw `config.yaml` text |
 | PUT | `/api/config/raw` | Replace raw `config.yaml` text |
 | GET | `/api/config/schema` | Configuration JSON schema used by Settings and More settings |
-| GET | `/api/config/agents` | List agents |
 | GET | `/api/config/personal-agents` | List generated personal agents |
-| POST | `/api/config/agents` | Create agent |
-| PUT | `/api/config/agents/{id}` | Update agent |
-| DELETE | `/api/config/agents/{id}` | Delete agent |
-| GET | `/api/config/teams` | List teams |
-| POST | `/api/config/teams` | Create team |
-| PUT | `/api/config/teams/{id}` | Update team |
-| DELETE | `/api/config/teams/{id}` | Delete team |
-| GET | `/api/config/models` | List model configurations |
-| PUT | `/api/config/models/{id}` | Update model configuration |
-| GET | `/api/config/room-models` | Get room model overrides |
-| PUT | `/api/config/room-models` | Update room model overrides |
 | POST | `/api/config/agent-policies` | Derived agent policies for a draft config |
 
 ### Credentials API
@@ -253,7 +241,6 @@ Upload and delete return HTTP 409 for Git-backed bases (see [Sync Behavior](know
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/tools` | List available tools |
-| GET | `/api/rooms` | List configured rooms |
 | GET | `/api/matrix/agents/rooms` | All agents' room memberships |
 | GET | `/api/matrix/agents/{id}/rooms` | One agent's rooms |
 | POST | `/api/matrix/rooms/leave` | Leave one room |

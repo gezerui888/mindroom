@@ -23,10 +23,12 @@ from mindroom.message_target import MessageTarget
 from mindroom.oauth.credential_lifecycle import resolve_oauth_credential_context
 from mindroom.oauth.credential_store import _oauth_credential_database_path
 from mindroom.oauth.github import github_oauth_provider
-from mindroom.oauth.google_drive import google_drive_oauth_provider
+from mindroom.oauth.google import google_oauth_provider
 from mindroom.tool_system.agent_tools import resolve_agent_tools
 from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess, ToolManagedInitArg, ToolStatus
-from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
+from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from tests.conftest import bind_runtime_paths, make_conversation_reader_mock, make_relation_lookup
 from tests.egress_broker.conftest import account_store, allow_oauth_reuse, connect_account, worker_target
@@ -78,13 +80,15 @@ def _context(
     services: dict[str, object] | None = None,
     agents: dict[str, AgentConfig] | None = None,
 ) -> ToolRuntimeContext:
+    config = Config(agents=agents or {}, egress_broker={"services": _SERVICES if services is None else services})
     return ToolRuntimeContext(
         agent_name="code",
         target=MessageTarget.resolve(room_id="!room:example.org", thread_id="$thread", reply_to_event_id="$request"),
         requester_id=_ALICE,
         client=MagicMock(),
-        config=Config(agents=agents or {}, egress_broker={"services": _SERVICES if services is None else services}),
+        config=config,
         runtime_paths=runtime_paths,
+        plugins=config_plugins(config, runtime_paths),
         relations=make_relation_lookup(),
         conversation_reader=make_conversation_reader_mock(),
     )
@@ -184,7 +188,7 @@ def _connect_drive(
     worker_scope: WorkerScope | None,
 ) -> None:
     """Store Alice's Google Drive connection where the provider's own scope policy puts it for that call."""
-    provider = google_drive_oauth_provider()
+    provider = google_oauth_provider("google_drive")
     target = worker_target(_ALICE, scope=worker_scope)
     store = resolve_oauth_credential_context(provider, runtime_paths, manager, target).worker_target
     connect_account(
@@ -418,7 +422,11 @@ def test_without_worker_target_explains_a_worker_scoped_agent_is_required(tmp_pa
 
 def test_an_agent_whose_commands_run_in_the_primary_is_told_agent_keys_do_not_apply(tmp_path: Path) -> None:
     """Its shell runs in the primary, so the tool lists no services and sends the agent to the operator, not a page."""
-    runtime_paths = _runtime_paths(tmp_path, MINDROOM_PUBLIC_URL="https://mindroom.example")
+    runtime_paths = _runtime_paths(
+        tmp_path,
+        MINDROOM_PUBLIC_URL="https://mindroom.example",
+        MINDROOM_EGRESS_BROKER_PORT="8768",
+    )
     agent = AgentConfig(display_name="Code", tools=["shell", "egress_credentials"], worker_tools=[])
 
     payload = _list(_tool(runtime_paths), _context(runtime_paths, agents={"code": agent}))
@@ -451,7 +459,7 @@ def test_no_configured_services_says_so(tmp_path: Path) -> None:
 
 def test_registers_and_builds_via_metadata(tmp_path: Path) -> None:
     """The tool builds through the registry with runtime paths and worker target injected."""
-    metadata = TOOL_METADATA["egress_credentials"]
+    metadata = builtin_tool_registry().entries["egress_credentials"]
     assert metadata.display_name == "Egress Credentials"
     assert metadata.description == (
         "Opt this agent's worker-routed shell and python calls into Agent Keys and see which keys and accounts it can use"
@@ -463,10 +471,15 @@ def test_registers_and_builds_via_metadata(tmp_path: Path) -> None:
     assert metadata.managed_init_args == (ToolManagedInitArg.RUNTIME_PATHS, ToolManagedInitArg.WORKER_TARGET)
     assert metadata.function_names == ("list_egress_credentials",)
 
-    tool = get_tool_by_name("egress_credentials", _runtime_paths(tmp_path), worker_target=worker_target())
+    tool = get_tool_by_name(
+        "egress_credentials",
+        _runtime_paths(tmp_path),
+        worker_target=worker_target(),
+        tools=builtin_tool_registry(),
+    )
 
     assert isinstance(tool, EgressCredentialsTools)
-    assert [function.__name__ for function in tool.tools] == ["list_egress_credentials"]
+    assert [function.__name__ for function in tool.functions.values()] == ["list_egress_credentials"]
 
 
 @pytest.mark.parametrize("broker_on", [False, True])
@@ -476,7 +489,8 @@ def test_an_agent_gets_the_tool_only_while_the_broker_is_on(tmp_path: Path, *, b
     agent = AgentConfig(display_name="Code", tools=["shell", "egress_credentials"], worker_scope="user_agent")
     config = bind_runtime_paths(Config(agents={"code": agent}), runtime_paths)
 
-    toolkit_names = [entry.name for entry in resolve_agent_tools(config, "code").candidates()]
+    tools = config_plugins(config, runtime_paths).tools
+    toolkit_names = [entry.name for entry in resolve_agent_tools(config, "code", tools).candidates()]
 
     assert config.agents["code"].tool_names == ["shell", "egress_credentials"]
     assert "shell" in toolkit_names
@@ -674,7 +688,7 @@ def test_shared_service_account_is_not_injected_so_it_is_not_connected(tmp_path:
         runtime_paths,
         worker_target(),
         "drive",
-        provider=google_drive_oauth_provider(),
+        provider=google_oauth_provider("google_drive"),
     )
 
     payload = _list(_tool(runtime_paths), _context(runtime_paths, _DRIVE_SERVICES))
@@ -857,3 +871,26 @@ def test_a_service_with_its_own_account_is_marked_and_the_note_names_the_header(
     assert "`X-Agent-Keys-Service: <name>`" in str(payload["note"])
     # A key wins elsewhere, but such a service takes none, so the agent never sends the user to add one for it.
     assert "a `separate_account: true` service takes no API key, only its own account" in str(payload["note"])
+
+
+def test_an_administrator_key_is_listed_as_set_and_marked_as_the_administrators(tmp_path: Path) -> None:
+    """A personal scope reads the administrator's key from the global store, and the entry says nobody else sets it."""
+    runtime_paths = _runtime_paths(tmp_path)
+    save_secret(get_runtime_credentials_manager(runtime_paths), None, "openai", _SECRET, admin_key=True)
+    services = {**_SERVICES, "openai": {**_SERVICES["openai"], "admin_key": True}}
+
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, services))
+
+    assert payload["services"] == [_unconfigured("github", "GitHub"), {**_keyed("openai"), "admin_key": True}]
+    assert "`admin_key: true`" in payload["note"]
+
+
+def test_a_service_limited_to_other_agents_is_not_listed(tmp_path: Path) -> None:
+    """The broker refuses this agent such a service, so it is not offered as one the user could fix."""
+    runtime_paths = _runtime_paths(tmp_path)
+    agents = {"code": AgentConfig(display_name="Code"), "other": AgentConfig(display_name="Other")}
+    services = {**_SERVICES, "openai": {**_SERVICES["openai"], "agents": ["other"]}}
+
+    payload = _list(_tool(runtime_paths), _context(runtime_paths, services, agents))
+
+    assert [entry["name"] for entry in payload["services"]] == ["github"]

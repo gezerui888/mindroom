@@ -13,8 +13,6 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
-from agno.tools import Toolkit
-
 from mindroom.attachments.storage import register_bytes_attachment
 from mindroom.background_tasks import run_blocking_until_complete
 from mindroom.config.main import Config  # noqa: TC001  # resolved by tool contract introspection
@@ -60,6 +58,7 @@ from mindroom.oauth.service import (
     OAUTH_RESET_REQUIRED_REASON,
     oauth_connection_required,
 )
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.runtime_context import append_tool_runtime_attachment_id, get_tool_runtime_context
 from mindroom.tool_system.sandbox_proxy import INLINE_ATTACHMENT_BYTES_ENV, inline_attachment_byte_limit
 
@@ -98,70 +97,62 @@ class _InvalidArgumentError(AtlassianError):
         super().__init__(code="invalid_argument", message=message)
 
 
-def _page_id(value: object, *, field_name: str = "page_id") -> str:
-    if isinstance(value, str) and value.isascii() and _PAGE_ID_PATTERN.fullmatch(value):
+def _page_id(value: str, *, field_name: str = "page_id") -> str:
+    if _PAGE_ID_PATTERN.fullmatch(value):
         return value
     msg = f"{field_name} must be a numeric Confluence page ID, not a URL, title, or path."
     raise _InvalidArgumentError(msg)
 
 
-def _confluence_attachment_id(value: object) -> str:
-    match = _ATTACHMENT_ID_PATTERN.fullmatch(value) if isinstance(value, str) and value.isascii() else None
+def _confluence_attachment_id(value: str) -> str:
+    match = _ATTACHMENT_ID_PATTERN.fullmatch(value)
     if match is None:
         msg = "attachment_id must be a Confluence attachment ID from confluence_list_attachments, such as att123456."
         raise _InvalidArgumentError(msg)
     return f"att{match.group(1)}"
 
 
-def _issue_key(value: object) -> str:
-    if isinstance(value, str) and value.isascii() and _ISSUE_KEY_PATTERN.fullmatch(value):
+def _issue_key(value: str) -> str:
+    if _ISSUE_KEY_PATTERN.fullmatch(value):
         return value.upper()
     msg = "issue_key must be a Jira issue key such as PROJ-123, or a numeric issue ID."
     raise _InvalidArgumentError(msg)
 
 
-def _required_text(value: object, field_name: str) -> str:
-    if isinstance(value, str) and value.strip():
+def _required_text(value: str, field_name: str) -> str:
+    if value.strip():
         return value
     msg = f"{field_name} must be a non-empty string."
     raise _InvalidArgumentError(msg)
 
 
-def _page_size(value: object, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        msg = f"{field_name} must be an integer."
-        raise _InvalidArgumentError(msg)
+def _page_size(value: int) -> int:
     return max(1, min(value, _MAX_PAGE_SIZE))
 
 
-def _cursor(value: object, field_name: str) -> str | None:
+def _cursor(value: str | None, field_name: str) -> str | None:
     if value is None:
         return None
-    if isinstance(value, str) and _CURSOR_PATTERN.fullmatch(value):
+    if _CURSOR_PATTERN.fullmatch(value):
         return value
     msg = f"{field_name} must be the unchanged value returned by a previous call."
     raise _InvalidArgumentError(msg)
 
 
-def _string_list(value: object, field_name: str) -> list[str] | None:
+def _string_list(value: list[str] | None, field_name: str) -> list[str] | None:
     if value is None:
         return None
-    raw_items = cast("list[object]", value) if isinstance(value, list) else []
-    items = [item.strip() for item in raw_items if isinstance(item, str) and item.strip()]
-    if not raw_items or len(items) != len(raw_items):
+    items = [item.strip() for item in value]
+    if not items or not all(items):
         msg = f"{field_name} must be a non-empty list of strings."
         raise _InvalidArgumentError(msg)
     return items
 
 
-def _extra_fields(value: object) -> dict[str, object]:
+def _extra_fields(value: dict | None) -> dict[str, object]:
     if value is None:
         return {}
-    fields = cast("dict[object, object]", value) if isinstance(value, dict) else None
-    if fields is None or not all(isinstance(key, str) for key in fields):
-        msg = "fields must be an object mapping Jira field IDs to values."
-        raise _InvalidArgumentError(msg)
-    return {str(key): item for key, item in fields.items()}
+    return dict(value)
 
 
 def _adf_document(text: str) -> dict[str, object]:
@@ -416,8 +407,9 @@ class AtlassianToolkit(Toolkit):
             "confluence_update_page": self.confluence_update_page,
             "confluence_add_comment": self.confluence_add_comment,
         }
-        for name in atlassian_function_names(products, write=write):
-            self.register(functions[name], name=f"{function_prefix}{name}")
+        self.functions = {
+            f"{function_prefix}{name}": functions[name] for name in atlassian_function_names(products, write=write)
+        }
 
     def _payload(self, status: str, **fields: object) -> str:
         return custom_tool_payload(self.name, status, **fields)
@@ -512,7 +504,7 @@ class AtlassianToolkit(Toolkit):
         try:
             body: dict[str, object] = {
                 "jql": _required_text(jql, "jql"),
-                "maxResults": _page_size(max_results, "max_results"),
+                "maxResults": _page_size(max_results),
                 "fields": _string_list(fields, "fields") or list(_DEFAULT_ISSUE_FIELDS),
             }
             if token := _cursor(next_page_token, "next_page_token"):
@@ -586,7 +578,7 @@ class AtlassianToolkit(Toolkit):
 
         """
         try:
-            if not isinstance(project_key, str) or not _PROJECT_KEY_PATTERN.fullmatch(project_key):
+            if not _PROJECT_KEY_PATTERN.fullmatch(project_key):
                 msg = "project_key must be a Jira project key such as PROJ."
                 raise _InvalidArgumentError(msg)
             issue_fields: dict[str, object] = {
@@ -721,7 +713,7 @@ class AtlassianToolkit(Toolkit):
         try:
             params: dict[str, str | int] = {
                 "cql": _required_text(cql, "cql"),
-                "limit": _page_size(limit, "limit"),
+                "limit": _page_size(limit),
                 "excerpt": "indexed",
                 "expand": "content.history,content.history.ownedBy,content.version",
             }
@@ -813,7 +805,7 @@ class AtlassianToolkit(Toolkit):
             page = _page_id(page_id)
             params: dict[str, str | int] = {
                 "cql": f"type = attachment AND container = {page}",
-                "limit": _page_size(limit, "limit"),
+                "limit": _page_size(limit),
                 "expand": "version",
             }
             if next_cursor := _cursor(cursor, "cursor"):
@@ -932,7 +924,7 @@ class AtlassianToolkit(Toolkit):
 
         """
         try:
-            if not isinstance(space_key, str) or not _SPACE_KEY_PATTERN.fullmatch(space_key):
+            if not _SPACE_KEY_PATTERN.fullmatch(space_key):
                 msg = "space_key must be a Confluence space key such as DOCS."
                 raise _InvalidArgumentError(msg)
             body: dict[str, object] = {
@@ -1004,7 +996,7 @@ class AtlassianToolkit(Toolkit):
         """
         try:
             page = _page_id(page_id)
-            if isinstance(version_number, bool) or not isinstance(version_number, int) or version_number < 2:
+            if version_number < 2:
                 msg = "version_number must be the page's current version number plus one."
                 raise _InvalidArgumentError(msg)
             version: dict[str, object] = {"number": version_number}

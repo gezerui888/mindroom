@@ -23,6 +23,7 @@ from mindroom.api.worker_computer import router
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.custom_tools.browser import BrowserTools
+from mindroom.tool_system.authoring import tool
 from mindroom.tool_system.media_transport import decode_media_result
 from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_key
@@ -31,6 +32,7 @@ from mindroom.worker_computer.worker_browser import WorkerBrowserRuntime
 from mindroom.workers.backends.local import local_worker_state_paths_for_root
 from mindroom.workers.models import WorkerHandle
 from mindroom.workers.protocol import WORKER_PROTOCOL_VERSION, ExecuteResponse
+from tests.conftest import replace_test_tool_factory
 from tests.test_worker_computer_runtime import FakeDisplay
 
 RUNNER_TOKEN = "test-runner-token"  # noqa: S105 - isolated test credential
@@ -102,6 +104,7 @@ def test_two_execute_requests_reuse_browser_and_disabled_uses_subprocess(
     monkeypatch.setattr(sandbox_worker_prep, "prepare_worker_request", lambda **_kwargs: prepared)
     pages = {}
 
+    @tool(name="browser_control")
     async def browser(self: BrowserTools, action: str, targetId: str | None = None) -> str:  # noqa: N803
         if action == "open":
             pages[id(self)] = "target-one"
@@ -423,7 +426,7 @@ def test_native_functions_reuse_one_guarded_session(  # noqa: PLR0915 - full HTT
         unsupported = client.post("/api/sandbox-runner/execute", headers=headers, json=payload)
         assert unsupported.json()["failure_kind"] == "tool"
         payload["function_name"] = "browser_snapshot"
-        monkeypatch.setattr(sandbox_runner.TOOL_METADATA["browser_mcp"], "factory", lambda: type(None))
+        replace_test_tool_factory(monkeypatch, "browser_mcp", lambda: type(None))
         replaced = client.post("/api/sandbox-runner/execute", headers=headers, json=payload)
         assert replaced.json()["failure_kind"] == "tool"
         assert "built-in browser factory" in replaced.json()["error"]

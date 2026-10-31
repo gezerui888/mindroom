@@ -1,4 +1,4 @@
-"""``create_agent`` builds the owned agent: its spec, prompt, request template, store, tool owners, and surface."""
+"""``create_agent`` builds the owned agent: its spec, prompt, request template, tool owners, and surface."""
 
 from __future__ import annotations
 
@@ -33,10 +33,11 @@ from mindroom.knowledge.search import AgentKnowledge, KnowledgeSource, Knowledge
 from mindroom.llm.provider import ModelRequest
 from mindroom.matrix_rtc.call_tools import _function_available_during_call
 from mindroom.mcp.toolkit import MindRoomMCPToolkit
-from mindroom.session_storage.store import ConversationStore
-from mindroom.tool_system.skills import SKILL_FUNCTION_NAMES, get_plugin_skill_roots, set_plugin_skill_roots
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.skills import SKILL_FUNCTION_NAMES
+from mindroom.tool_system.tool_function import ToolGate
 from mindroom.tool_system.worker_routing import agent_workspace_root_path, build_tool_execution_identity
-from tests.conftest import bind_runtime_paths, test_runtime_paths
+from tests.conftest import bind_runtime_paths, publish_test_plugins, test_runtime_paths
 from tests.turn_model_helpers import turn_model
 
 if TYPE_CHECKING:
@@ -116,7 +117,14 @@ def _build(config: Config, runtime_paths: RuntimePaths, **kwargs: Any) -> AgentB
         config,
         runtime_paths,
         identity,
-        **({"knowledge": None, "model": turn_model(config, runtime_paths, "assistant")} | kwargs),
+        **(
+            {
+                "knowledge": None,
+                "model": turn_model(config, runtime_paths, "assistant"),
+                "plugins": config_plugins(config, runtime_paths),
+            }
+            | kwargs
+        ),
     )
 
 
@@ -129,7 +137,7 @@ def _offered(build: AgentBuild) -> dict[str, ToolFunction]:
     return dict(build.spec.functions)
 
 
-def test_create_agent_builds_the_spec_prompt_store_and_owners(tmp_path: Path) -> None:
+def test_create_agent_builds_the_spec_prompt_and_owners(tmp_path: Path) -> None:
     """The build offers the configured toolkits, then the knowledge search, then skills, and renders their prompt."""
     config, runtime_paths = _config(tmp_path)
     knowledge = _knowledge()
@@ -157,7 +165,6 @@ def test_create_agent_builds_the_spec_prompt_store_and_owners(tmp_path: Path) ->
     assert build.prompt.turn_context.startswith("<mindroom_session_context>")
     assert build.request_template == ModelRequest(messages=())
     assert build.history_settings == config.resolve_scope("assistant").history_settings
-    assert isinstance(build.store, ConversationStore)
     # Large CLI results and their media are saved in the agent's own workspace.
     assert build.surface.output_file_policy is not None
     assert build.surface.output_file_policy.workspace_root == workspace
@@ -172,19 +179,17 @@ def test_create_agent_builds_the_spec_prompt_store_and_owners(tmp_path: Path) ->
     )
 
 
-def test_a_build_without_runtime_state_has_no_store_tools_or_context(tmp_path: Path) -> None:
-    """A restricted in-process run keeps the role and instructions but no tools, skills, knowledge, or store."""
+def test_a_build_without_runtime_capabilities_has_no_tools_or_context(tmp_path: Path) -> None:
+    """A restricted in-process run keeps the role and instructions but no tools, skills, or knowledge."""
     config, runtime_paths = _config(tmp_path)
 
     build = _build(
         config,
         runtime_paths,
         knowledge=_knowledge(),
-        persist_runtime_state=False,
         disable_runtime_capabilities=True,
     )
 
-    assert build.store is None
     assert build.spec.toolkits == ()
     assert (build.prompt.skills_block, build.prompt.knowledge_block) == (None, None)
     assert "SOUL.md" not in build.prompt.role
@@ -205,7 +210,7 @@ def test_approval_rules_gate_configured_functions_and_hide_generated_ones(tmp_pa
 
     offered = _offered(build)
     assert set(offered) == _CALCULATOR_FUNCTIONS
-    assert all(function.requires_confirmation is True for function in offered.values())
+    assert all(function.gate is ToolGate.POLICY for function in offered.values())
     assert (build.prompt.knowledge_block, build.prompt.skills_block) == (None, None)
     assert build.surface.knowledge_sources == ()
     assert config.get_prompt("SKILLS_TOOL_USAGE_PROMPT") not in build.prompt.instructions
@@ -243,15 +248,14 @@ def test_a_build_offers_the_skills_of_the_plugins_its_config_loads(tmp_path: Pat
     _write_plugin_skill(tmp_path / "plugins" / "fresh", "fresh-skill")
     stale = tmp_path / "stale"
     _write_plugin_skill(stale, "stale-skill")
+    # An earlier config loaded another plugin.
+    earlier = {**config.authored_model_dump(), "plugins": [str(stale)]}
+    publish_test_plugins(bind_runtime_paths(Config.model_validate(earlier), runtime_paths), runtime_paths)
     authored = {**config.authored_model_dump(), "plugins": ["./plugins/fresh"]}
     config = bind_runtime_paths(Config.model_validate(authored), runtime_paths)
-    previous_roots = get_plugin_skill_roots()
-    # The skill roots of the plugins an earlier config loaded.
-    set_plugin_skill_roots([stale / "skills"])
-    try:
-        build = _build(config, runtime_paths, persist_runtime_state=False)
-    finally:
-        set_plugin_skill_roots(previous_roots)
+    publish_test_plugins(config, runtime_paths)
+
+    build = _build(config, runtime_paths)
 
     assert build.prompt.skills_block is not None
     assert "<name>fresh-skill</name>" in build.prompt.skills_block
@@ -261,7 +265,7 @@ def test_a_build_offers_the_skills_of_the_plugins_its_config_loads(tmp_path: Pat
 def test_prompt_for_turn_appends_the_turns_context_blocks(tmp_path: Path) -> None:
     """Each turn block follows the context so far after one blank line; empty blocks and trailing whitespace drop out."""
     config, runtime_paths = _config(tmp_path)
-    build = _build(config, runtime_paths, persist_runtime_state=False)
+    build = _build(config, runtime_paths)
     base = build.prompt.turn_context
     assert base is not None
 
@@ -296,7 +300,7 @@ def test_deferred_toolkits_fill_the_request_template_and_the_surface(tmp_path: P
     """A natively deferred toolkit is offered but named deferred; minimal mode materializes it through the CLI."""
     config, runtime_paths = _config(tmp_path, tools=["calculator", {"name": "wikipedia", "defer": True}])
 
-    build = _build(config, runtime_paths, persist_runtime_state=False, agent_mode=agent_mode)
+    build = _build(config, runtime_paths, agent_mode=agent_mode)
 
     if agent_mode == "standard":
         assert "search_wikipedia" in _offered(build)
@@ -341,7 +345,7 @@ def test_the_toolkit_whose_function_a_run_offers_owns_its_name_for_approvals_and
         return built[tool_name]
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit):
-        build = _build(config, runtime_paths, persist_runtime_state=False)
+        build = _build(config, runtime_paths)
 
     calculator, wikipedia = build.spec.toolkits[:2]
     assert (calculator.name, wikipedia.name) == ("calculator", "wikipedia")
@@ -361,7 +365,7 @@ def test_a_shadowed_function_is_reported_once_per_build_however_often_its_runs_r
         return Toolkit(name=tool_name, tools=[ping])
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
-        build = _build(config, runtime_paths, persist_runtime_state=False)
+        build = _build(config, runtime_paths)
         for _run in range(3):
             PreparedTools(functions=build.spec.functions).specs()
 
@@ -381,7 +385,7 @@ def test_a_configured_toolkit_the_run_offers_nothing_of_is_reported(tmp_path: Pa
         return Toolkit(name=tool_name, tools=surfaces[tool_name])
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
-        _build(config, runtime_paths, persist_runtime_state=False)
+        _build(config, runtime_paths)
 
     shadowed = [log for log in logs if log["event"].startswith("Configured toolkit exposes no unique")]
     assert [(log["toolkit"], log["function_names"]) for log in shadowed] == [("wikipedia", ["ping"])]
@@ -399,7 +403,7 @@ def test_a_deferred_function_an_earlier_one_shadows_is_offered_nowhere_and_repor
         return Toolkit(name=tool_name, tools=surfaces[tool_name])
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
-        build = _build(config, runtime_paths, persist_runtime_state=False)
+        build = _build(config, runtime_paths)
         offered = _offered(build)
 
     calculator, wikipedia, arxiv = build.spec.toolkits[:3]
@@ -424,16 +428,66 @@ def test_a_function_hidden_across_toolkits_leaves_the_run_and_its_owners(tmp_pat
         if tool_name == "calculator":
             return Toolkit(name="calculator", tools=[ping])
         server = MindRoomMCPToolkit(server_id="demo", manager=None, catalog=None)
-        server.async_functions["ping"] = Function(name="ping", entrypoint=ping)
+        server.functions["ping"] = ping
         return server
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit):
-        build = _build(config, runtime_paths, persist_runtime_state=False)
+        build = _build(config, runtime_paths)
 
     server, calculator = build.spec.toolkits[:2]
     assert (server.name, server.functions) == ("demo", ())
     assert _offered(build)["ping"] is calculator.functions[0]
     assert _owners(build) == {"ping": "calculator"}
+
+
+def test_an_mcp_function_yields_to_a_local_toolkit_that_shares_its_toolkit_name(tmp_path: Path) -> None:
+    """A local toolkit whose name matches an MCP toolkit's still counts as another owner of the function name."""
+    config, runtime_paths = _config(tmp_path, tools=["wikipedia", "calculator"])
+
+    def build_toolkit(tool_name: str, **_kwargs: object) -> Toolkit:
+        if tool_name == "calculator":
+            return Toolkit(name="demo", tools=[ping])
+        server = MindRoomMCPToolkit(server_id="demo", manager=None, catalog=None)
+        server.functions["ping"] = ping
+        return server
+
+    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit):
+        build = _build(config, runtime_paths)
+
+    server, local = build.spec.toolkits[:2]
+    assert (server.name, server.functions) == ("demo", ())
+    assert (local.name, [function.name for function in local.functions]) == ("demo", ["ping"])
+    assert _offered(build)["ping"] is local.functions[0]
+    assert _owners(build) == {"ping": "calculator"}
+
+
+def test_an_mcp_function_yields_to_a_generated_one_and_mcp_copies_of_one_name_all_leave(tmp_path: Path) -> None:
+    """A remote catalog never takes the knowledge search's name, and two servers offering one name both lose it."""
+    config, runtime_paths = _config(tmp_path, tools=["wikipedia", "arxiv"])
+
+    def build_toolkit(tool_name: str, **_kwargs: object) -> Toolkit:
+        server = MindRoomMCPToolkit(server_id=tool_name, manager=None, catalog=None)
+        names = ("search_knowledge_base", "ping") if tool_name == "wikipedia" else ("ping", "pong")
+        for name in names:
+            server.functions[name] = ping
+        return server
+
+    with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
+        build = _build(config, runtime_paths, knowledge=_knowledge())
+
+    wikipedia, arxiv, generated = build.spec.toolkits[:3]
+    assert wikipedia.functions == ()
+    assert [function.name for function in arxiv.functions] == ["pong"]
+    assert (generated.name, [function.name for function in generated.functions]) == (
+        "search_knowledge_base",
+        ["search_knowledge_base"],
+    )
+    hidden = [log for log in logs if log["event"] == "Hiding an MCP function whose name another toolkit offers"]
+    assert [(log["toolkit"], log["function_name"], log["colliding_toolkits"]) for log in hidden] == [
+        ("wikipedia", "search_knowledge_base", ["search_knowledge_base"]),
+        ("wikipedia", "ping", ["arxiv"]),
+        ("arxiv", "ping", ["wikipedia"]),
+    ]
 
 
 def test_a_configured_function_named_like_a_generated_one_is_what_the_run_offers_owns_and_runs_as_a_job(
@@ -449,7 +503,7 @@ def test_a_configured_function_named_like_a_generated_one_is_what_the_run_offers
         return built[tool_name]
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
-        build = _build(config, runtime_paths, knowledge=_knowledge(), persist_runtime_state=False)
+        build = _build(config, runtime_paths, knowledge=_knowledge())
 
     configured, generated = build.spec.toolkits[:2]
     assert (configured.name, generated.name) == ("calculator", "search_knowledge_base")
@@ -472,7 +526,7 @@ def test_a_function_asking_for_prompt_instructions_loads_only_in_a_deferred_tool
         return Toolkit(name=tool_name, tools=[function])
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
-        build = _build(config, runtime_paths, persist_runtime_state=False)
+        build = _build(config, runtime_paths)
 
     assert [toolkit.name for toolkit in build.spec.toolkits] == ["wikipedia", "skills"]
     assert build.request_template.deferred_tools.names == frozenset({"wikipedia_lookup"})
@@ -490,14 +544,19 @@ def _no_hook(*_args: object, **_kwargs: object) -> None:
     return None
 
 
-_REFUSED_FIELDS = [{"pre_hook": _no_hook}, {"requires_user_input": True}, {"instructions": "Look up named pages."}]
+_REFUSED_FIELDS = [
+    {"pre_hook": _no_hook},
+    {"requires_user_input": True},
+    {"external_execution": True},
+    {"instructions": "Look up named pages."},
+]
 
 
 @pytest.mark.parametrize(
     ("agent_mode", "narrowed_by"),
     [("standard", "caller"), ("standard", "persona"), ("minimal", "caller")],
 )
-@pytest.mark.parametrize("refused", _REFUSED_FIELDS, ids=["hook", "user_input", "instructions"])
+@pytest.mark.parametrize("refused", _REFUSED_FIELDS, ids=["hook", "user_input", "external_execution", "instructions"])
 def test_a_refused_function_the_agent_never_offers_costs_its_toolkit_nothing(
     tmp_path: Path,
     agent_mode: str,
@@ -523,7 +582,7 @@ def test_a_refused_function_the_agent_never_offers_costs_its_toolkit_nothing(
         }
     )
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
-        build = _build(config, runtime_paths, persist_runtime_state=False, agent_mode=agent_mode, **narrowing)
+        build = _build(config, runtime_paths, agent_mode=agent_mode, **narrowing)
 
     assert not [log for log in logs if log["event"] == "Could not load tool for agent construction"]
     assert [function.name for function in build.spec.toolkits[0].functions] == ["ping"]
@@ -533,7 +592,7 @@ def test_a_toolkit_s_instructions_show_whenever_it_offers_a_function(tmp_path: P
     """Agno's own toolkits show their instructions too, though their ``add_instructions`` switch is off."""
     config, runtime_paths = _config(tmp_path, tools=["reasoning"])
 
-    build = _build(config, runtime_paths, persist_runtime_state=False)
+    build = _build(config, runtime_paths)
 
     assert ReasoningTools().add_instructions is False
     assert build.prompt.tool_instructions == (ReasoningTools().instructions,)
@@ -570,7 +629,7 @@ def test_reasoning_s_default_instructions_show_only_while_both_its_functions_are
     config, runtime_paths = _config(tmp_path, tools=[{"reasoning": overrides}])
     get_runtime_credentials_manager(runtime_paths).save_credentials("reasoning", saved)
 
-    build = _build(config, runtime_paths, persist_runtime_state=False)
+    build = _build(config, runtime_paths)
 
     [reasoning] = [toolkit for toolkit in build.spec.toolkits if toolkit.name == "reasoning_tools"]
     assert len(reasoning.functions) == 1
@@ -610,10 +669,10 @@ def test_matrix_message_guidance_reaches_the_prompt_only_with_the_matrix_message
         identity,
         knowledge=None,
         model=turn_model(config, runtime_paths, "assistant"),
-        persist_runtime_state=False,
         tool_function_filter=call_filter if realtime_call else None,
         # Chat asks for the approval; the realtime call builds as build_call_tools does.
         supports_native_tool_approval=not realtime_call,
+        plugins=config_plugins(config, runtime_paths),
     )
 
     offered = {function.name for toolkit in build.spec.toolkits for function in toolkit.functions}
@@ -629,7 +688,6 @@ def test_a_toolkit_whose_functions_are_all_left_out_shows_no_instructions(tmp_pa
     build = _build(
         config,
         runtime_paths,
-        persist_runtime_state=False,
         tool_function_filter=lambda function: function.name not in {"think", "analyze"},
     )
 
@@ -645,7 +703,7 @@ def test_a_toolkit_whose_every_function_an_earlier_one_took_shows_no_instruction
         return Toolkit(name="pinger", tools=[ping], instructions=f"Ping for {tool_name}.")
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit):
-        build = _build(config, runtime_paths, persist_runtime_state=False)
+        build = _build(config, runtime_paths)
 
     assert [toolkit.functions != () for toolkit in build.spec.toolkits[:2]] == [True, False]
     assert build.prompt.tool_instructions == ("Ping for calculator.",)
@@ -682,7 +740,7 @@ def test_a_toolkit_claiming_a_room_recovery_function_stops_the_build(
         patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit),
         pytest.raises(ValueError, match="reserved for Matrix room recovery tools"),
     ):
-        _build(config, runtime_paths, persist_runtime_state=False, tool_function_filter=lambda _function: False)
+        _build(config, runtime_paths, tool_function_filter=lambda _function: False)
 
 
 def test_a_toolkit_that_cannot_be_adapted_drops_only_itself_and_its_deferral(tmp_path: Path) -> None:
@@ -698,7 +756,7 @@ def test_a_toolkit_that_cannot_be_adapted_drops_only_itself_and_its_deferral(tmp
         return toolkit
 
     with patch.object(agents_module, "build_agent_toolkit", side_effect=build_toolkit), capture_logs() as logs:
-        build = _build(config, runtime_paths, persist_runtime_state=False)
+        build = _build(config, runtime_paths)
 
     assert [toolkit.name for toolkit in build.spec.toolkits] == ["calculator", "skills"]
     assert build.request_template.deferred_tools.names == frozenset()

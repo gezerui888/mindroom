@@ -15,6 +15,7 @@ from urllib.parse import parse_qs
 import httpx
 import nio
 import pytest
+from pydantic import ValidationError
 
 from mindroom import constants
 from mindroom.api.config_lifecycle import ApiSnapshot
@@ -30,8 +31,10 @@ from mindroom.slack import files as slack_files
 from mindroom.slack.oauth import slack_oauth_provider
 from mindroom.slack.watches import SlackWatch, SlackWatchStore, _watch_id_for
 from mindroom.tool_system.agno_toolkits import adapt_toolkit, with_offered_instructions
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
+from tests.agent_tool_helpers import toolkit_offers
 from tests.oauth_test_utils import publish_oauth_credentials
 from tests.slack.room_state import room_state_client
 
@@ -193,19 +196,21 @@ def _turn_context(
     hook_source: str | None,
     client: AsyncMock | None = None,
 ) -> ToolRuntimeContext:
+    config = Config.model_validate(
+        {
+            "models": {"default": {"provider": "ollama", "id": "test-model"}},
+            "agents": {"assistant": {"display_name": "Assistant"}},
+            "authorization": {"aliases": {ALICE: [ALICE_BRIDGE]}},
+        },
+    )
     return ToolRuntimeContext(
         agent_name="assistant",
         target=MessageTarget.resolve(ROOM, None, "$event", room_mode=True),
         requester_id=ALICE,
         client=client or AsyncMock(),
-        config=Config.model_validate(
-            {
-                "models": {"default": {"provider": "ollama", "id": "test-model"}},
-                "agents": {"assistant": {"display_name": "Assistant"}},
-                "authorization": {"aliases": {ALICE: [ALICE_BRIDGE]}},
-            },
-        ),
+        config=config,
         runtime_paths=paths,
+        plugins=config_plugins(config, paths),
         conversation_reader=MagicMock(),
         relations=MagicMock(),
         hook_source=hook_source,
@@ -872,11 +877,11 @@ async def test_recent_returns_the_newest_limit_conversations(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("days", [0, -1, 366, True, 1.5])
+@pytest.mark.parametrize("days", [0, -1, 366])
 async def test_recent_refuses_a_window_it_cannot_read(
     paths: RuntimePaths,
     monkeypatch: pytest.MonkeyPatch,
-    days: Any,  # noqa: ANN401
+    days: int,
 ) -> None:
     _connect_alice(paths)
     fake = FakeSlack().install(monkeypatch)
@@ -884,6 +889,51 @@ async def test_recent_refuses_a_window_it_cannot_read(
     result = json.loads(await _tools(paths).slack_recent(days=days))
 
     assert result["message"] == "days must be an integer from 1 to 365"
+    assert fake.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 101])
+async def test_listings_refuse_a_limit_outside_one_to_a_hundred(
+    paths: RuntimePaths,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+) -> None:
+    _connect_alice(paths)
+    fake = FakeSlack().install(monkeypatch)
+    tools = _tools(paths)
+
+    for result in (await tools.slack_search("launch", limit=limit), await tools.slack_recent(limit=limit)):
+        assert json.loads(result)["message"] == "limit must be an integer from 1 to 100"
+    assert fake.requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "arguments"),
+    [
+        ("slack_recent", {"days": 1.5}),
+        ("slack_recent", {"kind": "groups"}),
+        ("slack_recent", {"limit": "many"}),
+        ("slack_search", {"query": "launch", "kind": "files"}),
+        ("slack_search", {"query": "launch", "limit": 2.5}),
+        ("slack_search", {"query": None}),
+        ("slack_watch", {"action": "pause"}),
+    ],
+)
+async def test_malformed_arguments_fail_call_validation_before_any_request(
+    paths: RuntimePaths,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    arguments: dict[str, object],
+) -> None:
+    """Arguments that disagree with a function's signature fail call validation before its body runs."""
+    _connect_alice(paths)
+    fake = FakeSlack().install(monkeypatch)
+
+    with pytest.raises(ValidationError):
+        await toolkit_offers(_watch_tools(paths), name).entrypoint(**arguments)
+
     assert fake.requests == []
 
 
@@ -1228,7 +1278,6 @@ def _gateway_context(tmp_path: Path) -> AgentToolContext:
     snapshot = ApiSnapshot(
         generation=1,
         runtime_paths=runtime_paths,
-        config_data=config.model_dump(),
         runtime_config=config,
     )
     return resolve_connection_agent(resolve_connection_user(snapshot, ALICE), "mind")
@@ -1278,13 +1327,13 @@ def test_slack_tools_require_a_credentials_manager(paths: RuntimePaths) -> None:
 
 
 def _write_names(tools: SlackTools) -> set[str]:
-    return set(tools.get_async_functions()) & slack_toolkit._WRITE_FUNCTIONS
+    return set(tools.functions) & slack_toolkit._WRITE_FUNCTIONS
 
 
 def test_write_false_hides_write_functions(paths: RuntimePaths) -> None:
     assert _write_names(_tools(paths)) == {"slack_post", "slack_react", "slack_edit", "slack_delete", "slack_upload"}
     assert _write_names(_tools(paths, write=False)) == set()
-    assert set(_tools(paths, write=False).get_async_functions()) == {
+    assert set(_tools(paths, write=False).functions) == {
         "slack_search",
         "slack_recent",
         "slack_read",
@@ -1886,17 +1935,17 @@ LATER_JOINERS = "paused: people who join this room later could read earlier mess
 
 
 def test_watch_is_registered_only_in_personal_mode_with_a_room(paths: RuntimePaths) -> None:
-    assert "slack_watch" in _watch_tools(paths).get_async_functions()
-    assert "slack_watch" not in _tools(paths).get_async_functions()
-    assert "slack_watch" not in _tools(paths, current_room_id=None).get_async_functions()
+    assert "slack_watch" in _watch_tools(paths).functions
+    assert "slack_watch" not in _tools(paths).functions
+    assert "slack_watch" not in _tools(paths, current_room_id=None).functions
     # A watch never writes to Slack, so turning writes off keeps it.
-    assert "slack_watch" in _tools(paths, current_room_id=ROOM, write=False).get_async_functions()
+    assert "slack_watch" in _tools(paths, current_room_id=ROOM, write=False).functions
 
 
 def test_watch_not_in_project_mode(paths: RuntimePaths) -> None:
     project = _tools(paths, channels=[CHANNEL], room="lobby", current_room_id=ROOM)
 
-    assert "slack_watch" not in project.get_async_functions()
+    assert "slack_watch" not in project.functions
 
 
 @pytest.mark.asyncio
@@ -1951,7 +2000,6 @@ async def test_start_words_follow_the_filters(paths: RuntimePaths, filters: dict
     [
         ({"mentions": False, "direct_messages": False}, "Watch mentions, direct messages, or both"),
         ({"channels": ["U0123ABCD"]}, "Use a Slack conversation ID, <conversation>:<ts>, or a message link"),
-        ({"action": "pause"}, "action must be start, stop, or status"),
     ],
 )
 async def test_start_refuses_filters_that_watch_nothing_or_name_no_channel(

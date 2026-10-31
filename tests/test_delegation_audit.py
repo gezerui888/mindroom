@@ -7,24 +7,23 @@ import json
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from uuid import uuid4
 
 import pytest
 
-from mindroom.ai_run_metadata import build_ai_run_metadata_content
+from mindroom.ai_run_metadata import build_ai_run_metadata_content, with_prior_usage
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig, AgentPrivateKnowledgeConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.constants import AI_RUN_METADATA_KEY
 from mindroom.delegation import records
-from mindroom.delegation.audit import (
-    child_audit_context,
-    finish_child_record,
+from mindroom.delegation.audit import finish_child_record, record_child_response, start_child_record
+from mindroom.delegation.lifecycle import (
+    child_run_context,
     observe_child_event,
-    record_child_response,
-    start_child_record,
+    running_child_id,
+    settle_child_response,
+    start_child_turn,
 )
-from mindroom.delegation.lifecycle import settle_child_response, start_child_turn
 from mindroom.delegation.records import DelegationRecordLimitError, DelegationRecordLocator, DelegationRecordOwner
 from mindroom.delegation.recovery import interrupt_child, read_child_run
 from mindroom.delegation.sessions import reserve_subagent_turn
@@ -33,7 +32,7 @@ from mindroom.delegation.storage import freeze_delegation_storage
 from mindroom.history.storage import new_scope_session
 from mindroom.history.types import HistoryScope
 from mindroom.llm.events import RunFinished, TextDelta, ToolCompleted, ToolStarted
-from mindroom.llm.runs import RunRecord, RunStatus, ToolExecution
+from mindroom.llm.runs import RunRecord, RunStatus, TeamRunRecord, ToolExecution
 from mindroom.llm.usage import MessageMetrics, RunMetrics, TokenCounts
 from mindroom.runtime_resolution import resolve_agent_runtime
 from mindroom.session_storage.agent_storage import create_session_storage
@@ -41,7 +40,8 @@ from mindroom.tool_system.worker_routing import (
     ToolExecutionIdentity,
     serialize_tool_execution_identity,
 )
-from tests.conftest import test_runtime_paths
+from tests.approval_continuation_helpers import answered_calls
+from tests.conftest import record_store_threads, test_runtime_paths
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
@@ -83,6 +83,7 @@ def _child() -> DelegationChild:
         requested_model_name="test-model",
         depth=1,
         execution_identity=serialize_tool_execution_identity(identity),
+        subagent_id="c" * 32,
         agent_mode="standard",
         persona=None,
     )
@@ -95,15 +96,8 @@ async def test_audit_snapshot_cannot_settle_child_or_release_followup(tmp_path: 
     config = _config()
     paths = test_runtime_paths(tmp_path)
     child = _child()
-    child.subagent_id = uuid4().hex
     await reserve_subagent_turn(child, owner=_identity("leader", "parent-session"), runtime_paths=paths)
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, paths)
     before_child = asdict(child)
     handle_path = paths.storage_root / "subagent_sessions" / f"{child.subagent_id}.json"
     before_handle = handle_path.read_bytes()
@@ -112,13 +106,23 @@ async def test_audit_snapshot_cannot_settle_child_or_release_followup(tmp_path: 
         RunRecord(run_id=child.run_id, session_id=child.session_id, status=status, content="retained outcome"),
         config=config,
         runtime_paths=paths,
-        decisions=None,
-        denial_reasons=None,
+        approval_calls=(),
     )
     assert asdict(child) == before_child
     assert handle_path.read_bytes() == before_handle
     record_dir = await _record_dir(child, config, paths)
     assert not any(event["kind"] == "delegation_finished" for event in _events(record_dir))
+
+
+async def _start(child: DelegationChild, config: Config, runtime_paths: RuntimePaths) -> None:
+    """Start the child's record as the leader's parent run does."""
+    await start_child_turn(
+        child,
+        parent_run_id="parent-run",
+        config=config,
+        runtime_paths=runtime_paths,
+        caller_execution_identity=_identity("leader", "parent-session"),
+    )
 
 
 def _events(record_dir: Path) -> list[dict[str, object]]:
@@ -138,13 +142,7 @@ async def test_start_child_record_persists_restart_locator_and_source_scope(tmp_
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
 
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
 
     assert child.record_locator["delegation_id"] == child.delegation_id
     record_dir = await _record_dir(child, config, runtime_paths)
@@ -205,13 +203,7 @@ async def test_interruption_recovery_preserves_workspace_knowledge_links(
         assert link.is_symlink()
         links.append(link)
     child.storage_bindings = freeze_delegation_storage(config, ("leader", "child"))
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, paths)
     record_dir = await _record_dir(child, config, paths)
     if removed_config:
         config = config.model_copy(update={"agents": {}})
@@ -230,15 +222,8 @@ async def test_interruption_recovery_keeps_a_settlement_saved_before_a_crash(tmp
     config = _config()
     paths = test_runtime_paths(tmp_path)
     child = _child()
-    child.subagent_id = uuid4().hex
     await reserve_subagent_turn(child, owner=_identity("leader", "parent-session"), runtime_paths=paths)
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, paths)
     # The job saved this running snapshot; then cancellation settled the child, and the process died.
     snapshot = replace(child)
     await interrupt_child(child, config=config, runtime_paths=paths, reason="Delegation cancelled.")
@@ -260,13 +245,7 @@ async def test_a_child_recovery_stops_keeps_its_text_and_stores_why_it_stopped_a
     config = _config()
     paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, paths)
     storage = create_session_storage("child", config, paths, _identity("child", "child-session"))
     session = new_scope_session(session_id=child.session_id, scope=HistoryScope(kind="agent", scope_id="child"))
     paused = RunRecord(
@@ -294,6 +273,66 @@ async def test_a_child_recovery_stops_keeps_its_text_and_stores_why_it_stopped_a
 
 
 @pytest.mark.asyncio
+async def test_a_child_recovery_settles_a_completed_run_with_the_usage_its_turn_spent_before_it(tmp_path: Path) -> None:
+    """A child whose run completed before a restart settled it reports the usage its turn spent before that run too.
+
+    The run's record carries that usage, as the turn stored it on the run, such as an empty answer the turn retried.
+    """
+    config = _config()
+    paths = test_runtime_paths(tmp_path)
+    child = _child()
+    await _start(child, config, paths)
+    storage = create_session_storage("child", config, paths, _identity("child", "child-session"))
+    session = new_scope_session(session_id=child.session_id, scope=HistoryScope(kind="agent", scope_id="child"))
+    completed = RunRecord(
+        run_id=child.run_id,
+        session_id=child.session_id,
+        user_id="@alice:localhost",
+        agent_id="child",
+        status=RunStatus.completed,
+        content="Report written.",
+        metrics=RunMetrics(tokens=TokenCounts(input_tokens=120, output_tokens=9)),
+        metadata=with_prior_usage(None, [RunMetrics(tokens=TokenCounts(input_tokens=100, output_tokens=5))]),
+    )
+    assert storage.save_run(session, completed, record_usage=False) == "written"
+
+    await interrupt_child(child, config=config, runtime_paths=paths, reason="Restarted", status="failed")
+
+    assert (child.status, child.result) == ("completed", "Report written.")
+    run = json.loads((await _record_dir(child, config, paths) / "run.json").read_text())
+    assert (run["usage"]["input_tokens"], run["usage"]["output_tokens"]) == (220, 14)
+
+
+@pytest.mark.asyncio
+async def test_a_child_recovery_reads_and_rewrites_its_run_in_the_database_s_lane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery reads the child's paused run and saves its stopped run in the database's lane, behind its other work."""
+    config = _config()
+    paths = test_runtime_paths(tmp_path)
+    child = _child()
+    await _start(child, config, paths)
+    storage = create_session_storage("child", config, paths, _identity("child", "child-session"))
+    session = new_scope_session(session_id=child.session_id, scope=HistoryScope(kind="agent", scope_id="child"))
+    paused = RunRecord(
+        run_id=child.run_id,
+        session_id=child.session_id,
+        user_id="@alice:localhost",
+        agent_id="child",
+        status=RunStatus.paused,
+    )
+    assert storage.save_run(session, paused, record_usage=False) == "written"
+    threads = record_store_threads(monkeypatch, "get_run", "save_run")
+
+    await interrupt_child(child, config=config, runtime_paths=paths, reason="Restarted", status="failed")
+
+    assert threads["get_run"]
+    assert threads["save_run"]
+    assert all(name.startswith("conversation-store") for names in threads.values() for name in names), threads
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "result"),
     [
@@ -311,13 +350,7 @@ async def test_a_child_run_that_ends_without_text_settles_with_a_note_for_how_it
     config = _config()
     paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, paths)
 
     await settle_child_response(
         child,
@@ -352,13 +385,7 @@ async def test_a_child_row_an_earlier_recovery_stopped_still_settles_with_its_re
     config = _config()
     paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, paths)
     storage = create_session_storage("child", config, paths, _identity("child", "child-session"))
     session = new_scope_session(session_id=child.session_id, scope=HistoryScope(kind="agent", scope_id="child"))
     assert storage.save_run(session, RunRecord.from_dict(stored), record_usage=False) == "written"
@@ -376,13 +403,7 @@ async def test_record_child_response_orders_tools_approval_output_usage_and_fini
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
     completed_tool = ToolExecution(
         tool_call_id="first-tool",
         tool_name="lookup",
@@ -428,8 +449,7 @@ async def test_record_child_response_orders_tools_approval_output_usage_and_fini
         completed,
         config=config,
         runtime_paths=runtime_paths,
-        decisions={"pending-tool": True},
-        denial_reasons={"pending-tool": None},
+        approval_calls=answered_calls(["pending-tool"], approved=True),
     )
 
     record_dir = await _record_dir(child, config, runtime_paths)
@@ -469,6 +489,66 @@ async def test_record_child_response_orders_tools_approval_output_usage_and_fini
 
 
 @pytest.mark.asyncio
+async def test_a_child_paused_on_no_approval_records_its_pause_as_a_status(tmp_path: Path) -> None:
+    """A child that paused on something other than an approval, such as its own delegation, records the pause itself."""
+    config = _config()
+    runtime_paths = test_runtime_paths(tmp_path)
+    child = _child()
+    await _start(child, config, runtime_paths)
+    delegation = ToolExecution(
+        tool_call_id="nested",
+        tool_name="run_subagent",
+        tool_args={"agent_name": "code"},
+        external_execution_required=True,
+    )
+    paused = RunRecord(run_id=child.run_id, session_id=child.session_id, status=RunStatus.paused, tools=[delegation])
+
+    await settle_child_response(child, paused, config=config, runtime_paths=runtime_paths)
+
+    events = _events(await _record_dir(child, config, runtime_paths))
+    assert [event["kind"] for event in events] == ["delegation_started", "tool_call", "status"]
+    assert (events[-1]["status"], events[-1]["data"]) == ("paused", {"status": "paused"})
+
+
+@pytest.mark.asyncio
+async def test_a_childs_record_keeps_each_decision_its_resume_answered_with_the_reason_given(tmp_path: Path) -> None:
+    """Each decided call a resumed child answers is recorded once, in order, as approved or denied with its reason."""
+    config = _config()
+    runtime_paths = test_runtime_paths(tmp_path)
+    child = _child()
+    await _start(child, config, runtime_paths)
+    resumed = RunRecord(
+        run_id=child.run_id,
+        session_id=child.session_id,
+        status=RunStatus.completed,
+        content="final response",
+    )
+
+    await settle_child_response(
+        child,
+        resumed,
+        config=config,
+        runtime_paths=runtime_paths,
+        approval_calls=(
+            *answered_calls(["approved-tool"], approved=True),
+            *answered_calls(["denied-tool"], approved=False, reason="Not this one"),
+        ),
+    )
+
+    events = _events(await _record_dir(child, config, runtime_paths))
+    assert [(event["event_id"], event["data"]) for event in events if event["kind"] == "approval_decision"] == [
+        (
+            f"run:{child.run_id}:approval:approved-tool:decision",
+            {"tool_call_id": "approved-tool", "approved": True, "reason": None},
+        ),
+        (
+            f"run:{child.run_id}:approval:denied-tool:decision",
+            {"tool_call_id": "denied-tool", "approved": False, "reason": "Not this one"},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("breakdown", [True, False], ids=["per_model", "totals_only"])
 async def test_a_childs_usage_is_recorded_as_its_reply_would_publish_it(tmp_path: Path, *, breakdown: bool) -> None:
     """An agent reading a child's record sees the usage shape a reply publishes, not the stored per-model metrics.
@@ -478,23 +558,17 @@ async def test_a_childs_usage_is_recorded_as_its_reply_would_publish_it(tmp_path
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
     tokens = TokenCounts(input_tokens=8, output_tokens=4, total_tokens=12, cache_read_tokens=100, cache_write_tokens=20)
     if breakdown:
         metrics = RunMetrics(time_to_first_token=0.5, duration=1.5)
         metrics.add(
-            MessageMetrics(tokens=tokens, cost=0.25, provider_metrics={"service_tier": "standard"}),
+            MessageMetrics(tokens=tokens),
             model_id="claude-test",
             provider="VertexAI",
         )
     else:
-        metrics = RunMetrics(tokens=tokens, cost=0.25, time_to_first_token=0.5, duration=1.5)
+        metrics = RunMetrics(tokens=tokens, time_to_first_token=0.5, duration=1.5)
     response = RunRecord(
         run_id=child.run_id,
         session_id=child.session_id,
@@ -525,7 +599,6 @@ async def test_a_childs_usage_is_recorded_as_its_reply_would_publish_it(tmp_path
         "total_tokens": 12,
         "cache_read_tokens": 100,
         "cache_write_tokens": 20,
-        "cost": "0.25",
         "time_to_first_token": "0.5",
         "duration": "1.5",
         # Claude on Vertex AI counts cache tokens outside its input, so its cache writes are new input.
@@ -548,13 +621,7 @@ async def test_settlement_finishes_a_full_record_with_its_reserved_terminal_even
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
     # The start event and one ordinary event fill the record, leaving the slot reserved for the terminal event.
     monkeypatch.setattr(records, "_MAX_EVENTS", 3)
     response = RunRecord(
@@ -591,13 +658,7 @@ async def test_a_child_that_edits_its_exported_log_still_settles(tmp_path: Path)
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
     record_dir = await _record_dir(child, config, runtime_paths)
     with (record_dir / "events.jsonl").open("a", encoding="utf-8") as events:
         events.write('{"sequence": 2, "kind": "output", "data": {"content": "edited by the child"}}\n')
@@ -621,20 +682,14 @@ async def test_live_observer_records_matching_child_events_once(tmp_path: Path) 
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
     tool = ToolExecution(
         tool_call_id="live-tool",
         tool_name="lookup",
         tool_args={"query": "live query"},
         result="live result",
     )
-    async with child_audit_context(child, config=config, runtime_paths=runtime_paths):
+    async with child_run_context(child, config=config, runtime_paths=runtime_paths):
         await observe_child_event(ToolStarted(tool.call))
         await observe_child_event(TextDelta("visible "))
         await observe_child_event(TextDelta("chunk"))
@@ -658,16 +713,10 @@ async def test_live_observer_flushes_buffered_partial_output_during_cancellation
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
 
     async def cancel_during_context() -> None:
-        async with child_audit_context(child, config=config, runtime_paths=runtime_paths):
+        async with child_run_context(child, config=config, runtime_paths=runtime_paths):
             await observe_child_event(TextDelta("partial before cancel"))
             raise asyncio.CancelledError
 
@@ -686,17 +735,11 @@ async def test_live_observer_distinguishes_retried_attempt_tool_ids(tmp_path: Pa
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
     tool = ToolExecution(tool_call_id="reused-tool", tool_name="lookup", tool_args={"value": 1})
     first_metrics = RunMetrics(tokens=TokenCounts(input_tokens=9, output_tokens=3))
 
-    async with child_audit_context(child, config=config, runtime_paths=runtime_paths):
+    async with child_run_context(child, config=config, runtime_paths=runtime_paths):
         await observe_child_event(ToolStarted(tool.call))
         await observe_child_event(
             RunFinished(
@@ -731,19 +774,13 @@ async def test_live_observer_numbers_a_resumed_run_past_its_earlier_leg(tmp_path
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
     gated = ToolExecution(tool_call_id="gated", tool_name="lookup", tool_args={}, requires_confirmation=True)
-    async with child_audit_context(child, config=config, runtime_paths=runtime_paths):
+    async with child_run_context(child, config=config, runtime_paths=runtime_paths):
         await observe_child_event(TextDelta("first leg"))
         await observe_child_event(ToolStarted(gated.call))
     done = ToolExecution(tool_call_id="gated", tool_name="lookup", tool_args={}, result="ok")
-    async with child_audit_context(child, config=config, runtime_paths=runtime_paths):
+    async with child_run_context(child, config=config, runtime_paths=runtime_paths):
         await observe_child_event(TextDelta("final answer"))
         await observe_child_event(ToolCompleted(done.call))
 
@@ -752,6 +789,153 @@ async def test_live_observer_numbers_a_resumed_run_past_its_earlier_leg(tmp_path
         ("run:child-run:stream:1", "first leg"),
         ("run:child-run:stream:2", "final answer"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_child_whose_last_buffered_output_fails_to_record_still_settles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A run that ended settles its child even when the record cannot take the text buffered after its end."""
+    config = _config()
+    runtime_paths = test_runtime_paths(tmp_path)
+    child = _child()
+    await _start(child, config, runtime_paths)
+    append_event = DelegationRecordOwner.append_event
+
+    async def refuse_stream_output(
+        owner: DelegationRecordOwner,
+        handle: records.DelegationRecordHandle,
+        event: records.DelegationEvent,
+    ) -> None:
+        if event.event_id.startswith("run:child-run:stream:"):
+            msg = "record is full"
+            raise OSError(msg)
+        await append_event(owner, handle, event)
+
+    monkeypatch.setattr(DelegationRecordOwner, "append_event", refuse_stream_output)
+    finished = RunRecord(run_id=child.run_id, session_id=child.session_id, status=RunStatus.completed, content="done")
+
+    async def run_child() -> None:
+        async with child_run_context(child, config=config, runtime_paths=runtime_paths):
+            await observe_child_event(RunFinished(finished))
+            await observe_child_event(TextDelta("text after the end"))
+
+    with pytest.raises(OSError, match="record is full"):
+        await run_child()
+
+    assert (child.status, child.result) == ("completed", "done")
+    events = _events(await _record_dir(child, config, runtime_paths))
+    assert events[-1]["kind"] == "delegation_finished"
+    assert "text after the end" not in json.dumps(events)
+
+
+@pytest.mark.asyncio
+async def test_a_child_context_ends_even_when_its_settlement_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settlement that raises still ends the child's context, so later events are not attributed to it."""
+    config = _config()
+    runtime_paths = test_runtime_paths(tmp_path)
+    child = _child()
+    await _start(child, config, runtime_paths)
+
+    async def refuse_finish(*_args: object, **_kwargs: object) -> None:
+        msg = "record is gone"
+        raise OSError(msg)
+
+    monkeypatch.setattr(DelegationRecordOwner, "finish", refuse_finish)
+    finished = RunRecord(run_id=child.run_id, session_id=child.session_id, status=RunStatus.completed, content="done")
+
+    async def run_child() -> None:
+        async with child_run_context(child, config=config, runtime_paths=runtime_paths):
+            await observe_child_event(RunFinished(finished))
+
+    with pytest.raises(OSError, match="record is gone"):
+        await run_child()
+
+    assert running_child_id() is None
+    assert child.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_an_inner_child_context_hands_later_events_back_to_its_outer_child(tmp_path: Path) -> None:
+    """A nested child's events go to its own record, and the outer child's events after it to the outer's."""
+    config = _config()
+    runtime_paths = test_runtime_paths(tmp_path)
+    outer = _child()
+    inner = replace(
+        _child(),
+        delegation_id="inner-delegation",
+        parent_tool_call_id="inner-call",
+        session_id="inner-session",
+        run_id="inner-run",
+        execution_identity=serialize_tool_execution_identity(_identity("child", "inner-session")),
+        subagent_id="d" * 32,
+    )
+    for child in (outer, inner):
+        await _start(child, config, runtime_paths)
+    outer_tool = ToolExecution(tool_call_id="outer-tool", tool_name="lookup", tool_args={}, result="outer result")
+    inner_tool = ToolExecution(tool_call_id="inner-tool", tool_name="lookup", tool_args={})
+
+    async with child_run_context(outer, config=config, runtime_paths=runtime_paths):
+        await observe_child_event(ToolStarted(outer_tool.call))
+        async with child_run_context(inner, config=config, runtime_paths=runtime_paths):
+            assert running_child_id() == "inner-delegation"
+            await observe_child_event(TextDelta("inner text"))
+            await observe_child_event(ToolStarted(inner_tool.call))
+        assert running_child_id() == "child-delegation"
+        await observe_child_event(TextDelta("outer text"))
+        await observe_child_event(ToolCompleted(outer_tool.call))
+    assert running_child_id() is None
+
+    outer_events = _events(await _record_dir(outer, config, runtime_paths))
+    inner_events = _events(await _record_dir(inner, config, runtime_paths))
+    assert [(event["kind"], event["event_id"]) for event in outer_events[1:]] == [
+        ("tool_call", "run:child-run:tool:outer-tool:call"),
+        ("output", "run:child-run:stream:2"),
+        ("tool_result", "run:child-run:tool:outer-tool:result"),
+    ]
+    assert outer_events[2]["data"]["content"] == "outer text"
+    assert [(event["kind"], event["event_id"]) for event in inner_events[1:]] == [
+        ("output", "run:inner-run:stream:1"),
+        ("tool_call", "run:inner-run:tool:inner-tool:call"),
+    ]
+    assert inner_events[1]["data"]["content"] == "inner text"
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_record_of_another_run_is_neither_the_childs_evidence_nor_in_its_record(
+    tmp_path: Path,
+) -> None:
+    """Only a record of the child's current run and session settles it or reaches its audit, and only it is numbered."""
+    config = _config()
+    runtime_paths = test_runtime_paths(tmp_path)
+    child = _child()
+    await _start(child, config, runtime_paths)
+    foreign_records = (
+        RunRecord(run_id="other-run", session_id=child.session_id, status=RunStatus.completed, content="other run"),
+        RunRecord(run_id=child.run_id, session_id="other-session", status=RunStatus.completed, content="other session"),
+        TeamRunRecord(
+            run_id=child.run_id,
+            session_id=child.session_id,
+            status=RunStatus.completed,
+            content="team run",
+            team_id="team",
+        ),
+    )
+
+    async with child_run_context(child, config=config, runtime_paths=runtime_paths) as observation:
+        for record in foreign_records:
+            await observe_child_event(RunFinished(record))
+        await observe_child_event(TextDelta("own text"))
+        assert observation.response is None
+
+    assert child.status == "running"
+    events = _events(await _record_dir(child, config, runtime_paths))
+    assert [(event["kind"], event["event_id"]) for event in events[1:]] == [("output", "run:child-run:stream:1")]
+    assert events[1]["data"]["content"] == "own text"
 
 
 @pytest.mark.asyncio
@@ -764,13 +948,7 @@ async def test_finish_child_record_settles_non_success_outcome_idempotently(
     config = _config()
     runtime_paths = test_runtime_paths(tmp_path)
     child = _child()
-    await start_child_turn(
-        child,
-        parent_run_id="parent-run",
-        config=config,
-        runtime_paths=runtime_paths,
-        caller_execution_identity=_identity("leader", "parent-session"),
-    )
+    await _start(child, config, runtime_paths)
     child.status = status
     child.result = f"child {status}"
 

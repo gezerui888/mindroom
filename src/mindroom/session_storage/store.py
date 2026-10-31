@@ -34,7 +34,6 @@ from mindroom.constants import (
 )
 from mindroom.history.types import HistoryScope, ScopeSummary, owner_scope
 from mindroom.llm.runs import RunStatus, TeamRunRecord
-from mindroom.llm.usage import ModelMetrics, RunMetrics, SessionMetrics, TokenCounts
 from mindroom.session_storage.codec import RunColumns, decode_json, run_columns, run_kind, run_record
 from mindroom.session_storage.lanes import run_session_storage_operation
 from mindroom.session_storage.schema import (
@@ -45,7 +44,7 @@ from mindroom.session_storage.schema import (
     usage_upsert_sql,
 )
 from mindroom.session_storage.types import ConversationSession, session_state_snapshot
-from mindroom.usage.storage import project_helper_usage, project_usage
+from mindroom.usage.storage import helper_usage_snapshot, run_usage_snapshot
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator, Mapping, Sequence
@@ -241,11 +240,12 @@ class ConversationStore:
         after the turns it waited for, and the first requester a written run names goes on a row that has none.
 
         ``record_usage`` replaces the run's usage snapshot in the ledger, which outlives removed runs, and moves the
-        session totals by the difference; a final run's usage changes neither. ``state``, a
-        ``session_state_snapshot`` of the state the run ran with, commits with the run when the row does not hold it.
-        ``session.runs`` then holds the run as the store does (``_mirror``).
+        session's update time; a final run's usage is not recorded. ``state``, a ``session_state_snapshot`` of the
+        state the run ran with, commits with the run when the row does not hold it. ``session.runs`` then holds the run
+        as the store does (``_mirror``).
         """
-        return self._save(session, run.to_dict(), run_kind(run), record_usage=record_usage, state=state)
+        usage = run_usage_snapshot(run) if record_usage else None
+        return self._save(session, run.to_dict(), run_kind(run), usage=usage, state=state)
 
     def save_interrupted_record(
         self,
@@ -260,7 +260,7 @@ class ConversationStore:
         answer; a visible run keeps its ``seq``, so replay order does not change.
         """
         kind = run_kind(record)
-        outcome = self._save(session, record.to_dict(), kind, record_usage=False, state=state, interrupted=True)
+        outcome = self._save(session, record.to_dict(), kind, usage=None, state=state, interrupted=True)
         return cast("Literal['written', 'removed']", outcome)
 
     def _save(
@@ -269,23 +269,71 @@ class ConversationStore:
         data: dict[str, Any],
         kind: SessionKind,
         *,
-        record_usage: bool,
+        usage: dict[str, object] | None,
         state: dict[str, Any] | None,
         interrupted: bool = False,
     ) -> SaveOutcome:
-        """Save one run from its stored dict and ``state`` in one transaction, then mirror it in ``session``."""
+        """Save one run from its stored dict, its ``usage`` snapshot when given, and ``state`` in one transaction.
+
+        The run is then mirrored in ``session``.
+        """
         with self.transaction(write=True) as connection:
             created = ensure_session_row(connection, self.names, session)
             saved = _write_run(connection, self.names, session.session_id, data, kind, interrupted=interrupted)
-            if record_usage and saved.outcome != "final":
-                snapshot = project_usage({**data, "created_at": saved.created_at, "updated_at": saved.updated_at})
-                _record_run_usage(connection, self.names, session.session_id, data["run_id"], snapshot)
+            if usage is not None and saved.outcome != "final":
+                _record_usage(
+                    connection,
+                    self.names,
+                    session.session_id,
+                    data["run_id"],
+                    usage,
+                    created_at=saved.created_at,
+                    updated_at=saved.updated_at,
+                )
+            elif saved.moved and data["status"] not in _NON_VISIBLE:
+                # A finished run new to the log, or finished after the turns it waited for, is news to the readers too.
+                _move_update_time(connection, self.names, session.session_id, saved.updated_at)
             stored = self._write_state(connection, session, created, state)
         _record_stored_state(session, stored)
         _mirror(session, saved)
         if created is not None:
             report_created_row(session)
         return saved.outcome
+
+    def _save_usage(
+        self,
+        session: ConversationSession,
+        data: dict[str, Any],
+        usage: dict[str, object],
+        *,
+        state: dict[str, Any] | None,
+    ) -> None:
+        """Record the ``usage`` snapshot of the run whose stored dict is ``data`` and commit ``state``, but no run.
+
+        The run is no turn of the conversation, so no load ever replays it: any row it already holds, such as the
+        cancelled one a mid-turn fold wrote, goes with its member runs and messages, while every summary row stays.
+        Its usage counts as a stored run's does, the session row is created if needed, and the first requester the
+        run names goes on a row that has none. ``session.runs`` then holds none of the run.
+        """
+        session_id, run_id, now = session.session_id, data["run_id"], int(time())
+        with self.transaction(write=True) as connection:
+            created = ensure_session_row(connection, self.names, session)
+            delete_runs_in_transaction(connection, self.names, [run_id], session_id=session_id)
+            _adopt_requester(connection, self.names, session_id, data.get("user_id"))
+            _record_usage(
+                connection,
+                self.names,
+                session_id,
+                run_id,
+                usage,
+                created_at=data.get("created_at") or now,
+                updated_at=now,
+            )
+            stored = self._write_state(connection, session, created, state)
+        _record_stored_state(session, stored)
+        session.runs = runs_without(session.runs, [run_id])
+        if created is not None:
+            report_created_row(session)
 
     def patch_run_metadata(
         self,
@@ -321,51 +369,6 @@ class ConversationStore:
             ]
         return True
 
-    def rewrite_run_messages(
-        self,
-        session_id: str,
-        edit: Callable[[list[AnyRunRecord]], list[AnyRunRecord]],
-        *,
-        session: ConversationSession | None = None,
-    ) -> None:
-        """Apply ``edit`` to fresh copies of the runs a load returns, under the write lock, and store their messages.
-
-        ``edit`` returns the runs it changed and changes no other. Only messages store, under the save's message rules,
-        and only for runs the load returned, so no other writer's status, metadata, or messages are lost and no covered
-        run changes. Once it commits, ``session``, when given, holds what a load returns: the load ``edit`` was handed
-        when it stored nothing, which spares a second read.
-        """
-        with self.transaction(write=True) as connection:
-            loaded = self._read_load(connection, session_id)
-            runs = loaded.runs if loaded is not None else []
-            statuses = {run.run_id: run.status.value for run in runs}
-            stored = [(run, status) for run in edit(runs) if (status := statuses.get(run.run_id)) is not None]
-            for run, status in stored:
-                messages = [message.to_dict() for message in run.messages]
-                set_visible_messages(connection, self.names, run.run_id, messages, status)
-            if stored and session is not None:
-                loaded = self._read_load(connection, session_id)
-        if session is not None:
-            _adopt_log(session, loaded)
-
-    def delete_runs(
-        self,
-        run_ids: Collection[str],
-        *,
-        session_id: str,
-        session: ConversationSession | None = None,
-    ) -> set[str]:
-        """Delete session ``session_id``'s runs ``run_ids`` with their member runs and messages; return the deleted ids.
-
-        It records no removed run and keeps every summary row, so it suits discarding a run, not cutting history.
-        Once it commits, ``session``, when given, holds none of the runs nor their members.
-        """
-        with self.transaction(write=True) as connection:
-            deleted = delete_runs_in_transaction(connection, self.names, run_ids, session_id=session_id)
-        if session is not None:
-            session.runs = runs_without(session.runs, run_ids)
-        return deleted
-
     def get_run(self, run_id: str) -> AnyRunRecord | None:
         """Return one stored run, in whatever session, in its replay view; a paused team run comes with its members."""
         with self.transaction(write=False) as connection:
@@ -375,6 +378,19 @@ class ConversationStore:
         """Return every stored run of the session, member runs included, in ``seq`` order, each in its replay view."""
         with self.transaction(write=False) as connection:
             return _read_runs(connection, self.names, "run.session_id = ?", (session_id,))
+
+    def logged_runs(self, session_id: str) -> list[LoggedRun]:
+        """Return the session's top-level runs with their places in its log, as ``logged_runs`` reads them."""
+        with self.transaction(write=False) as connection:
+            return logged_runs(connection, self.names, session_id)
+
+    def log_end(self) -> int:
+        """Return the last place the database's log handed out, or 0 before its first run; later saves place after it."""
+        with self.transaction(write=False) as connection:
+            (next_seq,) = connection.execute(
+                f"SELECT next_seq FROM {quote_identifier(self.names.log_meta)} WHERE id = 1",  # noqa: S608
+            ).fetchone()
+        return next_seq - 1
 
     def _write_state(
         self,
@@ -432,7 +448,9 @@ class ConversationStore:
         """Return ``(session_id, updated_at)`` of the sessions updated after ``since``, oldest first.
 
         A session's update time moves when its row is written: a changed state a run save carries, a metadata change,
-        or a run save that records its usage, as a run's terminal save through ``persist_to`` does.
+        a run save that records its usage, as a run's terminal save through ``persist_to`` does, and a save that places
+        a visible run at the log's end (a new one, or one saved visible over its paused, cancelled, or errored row), so a
+        reader following ``seq`` learns of every run that finished, however it was saved.
         """
         with self.transaction(write=False) as connection:
             return connection.execute(
@@ -454,10 +472,9 @@ class ConversationStore:
     ) -> None:
         """Upsert helper usage as ``usage_id``, owned by a conversation and a requester, beside the run log.
 
-        ``initial_session`` creates the conversation's row when no run has yet. Helper usage is not part of the
-        session totals.
+        ``initial_session`` creates the conversation's row when no run has yet.
         """
-        snapshot = project_helper_usage(usage, usage_id=usage_id, kind=kind, requester_id=requester_id)
+        snapshot = helper_usage_snapshot(usage, usage_id=usage_id, kind=kind, requester_id=requester_id)
         created = None
         with self.transaction(write=True) as connection:
             if initial_session is not None and ensure_session_row(connection, self.names, initial_session) is not None:
@@ -465,6 +482,13 @@ class ConversationStore:
             connection.execute(usage_upsert_sql(self.names), (session_id, usage_id, json.dumps(snapshot)))
         if created is not None:
             report_created_row(created)
+
+
+class LoggedRun(NamedTuple):
+    """A stored run and its place in its session's log."""
+
+    seq: int
+    run: AnyRunRecord
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,7 +509,10 @@ def _adopt_log(session: ConversationSession, loaded: _Load | None) -> None:
 
 @dataclass(frozen=True, slots=True)
 class _Saved:
-    """One full save: its outcome, the timestamps its usage takes, and a written run's move and read-back copy."""
+    """One full save: its outcome, its timestamps, and a written run's move and read-back copy.
+
+    The usage it records takes both timestamps, and the session's update time moves to ``updated_at``.
+    """
 
     run_id: str
     outcome: SaveOutcome
@@ -525,29 +552,80 @@ def _mirror(session: ConversationSession, saved: _Saved) -> None:
     session.runs = runs
 
 
+def _record_usage(
+    connection: sqlite3.Connection,
+    names: TableNames,
+    session_id: str,
+    run_id: str,
+    usage: dict[str, object],
+    *,
+    created_at: int,
+    updated_at: int,
+) -> None:
+    """Replace the run's usage snapshot, so a run saved again after a pause or at a checkpoint counts once.
+
+    The session's update time moves to the snapshot's, so background readers learn of the recorded usage.
+    """
+    snapshot = {**usage, "created_at": created_at, "updated_at": updated_at}
+    connection.execute(usage_upsert_sql(names), (session_id, run_id, json.dumps(snapshot)))
+    _move_update_time(connection, names, session_id, updated_at)
+
+
+def _move_update_time(connection: sqlite3.Connection, names: TableNames, session_id: str, updated_at: int) -> None:
+    """Set the session row's update time, through which background readers learn of news (``list_updated_sessions``)."""
+    connection.execute(
+        f"UPDATE {quote_identifier(names.sessions)} SET updated_at = ? WHERE session_id = ?",  # noqa: S608
+        (updated_at, session_id),
+    )
+
+
+def logged_runs(connection: sqlite3.Connection, names: TableNames, session_id: str) -> list[LoggedRun]:
+    """Return every top-level run of the session with its ``seq``, in ``seq`` order, each in its replay view.
+
+    A run that finishes after the turns it waited for takes the next ``seq``, so it sorts after them.
+    """
+    condition, parameters = "run.session_id = ? AND run.parent_run_id IS NULL", (session_id,)
+    seqs = connection.execute(
+        f"SELECT seq FROM {quote_identifier(names.log_runs)} AS run WHERE {condition} ORDER BY seq",  # noqa: S608
+        parameters,
+    ).fetchall()
+    runs = _read_runs(connection, names, condition, parameters)
+    return [LoggedRun(run_seq, run) for (run_seq,), run in zip(seqs, runs, strict=True)]
+
+
 def runs_without(runs: Iterable[AnyRunRecord], run_ids: Iterable[str]) -> list[AnyRunRecord]:
     """Return ``runs`` minus ``run_ids`` and their member runs; team members are agents, so none has members."""
     removed = set(run_ids)
     return [run for run in runs if run.run_id not in removed and run.parent_run_id not in removed]
 
 
-def persist_to(store: ConversationStore, session: ConversationSession) -> Callable[[AnyRunRecord], Awaitable[None]]:
+def persist_to(
+    store: ConversationStore,
+    session: ConversationSession,
+    *,
+    replays: Callable[[AnyRunRecord], bool] | None = None,
+) -> Callable[[AnyRunRecord], Awaitable[None]]:
     """Return the callback a run hands its terminal record to: save it to ``store`` with its usage, in the database's lane.
 
-    The record saves as ``ConversationStore.save_run`` saves it with ``record_usage``.
-    The record and ``session.session_state``, which the run's tools change in place, are copied on the caller's task
-    before the lane is awaited, so what lands is what was handed over. The state is written back, in the record's
-    own transaction, when it differs from ``session.stored_session_state``, which every write of the field records,
-    so a turn whose runs or checkpoints change the state and restore it stores it restored.
+    A record saves as ``ConversationStore.save_run`` saves it with ``record_usage``, a turn later loads replay, unless
+    ``replays`` rejects it: such a record is no turn, and only its usage is recorded (``_save_usage``).
+    The record, with its usage snapshot, and ``session.session_state``, which the run's tools change in place, are
+    copied on the caller's task before the lane is awaited, so what lands is what was handed over. The state is written
+    back, in the record's own transaction, when it differs from ``session.stored_session_state``, which every write of
+    the field records, so a turn whose runs or checkpoints change the state and restore it stores it restored.
     The save mirrors itself in ``session.runs`` in the lane, where the session's saves run one at a time; it completes
     even when the caller is cancelled, as the lane's operations do.
     """
 
     async def persist(record: AnyRunRecord) -> None:
-        data, kind = record.to_dict(), run_kind(record)
+        data, kind, usage = record.to_dict(), run_kind(record), run_usage_snapshot(record)
+        turn = replays is None or replays(record)
 
-        def save(opened: ConversationStore, state: dict[str, Any]) -> SaveOutcome:
-            return opened._save(session, data, kind, record_usage=True, state=state)
+        def save(opened: ConversationStore, state: dict[str, Any]) -> None:
+            if turn:
+                opened._save(session, data, kind, usage=usage, state=state)
+            else:
+                opened._save_usage(session, data, usage, state=state)
 
         await write_with_session_state(store, session, save)
 
@@ -568,21 +646,17 @@ async def write_with_session_state[Result](
     return await run_session_storage_operation(lambda: store, lambda opened: write(opened, state))
 
 
-def decoded_mapping(raw_value: object, *, null: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    """Return a stored JSON object column, ``null`` for SQL or JSON null, or None when unreadable or not an object.
+def decoded_mapping(raw_value: object) -> dict[str, Any] | None:
+    """Return a stored JSON object column, or None when it is null, unreadable, or not an object.
 
     An odd row therefore never fails a load or a conversion; JSON nested too deep to decode is unreadable too.
     """
-    if raw_value is None:
-        return null
     if not isinstance(raw_value, (str, bytes, bytearray)):
         return None
     try:
         value = decode_json(raw_value)
     except (RecursionError, ValueError):
         return None
-    if value is None:
-        return null
     return cast("dict[str, Any]", value) if isinstance(value, dict) else None
 
 
@@ -873,16 +947,20 @@ def _read_runs(
 ) -> list[AnyRunRecord]:
     """Decode the runs whose rows meet ``condition``, in ``seq`` order, each in its replay view.
 
-    A paused team run's ``member_responses``, which its resume reads, are the member runs its requirements name, in
-    first-mention order, each decoded apart from the member's own record so the two share nothing.
+    A paused team run's ``member_responses``, whose calls it waits on and its resume continues, are its paused member
+    runs in ``seq`` order, the order their rows were first written, each decoded apart from the member's own record so
+    the two share nothing.
     """
     records = _decoded_runs(connection, names, f"{condition} ORDER BY run.seq", parameters)
     for record in records:
         if isinstance(record, TeamRunRecord) and record.status is RunStatus.paused:
-            named = list(dict.fromkeys(item.member_run_id for item in record.requirements or () if item.member_run_id))
-            members = _decoded_runs(connection, names, "run.parent_run_id = ?", (record.run_id,))
-            by_id = {member.run_id: cast("RunRecord", member) for member in members}
-            record.member_responses = [by_id[member_id] for member_id in named if member_id in by_id]
+            members = _decoded_runs(
+                connection,
+                names,
+                "run.parent_run_id = ? AND run.status = ? ORDER BY run.seq",
+                (record.run_id, RunStatus.paused.value),
+            )
+            record.member_responses = [cast("RunRecord", member) for member in members]
     return records
 
 
@@ -1024,7 +1102,7 @@ def store_fold(
     runs, now, seq = quote_identifier(names.log_runs), int(time()), _next_seq(connection, names)
     move = f"UPDATE {runs} SET seq = ? WHERE session_id = ? AND run_id = ?"  # noqa: S608
     if not connection.execute(move, (seq, session_id, run.run_id)).rowcount:
-        data = {**run.to_dict(), "status": RunStatus.cancelled.value, "tools": None, "requirements": None}
+        data = {**run.to_dict(), "status": RunStatus.cancelled.value, "tools": None}
         created_at, kind = run.created_at or now, run_kind(run)
         upsert_run(connection, names, session_id, data, kind, seq=seq, created_at=created_at, updated_at=now)
     folded = [message.to_dict() for message in messages]
@@ -1070,7 +1148,11 @@ def delete_runs_in_transaction(
     *,
     session_id: str,
 ) -> set[str]:
-    """Delete session ``session_id``'s runs ``run_ids`` with their members and messages; return the deleted ids."""
+    """Delete session ``session_id``'s runs ``run_ids`` with their members and messages; return the deleted ids.
+
+    It records no removed run and keeps every summary row; a caller that cuts or retires history records the removed
+    runs itself.
+    """
     selected = json.dumps(sorted(run_ids))
     return {
         run_id
@@ -1082,80 +1164,10 @@ def delete_runs_in_transaction(
     }
 
 
-# TODO(simplify): the session totals in `session_data` repeat what the usage ledger's run snapshots record.
-# Report undated totals from the ledger and stop writing them, once a migration keeps pre-ledger history.
-# Operators would notice in admin and private usage totals, and stored data.
-def _record_run_usage(
-    connection: sqlite3.Connection,
-    names: TableNames,
-    session_id: str,
-    run_id: str,
-    snapshot: dict[str, object],
-) -> None:
-    """Replace the run's usage snapshot and move the session totals by the difference from the snapshot it replaces.
-
-    A run saved again when it continues after a pause, or at a checkpoint, so counts once in the totals. The totals
-    count what the ledger records: token counters, in total and per model.
-    """
-    usage, sessions = quote_identifier(names.usage), quote_identifier(names.sessions)
-    previous = connection.execute(
-        f"SELECT usage_data FROM {usage} WHERE session_id = ? AND run_id = ?",  # noqa: S608
-        (session_id, run_id),
-    ).fetchone()
-    connection.execute(usage_upsert_sql(names), (session_id, run_id, json.dumps(snapshot)))
-    (raw_session_data,) = connection.execute(
-        f"SELECT session_data FROM {sessions} WHERE session_id = ?",  # noqa: S608
-        (session_id,),
-    ).fetchone()
-    session_data = decoded_mapping(raw_session_data, null={})
-    if session_data is not None:
-        stored_totals = session_data.get("session_metrics")
-        totals = SessionMetrics.from_dict(stored_totals) if isinstance(stored_totals, dict) else SessionMetrics()
-        totals.count_run(
-            _counted_usage(snapshot),
-            replacing=None if previous is None else _counted_usage(decoded_mapping(previous[0]) or {}),
-        )
-        session_data["session_metrics"] = totals.to_dict()
-    # An unreadable row keeps its bytes, so the ledger alone records this run; its update time moves either way.
-    connection.execute(
-        f"UPDATE {sessions} SET session_data = COALESCE(?, session_data), updated_at = ? WHERE session_id = ?",  # noqa: S608
-        (None if session_data is None else json.dumps(session_data), int(time()), session_id),
-    )
-
-
-def _counted_usage(snapshot: Mapping[str, object]) -> RunMetrics:
-    """Return the usage a ledger snapshot records: its token counters, in total and for each model."""
-    metrics = snapshot.get("metrics")
-    if not isinstance(metrics, dict):
-        return RunMetrics()
-    metrics = cast("dict[str, object]", metrics)
-    counted = RunMetrics(tokens=TokenCounts.from_mapping(metrics, _counted_value))
-    details = metrics.get("details")
-    models = cast("dict[str, object]", details).get("model") if isinstance(details, dict) else None
-    if isinstance(models, list):
-        counted.details = {
-            "model": [_counted_model(cast("dict[str, object]", entry)) for entry in models if isinstance(entry, dict)],
-        }
-    return counted
-
-
-def _counted_model(entry: Mapping[str, object]) -> ModelMetrics:
-    model_id, provider = entry.get("id"), entry.get("provider")
-    return ModelMetrics(
-        tokens=TokenCounts.from_mapping(entry, _counted_value),
-        id=model_id if isinstance(model_id, str) else "",
-        provider=provider if isinstance(provider, str) else "",
-    )
-
-
-def _counted_value(value: object) -> int:
-    # The ledger keeps an invalid counter as a sentinel for its reporter; only real counts add up.
-    return value if isinstance(value, int) and not isinstance(value, bool) else 0
-
-
 __all__ = [
     "BUSY_TIMEOUT_SECONDS",
     "ConversationStore",
+    "LoggedRun",
     "SaveOutcome",
     "begun",
     "connect_by_name",
@@ -1166,6 +1178,7 @@ __all__ = [
     "ensure_session_row",
     "flag_folded",
     "is_removed",
+    "logged_runs",
     "persist_to",
     "report_created_row",
     "runs_without",

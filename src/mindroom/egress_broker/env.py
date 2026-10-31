@@ -5,16 +5,16 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping  # noqa: TC003
 from pathlib import Path  # noqa: TC003
 from typing import TYPE_CHECKING, Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
-from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, WORKER_EGRESS_NO_PROXY, RuntimePaths, compose_worker_proxy_env
+from mindroom.constants import EXECUTION_ENV_TOOL_NAMES, RuntimePaths
 from mindroom.origins import connections_sign_in_enabled
 from mindroom.runtime_env_policy import EGRESS_BROKER_ENV_BY_KEY
 from mindroom.workers.backend import WorkerBackendError
 
 if TYPE_CHECKING:
     from mindroom.config.main import Config
-    from mindroom.config.resolution import AgentToolFacts
+    from mindroom.tool_system.agent_tools import AgentTools
 
 __all__ = [
     "BROKER_CA_PEM_ENV",
@@ -35,6 +35,7 @@ BROKER_CA_PEM_ENV = "MINDROOM_EGRESS_BROKER_CA_PEM"
 RUNNER_CA_BUNDLE_ENV = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")
 # Not a secret: the broker ignores it. Clients that drop credentials with an empty password need a value here.
 _PROXY_PASSWORD = "mindroom"  # noqa: S105
+_BASE_NO_PROXY_HOSTS = ("localhost", "127.0.0.1", "::1", ".svc", ".cluster.local")
 # The agent tool that lists the broker's services; an agent that has it opts into Agent Keys.
 _EGRESS_TOOL_NAME = "egress_credentials"
 
@@ -86,14 +87,11 @@ def egress_agent_scope(config: Config, agent_name: str, runtime_paths: RuntimePa
     """
     if agent_name not in config.agents:
         return None
-    resolved = config.resolve_agent(agent_name)
-    if _EGRESS_TOOL_NAME not in resolved.tools.tool_names or not _runs_commands_in_a_worker(
-        config,
-        resolved.tools,
-        runtime_paths,
-    ):
+    agent_tools = _agent_tools(config, agent_name, runtime_paths)
+    # While the broker is off, the egress tool is unavailable, so no agent uses the broker.
+    if _EGRESS_TOOL_NAME not in agent_tools.tool_names or not _runs_commands_in_a_worker(agent_tools, runtime_paths):
         return None
-    execution_scope = resolved.policy.effective_execution_scope
+    execution_scope = config.resolve_agent(agent_name).policy.effective_execution_scope
     return "unscoped" if execution_scope is None else execution_scope
 
 
@@ -105,23 +103,29 @@ def egress_tool_without_worker_commands(config: Config, agent_name: str, runtime
     """
     if agent_name not in config.agents:
         return False
-    facts = config.resolve_agent(agent_name).tools
+    agent_tools = _agent_tools(config, agent_name, runtime_paths)
     return (
-        _EGRESS_TOOL_NAME in facts.tool_names
-        and not EXECUTION_ENV_TOOL_NAMES.isdisjoint(facts.tool_names)
-        and not _runs_commands_in_a_worker(config, facts, runtime_paths)
+        _EGRESS_TOOL_NAME in agent_tools.tool_names
+        and not EXECUTION_ENV_TOOL_NAMES.isdisjoint(agent_tools.tool_names)
+        and not _runs_commands_in_a_worker(agent_tools, runtime_paths)
     )
 
 
-def _runs_commands_in_a_worker(config: Config, facts: AgentToolFacts, runtime_paths: RuntimePaths) -> bool:
+def _agent_tools(config: Config, agent_name: str, runtime_paths: RuntimePaths) -> AgentTools:
+    # Deferred: the plugin loader and the agent tools import this module.
+    from mindroom.tool_system.agent_tools import resolve_agent_tools  # noqa: PLC0415
+    from mindroom.tool_system.plugins import config_plugins  # noqa: PLC0415
+
+    return resolve_agent_tools(config, agent_name, config_plugins(config, runtime_paths).tools)
+
+
+def _runs_commands_in_a_worker(agent_tools: AgentTools, runtime_paths: RuntimePaths) -> bool:
     """Return whether any of the agent's own `EXECUTION_ENV_TOOL_NAMES` runs in a worker."""
     # Deferred: the sandbox proxy imports this module.
-    from mindroom.tool_system.agent_tools import AgentTools  # noqa: PLC0415
     from mindroom.tool_system.sandbox_proxy import tool_placement  # noqa: PLC0415
 
-    agent_tools = AgentTools(config=config, facts=facts)
     try:
-        placement = tool_placement(runtime_paths)
+        placement = tool_placement(runtime_paths, agent_tools.tools)
         return any(
             agent_tools.runs_in_worker(tool_name, placement)
             for tool_name in EXECUTION_ENV_TOOL_NAMES.intersection(agent_tools.tool_names)
@@ -155,24 +159,53 @@ def broker_execution_env(
     none of them.
     """
     # NO_PROXY: the base entries, then the extra hosts, each once and in first-seen order
-    no_proxy = ",".join(dict.fromkeys([*WORKER_EGRESS_NO_PROXY.split(","), *extra_no_proxy_hosts]))
+    no_proxy = ",".join(dict.fromkeys([*_BASE_NO_PROXY_HOSTS, *extra_no_proxy_hosts]))
+    scheme, _, rest = broker_url.partition("://")
+    # Percent-encode the token so URL-significant characters (@ : / # ? % +, whitespace) cannot make HTTP clients
+    # mis-parse the userinfo.
+    proxy = f"{scheme}://{quote(token, safe='')}:{_PROXY_PASSWORD}@{rest}"
+    return {
+        "HTTP_PROXY": proxy,
+        "HTTPS_PROXY": proxy,
+        "http_proxy": proxy,
+        "https_proxy": proxy,
+        "NO_PROXY": no_proxy,
+        "no_proxy": no_proxy,
+        # Git/libcurl does not always send proxy credentials from HTTPS_PROXY userinfo on CONNECT, so
+        # environment-backed Git config names the same proxy without writing user or global Git config.
+        # It extends the call's env, never the primary's process env, whose Git config must not leak to workers.
+        **_git_config_env(call_env or {}, [("http.proxy", proxy), ("http.proxyAuthMethod", "basic")]),
+        BROKER_CA_PEM_ENV: ca_pem,
+        "NODE_USE_ENV_PROXY": "1",
+        **placeholder_env,
+    }
 
-    # Compose base proxy env
-    env = compose_worker_proxy_env(
-        # The call's env, never the primary's process env, whose git config must not leak to workers.
-        call_env or {},
-        proxy_url=broker_url,
-        username=token,
-        password=_PROXY_PASSWORD,
-        ca_file=None,  # CA is handled separately via BROKER_CA_PEM_ENV
-        no_proxy=no_proxy,
-    )
 
-    # Add broker-specific env
-    env[BROKER_CA_PEM_ENV] = ca_pem
-    env["NODE_USE_ENV_PROXY"] = "1"
-    env.update(placeholder_env)
+def _git_config_env(call_env: Mapping[str, str], entries: list[tuple[str, str]]) -> dict[str, str]:
+    """Append entries to any well-formed environment-backed Git config.
 
+    A malformed incoming block is discarded so Git never receives an
+    inconsistent count/key/value set.
+    """
+    existing_entries: list[tuple[str, str]] = []
+    try:
+        existing_count = int(call_env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        existing_count = 0
+    if existing_count > 0:
+        for index in range(existing_count):
+            key = call_env.get(f"GIT_CONFIG_KEY_{index}")
+            value = call_env.get(f"GIT_CONFIG_VALUE_{index}")
+            if key is None or value is None:
+                existing_entries = []
+                break
+            existing_entries.append((key, value))
+
+    merged_entries = [*existing_entries, *entries]
+    env = {"GIT_CONFIG_COUNT": str(len(merged_entries))}
+    for index, (key, value) in enumerate(merged_entries):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
     return env
 
 
@@ -201,7 +234,7 @@ def primary_callback_hosts(runtime_paths: RuntimePaths) -> list[str]:
     return list(dict.fromkeys(host for host in hosts if host))
 
 
-def apply_runner_ca_bundle(env: dict[str, str], directory: Path) -> bool:
+def apply_runner_ca_bundle(env: dict[str, str], directory: Path) -> None:
     """Materialize broker CA bundle into directory and set CA env vars.
 
     Pops BROKER_CA_PEM_ENV from env, writes combined and broker-only bundle
@@ -209,12 +242,11 @@ def apply_runner_ca_bundle(env: dict[str, str], directory: Path) -> bool:
     NODE_EXTRA_CA_CERTS to the broker-only file.
 
     `materialize_ca_bundle` creates the directory with mode 0700 if missing.
-
-    Returns True if the CA was present and materialized, False otherwise.
+    An env without the broker CA is left unchanged.
     """
     ca_pem = env.pop(BROKER_CA_PEM_ENV, None)
     if not ca_pem:
-        return False
+        return
 
     # Import lazily to keep the runner import light
     from mindroom.egress_broker.ca import materialize_ca_bundle  # noqa: PLC0415
@@ -226,5 +258,3 @@ def apply_runner_ca_bundle(env: dict[str, str], directory: Path) -> bool:
     for name in RUNNER_CA_BUNDLE_ENV:
         env[name] = str(combined)
     env["NODE_EXTRA_CA_CERTS"] = str(broker_only)
-
-    return True

@@ -31,7 +31,7 @@ if TYPE_CHECKING:
     icon_color="text-purple-500",
     config_fields=[],
     managed_init_args=(ToolManagedInitArg.RUNTIME_PATHS,),
-    dependencies=["agno", "pydantic", "pyyaml"],
+    dependencies=["pydantic", "pyyaml"],
     docs_url="https://docs.mindroom.chat/tools/agent-orchestration/#config_manager",
     function_names=("get_info", "manage_config", "manage_agent", "manage_team"),
 )
@@ -43,5 +43,5 @@ def config_manager_tools() -> type[ConfigManagerTools]:
 
 
 # Inspection and validation only read configuration, so no tool_approval rule or default pauses them.
-register_tool_approval_exemption("manage_config", lambda arguments: arguments.get("operation") == "inspect")
-register_tool_approval_exemption("manage_agent", lambda arguments: arguments.get("operation") == "validate")
+register_tool_approval_exemption("manage_config", lambda arguments, _: arguments.get("operation") == "inspect")
+register_tool_approval_exemption("manage_agent", lambda arguments, _: arguments.get("operation") == "validate")

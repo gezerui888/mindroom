@@ -23,13 +23,14 @@ from mindroom.llm.errors import (
     MODEL_SAFEGUARD_REFUSAL_MESSAGE,
     QUOTA_EXHAUSTED,
     SAFEGUARD_REFUSAL,
+    ContextWindowExceeded,
     InvalidRequest,
     ModelSafeguardRefusal,
     ProviderError,
     ProviderUnavailable,
     RateLimited,
 )
-from mindroom.llm.media import Audio, Image
+from mindroom.llm.media import Audio, File, Image
 from mindroom.llm.messages import AGGREGATE_USAGE_KEY, Message
 from mindroom.llm.provider import (
     Capabilities,
@@ -75,7 +76,7 @@ _FALLBACK_PROMPT = "Media was not inspected."
 type _Step = StreamEvent | Exception | float | Await
 
 
-_IDENTITY = ModelIdentity(id="scripted", provider="Scripted", provider_name="Scripted Chat")
+_IDENTITY = ModelIdentity(id="scripted", provider="Scripted")
 _CAPABILITIES = Capabilities()
 
 
@@ -125,12 +126,12 @@ def _turn(text: str = "done", usage: MessageMetrics | None = None) -> TurnComple
 
 
 def _transient(message: str = "overloaded") -> ProviderUnavailable:
-    return ProviderUnavailable(message, provider="Scripted Chat", status_code=503)
+    return ProviderUnavailable(message, provider="Scripted", status_code=503)
 
 
 def _malformed() -> ProviderError:
     message = "Generation ended with finish reason: MALFORMED_FUNCTION_CALL"
-    return ProviderError(message, provider="Scripted Chat", code=MALFORMED_TOOL_CALL)
+    return ProviderError(message, provider="Scripted", code=MALFORMED_TOOL_CALL)
 
 
 async def _drain(provider: WrappedProvider, request: ModelRequest) -> list[StreamEvent]:
@@ -181,13 +182,13 @@ async def test_transient_failure_before_output_is_retried_and_its_usage_carried(
 
 
 @pytest.mark.asyncio
-async def test_a_retried_turn_keeps_the_answering_attempt_s_context_usage() -> None:
+async def test_a_retried_turn_keeps_the_answering_attempt_s_context() -> None:
     """Counters sum across attempts, but the context the model saw is the answering attempt's, not the failed one's."""
 
     def usage(input_tokens: int) -> MessageMetrics:
         return MessageMetrics(
             tokens=TokenCounts(input_tokens=input_tokens, total_tokens=input_tokens),
-            provider_metrics={"context_usage": {"input_tokens": input_tokens}, "server_tool_requests": 1},
+            context=TokenCounts(input_tokens=input_tokens),
         )
 
     inner = _ScriptedProvider([[UsageReported(usage(40)), _transient()], [TextDelta("done"), _turn(usage=usage(90))]])
@@ -196,10 +197,7 @@ async def test_a_retried_turn_keeps_the_answering_attempt_s_context_usage() -> N
     finished = (await _drain(provider, ModelRequest(messages=[_user()])))[-1]
 
     assert isinstance(finished, TurnCompleted)
-    assert finished.message.metrics.provider_metrics == {
-        "context_usage": {"input_tokens": 90},
-        "server_tool_requests": 2,
-    }
+    assert finished.message.metrics.context == TokenCounts(input_tokens=90)
     assert finished.message.metrics.tokens.input_tokens == 130
 
 
@@ -220,7 +218,7 @@ async def test_a_transient_failure_is_reissued_after_its_backoff(monkeypatch: py
 @pytest.mark.parametrize(("hint", "delay"), [(0.25, 0.25), (61.0, 0.0), (None, 0.0)])
 async def test_a_retry_after_hint_of_at_most_a_minute_replaces_the_backoff(hint: float | None, delay: float) -> None:
     """The provider's ``Retry-After`` decides the wait, as the SDK did when it retried; a longer hint is no hint."""
-    throttled = RateLimited("slow down", provider="Scripted Chat", status_code=429, retry_after_seconds=hint)
+    throttled = RateLimited("slow down", provider="Scripted", status_code=429, retry_after_seconds=hint)
     inner = _ScriptedProvider([[throttled], [_turn()]])
     provider = WrappedProvider(inner, partial(retrying_stream, idle_timeout_seconds=None))
     loop = asyncio.get_running_loop()
@@ -308,7 +306,7 @@ def test_only_a_hosted_tool_that_reads_keeps_the_attempt_retryable(name: str, *,
 
 @pytest.mark.asyncio
 async def test_non_retryable_failure_propagates_at_once() -> None:
-    inner = _ScriptedProvider([[InvalidRequest("bad body", provider="Scripted Chat", status_code=400)], [_turn()]])
+    inner = _ScriptedProvider([[InvalidRequest("bad body", provider="Scripted", status_code=400)], [_turn()]])
     provider = WrappedProvider(inner, partial(retrying_stream, idle_timeout_seconds=None))
 
     with pytest.raises(InvalidRequest):
@@ -410,10 +408,10 @@ async def test_usage_that_sums_attempts_stays_marked_when_an_outer_stage_forward
     started = MessageMetrics(tokens=TokenCounts(input_tokens=700, total_tokens=700))
     image_rejection = InvalidRequest(
         "This model does not support image input",
-        provider="Scripted Chat",
+        provider="Scripted",
         status_code=400,
     )
-    rejection = InvalidRequest("The request was rejected", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("The request was rejected", provider="Scripted", status_code=400)
     inner = _ScriptedProvider(
         [
             [UsageReported(started, final=False), _transient()],
@@ -457,7 +455,7 @@ async def test_media_the_route_omits_is_replaced_by_the_fallback_note() -> None:
 
 @pytest.mark.asyncio
 async def test_rejected_media_is_removed_for_one_retry_and_remembered_for_the_route() -> None:
-    rejection = InvalidRequest("This model does not support image input", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("This model does not support image input", provider="Scripted", status_code=400)
     inner = _ScriptedProvider(
         [[UsageReported(MessageMetrics(tokens=TokenCounts(input_tokens=5))), rejection], [_turn()], [_turn()]],
     )
@@ -480,7 +478,7 @@ async def test_rejected_media_is_removed_for_one_retry_and_remembered_for_the_ro
 
 @pytest.mark.asyncio
 async def test_a_media_free_retry_that_is_rejected_too_ends_the_request() -> None:
-    rejection = InvalidRequest("This model does not support image input", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("This model does not support image input", provider="Scripted", status_code=400)
     inner = _ScriptedProvider([[rejection], [rejection], [_turn()]])
     provider = WrappedProvider(inner, partial(media_fallback_stream, fallback_prompt=_FALLBACK_PROMPT))
 
@@ -492,7 +490,7 @@ async def test_a_media_free_retry_that_is_rejected_too_ends_the_request() -> Non
 
 @pytest.mark.asyncio
 async def test_input_specific_rejection_retries_without_learning() -> None:
-    rejection = InvalidRequest("Image exceeds 5 MB maximum", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("Image exceeds 5 MB maximum", provider="Scripted", status_code=400)
     inner = _ScriptedProvider([[rejection], [_turn()], [_turn()]])
     provider = WrappedProvider(inner, partial(media_fallback_stream, fallback_prompt=_FALLBACK_PROMPT))
     request = ModelRequest(messages=[_user(_PROMPT, images=[_image()])])
@@ -509,7 +507,7 @@ async def test_a_payload_rejection_retries_without_learning() -> None:
     """A 413 proves nothing about the model, even when its text names a capability gap."""
     rejection = classify_provider_error(
         "This model does not support image input",
-        provider="Scripted Chat",
+        provider="Scripted",
         status_code=413,
     )
     inner = _ScriptedProvider([[rejection], [_turn()], [_turn()]])
@@ -526,7 +524,7 @@ async def test_a_payload_rejection_retries_without_learning() -> None:
 @pytest.mark.asyncio
 async def test_a_mixed_media_rejection_retries_without_learning() -> None:
     """A rejection of a request with two media kinds cannot say which kind the model lacks."""
-    rejection = InvalidRequest("This model does not support image input", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("This model does not support image input", provider="Scripted", status_code=400)
     inner = _ScriptedProvider([[rejection], [_turn()], [_turn()]])
     provider = WrappedProvider(inner, partial(media_fallback_stream, fallback_prompt=_FALLBACK_PROMPT))
     audio = Audio(content=b"RIFF", mime_type="audio/wav")
@@ -542,7 +540,7 @@ async def test_a_mixed_media_rejection_retries_without_learning() -> None:
 @pytest.mark.asyncio
 async def test_a_learned_media_limit_stays_with_its_endpoint() -> None:
     """The same model id behind another endpoint keeps sending the media one endpoint rejected."""
-    rejection = InvalidRequest("This model does not support image input", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("This model does not support image input", provider="Scripted", status_code=400)
     first = _ScriptedProvider([[rejection], [_turn()]], identity=replace(_IDENTITY, endpoint="http://one/v1"))
     other = _ScriptedProvider([[_turn()]], identity=replace(_IDENTITY, endpoint="http://two/v1"))
     request = ModelRequest(messages=[_user(_PROMPT, images=[_image()])])
@@ -555,7 +553,7 @@ async def test_a_learned_media_limit_stays_with_its_endpoint() -> None:
 
 @pytest.mark.asyncio
 async def test_a_rejection_after_a_hosted_tool_committed_the_attempt_is_not_resent_without_media() -> None:
-    rejection = InvalidRequest("This model does not support image input", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("This model does not support image input", provider="Scripted", status_code=400)
     inner = _ScriptedProvider([[StreamProgress(commits=True), rejection], [_turn()]])
     provider = WrappedProvider(inner, partial(media_fallback_stream, fallback_prompt=_FALLBACK_PROMPT))
 
@@ -602,6 +600,218 @@ async def test_removed_viewed_image_marks_its_receipt_unsupported() -> None:
     tool_result = json.loads(inner.requests[0].messages[1].content)
     assert tool_result["view_status"] == "unsupported"
     assert messages[1].content == receipt
+
+
+# --- Media the rejection names --------------------------------------------------------------------------------
+
+_REPORT = File(id="att_report", content=b"%PDF-1.4", filename="report.pdf", mime_type="application/pdf")
+_CLIP = Audio(id="att_clip", content=b"RIFF", mime_type="audio/wav")
+
+
+def _rejection(*rejected: str, message: str = "Unsupported image") -> InvalidRequest:
+    return InvalidRequest(message, provider="Scripted", status_code=400, rejected_media=frozenset(rejected))
+
+
+def _media_request() -> ModelRequest:
+    """A prompt with two images, a file, and a clip, after a turn without media."""
+    return ModelRequest(
+        messages=[
+            _user("Earlier"),
+            _user(_PROMPT, images=[_image("att_photo"), _image("att_scan")], files=[_REPORT], audio=[_CLIP]),
+        ],
+    )
+
+
+def _sent(messages: list[Message]) -> list[tuple[object, ...]]:
+    """What a request's messages send: each one's role, content, and media."""
+    return [(item.role, item.content, item.images, item.audio, item.videos, item.files) for item in messages]
+
+
+# What the media-free retry sends for ``_media_request``, as the stage sent it before rejections named media.
+_MEDIA_FREE = [
+    ("user", "Earlier", None, None, None, None),
+    ("user", f"{_PROMPT}\n\n{FALLBACK_MARKER}\n{_FALLBACK_PROMPT}", None, None, None, None),
+]
+
+
+def _fallback_stage(inner: _ScriptedProvider) -> WrappedProvider:
+    return WrappedProvider(inner, partial(media_fallback_stream, fallback_prompt=_FALLBACK_PROMPT))
+
+
+@pytest.mark.asyncio
+async def test_a_rejection_that_names_some_media_retries_without_only_those_and_names_them() -> None:
+    inner = _ScriptedProvider([[_rejection("att_photo", "att_report")], [_turn()]])
+
+    await _drain(_fallback_stage(inner), _media_request())
+
+    earlier, retried = inner.requests[1].messages
+    assert _sent([earlier]) == _MEDIA_FREE[:1]
+    assert (retried.images, retried.files, retried.audio) == ([_image("att_scan")], None, [_CLIP])
+    named = "Not sent: image (att_photo), report.pdf (att_report)."
+    assert retried.content == f"{_PROMPT}\n\n{FALLBACK_MARKER}\n{named}\n{_FALLBACK_PROMPT}"
+    assert len(inner.requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rejected",
+    [(), ("att_photo", "att_scan", "att_report", "att_clip"), ("att_unsent",)],
+    ids=["names-none", "names-all", "names-only-unsent-media"],
+)
+async def test_a_rejection_that_names_no_part_of_the_media_retries_without_any_of_it(rejected: tuple[str, ...]) -> None:
+    """The retry is the media-free request the stage always sent, byte for byte, note included."""
+    inner = _ScriptedProvider([[_rejection(*rejected)], [_turn()]])
+
+    await _drain(_fallback_stage(inner), _media_request())
+
+    assert _sent(inner.requests[1].messages) == _MEDIA_FREE
+    assert len(inner.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_request_too_large_for_the_window_retries_without_any_media_whatever_it_names() -> None:
+    """Only a rejected request body names its parts; a request that does not fit shrinks as a whole."""
+    too_large = ContextWindowExceeded(
+        "Request too large",
+        provider="Scripted",
+        status_code=413,
+        rejected_media=frozenset({"att_photo"}),
+    )
+    inner = _ScriptedProvider([[too_large], [_turn()]])
+
+    await _drain(_fallback_stage(inner), _media_request())
+
+    assert _sent(inner.requests[1].messages) == _MEDIA_FREE
+
+
+@pytest.mark.asyncio
+async def test_a_named_retry_that_is_rejected_too_is_sent_once_more_without_any_media() -> None:
+    """A wrong or partial naming costs one request: the media-free request still answers."""
+    inner = _ScriptedProvider([[_rejection("att_photo")], [_rejection("att_scan")], [_turn("answered")]])
+
+    events = await _drain(_fallback_stage(inner), _media_request())
+
+    assert inner.requests[1].messages[1].images == [_image("att_scan")]
+    assert _sent(inner.requests[2].messages) == _MEDIA_FREE
+    finished = events[-1]
+    assert isinstance(finished, TurnCompleted)
+    assert finished.message.content == "answered"
+
+
+@pytest.mark.asyncio
+async def test_a_third_rejection_ends_the_request() -> None:
+    inner = _ScriptedProvider([[_rejection("att_photo")], [_rejection()], [_rejection()], [_turn()]])
+
+    with pytest.raises(InvalidRequest):
+        await _drain(_fallback_stage(inner), _media_request())
+
+    assert len(inner.requests) == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _transient(),
+        ProviderError("You exceeded your current quota", provider="Scripted", code=QUOTA_EXHAUSTED),
+    ],
+    ids=["retryable", "quota"],
+)
+async def test_a_named_retry_ends_at_a_failure_the_media_cannot_have_caused(failure: ProviderError) -> None:
+    inner = _ScriptedProvider([[_rejection("att_photo")], [failure], [_turn()]])
+
+    with pytest.raises(ProviderError) as raised:
+        await _drain(_fallback_stage(inner), _media_request())
+
+    assert raised.value is failure
+    assert len(inner.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_named_retry_that_answers_teaches_the_route_nothing() -> None:
+    """Only a request without any of the media shows the model lacks a kind, so the next request sends it all."""
+    gap = "This model does not support image input"
+    inner = _ScriptedProvider([[_rejection("att_photo", message=gap)], [_turn()], [_turn()]])
+    request = ModelRequest(messages=[_user(_PROMPT, images=[_image("att_photo"), _image("att_scan")])])
+
+    await _drain(_fallback_stage(inner), request)
+    await _drain(_fallback_stage(inner), request)
+
+    assert inner.requests[1].messages[0].images == [_image("att_scan")]
+    assert inner.requests[2].messages[0].images == [_image("att_photo"), _image("att_scan")]
+
+
+@pytest.mark.asyncio
+async def test_a_capability_gap_is_learned_once_the_media_free_backstop_answers() -> None:
+    gap = "This model does not support image input"
+    inner = _ScriptedProvider([[_rejection("att_photo", message=gap)], [_rejection(message=gap)], [_turn()], [_turn()]])
+    request = ModelRequest(messages=[_user(_PROMPT, images=[_image("att_photo"), _image("att_scan")])])
+
+    await _drain(_fallback_stage(inner), request)
+    await _drain(_fallback_stage(inner), request)
+
+    assert [len(attempt.messages[0].images or ()) for attempt in inner.requests] == [2, 1, 0, 0]
+    assert len(inner.requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_a_named_retry_leaves_the_media_the_route_omits_out_and_names_it_too() -> None:
+    """Media the route never takes stays out of the named retry, and the one note names it beside the rejected item."""
+    inner = _ScriptedProvider(
+        [[_rejection("att_photo")], [_turn()]],
+        capabilities=Capabilities(omitted_media=frozenset({"audio"})),
+    )
+
+    await _drain(_fallback_stage(inner), _media_request())
+
+    sent = inner.requests[0].messages[1]
+    assert (sent.audio, sent.content) == (None, f"{_PROMPT}\n\n{FALLBACK_MARKER}\n{_FALLBACK_PROMPT}")
+    retried = inner.requests[1].messages[1]
+    assert (retried.audio, retried.images, retried.files) == (None, [_image("att_scan")], [_REPORT])
+    named = "Not sent: image (att_photo), audio (att_clip)."
+    assert retried.content == f"{_PROMPT}\n\n{FALLBACK_MARKER}\n{named}\n{_FALLBACK_PROMPT}"
+
+
+@pytest.mark.asyncio
+async def test_a_named_viewed_image_removes_every_image_and_marks_the_receipts() -> None:
+    """A viewed image's receipt cannot be told apart from the others', so naming one leaves every image out."""
+    receipt = json.dumps({"view_status": "ready", "attachment_id": "att-1"})
+    viewed = _image(f"{VIEWED_IMAGE_ID_PREFIX}1")
+    messages = [
+        Message(
+            role="assistant",
+            tool_calls=[
+                {"id": "call_1", "type": "function", "function": {"name": "get_attachment", "arguments": "{}"}},
+            ],
+        ),
+        Message(role="tool", tool_call_id="call_1", content=receipt),
+        _user("Viewed image follows.", images=[viewed, _image("att_photo")], files=[_REPORT]),
+    ]
+    inner = _ScriptedProvider([[_rejection(viewed.id)], [_turn()]])
+
+    await _drain(_fallback_stage(inner), ModelRequest(messages=messages))
+
+    retried = inner.requests[1].messages
+    assert json.loads(retried[1].content)["view_status"] == "unsupported"
+    assert (retried[2].images, retried[2].files) == (None, [_REPORT])
+    named = "Not sent: image, image (att_photo)."
+    assert retried[2].content == f"Viewed image follows.\n\n{FALLBACK_MARKER}\n{named}\n{_FALLBACK_PROMPT}"
+
+
+@pytest.mark.asyncio
+async def test_the_note_names_each_removed_item_by_its_file_name_or_kind() -> None:
+    """Only stored attachments' ids, which ``get_attachment`` takes, appear beside the label."""
+    unnamed = File(id="tool-file", content=b"data")
+    clip = Audio(id="generated-clip", content=b"RIFF", mime_type="audio/wav")
+    message = _user(_PROMPT, images=[_image("att_photo")], files=[_REPORT, unnamed], audio=[clip, _CLIP])
+    inner = _ScriptedProvider([[_rejection("tool-file", "generated-clip", "att_report")], [_turn()]])
+
+    await _drain(_fallback_stage(inner), ModelRequest(messages=[message]))
+
+    retried = inner.requests[1].messages[0]
+    named = "Not sent: audio, report.pdf (att_report), file."
+    assert retried.content == f"{_PROMPT}\n\n{FALLBACK_MARKER}\n{named}\n{_FALLBACK_PROMPT}"
+    assert (retried.images, retried.files, retried.audio) == ([_image("att_photo")], None, [_CLIP])
 
 
 # --- Portable tool search -------------------------------------------------------------------------------------
@@ -742,7 +952,7 @@ async def test_a_refused_turn_raises_the_typed_refusal_after_its_usage() -> None
     assert (str(refusal), refusal.code, refusal.provider, refusal.retryable) == (
         MODEL_SAFEGUARD_REFUSAL_MESSAGE,
         SAFEGUARD_REFUSAL,
-        "Scripted Chat",
+        "Scripted",
         False,
     )
     assert inner.closed == 1
@@ -770,7 +980,7 @@ async def test_an_account_out_of_credit_is_neither_retried_nor_resent_without_me
     """Only a change to the account's billing lets the request through, and its media did not cause the failure."""
     quota = classify_provider_error(
         "You exceeded your current quota, please check your plan and billing details.",
-        provider="Scripted Chat",
+        provider="Scripted",
         status_code=429,
         code="insufficient_quota",
     )
@@ -815,7 +1025,7 @@ async def test_a_malformed_tool_call_is_retried_with_guidance_on_the_retried_req
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "attempt",
-    [[TextDelta("partial"), _malformed()], [InvalidRequest("bad", provider="Scripted Chat", status_code=400)]],
+    [[TextDelta("partial"), _malformed()], [InvalidRequest("bad", provider="Scripted", status_code=400)]],
     ids=["malformed-after-output", "other-error"],
 )
 async def test_only_a_malformed_tool_call_before_output_gets_guidance(attempt: list[_Step]) -> None:
@@ -876,7 +1086,7 @@ async def test_the_request_record_is_written_before_the_request_is_sent(tmp_path
 @pytest.mark.asyncio
 async def test_a_request_that_is_never_sent_logs_only_its_usage_line(tmp_path: Path) -> None:
     """An attempt that fails before its adapter sends a body, such as one with an unreadable file, writes no record."""
-    unsent = _ScriptedProvider([[InvalidRequest("unreadable file", provider="Scripted Chat")]], sends=False)
+    unsent = _ScriptedProvider([[InvalidRequest("unreadable file", provider="Scripted")]], sends=False)
 
     with capture_logs() as logs, pytest.raises(InvalidRequest, match="unreadable file"):
         await _drain(WrappedProvider(unsent, partial(logged_stream, log=_request_log(tmp_path))), _request())
@@ -1048,9 +1258,7 @@ async def test_usage_telemetry_logs_a_compacted_claude_request_s_final_iteration
     """After a native compaction the context fields read the final iteration, while the billed counters sum them all."""
     usage = MessageMetrics(
         tokens=TokenCounts(input_tokens=30_000, output_tokens=900, cache_read_tokens=5_000),
-        provider_metrics={
-            "context_usage": {"input_tokens": 1_200, "cache_read_tokens": 300, "cache_write_tokens": 100},
-        },
+        context=TokenCounts(input_tokens=1_200, cache_read_tokens=300, cache_write_tokens=100),
     )
     identity = replace(_IDENTITY, provider="Anthropic")
     inner = _ScriptedProvider([[UsageReported(usage), _turn(usage=usage)]], identity=identity)
@@ -1111,9 +1319,15 @@ async def test_usage_telemetry_bounds_over_reported_cache_reads_to_the_context(t
 
 
 @pytest.mark.asyncio
-async def test_a_request_without_usage_is_reported_and_writes_no_response_record(tmp_path: Path) -> None:
+@pytest.mark.parametrize("zero_report", [False, True], ids=["no-report", "all-zero-report"])
+async def test_a_request_without_usage_is_reported_and_writes_no_response_record(
+    tmp_path: Path,
+    zero_report: bool,
+) -> None:
+    """A report whose counters are all zero, as some OpenAI-compatible servers send, is no usage either."""
     served = Message(role="assistant", content="ok", provider_data={"model_extra": {"provider": "OpenInference"}})
-    inner = _ScriptedProvider([[TurnCompleted(message=served, stop_reason="end")]])
+    reports = [UsageReported(MessageMetrics(duration=0.2), final=False)] if zero_report else []
+    inner = _ScriptedProvider([[*reports, TurnCompleted(message=served, stop_reason="end")]])
 
     with capture_logs() as logs:
         await _drain(
@@ -1123,6 +1337,7 @@ async def test_a_request_without_usage_is_reported_and_writes_no_response_record
 
     [usage_log] = [entry for entry in logs if entry["event"] == "LLM usage"]
     assert (usage_log["usage_available"], usage_log["served_provider"]) == (False, "OpenInference")
+    assert "input_tokens" not in usage_log
     assert [record.get("record") for record in _log_records(tmp_path)] == [None]
 
 
@@ -1138,7 +1353,7 @@ async def test_a_failing_request_log_neither_fails_the_request_nor_hides_its_err
     monkeypatch.setattr(request_log_stage, "_write_line", unwritable)
     usage = MessageMetrics(tokens=TokenCounts(input_tokens=3, output_tokens=1))
     answered = _ScriptedProvider([[UsageReported(usage), _turn(usage=usage)]])
-    failed = _ScriptedProvider([[InvalidRequest("bad request", provider="Scripted Chat", status_code=400)]])
+    failed = _ScriptedProvider([[InvalidRequest("bad request", provider="Scripted", status_code=400)]])
 
     with capture_logs() as logs:
         events = await _drain(WrappedProvider(answered, partial(logged_stream, log=_request_log(tmp_path))), _request())
@@ -1280,7 +1495,7 @@ async def test_composed_pipeline_drains_with_complete() -> None:
 
 @pytest.mark.asyncio
 async def test_a_guidance_retry_after_a_media_fallback_does_not_resend_the_rejected_media() -> None:
-    rejection = InvalidRequest("Unsupported mime type: image/png", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("Unsupported mime type: image/png", provider="Scripted", status_code=400)
     inner = _ScriptedProvider([[rejection], [_malformed()], [TextDelta("done"), _turn()]])
 
     turn = await complete(pipeline_provider(inner), ModelRequest(messages=[_user(_PROMPT, images=[_image()])]))
@@ -1294,7 +1509,7 @@ async def test_a_guidance_retry_after_a_media_fallback_does_not_resend_the_rejec
 @pytest.mark.parametrize(
     "rejection",
     [
-        InvalidRequest("This model does not support image input", provider="Scripted Chat", status_code=400),
+        InvalidRequest("This model does not support image input", provider="Scripted", status_code=400),
         _malformed(),
     ],
     ids=["media-retry", "guidance-retry"],
@@ -1326,7 +1541,7 @@ async def test_reported_usage_always_sums_to_the_finished_turn(rejection: Provid
     "failure",
     [
         _transient(),
-        InvalidRequest("This model does not support image input", provider="Scripted Chat", status_code=400),
+        InvalidRequest("This model does not support image input", provider="Scripted", status_code=400),
         _malformed(),
     ],
     ids=["stream-retry", "media-retry", "guidance-retry"],
@@ -1385,7 +1600,7 @@ async def test_a_run_whose_retried_request_fails_again_stores_each_attempts_part
     async def persist(record: RunRecord) -> None:
         saved.append(record)
 
-    rejection = InvalidRequest("The request was rejected", provider="Scripted Chat", status_code=400)
+    rejection = InvalidRequest("The request was rejected", provider="Scripted", status_code=400)
     inner = _ScriptedProvider(
         [
             [

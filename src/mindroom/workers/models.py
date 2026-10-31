@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, get_args
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -12,10 +12,28 @@ if TYPE_CHECKING:
 
     from mindroom.agent_policy import ResolvedAgentPolicy
     from mindroom.config.main import Config
+    from mindroom.workers.backend import WorkerBackend
 
 WorkerStatus = Literal["starting", "ready", "idle", "failed"]
 WorkerReadyPhase = Literal["cold_start", "waiting", "ready", "failed"]
 ScriptResourceProfileName = Literal["small", "standard", "large"]
+SCRIPT_RESOURCE_PROFILE_NAMES: frozenset[ScriptResourceProfileName] = frozenset(get_args(ScriptResourceProfileName))
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptResourceProfile:
+    """The exact CPU and memory requests and limits of one script resource profile."""
+
+    requests: dict[str, str]
+    limits: dict[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class ScriptResourceProfiles:
+    """The script resource profiles a backend enforces, and the one a launch gets when it names none."""
+
+    default_profile: ScriptResourceProfileName
+    profiles: dict[ScriptResourceProfileName, ScriptResourceProfile]
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +80,6 @@ class WorkerHandle:
     last_used_at: float
     created_at: float
     last_started_at: float | None = None
-    expires_at: float | None = None
     startup_count: int = 0
     failure_count: int = 0
     failure_reason: str | None = None
@@ -90,13 +107,36 @@ class WorkerReadyProgress:
 
 ProgressSink = Callable[[WorkerReadyProgress], None]
 
+
+@dataclass(frozen=True, slots=True)
+class ConfiguredWorkerBackend:
+    """One reading of the selected worker backend's settings.
+
+    ``signature`` changes whenever these settings would build a different manager.
+    ``cleanup_signature`` names the workers that manager owns, which outlive routine changes of its settings.
+    ``build`` constructs the manager from this same reading; its dedicated workers launch from ``current_launch``.
+    """
+
+    signature: tuple[str, ...]
+    cleanup_signature: tuple[str, ...]
+    build: Callable[[Callable[[], WorkerLaunchConfig]], WorkerBackend]
+
+
+SANDBOX_RUNNER_API_ROOT = "/api/sandbox-runner"
 _API_ROUTES = {
-    "cleanup": "workers/cleanup",
     "script-run": "scripts/run",
-    "script-status": "scripts",
-    "script-cancel": "scripts",
     "execute-cancel": "execute/cancel",
 }
+
+
+def normalize_sandbox_runner_api_root(url: str) -> str:
+    """Normalize a sandbox-runner base URL, API root, or execute endpoint into its API root; blank stays blank."""
+    normalized = url.strip().rstrip("/")
+    if not normalized or normalized.endswith(SANDBOX_RUNNER_API_ROOT):
+        return normalized
+    if normalized.endswith("/execute"):
+        return normalized.removesuffix("/execute")
+    return f"{normalized}{SANDBOX_RUNNER_API_ROOT}"
 
 
 def worker_api_endpoint(
@@ -104,13 +144,10 @@ def worker_api_endpoint(
     operation: Literal[
         "execute",
         "leases",
-        "workers",
-        "cleanup",
         "save-attachment",
         "view-file",
         "script-run",
-        "script-status",
-        "script-cancel",
+        "scripts",
         "execute-cancel",
     ],
 ) -> str:

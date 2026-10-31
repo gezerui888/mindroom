@@ -12,9 +12,10 @@ from typing import TYPE_CHECKING, NamedTuple, NotRequired, TypedDict, Unpack, ca
 from uuid import uuid4
 
 from mindroom.agent_loop.build import tool_owners_by_agent
+from mindroom.ai_run_metadata import prior_usage_of
 from mindroom.approval.receipt_readers import add_approval_receipt_reader, approval_receipt_call_ids
 from mindroom.approval.resume import ResumeDecisions, ResumeRunner, approval_decisions, forward_resume
-from mindroom.approval.tool_approval import POLICY_CONFIRMATION_APPROVAL_TYPE, tool_may_require_approval
+from mindroom.approval.tool_approval import tool_may_require_approval
 from mindroom.approval.tool_owners import required_approval_tool_names, validate_approval_tool_owners
 from mindroom.delegation.background import (
     delegation_outcome,
@@ -36,20 +37,9 @@ from mindroom.delegation.lifecycle import (
     settle_child_response,
     start_child_turn,
 )
-from mindroom.delegation.personas import (
-    caller_knowledge_names,
-    caller_skill_names,
-    caller_toolkit_names,
-    follow_up_refusal,
-    resolve_persona_request,
-)
-from mindroom.delegation.recovery import interrupt_child, interrupt_stopped_child, read_child_run, resolve_subagent
-from mindroom.delegation.sessions import (
-    SubagentSessionError,
-    subagent_liveness,
-)
+from mindroom.delegation.recovery import interrupt_child, interrupt_stopped_child, read_child_run
+from mindroom.delegation.sessions import subagent_liveness
 from mindroom.delegation.state import (
-    CONTINUE_SUBAGENT,
     DELEGATION_FUNCTIONS,
     DELEGATION_STATE_KEY,
     DelegationChild,
@@ -63,6 +53,7 @@ from mindroom.delegation.state import (
     member_call_id,
 )
 from mindroom.delegation.storage import freeze_delegation_storage
+from mindroom.delegation.targets import DelegationTarget, resolve_delegation_target
 from mindroom.failure_text import failure_text
 from mindroom.knowledge.utils import resolve_agent_knowledge_access_async
 from mindroom.llm.events import RunFinished, ToolCompleted, ToolStarted
@@ -77,7 +68,7 @@ from mindroom.response_turn import (
     pending_approval_requirements,
 )
 from mindroom.run_storage import RunStorage, TerminalRecord
-from mindroom.runtime_resolution import resolve_agent_runtime, resolve_agent_storage
+from mindroom.runtime_resolution import resolve_agent_storage
 from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.session_storage.lanes import run_session_storage_operation
 from mindroom.tool_jobs.background_after import BACKGROUND_AFTER, application_arguments, read_background_after
@@ -101,11 +92,12 @@ from mindroom.tool_system.output_files import (
     finalize_tool_output_file,
     prepare_tool_output_file,
 )
-from mindroom.tool_system.runtime_context import current_budget_monitor, get_tool_runtime_context, tool_runtime_context
-from mindroom.tool_system.tool_function import ToolOutcome
-from mindroom.tool_system.worker_routing import (
-    run_with_tool_execution_identity,
+from mindroom.tool_system.runtime_context import (
+    current_budget_monitor,
+    get_tool_runtime_context,
+    tool_runtime_context,
 )
+from mindroom.tool_system.tool_function import POLICY_CONFIRMATION_APPROVAL_TYPE, ToolOutcome
 from mindroom.turn_continuation import continuation_decision_from_tools, stopped_calls
 from mindroom.turn_model import ModelScope, resolve_turn_model
 from mindroom.workspaces import resolve_agent_workspace_from_state_path
@@ -114,22 +106,21 @@ logger = get_logger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-    from pathlib import Path
 
-    from mindroom.agent_modes import AgentMode
     from mindroom.approval.resume import ContinueRun, ResumeEvents
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.delegation.lifecycle import ChildRunObservation
     from mindroom.delegation.state import (
         ChildResponseRunner,
         DelegationHookState,
         DelegationTerminalStatus,
-        SubagentPersona,
     )
     from mindroom.event_journal import ApprovalCall
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.llm.events import RunEvent
     from mindroom.llm.runs import AnyRunRecord
+    from mindroom.llm.usage import RunMetrics
     from mindroom.session_storage.store import ConversationStore
     from mindroom.session_storage.types import ConversationSession
     from mindroom.tool_jobs.runtime import ToolJobRuntime
@@ -146,9 +137,7 @@ class _DelegationOptions(TypedDict):
     execution_identity: ToolExecutionIdentity | None
     delegation_depth: NotRequired[int]
     refresh_scheduler: NotRequired[KnowledgeRefreshScheduler | None]
-    decisions: NotRequired[dict[str, bool] | None]
-    denial_reasons: NotRequired[dict[str, str | None] | None]
-    approval_calls: NotRequired[Sequence[ApprovalCall]]
+    approval_calls: NotRequired[Sequence[ApprovalCall] | None]
     tag_call_event: NotRequired[_CallEventTag]
 
 
@@ -169,18 +158,6 @@ class _ChildOutcome:
     toolkit_owners: Mapping[tuple[str, str], str]
 
 
-@dataclass(frozen=True)
-class _DelegationTarget:
-    """Validated destination and task for a fresh or continued subagent."""
-
-    agent_name: str
-    task: str
-    previous_child: DelegationChild | None = None
-    agent_mode: AgentMode = "standard"
-    persona: SubagentPersona | None = None
-    model: str | None = None
-
-
 def _delegation_call(requirement: RunRequirement) -> bool:
     tool = requirement.tool_execution
     return tool.tool_name in DELEGATION_FUNCTIONS and bool(tool.external_execution_required)
@@ -188,16 +165,39 @@ def _delegation_call(requirement: RunRequirement) -> bool:
 
 def _external_requirements(response: AnyRunRecord) -> list[RunRequirement]:
     """Return the run's delegation calls still waiting for their answers."""
-    return [
-        requirement
-        for requirement in response.requirements or ()
-        if _delegation_call(requirement) and requirement.external_execution_result is None
-    ]
+    return [item for item in response.requirements if _delegation_call(item) and item.needs_external_execution]
 
 
-def has_delegation_state(response: AnyRunRecord) -> bool:
+def _has_delegation_state(response: AnyRunRecord) -> bool:
     """Return whether the native delegation driver owns this run's pause."""
     return bool(_external_requirements(response) or (response.metadata or {}).get(DELEGATION_STATE_KEY))
+
+
+class _ApprovalResume(NamedTuple):
+    """Where a saved approval's paused run resumes from, and the decided calls its delegation driver still answers."""
+
+    events: AsyncIterator[RunEvent]
+    driver_calls: Sequence[ApprovalCall] | None
+
+
+def resume_from_approval[R: AnyRunRecord](
+    persisted: R,
+    approval_calls: Sequence[ApprovalCall],
+    continue_parent: ContinueRun[R],
+) -> _ApprovalResume:
+    """Return how the paused run ``persisted`` resumes with a saved approval's decided calls.
+
+    A run the delegation driver owns resumes through it, with the decisions on its children's calls; any other run
+    resumes with the decisions on its own calls, and the driver continues it if it then pauses on a delegation.
+    """
+    if _has_delegation_state(persisted):
+        return _ApprovalResume(_stored_run(persisted), approval_calls)
+    return _ApprovalResume(continue_parent.events(persisted, approval_decisions(approval_calls)), None)
+
+
+async def _stored_run(record: AnyRunRecord) -> AsyncIterator[RunEvent]:
+    """Yield a stored run as the end of a stream, for the driver to continue."""
+    yield RunFinished(record)
 
 
 def answered_delegation_calls(response: AnyRunRecord) -> dict[tuple[str | None, str], str]:
@@ -208,23 +208,21 @@ def answered_delegation_calls(response: AnyRunRecord) -> dict[tuple[str | None, 
     """
     return {
         (requirement.member_agent_id, requirement.tool_execution.tool_call_id): answer
-        for requirement in response.requirements or ()
-        if _delegation_call(requirement) and (answer := requirement.external_execution_result) is not None
+        for requirement in response.requirements
+        if _delegation_call(requirement) and (answer := requirement.tool_execution.result) is not None
     }
 
 
 def _awaiting_answers[R: AnyRunRecord](response: R) -> R:
-    """Return ``response`` with its delegation calls waiting again, for the continuation that answers them.
+    """Return a copy of ``response`` with its delegation calls waiting again, for the continuation that answers them.
 
     The loop answers an external call only from the results it is handed, under its exact-coverage check.
     """
-    return replace(
-        response,
-        requirements=[
-            replace(requirement, external_execution_result=None) if _delegation_call(requirement) else requirement
-            for requirement in response.requirements or ()
-        ],
-    )
+    awaiting = deepcopy(response)
+    for requirement in awaiting.requirements:
+        if _delegation_call(requirement):
+            requirement.tool_execution.result = None
+    return awaiting
 
 
 async def persist_delegation_state(
@@ -235,10 +233,11 @@ async def persist_delegation_state(
 ) -> None:
     """Save native child ownership on its real parent run, including hidden calls, in ``store`` and ``session``.
 
-    A paused run is saved whole, since its requirements carry the child answers, without touching the usage ledger:
-    the loop recorded the run's usage when it stored the pause, and records the continuation's when that ends. Any
-    other run, such as a minimal-mode turn's checkpoint or a continued run, or a paused run the store holds as final,
-    gets only its delegation key. ``session`` then holds the run as stored.
+    A paused run is saved whole, since its delegation calls carry the child answers and the ids their children are
+    kept under, and so is each paused member run of a team, which holds its own delegation calls; neither touches the
+    usage ledger: the loop recorded each run's usage when it stored the pause, and records the continuation's when
+    that ends. Any other run, such as a minimal-mode turn's checkpoint or a continued run, or a paused run the store
+    holds as final, gets only its delegation key. ``session`` then holds the run as stored.
     """
     changes = {DELEGATION_STATE_KEY: state.to_dict()}
     response.metadata = {**(response.metadata or {}), **changes}
@@ -253,6 +252,9 @@ async def persist_delegation_state(
         paused = handed_over.status is RunStatus.paused
         if not paused or opened.save_run(session, handed_over, record_usage=False) == "final":
             opened.patch_run_metadata(session.session_id, handed_over.run_id, changes, session=session)
+        elif isinstance(handed_over, TeamRunRecord):
+            for member in handed_over.member_responses:
+                opened.save_run(session, member, record_usage=False)
 
     await run_session_storage_operation(lambda: store, persist)
 
@@ -265,47 +267,43 @@ async def _run_child(
     runtime_paths: RuntimePaths,
     caller_identity: ToolExecutionIdentity,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
-    decisions: dict[str, bool] | None,
-    denial_reasons: dict[str, str | None] | None,
-    approval_calls: Sequence[ApprovalCall],
+    approval_calls: Sequence[ApprovalCall] | None,
     fresh: bool,
 ) -> _ChildOutcome:
     """Reserve the child and run it in its execution scope; the caller holds its liveness through settlement.
 
-    ``decisions``, ``denial_reasons``, and ``approval_calls`` name the child's calls by its own ids, as
-    ``child_call_id`` gives them, and so does a bound approval receipt within the scope.
+    ``approval_calls`` are the decided calls a paused child resumes with, or None when no approval answers it; they
+    name the child's calls by its own ids, as ``child_call_id`` gives them, and so does a bound approval receipt within
+    the scope.
     """
     await reserve_child_turn(child, owner=caller_identity, runtime_paths=runtime_paths)
     async with child_run_context(child, config=config, runtime_paths=runtime_paths) as observation:
         with approval_receipt_call_ids(partial(child_call_id, child.delegation_id)):
-            response = await run_with_tool_execution_identity(
-                child_execution_identity(child),
-                operation=lambda: _execute_child(
-                    child,
-                    run_child=run_child,
-                    config=config,
-                    runtime_paths=runtime_paths,
-                    refresh_scheduler=refresh_scheduler,
-                    decisions=decisions,
-                    denial_reasons=denial_reasons,
-                    approval_calls=approval_calls,
-                    fresh=fresh,
-                ),
+            response = await _execute_child(
+                child,
+                observation=observation,
+                run_child=run_child,
+                config=config,
+                runtime_paths=runtime_paths,
+                refresh_scheduler=refresh_scheduler,
+                approval_calls=approval_calls,
+                fresh=fresh,
             )
-        observation.keep_outcome(response.response)
+        # The child's latest record: the one its run's stream ended with, or, for a child that did not run, the one
+        # retained for it.
+        observation.response = response.response
         return response
 
 
 async def _execute_child(
     child: DelegationChild,
     *,
+    observation: ChildRunObservation,
     run_child: ChildResponseRunner,
     config: Config,
     runtime_paths: RuntimePaths,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
-    decisions: dict[str, bool] | None,
-    denial_reasons: dict[str, str | None] | None,
-    approval_calls: Sequence[ApprovalCall],
+    approval_calls: Sequence[ApprovalCall] | None,
     fresh: bool,
 ) -> _ChildOutcome:
     """Start a fresh envelope or resume the exact stored child under its own scope."""
@@ -321,6 +319,7 @@ async def _execute_child(
     if fresh:
         return await _start_child_envelope(
             child,
+            observation,
             run_child,
             config,
             runtime_paths,
@@ -331,15 +330,16 @@ async def _execute_child(
     if persisted is None:
         msg = "Delegated run was interrupted before retaining an outcome"
         raise RuntimeError(msg)
-    if persisted.status != RunStatus.paused or decisions is None:
+    if persisted.status != RunStatus.paused or approval_calls is None:
         # A retained pause must never acquire ownership from a later reconstruction.
         return _ChildOutcome(persisted, {})
-    approved_calls = own_approved_calls(persisted, approval_calls, decisions)
+    approved_calls = own_approved_calls(persisted, approval_calls)
     required_tool_names = await required_approval_tool_names(
         child.child_agent_name,
         approved_calls,
         config=config,
         runtime_paths=runtime_paths,
+        tools=context.plugins.tools,
         execution_identity=identity,
         delegation_depth=child.depth,
     )
@@ -348,8 +348,7 @@ async def _execute_child(
         persisted,
         config=config,
         runtime_paths=runtime_paths,
-        decisions=decisions,
-        denial_reasons=denial_reasons,
+        approval_calls=approval_calls,
     )
     knowledge = await resolve_agent_knowledge_access_async(
         child.child_agent_name,
@@ -359,13 +358,13 @@ async def _execute_child(
         execution_identity=identity,
         only=child.persona.kept_knowledge if child.persona is not None else None,
     )
-    store = await asyncio.to_thread(
-        create_session_storage,
-        child.child_agent_name,
-        config,
-        runtime_paths,
-        execution_identity=identity,
+    store, session = await run_session_storage_operation(
+        partial(create_session_storage, child.child_agent_name, config, runtime_paths, execution_identity=identity),
+        lambda opened: (opened, opened.load_session(child.session_id)),
     )
+    if session is None:
+        msg = "Delegated run's session is no longer available"
+        raise RuntimeError(msg)
     build = await asyncio.to_thread(
         create_agent,
         child.child_agent_name,
@@ -379,7 +378,7 @@ async def _execute_child(
             None,
         ),
         knowledge=knowledge.knowledge,
-        history_storage=store,
+        plugins=context.plugins,
         refresh_scheduler=refresh_scheduler,
         delegation_depth=child.depth,
         supports_native_tool_approval=True,
@@ -388,10 +387,6 @@ async def _execute_child(
         required_tool_names=required_tool_names,
         persona=child.persona,
     )
-    session = await asyncio.to_thread(store.load_session, child.session_id)
-    if session is None:
-        msg = "Delegated run's session is no longer available"
-        raise RuntimeError(msg)
     toolkit_owners = tool_owners_by_agent(build)
     validate_approval_tool_owners(toolkit_owners, approved_calls, pending_approval_requirements(persisted))
     runner = ResumeRunner(
@@ -410,8 +405,6 @@ async def _execute_child(
             persisted,
             identity=identity,
             refresh_scheduler=refresh_scheduler,
-            decisions=decisions,
-            denial_reasons=denial_reasons,
             approval_calls=approval_calls,
         )
 
@@ -421,34 +414,39 @@ async def _execute_child(
             original_prompt=child.task,
             continuation_count=0,
         )
-        if decision.next_prompt is not None:
-            model_name = (
-                decision.model_switch_name
-                if decision.model_switch_when == "after-toolcall" and decision.model_switch_name is not None
-                else child.model_name
-            )
-            note_child_run_id(child, uuid4().hex, runtime_paths, model_name=model_name)
+        if decision.continuation is not None:
+            note_child_run_id(child, uuid4().hex, runtime_paths, model_name=decision.continuation.model_name)
             return await _start_child_envelope(
                 child,
+                observation,
                 run_child,
                 config,
                 runtime_paths,
-                prompt=decision.next_prompt,
+                prompt=decision.continuation.prompt,
                 refresh_scheduler=refresh_scheduler,
+                # The continuation's runs follow the resumed run and the attempts its turn spent before it.
+                prior_usage=(*prior_usage_of(response), *(() if response.metrics is None else (response.metrics,))),
             )
     return _ChildOutcome(response, toolkit_owners)
 
 
 async def _start_child_envelope(
     child: DelegationChild,
+    observation: ChildRunObservation,
     run_child: ChildResponseRunner,
     config: Config,
     runtime_paths: RuntimePaths,
     *,
     prompt: str,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
+    prior_usage: Sequence[RunMetrics] = (),
 ) -> _ChildOutcome:
-    """Run the normal response loop in the child's retained conversation scope."""
+    """Run the normal response loop in the child's retained conversation scope.
+
+    The outcome is the record the stream of the turn's last run ended with, which ``observation`` kept; a turn whose
+    last run handed over none fails with the turn's reply. ``prior_usage`` is the usage of the child's turn before
+    the loop's first run.
+    """
     result = None
     toolkit_owners = {}
     try:
@@ -458,11 +456,12 @@ async def _start_child_envelope(
             config=config,
             runtime_paths=runtime_paths,
             refresh_scheduler=refresh_scheduler,
+            prior_usage=prior_usage,
         )
     except ResponsePausedForApproval as suspension:
         # The paused attempt published its run id and model when it started, through ``run_child``.
         toolkit_owners = suspension.paused.toolkit_owners
-    response = await read_child_run(child, config, runtime_paths)
+    response = observation.current_record()
     if response is None:
         msg = result or "Delegated execution did not retain its exact run outcome"
         raise RuntimeError(msg)
@@ -501,24 +500,13 @@ async def _continue_child(
     *,
     identity: ToolExecutionIdentity,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
-    decisions: dict[str, bool],
-    denial_reasons: dict[str, str | None] | None,
     approval_calls: Sequence[ApprovalCall],
 ) -> RunRecord:
     """Apply child decisions and drive any further nested delegations under the config ``runner`` resumes with."""
     resume = _ObservedChildResume(runner)
-    driver_decisions: dict[str, bool] | None = decisions
-    if not has_delegation_state(persisted):
-        persisted = await forward_resume(
-            resume.events(persisted, approval_decisions(approval_calls, decisions, denial_reasons or {})),
-            None,
-            paused=persisted,
-        )
-        driver_decisions = None
-        denial_reasons = None
-        approval_calls = ()
+    events, driver_calls = resume_from_approval(persisted, approval_calls, resume)
     return await _drive_delegations(
-        persisted,
+        await forward_resume(events, None, paused=persisted),
         continue_parent=resume,
         agent_name=child.child_agent_name,
         run_child=run_child,
@@ -527,9 +515,7 @@ async def _continue_child(
         execution_identity=identity,
         delegation_depth=child.depth,
         refresh_scheduler=refresh_scheduler,
-        decisions=driver_decisions,
-        denial_reasons=denial_reasons,
-        approval_calls=approval_calls,
+        approval_calls=driver_calls,
     )
 
 
@@ -557,7 +543,6 @@ def _pending_child(state: DelegationState, child: DelegationChild, outcome: _Chi
                 toolkit_name=paused.toolkit_owners.get((child.child_agent_name, tool.tool_name)),
             ),
         )
-        state.pending_requirements.append(RunRequirement(projected).to_dict())
 
 
 async def _complete_approved_child_tools(
@@ -632,8 +617,8 @@ def _resolve_delegation_requirement(
 
     Every answer says whether it ``failed``: a call delegation refused, or whose child did not complete, is marked
     failed so Claude and Gemini read it as a failure.
-    The answer stays on the parent's requirement, so a later entry never advances the call again; the parent's
-    continuation hands every answer to the loop's own decision check.
+    The answer stays on the parent's call, so a later entry never advances the call again; the parent's continuation
+    hands every answer to the loop's own decision check.
     """
     if failed:
         requirement.tool_execution.is_error = True
@@ -689,10 +674,10 @@ async def _background_child_outcome(
     async with subagent_liveness(child, runtime_paths):
         primary_error: str | None = None
         try:
-            outcome = await run(config=config, decisions=None, denial_reasons=None, approval_calls=(), fresh=True)
+            outcome = await run(config=config, approval_calls=None, fresh=True)
             while outcome.response.status == RunStatus.paused:
-                # The job, not a parent reply, asks for the child's approvals and resumes it with the decisions.
-                decisions, denial_reasons, calls = await request_child_approvals(
+                # The job, not a parent reply, asks for the child's approvals and resumes it with the decided calls.
+                calls = await request_child_approvals(
                     child,
                     outcome.response,
                     outcome.toolkit_owners,
@@ -704,8 +689,6 @@ async def _background_child_outcome(
                     # A child resumes long after it started: it rebuilds under the policy current now, as its
                     # approvals did, so a rule a reload added gates its later calls too.
                     config=live_delegation_config(config),
-                    decisions=decisions,
-                    denial_reasons=denial_reasons,
                     approval_calls=calls,
                     fresh=False,
                 )
@@ -760,10 +743,12 @@ async def _detach_from_job(
 
 
 class _ParentCall(NamedTuple):
-    """The parent run and exact tool call that receive a background child's result."""
+    """The agent run and exact tool call that receive a background child's result.
+
+    A team's leader cannot delegate, so in a team the run is the calling member's own.
+    """
 
     run_id: str
-    team: bool
     call_id: str
 
 
@@ -835,7 +820,6 @@ async def _await_background_child(
                 child.delegation_id,
                 waited.claim,
                 run_id=parent_call.run_id,
-                team=parent_call.team,
                 call_id=parent_call.call_id,
             )
             retained = True
@@ -845,137 +829,9 @@ async def _await_background_child(
     return settled
 
 
-async def _resolve_delegation_target(
-    tool: ToolExecution,
-    retained: DelegationChild | None,
-    *,
-    caller_identity: ToolExecutionIdentity,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    depth: int,
-) -> _DelegationTarget | str:
-    """Resolve fresh/follow-up arguments, returning a user-facing rejection if invalid."""
-    args = tool.tool_args or {}
-    if tool.tool_name == CONTINUE_SUBAGENT:
-        return await _resolve_follow_up_target(
-            args,
-            retained,
-            caller_identity=caller_identity,
-            config=config,
-            runtime_paths=runtime_paths,
-            depth=depth,
-        )
-    return _resolve_fresh_target(
-        args,
-        retained,
-        caller_identity=caller_identity,
-        config=config,
-        runtime_paths=runtime_paths,
-        depth=depth,
-    )
-
-
-async def _resolve_follow_up_target(
-    args: dict[str, object],
-    retained: DelegationChild | None,
-    *,
-    caller_identity: ToolExecutionIdentity,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    depth: int,
-) -> _DelegationTarget | str:
-    """Resolve a follow-up to its retained child, which keeps its model, mode, and persona."""
-    subagent_id, task = args.get("subagent_id"), args.get("message")
-    if not isinstance(subagent_id, str) or not isinstance(task, str):
-        return "Cannot continue: subagent_id and message must be strings."
-    try:
-        previous_child = retained or await resolve_subagent(
-            subagent_id,
-            owner=caller_identity,
-            config=config,
-            runtime_paths=runtime_paths,
-            depth=depth,
-        )
-    except SubagentSessionError as error:
-        return str(error)
-    if previous_child.subagent_id != subagent_id:
-        msg = "Subagent ID no longer matches its retained requirement"
-        raise RuntimeError(msg)
-    refusal = retained is None and follow_up_refusal(
-        previous_child.persona,
-        caller_identity.agent_name,
-        live_delegation_config(config),
-        delegation_depth=depth,
-    )
-    if refusal:
-        return refusal
-    return _DelegationTarget(previous_child.child_agent_name, task, previous_child)
-
-
-def _resolve_fresh_target(
-    args: dict[str, object],
-    retained: DelegationChild | None,
-    *,
-    caller_identity: ToolExecutionIdentity,
-    config: Config,
-    runtime_paths: RuntimePaths,
-    depth: int,
-) -> _DelegationTarget | str:
-    """Resolve a fresh child and any persona it authors; a started child keeps its frozen persona."""
-    child_name, task, minimal = args.get("agent_name"), args.get("task"), args.get("minimal")
-    model = cast("str | None", args.get("model"))
-    if child_name is None:
-        child_name = caller_identity.agent_name
-    if minimal is not None and not isinstance(minimal, bool):
-        return "Cannot delegate: minimal must be a boolean or null."
-    if not isinstance(child_name, str) or not isinstance(task, str):
-        return "Cannot delegate: task must be a string and agent_name must be a string or null."
-    if retained is not None:
-        # A resumed call never rereads a profile the worker could have changed.
-        return _DelegationTarget(child_name, task, model=model)
-
-    def caller_workspace_root() -> Path:
-        return resolve_agent_runtime(
-            caller_identity.agent_name,
-            config,
-            runtime_paths,
-            execution_identity=caller_identity,
-        ).workspace.root
-
-    request = resolve_persona_request(
-        caller_name=caller_identity.agent_name,
-        agent_name=child_name,
-        system_prompt=args.get("system_prompt"),
-        tools=args.get("tools"),
-        skills=args.get("skills"),
-        knowledge=args.get("knowledge"),
-        profile=args.get("profile"),
-        model=model,
-        minimal=bool(minimal),
-        workspace_root=caller_workspace_root,
-        # The copy runs one level deeper, where delegate may no longer be offered.
-        available_toolkits=lambda: caller_toolkit_names(
-            caller_identity.agent_name,
-            live_delegation_config(config),
-            delegation_depth=depth + 1,
-        ),
-        available_skills=lambda: caller_skill_names(
-            caller_identity.agent_name,
-            live_delegation_config(config),
-            runtime_paths,
-            caller_workspace_root(),
-        ),
-        available_knowledge=lambda: caller_knowledge_names(caller_identity.agent_name, live_delegation_config(config)),
-        cap=context.persona if (context := get_tool_runtime_context()) is not None else None,
-    )
-    if isinstance(request, str):
-        return request
-    return _DelegationTarget(child_name, task, None, request.agent_mode, request.persona, request.model)
-
-
 def _validate_child_scope(
     child: DelegationChild,
-    target: _DelegationTarget,
+    target: DelegationTarget,
     *,
     caller_identity: ToolExecutionIdentity,
     config: Config,
@@ -1017,9 +873,7 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
     execution_identity: ToolExecutionIdentity,
     delegation_depth: int,
     refresh_scheduler: KnowledgeRefreshScheduler | None,
-    decisions: dict[str, bool] | None,
-    denial_reasons: dict[str, str | None] | None,
-    approval_calls: Sequence[ApprovalCall],
+    approval_calls: Sequence[ApprovalCall] | None,
     on_event: ResumeEvents | None,
     background: ToolJobRuntime | None = None,
     tag_call_event: _CallEventTag = _untagged,
@@ -1037,6 +891,10 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
     tool = requirement.tool_execution
     tool_name = tool.tool_name
     requirement_key = delegation_card_id(requirement.member_agent_id, tool.tool_call_id)
+    if tool.pause_id is None:
+        # The call's child and hooks are kept under this id; the run that holds the call stores it with them.
+        tool.pause_id = str(uuid4())
+    pause_id = tool.pause_id
 
     def emit_call(event: ToolStarted | ToolCompleted) -> None:
         if on_event is not None:
@@ -1046,27 +904,25 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
     # A team member's id is its config name, so its delegations run as that member.
     caller = agent_name if requirement.member_agent_id is None else requirement.member_agent_id
     caller_identity = replace(execution_identity, agent_name=caller)
+    # The run that made the call, a member's own run in a team, continues with its result and saves it.
+    caller_run_id = requirement.member_run_id or response.run_id
     resolve_result = partial(_resolve_delegation_requirement, requirement, emit_call=emit_call)
-    retained = next((item for item in state.children if item.parent_requirement_id == requirement.id), None)
+    retained = next((item for item in state.children if item.parent_requirement_id == pause_id), None)
     # The retained child whose own approval this call waits on, the pause the presented decisions are about.
     waited_child = retained if retained and retained.delegation_id == previous_state.pending_child_id else None
-    # What the decisions answer for this call: its own card, or the calls of the child it waits on, which go to that
-    # child under its own call ids.
-    card_decision = None if decisions is None else decisions.get(requirement_key)
-    child_decisions = None
-    child_reasons = None
-    child_calls: tuple[ApprovalCall, ...] = ()
-    if decisions is not None and waited_child is not None:
+    # What the decided calls answer for this call: its own card, or the calls of the child it waits on, which go to
+    # that child under its own call ids.
+    card = next((call for call in approval_calls or () if call.tool_call_id == requirement_key), None)
+    child_calls = None
+    if approval_calls is not None and waited_child is not None:
         delegation_id = waited_child.delegation_id
-        child_decisions = {child_call_id(delegation_id, key): value for key, value in decisions.items()}
-        child_reasons = {child_call_id(delegation_id, key): value for key, value in (denial_reasons or {}).items()}
         child_calls = tuple(
             replace(call, tool_call_id=child_call_id(delegation_id, call.tool_call_id)) for call in approval_calls
         )
-    if card_decision is not None or child_decisions is not None:
+    if card is not None or child_calls is not None:
         # The run that made the call continues with its result, so that run reads the approval's receipt.
         add_approval_receipt_reader(
-            requirement.member_run_id or response.run_id,
+            caller_run_id,
             partial(member_call_id, requirement.member_agent_id),
         )
     # A child saved before a crash keeps its accepted owner when startup policy changes.
@@ -1086,7 +942,7 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
     except ValueError as error:
         return resolve_result(str(error), failed=True)
     args = application_arguments(tool.tool_args)
-    target = await _resolve_delegation_target(
+    target = await resolve_delegation_target(
         tool,
         retained,
         caller_identity=caller_identity,
@@ -1137,9 +993,9 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
             if waited_child is not None and on_event is not None:
                 _settle_pending_child_tools(previous_state.pending_tools, on_event, reason=authorization)
         result = resolve_result(authorization, failed=True)
-        if requirement.id in state.hooks:
+        if pause_id in state.hooks:
             await after_delegation(
-                state.hooks[requirement.id],
+                state.hooks[pause_id],
                 config=config,
                 runtime_paths=runtime_paths,
                 result=authorization,
@@ -1148,7 +1004,8 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
 
     # Approval and the before hook must settle before a child can start.
     gated = tool_may_require_approval(config, tool_name)
-    if gated and retained is None and card_decision is not True and state.gates.get(requirement_key) is not False:
+    card_approved = card is not None and card.approved
+    if gated and retained is None and not card_approved and state.gates.get(requirement_key) is not False:
         # Saved gates live in session storage that worker code can write, so only an approval
         # consumed by this continuation can start a fresh child; otherwise ask again.
         state.gates.pop(requirement_key, None)
@@ -1159,21 +1016,18 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
         projected.approval_type = POLICY_CONFIRMATION_APPROVAL_TYPE
         projected.tool_call_id = requirement_key
         state.pending_tools = [projected.to_dict()]
-        state.pending_requirements = [RunRequirement(projected).to_dict()]
         state.pending_agent_name = caller
         await persist(state)
         return None
     if state.gates.get(requirement_key) is False:
         return resolve_result("Delegation denied by requester; child was not executed.", failed=True)
-    if card_decision is not None:
+    if card is not None and not card.binds_arguments(tool.tool_args):
         # The approved gate card shows the projected call; the child starts from this separate requirement.
-        call = next((call for call in approval_calls if call.tool_call_id == requirement_key), None)
-        if call is None or not call.binds_arguments(tool.tool_args):
-            msg = "Saved delegation approval no longer matches its pending arguments; retry the request"
-            raise RuntimeError(msg)
+        msg = "Saved delegation approval no longer matches its pending arguments; retry the request"
+        raise RuntimeError(msg)
     # Hook records live in storage worker code can write, so only a started child may reuse its stored gate.
-    if retained is None or requirement.id not in state.hooks:
-        state.hooks[requirement.id] = await before_delegation(
+    if retained is None or pause_id not in state.hooks:
+        state.hooks[pause_id] = await before_delegation(
             execution_identity=caller_identity,
             arguments=args,
             tool_name=tool_name,
@@ -1181,7 +1035,7 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
             runtime_paths=runtime_paths,
         )
         await persist(state)
-    hook_state = state.hooks[requirement.id]
+    hook_state = state.hooks[pause_id]
     if hook_state.blocked_result is not None:
         blocked_result = resolve_result(hook_state.blocked_result, failed=True)
         await after_delegation(
@@ -1209,7 +1063,7 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
             agent_mode=target.agent_mode,
             previous=target.previous_child,
             parent_tool_call_id=tool.tool_call_id,
-            parent_requirement_id=requirement.id,
+            parent_requirement_id=pause_id,
             persona=target.persona,
         )
         state.children.append(child)
@@ -1238,7 +1092,7 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
                 if fresh:
                     await start_child_turn(
                         child,
-                        parent_run_id=response.run_id,
+                        parent_run_id=caller_run_id,
                         parent_delegation_id=running_child_id(),
                         config=config,
                         runtime_paths=runtime_paths,
@@ -1267,11 +1121,7 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
                         owner=caller_identity,
                         depth=delegation_depth,
                         background_after=background_after,
-                        parent_call=_ParentCall(
-                            run_id=response.run_id,
-                            team=not isinstance(response, RunRecord),
-                            call_id=tool.tool_call_id,
-                        ),
+                        parent_call=_ParentCall(run_id=caller_run_id, call_id=tool.tool_call_id),
                         # The job already applied the output policy to the child's result.
                         settle=lambda result, failed: detach(result=resolve_result(result, failed=failed)),
                         record_return=record_return,
@@ -1283,12 +1133,10 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
                     runtime_paths=runtime_paths,
                     caller_identity=caller_identity,
                     refresh_scheduler=refresh_scheduler,
-                    decisions=child_decisions,
-                    denial_reasons=child_reasons,
                     approval_calls=child_calls,
                     fresh=fresh,
                 )
-                if child_decisions is not None and on_event is not None:
+                if child_calls is not None and on_event is not None:
                     await _complete_approved_child_tools(
                         previous_state.pending_tools,
                         previous_state.pending_tool_sources,
@@ -1333,7 +1181,7 @@ async def advance_delegation_call(  # noqa: C901, PLR0911, PLR0912, PLR0915
                     reason=reason,
                     status="failed",
                 )
-                if child_decisions is not None and on_event is not None:
+                if child_calls is not None and on_event is not None:
                     _settle_pending_child_tools(previous_state.pending_tools, on_event, reason=reason)
             await persist(state)
 
@@ -1361,34 +1209,30 @@ def prepare_delegation_state(
     *,
     agent_name: str,
     config: Config,
-    decisions: dict[str, bool] | None,
-    denial_reasons: dict[str, str | None] | None,
-    approval_calls: Sequence[ApprovalCall] = (),
+    approval_calls: Sequence[ApprovalCall] | None,
 ) -> tuple[DelegationState, DelegationState, ResumeDecisions]:
     """Consume exact approval decisions and return the parent's state, its pre-decision snapshot, and its own decisions.
 
-    Decisions on the parent's own calls, asked about after its delegations, resume the parent; decisions on a
-    delegation's gate are kept as gates for the call they name.
+    ``approval_calls`` are the decided calls of the approval this entry answers, or None when it answers none; they
+    must cover exactly the calls that approval asked about (``pending_approval_requirements``). Decisions on the
+    parent's own calls, asked about after its delegations, resume the parent; decisions on a delegation's gate are
+    kept as gates for the call they name.
     """
     state = DelegationState.from_metadata(response.metadata)
     if not state.storage_bindings and isinstance(response, RunRecord):
         state.storage_bindings = freeze_delegation_storage(config, (agent_name,))
     previous_state = deepcopy(state)
     own = ResumeDecisions()
-    if decisions is not None:
+    if approval_calls is not None:
         # Validate every presented identity before touching any child or gate.
-        apply_exact_approval_decisions(
-            [RunRequirement.from_dict(item) for item in state.pending_requirements],
-            decisions=decisions,
-            denial_reasons=denial_reasons or {},
-        )
+        apply_exact_approval_decisions(pending_approval_requirements(response), approval_calls)
         if state.pending_child_id is None:
-            ordinary = [item for item in response.requirements or () if item.needs_confirmation]
+            ordinary = [item for item in response.requirements if item.needs_confirmation]
             ordinary_ids = {item.tool_execution.tool_call_id for item in ordinary}
-            if set(decisions) == ordinary_ids:
-                own = approval_decisions(approval_calls, decisions, denial_reasons or {})
+            if {call.tool_call_id for call in approval_calls} == ordinary_ids:
+                own = approval_decisions(approval_calls)
             else:
-                state.gates.update(decisions)
+                state.gates.update({call.tool_call_id: call.approved for call in approval_calls})
     state.clear_pending()
     return state, previous_state, own
 
@@ -1404,9 +1248,7 @@ async def _drive_delegations[R: AnyRunRecord](
     execution_identity: ToolExecutionIdentity | None,
     delegation_depth: int = 0,
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
-    decisions: dict[str, bool] | None = None,
-    denial_reasons: dict[str, str | None] | None = None,
-    approval_calls: Sequence[ApprovalCall] = (),
+    approval_calls: Sequence[ApprovalCall] | None = None,
     on_event: ResumeEvents | None = None,
     tag_call_event: _CallEventTag = _untagged,
 ) -> R:
@@ -1417,7 +1259,7 @@ async def _drive_delegations[R: AnyRunRecord](
     waits for. The continuation's events reach ``on_event``.
     """
     storage = continue_parent.storage
-    if not has_delegation_state(response):
+    if not _has_delegation_state(response):
         return response
     if execution_identity is None or execution_identity.channel != "matrix":
         msg = "Native delegation requires a Matrix execution owner"
@@ -1426,8 +1268,6 @@ async def _drive_delegations[R: AnyRunRecord](
         response,
         agent_name=agent_name,
         config=config,
-        decisions=decisions,
-        denial_reasons=denial_reasons,
         approval_calls=approval_calls,
     )
     background = get_background_runtime(runtime_paths) if delegation_depth == 0 and not job_owns_execution() else None
@@ -1442,7 +1282,7 @@ async def _drive_delegations[R: AnyRunRecord](
         decided = {call.tool_call_id for call in own.approved} | set(own.denied)
         ordinary = [
             requirement
-            for requirement in response.requirements or ()
+            for requirement in response.requirements
             if requirement.needs_confirmation and requirement.tool_execution.tool_call_id not in decided
         ]
         if (
@@ -1450,7 +1290,7 @@ async def _drive_delegations[R: AnyRunRecord](
             and not ordinary
             and any(
                 not item.is_resolved() and item.tool_execution.tool_call_id not in decided
-                for item in response.requirements or ()
+                for item in response.requirements
             )
         ):
             return response
@@ -1470,8 +1310,6 @@ async def _drive_delegations[R: AnyRunRecord](
                 execution_identity=execution_identity,
                 delegation_depth=delegation_depth,
                 refresh_scheduler=refresh_scheduler,
-                decisions=decisions,
-                denial_reasons=denial_reasons,
                 approval_calls=approval_calls,
                 on_event=on_event,
                 background=background,
@@ -1479,13 +1317,11 @@ async def _drive_delegations[R: AnyRunRecord](
             )
             if result is None:
                 return response
-        # Ask for ordinary calls last, so the approval that covers them belongs to the continuation that runs them.
-        if ordinary:
-            state.pending_requirements = [requirement.to_dict() for requirement in ordinary]
-            state.pending_tools = [requirement.tool_execution.to_dict() for requirement in ordinary]
-            await persist(state)
-            return response
         await persist(state)
+        # Ask for ordinary calls last, so the approval that covers them belongs to the continuation that runs them; the
+        # approval asks about the parent's own waiting calls, which the parent holds.
+        if ordinary:
+            return response
         awaiting = _awaiting_answers(response)
         response = await forward_resume(
             continue_parent.events(awaiting, replace(own, external_results=answered_delegation_calls(response))),
@@ -1507,8 +1343,10 @@ async def drive_delegation_stream[R: AnyRunRecord](
 ) -> AsyncIterator[RunEvent]:
     """Pass a run's events through; when it ends paused on delegations, drive them and end with the driven record.
 
-    The run's terminal record is a ``record_type`` record, and a run that ends without one fails. The driven record
-    is paused when a child waits for approval or the parent's own calls do, else the parent's continuation ended it.
+    The run's terminal record is a ``record_type`` record, and a run that ends without one fails. A failed run's
+    record passes on as it came, before its failure propagates, the record of a failed continuation the driver ran
+    included. The driven record is paused when a child waits for approval or the parent's own calls do, else the
+    parent's continuation ended it.
     """
     finished = TerminalRecord(record_type)
     async with closing_async_stream(events):
@@ -1516,7 +1354,7 @@ async def drive_delegation_stream[R: AnyRunRecord](
             if not finished.collect(event):
                 yield event
     record = finished.terminal(options["agent_name"])
-    if record.status is not RunStatus.paused or not has_delegation_state(record):
+    if record.status is not RunStatus.paused or not _has_delegation_state(record):
         yield RunFinished(record)
         return
 

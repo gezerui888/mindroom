@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import copy
 import json
-import sqlite3
-from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,11 +26,11 @@ from mindroom.history.types import CompactionDecision, PreparedHistoryState, Res
 from mindroom.llm.errors import ProviderError
 from mindroom.llm.runs import AnyRunRecord, RunRecord, RunStatus, TeamRunRecord
 from mindroom.message_target import MessageTarget
-from mindroom.response_turn import CompletedApprovalRun, TurnSinks, paused_attempt_from_response
+from mindroom.response_turn import CompletedApprovalRun, paused_attempt_from_response
 from mindroom.teams.presentation import TeamStreamPresentation
 from mindroom.teams.resume import continued_team_pause
 from mindroom.teams.spec import TeamMode
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, tool_runtime_context
+from mindroom.tool_system.runtime_context import tool_runtime_context
 from tests.approval_resume_helpers import AGENT_RESUMES, resume_case, setup_case
 from tests.authorization_helpers import make_test_tool_runtime_context
 from tests.conftest import (
@@ -45,6 +43,7 @@ from tests.conftest import (
 )
 from tests.fakes.scripted_model import Await, ScriptedModel, ScriptStep, answer, calls
 from tests.llm.agno_dict_helpers import stored_run_record
+from tests.session_storage.agno_layout import replacing_database
 from tests.session_storage.goldens import LEGACY_AGNO3, STORAGE
 from tests.team_turn_helpers import authored_team_config, build_team_turn
 from tests.teams.squad import SQUAD_APPROVED, approval, scripted
@@ -226,12 +225,11 @@ async def _agent_reply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: 
             requester_id=_REQUESTER,
         ),
         prompt="Hello",
-        execution_identity=build_execution_identity_from_runtime_context(runtime),
+        execution_identity=runtime.execution_identity,
     )
-    published: dict[str, Any] = {}
     with tool_runtime_context(runtime):
-        await ai_response(ctx, paths, config, sinks=TurnSinks(run_metadata_collector=published))
-    return published
+        result = await ai_response(ctx, paths, config)
+    return result.run_metadata
 
 
 async def _team_reply(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_id: str) -> dict[str, Any]:
@@ -273,9 +271,7 @@ async def _team_resume(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[
     team.models["leader"] = _resumed_model(_RUNS["team-approved"])
     team.models["checker-model"] = _resumed_model(checker)
     # The Agno-layout database the pause was stored in replaces the new one, and the next open converts it.
-    database = team.storage.path
-    database.unlink()
-    with closing(sqlite3.connect(database)) as connection:
+    with replacing_database(team.storage.path) as connection:
         connection.executescript((STORAGE / "team_squad__before_team-approved.sql").read_text(encoding="utf-8"))
     store = team.storage
     paused = store.get_run("team-approved")

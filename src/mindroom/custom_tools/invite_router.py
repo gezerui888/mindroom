@@ -5,13 +5,12 @@ from __future__ import annotations
 import asyncio
 
 import nio
-from agno.tools import Toolkit
 
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.matrix.invited_rooms_store import is_inviter_allowed
 from mindroom.matrix.personal_room_store import personal_room_excludes_router
-from mindroom.tool_system.declarations import MATRIX_ROOM_RUNTIME_APPROVAL_TYPE
+from mindroom.tool_system.authoring import Toolkit
 from mindroom.tool_system.runtime_context import get_tool_runtime_context
 
 _ROUTER_JOIN_POLL_SECONDS = 0.25
@@ -50,7 +49,6 @@ class InviteRouterTools(Toolkit):
 
     def __init__(self) -> None:
         super().__init__(name="invite_router", tools=[self.invite_router])
-        self.async_functions["invite_router"].approval_type = MATRIX_ROOM_RUNTIME_APPROVAL_TYPE
 
     async def invite_router(self) -> str:
         """Invite router to current Matrix room."""

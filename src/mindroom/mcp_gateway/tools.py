@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from mindroom.approval.tool_approval import tool_may_require_approval
-from mindroom.hooks import HookRegistry
+from mindroom.hooks import HookBindings
 from mindroom.mcp_gateway.execution import run_gateway_sync
 from mindroom.mcp_gateway.toolkits import run_toolkit_operation
 from mindroom.mcp_gateway.types import (
@@ -30,8 +30,7 @@ from mindroom.mcp_gateway.types import (
 from mindroom.oauth.providers import OAuthConnectionRequired
 from mindroom.origins import normalized_origin
 from mindroom.tool_system.agent_tools import resolve_agent_tools
-from mindroom.tool_system.agno_toolkits import adapt_function, adapt_toolkit
-from mindroom.tool_system.catalog import TOOL_METADATA, ensure_tool_registry_loaded
+from mindroom.tool_system.agno_toolkits import adapt_toolkit, toolkit_function
 from mindroom.tool_system.invocation import (
     DETACHED_SESSION_ID,
     CallResult,
@@ -39,12 +38,11 @@ from mindroom.tool_system.invocation import (
     client_tool_result,
     run_tool_call,
 )
-from mindroom.tool_system.plugins import load_plugins
-from mindroom.tool_system.runtime_context import ToolDispatchContext, tool_runtime_context
+from mindroom.tool_system.runtime_context import detached_tool_scope
 from mindroom.tool_system.tool_access import search_tool_metadata, validate_tool_arguments
+from mindroom.tool_system.tool_function import ToolGate
 from mindroom.tool_system.tool_hooks import build_tool_hook_middleware
 from mindroom.tool_system.worker_proxy_client import to_json_compatible
-from mindroom.tool_system.worker_routing import run_with_tool_execution_identity
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -52,7 +50,7 @@ if TYPE_CHECKING:
     from mindroom.api.connection_agents import AgentToolContext
     from mindroom.config.models import EffectiveToolConfig
     from mindroom.mcp.manager import MCPServerManager
-    from mindroom.tool_system.agno_toolkits import Function, Toolkit
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
     from mindroom.tool_system.tool_function import ToolFunction
 
 _MESSAGES: dict[GatewayErrorCode, str] = {
@@ -86,14 +84,13 @@ def _handle(value: object) -> bool:
 
 
 def _entries(context: AgentToolContext) -> dict[str, EffectiveToolConfig]:
-    ensure_tool_registry_loaded(context.runtime_paths, context.config)
-    agent_tools = resolve_agent_tools(context.config, context.agent_name)
+    tools = context.plugins.tools
+    agent_tools = resolve_agent_tools(context.config, context.agent_name, tools)
     authored = {entry.name for entry in agent_tools.facts.authored}
     return {
         entry.name: entry
         for entry in agent_tools.candidates()
-        if entry.authored_name in authored
-        and ((metadata := TOOL_METADATA.get(entry.name)) is None or metadata.mcp_available)
+        if entry.authored_name in authored and ((metadata := tools.get(entry.name)) is None or metadata.mcp_available)
     }
 
 
@@ -106,12 +103,12 @@ def _require_entry(context: AgentToolContext, name: str) -> EffectiveToolConfig:
     return entry
 
 
-def _blocked(context: AgentToolContext, function: Function | ToolFunction) -> bool:
-    return function.requires_confirmation is True or tool_may_require_approval(context.config, function.name)
+def _blocked(context: AgentToolContext, function: ToolFunction) -> bool:
+    return function.gate is ToolGate.CONFIRM or tool_may_require_approval(context.config, function.name)
 
 
-def _function(context: AgentToolContext, toolkit: Toolkit, name: str) -> Function:
-    function = toolkit.get_async_functions().get(name)
+def _function(context: AgentToolContext, toolkit: AnyToolkit, name: str) -> ToolFunction:
+    function = toolkit_function(toolkit, name)
     if function is None:
         raise GatewayError(code=GatewayErrorCode.TOOL_NOT_FOUND)
     if _blocked(context, function):
@@ -143,25 +140,19 @@ async def _selected_operation[T](
     context: AgentToolContext,
     name: str,
     manager: MCPServerManager | None,
-    operation: Callable[[Toolkit], Awaitable[T]],
+    operation: Callable[[AnyToolkit], Awaitable[T]],
     require_current_access: Callable[[], None] | None = None,
 ) -> T:
-    async def authorized(built: Toolkit) -> T:
+    async def authorized(built: AnyToolkit) -> T:
         if require_current_access is not None:
             await run_gateway_sync(require_current_access)
         return await operation(built)
 
-    async def selected() -> T:
+    with detached_tool_scope(context.execution_identity):
         entry = await run_gateway_sync(_require_entry, context, name)
         if require_current_access is not None:
             await run_gateway_sync(require_current_access)
         return await run_toolkit_operation(context, entry, manager, authorized, require_current_access)
-
-    with tool_runtime_context(None):
-        return await run_with_tool_execution_identity(
-            context.execution_identity,
-            operation=selected,
-        )
 
 
 async def _guard[T: GatewaySuccessResponse](
@@ -204,9 +195,9 @@ async def search_tools(
         if toolkit is not None:
             selected_toolkit = toolkit
 
-            async def selected(built: Toolkit) -> SearchResponse:
-                # Adapted, each function carries the description ``get_tool`` shows, which Agno derives from its
-                # docstring when the tool sets none.
+            async def selected(built: AnyToolkit) -> SearchResponse:
+                # Adapted, each function carries the description ``get_tool`` shows, derived from its docstring when
+                # the tool sets none.
                 items: list[SearchItem] = [
                     {
                         "agent": context.agent_name,
@@ -225,11 +216,11 @@ async def search_tools(
         for name in entries:
             if not _handle(name) or (allowed_toolkits is not None and name not in allowed_toolkits):
                 continue
-            metadata = TOOL_METADATA.get(name)
-            server = context.config.mcp_servers.get(name.removeprefix("mcp_")) if name.startswith("mcp_") else None
+            metadata = context.plugins.tools.get(name)
+            server_id = metadata.mcp_server_id if metadata is not None else None
             description = (
-                (server.description or "Remote tools")
-                if server is not None
+                (context.config.mcp_servers[server_id].description or "Remote tools")
+                if server_id is not None
                 else (metadata.description if metadata else name)
             )
             items.append(
@@ -283,8 +274,8 @@ async def get_tool(
     if not _handle(function):
         return _error(context, GatewayErrorCode.TOOL_NOT_FOUND)
 
-    async def selected(built: Toolkit) -> ToolSchemaResponse:
-        return _schema_payload(context.agent_name, toolkit, adapt_function(_function(context, built, function)))
+    async def selected(built: AnyToolkit) -> ToolSchemaResponse:
+        return _schema_payload(context.agent_name, toolkit, _function(context, built, function))
 
     return await _guard(context, _selected_operation(context, toolkit, manager, selected, require_current_access))
 
@@ -339,16 +330,13 @@ async def invoke_tool(
     except (TypeError, ValueError, UnicodeError, RecursionError):
         return _error(context, GatewayErrorCode.INVALID_ARGUMENTS)
 
-    async def selected(built: Toolkit) -> InvocationResponse:
-        target = replace(adapt_function(_function(context, built, function)), registered_toolkit=toolkit)
+    async def selected(built: AnyToolkit) -> InvocationResponse:
+        target = replace(_function(context, built, function), registered_toolkit=toolkit)
         _validate_arguments(_schema_payload(context.agent_name, toolkit, target)["inputSchema"], arguments)
-        plugins = await run_gateway_sync(load_plugins, context.config, context.runtime_paths, set_skill_roots=False)
         policy = build_tool_hook_middleware(
-            HookRegistry.from_plugins(plugins),
-            agent_name=context.agent_name,
-            dispatch_context=ToolDispatchContext(execution_identity=context.execution_identity),
-            config=context.config,
-            runtime_paths=context.runtime_paths,
+            HookBindings(registry=context.plugins.hooks),
+            context.config,
+            context.runtime_paths,
         )
         if require_current_config is not None:
             target = _guard_dispatch(target, require_current_config)
@@ -358,10 +346,7 @@ async def invoke_tool(
             session_id=DETACHED_SESSION_ID,
             user_id=context.requester_id,
         )
-        outcome = await run_with_tool_execution_identity(
-            context.execution_identity,
-            operation=lambda: run_tool_call(target, arguments, call_context, middleware=(policy,)),
-        )
+        outcome = await run_tool_call(target, arguments, call_context, middleware=(policy,))
         payload = _invocation_response(outcome)
         if _json_size(payload) > 65536:
             raise GatewayError(code=GatewayErrorCode.RESULT_TOO_LARGE)

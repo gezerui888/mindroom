@@ -20,9 +20,10 @@ from mindroom.approval.tool_approval import tool_may_require_approval
 from mindroom.config.main import Config
 from mindroom.credentials.manager import CredentialsManager, get_runtime_credentials_manager
 from mindroom.custom_tools.google_drive import GoogleDriveTools
-from mindroom.oauth.google_drive import _GOOGLE_DRIVE_OAUTH_SCOPES, GOOGLE_DRIVE_READ_OAUTH_SCOPES
-from mindroom.tool_system.agno_toolkits import adapt_toolkit
+from mindroom.oauth.google import GOOGLE_DRIVE_READ_OAUTH_SCOPES, google_oauth_provider
+from mindroom.tool_system.agno_toolkits import adapt_toolkit, configure_toolkit_functions, toolkit_function_names
 from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
 from tests.oauth_test_utils import publish_oauth_credentials
 
@@ -259,6 +260,7 @@ def test_google_drive_model_functions_do_not_collide_with_local_file_tools(tmp_p
             credentials_manager=credentials_manager,
             worker_target=None,
             runs_in_worker=False,
+            tools=builtin_tool_registry(),
         )
         for tool_name in ("file", "coding", "google_drive")
     ]
@@ -287,6 +289,7 @@ def test_google_drive_write_config_defaults_enabled_and_can_disable(tmp_path: Pa
         runs_in_worker=False,
         tool_output_workspace_root=tmp_path,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
     disabled_tool = get_tool_by_name(
         "google_drive",
@@ -296,6 +299,7 @@ def test_google_drive_write_config_defaults_enabled_and_can_disable(tmp_path: Pa
         runs_in_worker=False,
         tool_output_workspace_root=tmp_path,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
     write_functions = {
         "google_drive_upload_file",
@@ -340,6 +344,7 @@ def test_google_drive_download_uses_namespaced_model_function(tmp_path: Path) ->
         runs_in_worker=False,
         tool_output_workspace_root=tmp_path,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
 
     assert "google_drive_download_file" in tool.functions
@@ -357,6 +362,7 @@ def test_google_drive_download_disabled_without_workspace(tmp_path: Path) -> Non
         runs_in_worker=False,
         tool_output_workspace_root=None,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
 
     assert "google_drive_download_file" not in tool.functions
@@ -591,7 +597,7 @@ def test_google_drive_rejects_stored_token_disallowed_by_new_identity_policy(tmp
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
-            "scopes": list(_GOOGLE_DRIVE_OAUTH_SCOPES),
+            "scopes": list(google_oauth_provider("google_drive").scopes),
             "_source": "oauth",
             "_oauth_provider": "google_drive",
             "_oauth_claims": {"email": "alice@blocked.example", "email_verified": True},
@@ -624,7 +630,7 @@ def test_google_drive_rejects_stored_token_missing_claims_when_identity_policy_c
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
-            "scopes": list(_GOOGLE_DRIVE_OAUTH_SCOPES),
+            "scopes": list(google_oauth_provider("google_drive").scopes),
             "_source": "oauth",
             "_oauth_provider": "google_drive",
         },
@@ -653,7 +659,7 @@ def test_google_drive_stored_token_without_client_config_connects_on_invocation(
         {
             "token": "access-token",
             "refresh_token": "refresh-token",
-            "scopes": list(_GOOGLE_DRIVE_OAUTH_SCOPES),
+            "scopes": list(google_oauth_provider("google_drive").scopes),
             "_source": "oauth",
         },
     )
@@ -664,6 +670,7 @@ def test_google_drive_stored_token_without_client_config_connects_on_invocation(
         credentials_manager=credentials_manager,
         worker_target=None,
         runs_in_worker=False,
+        tools=builtin_tool_registry(),
     )
     assert isinstance(tool, GoogleDriveTools)
 
@@ -686,7 +693,7 @@ def test_google_drive_mismatched_client_id_connects_on_invocation(tmp_path: Path
             "token": "access-token",
             "refresh_token": "refresh-token",
             "client_id": "old-client-id",
-            "scopes": list(_GOOGLE_DRIVE_OAUTH_SCOPES),
+            "scopes": list(google_oauth_provider("google_drive").scopes),
             "_source": "oauth",
         },
     )
@@ -697,6 +704,7 @@ def test_google_drive_mismatched_client_id_connects_on_invocation(tmp_path: Path
         credentials_manager=credentials_manager,
         worker_target=None,
         runs_in_worker=False,
+        tools=builtin_tool_registry(),
     )
     assert isinstance(tool, GoogleDriveTools)
 
@@ -723,6 +731,7 @@ def test_google_drive_saved_numeric_config_is_coerced_before_tool_init(tmp_path:
         credentials_manager=credentials_manager,
         worker_target=None,
         runs_in_worker=False,
+        tools=builtin_tool_registry(),
     )
 
     assert isinstance(tool, GoogleDriveTools)
@@ -746,6 +755,7 @@ def test_google_drive_blank_numeric_config_uses_tool_default(tmp_path: Path) -> 
         credentials_manager=credentials_manager,
         worker_target=None,
         runs_in_worker=False,
+        tools=builtin_tool_registry(),
     )
 
     assert isinstance(tool, GoogleDriveTools)
@@ -1083,6 +1093,28 @@ def test_google_drive_read_refuses_binary_content_and_names_enabled_download_fun
 
     assert result["error"] == f"Cannot read {mime_type} as text. Use google_drive_download_file instead."
     assert "content" not in result
+
+
+def test_google_drive_read_names_no_download_function_its_filters_leave_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Drive toolkit whose function filters leave out the download function names none when it refuses a read."""
+    tool, service = _google_drive_download_tool(tmp_path, monkeypatch)
+    assert "google_drive_download_file" in toolkit_function_names(tool)
+    offered = [name for name in toolkit_function_names(tool) if name != "google_drive_download_file"]
+    configure_toolkit_functions(tool, offered=offered)
+    content = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\nstream\nx\x9c\x00\x01"
+    service.files_resource.file_metadata = {
+        "name": "report.pdf",
+        "mimeType": "application/pdf",
+        "size": str(len(content)),
+    }
+    tool._download_bytes = lambda _request: content
+
+    result = json.loads(tool.read_file("shared-drive-file-id"))
+
+    assert result["error"] == "Cannot read application/pdf as text."
 
 
 @pytest.mark.parametrize(

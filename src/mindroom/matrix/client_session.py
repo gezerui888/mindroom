@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import os
 import ssl as ssl_module
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
-from pathlib import Path
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import aiohttp
-import certifi
 import nio
 
 from mindroom.constants import (
@@ -23,9 +20,11 @@ from mindroom.failure_text import failure_text
 from mindroom.logging_config import get_logger
 from mindroom.matrix.encrypted_event_metadata import encryption_visible_metadata
 from mindroom.startup_errors import PermanentStartupError
+from mindroom.tls_trust import verifying_ssl_context
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Mapping
+    from pathlib import Path
 
 
 logger = get_logger(__name__)
@@ -49,16 +48,6 @@ class _MatrixTransportShutdownError(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("Matrix transport is fenced for process shutdown")
-
-
-@dataclass(frozen=True, slots=True)
-class MatrixSyncStorage:
-    """Select whether nio persists the ordinary sync cursor."""
-
-    store_tokens: bool = True
-
-
-DEFAULT_MATRIX_SYNC_STORAGE = MatrixSyncStorage()
 
 
 @runtime_checkable
@@ -153,19 +142,6 @@ def matrix_startup_error(
     return ValueError(message)
 
 
-def _verifying_ssl_context(runtime_paths: RuntimePaths) -> ssl_module.SSLContext:
-    """Trust the system store plus certifi's roots, which HTTPS through httpx already uses.
-
-    Some Python builds (for example uv-managed CPython on NixOS) look for CA files the host does not have,
-    so the system store alone can be empty and every Matrix login fails certificate verification.
-    An explicit SSL_CERT_FILE or SSL_CERT_DIR is the operator's trust choice and is left to OpenSSL unchanged.
-    """
-    ssl_context = ssl_module.create_default_context()
-    if not any(name in runtime_paths.process_env for name in ("SSL_CERT_FILE", "SSL_CERT_DIR")):
-        ssl_context.load_verify_locations(cafile=certifi.where())
-    return ssl_context
-
-
 def maybe_ssl_context(
     homeserver: str,
     runtime_paths: RuntimePaths,
@@ -182,7 +158,7 @@ def maybe_ssl_context(
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl_module.CERT_NONE
         else:
-            ssl_context = _verifying_ssl_context(runtime_paths)
+            ssl_context = verifying_ssl_context(runtime_paths.process_env)
         return ssl_context
     return None
 
@@ -202,56 +178,17 @@ def olm_store_exists(user_id: str, device_id: str, runtime_paths: RuntimePaths) 
 def matrix_client_config(
     *,
     http_headers: Mapping[str, str] | None = None,
-    sync_storage: MatrixSyncStorage = DEFAULT_MATRIX_SYNC_STORAGE,
 ) -> nio.AsyncClientConfig:
     """Return nio config, copying plain headers while preserving request-time mappings."""
     custom_headers = dict(http_headers) if isinstance(http_headers, dict) else http_headers
     return nio.AsyncClientConfig(
-        store_sync_tokens=sync_storage.store_tokens,
+        store_sync_tokens=True,
         custom_headers=cast("dict[str, str] | None", custom_headers),
-        replace_rotated_device_keys=True,
-    )
-
-
-def _create_matrix_client(
-    homeserver: str,
-    runtime_paths: RuntimePaths,
-    user_id: str | None = None,
-    access_token: str | None = None,
-    store_path: str | None = None,
-    *,
-    http_headers: Mapping[str, str] | None = None,
-    sync_storage: MatrixSyncStorage = DEFAULT_MATRIX_SYNC_STORAGE,
-) -> nio.AsyncClient:
-    """Create a Matrix client with consistent configuration."""
-    runtime_paths = require_runtime_paths_arg(runtime_paths)
-    ssl_context = maybe_ssl_context(homeserver, runtime_paths=runtime_paths)
-
-    if store_path is None and user_id:
-        store_path = str(olm_store_dir(user_id, runtime_paths=runtime_paths))
-        store_dir = Path(store_path)
-        store_dir.mkdir(parents=True, exist_ok=True)
-        if os.name != "nt":
-            store_dir.chmod(0o700)
-
-    client = MindRoomAsyncClient(
-        homeserver,
-        user_id or "",
-        store_path=store_path,
         # Agents trust devices on first use and never verify interactively;
         # accept a peer device's re-registered olm identity (trust reset)
         # instead of keeping stale keys that silently break E2EE and calls.
-        config=matrix_client_config(
-            http_headers=http_headers,
-            sync_storage=sync_storage,
-        ),
-        ssl=ssl_context,
+        replace_rotated_device_keys=True,
     )
-    if user_id:
-        client.user_id = user_id
-    if access_token:
-        client.access_token = access_token
-    return client
 
 
 def create_matrix_http_client(
@@ -274,77 +211,18 @@ def create_matrix_http_client(
     return client
 
 
-def create_authenticated_client(
-    homeserver: str,
-    user_id: str,
-    device_id: str,
-    access_token: str,
-    runtime_paths: RuntimePaths,
-    *,
-    http_headers: Mapping[str, str] | None = None,
-    sync_storage: MatrixSyncStorage = DEFAULT_MATRIX_SYNC_STORAGE,
-) -> nio.AsyncClient:
-    """Create a Matrix client from newly issued login credentials."""
-    client = _create_matrix_client(
-        homeserver,
-        runtime_paths,
-        user_id,
-        access_token,
-        http_headers=http_headers,
-        sync_storage=sync_storage,
-    )
-    client.restore_login(user_id, device_id, access_token)
-    return client
-
-
 @asynccontextmanager
 async def matrix_client(
     homeserver: str,
     runtime_paths: RuntimePaths,
-    user_id: str | None = None,
-    access_token: str | None = None,
-) -> AsyncGenerator[nio.AsyncClient, None]:
-    """Context manager for Matrix client that ensures proper cleanup."""
-    runtime_paths = require_runtime_paths_arg(runtime_paths)
-    client = _create_matrix_client(homeserver, runtime_paths, user_id, access_token)
+    user_id: str,
+) -> AsyncGenerator[nio.AsyncClient]:
+    """Open an HTTP-only Matrix client for one account and close it afterwards."""
+    client = create_matrix_http_client(homeserver, runtime_paths, user_id)
     try:
         yield client
     finally:
         await client.close()
-
-
-async def login(
-    homeserver: str,
-    user_id: str,
-    password: str,
-    runtime_paths: RuntimePaths,
-    *,
-    http_headers: Mapping[str, str] | None = None,
-    sync_storage: MatrixSyncStorage = DEFAULT_MATRIX_SYNC_STORAGE,
-) -> nio.AsyncClient:
-    """Login to Matrix and return an authenticated client."""
-    runtime_paths = require_runtime_paths_arg(runtime_paths)
-    client = _create_matrix_client(
-        homeserver,
-        runtime_paths,
-        user_id,
-        http_headers=http_headers,
-        sync_storage=sync_storage,
-    )
-
-    try:
-        response = await client.login(password)
-        if not isinstance(response, nio.LoginResponse):
-            msg = f"Failed to login {user_id}: {response}"
-            raise matrix_startup_error(msg, response=response)  # noqa: TRY301 - one close covers every unreturned client
-    except BaseException:
-        await client.close()
-        raise
-    client.user_id = response.user_id
-    client.device_id = response.device_id
-    client.access_token = response.access_token
-    logger.info("matrix_login_succeeded", user_id=response.user_id)
-    return client
 
 
 async def login_flows(
@@ -354,8 +232,7 @@ async def login_flows(
     http_headers: Mapping[str, str] | None = None,
 ) -> tuple[str, ...]:
     """Return login methods advertised by one Matrix homeserver."""
-    runtime_paths = require_runtime_paths_arg(runtime_paths)
-    client = _create_matrix_client(homeserver, runtime_paths, http_headers=http_headers)
+    client = create_matrix_http_client(homeserver, runtime_paths, "", http_headers=http_headers)
     try:
         response = await client.login_info()
     finally:
@@ -366,55 +243,10 @@ async def login_flows(
     raise matrix_startup_error(msg, response=response)
 
 
-async def restore_login(
-    homeserver: str,
-    user_id: str,
-    device_id: str,
-    access_token: str,
-    runtime_paths: RuntimePaths,
-    *,
-    http_headers: Mapping[str, str] | None = None,
-    sync_storage: MatrixSyncStorage = DEFAULT_MATRIX_SYNC_STORAGE,
-) -> nio.AsyncClient:
-    """Restore one authenticated Matrix session without creating a new device."""
-    runtime_paths = require_runtime_paths_arg(runtime_paths)
-    client = _create_matrix_client(
-        homeserver,
-        runtime_paths,
-        user_id,
-        access_token,
-        http_headers=http_headers,
-        sync_storage=sync_storage,
-    )
-    client.restore_login(user_id, device_id, access_token)
-
-    try:
-        response = await client.whoami()
-        if not isinstance(response, nio.WhoamiResponse):
-            msg = f"Failed to restore Matrix login for {user_id}: {response}"
-            raise matrix_startup_error(msg, response=response)  # noqa: TRY301 - one close covers every unreturned client
-    except BaseException:
-        await client.close()
-        raise
-    client.user_id = response.user_id
-    if response.device_id:
-        client.device_id = response.device_id
-    logger.info(
-        "matrix_login_restored",
-        user_id=response.user_id,
-        device_id=client.device_id,
-    )
-    return client
-
-
 __all__ = [
-    "DEFAULT_MATRIX_SYNC_STORAGE",
-    "MatrixSyncStorage",
     "MindRoomAsyncClient",
     "PermanentMatrixStartupError",
-    "create_authenticated_client",
     "create_matrix_http_client",
-    "login",
     "login_flows",
     "matrix_client",
     "matrix_client_config",
@@ -423,5 +255,4 @@ __all__ = [
     "olm_store_dir",
     "olm_store_exists",
     "require_runtime_paths_arg",
-    "restore_login",
 ]

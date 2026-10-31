@@ -20,6 +20,7 @@ from mindroom.private_storage.private_instance_identity_store import (
 from mindroom.runtime_env_policy import (
     CREDENTIALS_ENCRYPTION_KEY_ENV,
     KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY,
+    WORKER_BACKEND_ENV,
     WORKER_COMPUTER_ENABLED_ENV,
     credentials_encryption_key_value,
 )
@@ -34,10 +35,12 @@ from mindroom.workers.backends._config_helpers import (
     read_json_object_list_env,
 )
 from mindroom.workers.backends._dedicated_worker_common import stable_signature_json
+from mindroom.workers.backends._lifecycle import DEFAULT_IDLE_TIMEOUT_SECONDS
 from mindroom.workers.backends.kubernetes_pod_names import (
     RESERVED_EXTRA_CONTAINER_NAMES,
     RESERVED_EXTRA_VOLUME_NAMES,
 )
+from mindroom.workers.models import SCRIPT_RESOURCE_PROFILE_NAMES
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -52,7 +55,6 @@ class _WorkerSeccompProfile(TypedDict):
     localhostProfile: str
 
 
-_DEFAULT_IDLE_TIMEOUT_SECONDS = 1800.0
 _DEFAULT_READY_TIMEOUT_SECONDS = 60.0
 _DEFAULT_WORKER_PORT = 8766
 _DEFAULT_IMAGE_PULL_POLICY = "IfNotPresent"
@@ -64,17 +66,10 @@ _DEFAULT_MEMORY_REQUEST = "256Mi"
 _DEFAULT_MEMORY_LIMIT = "1Gi"
 _DEFAULT_CPU_REQUEST = "100m"
 _DEFAULT_CPU_LIMIT = "500m"
-_SCRIPT_RESOURCE_PROFILE_NAMES = frozenset({"small", "standard", "large"})
 _DEFAULT_SCRIPT_RESOURCE_PROFILE = "small"
 _IN_CLUSTER_TOKEN_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/token")
 _IN_CLUSTER_CERT_PATH = Path("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt")
 
-_DEFAULT_AGENT_VAULT_VAULT_NAME_PREFIX = "agent-vault"
-_DEFAULT_AGENT_VAULT_API_URL = "http://agent-vault:14321"
-_DEFAULT_AGENT_VAULT_PROXY_URL = "http://agent-vault:14322"
-_DEFAULT_AGENT_VAULT_BOOTSTRAP_SECRET_NAME = "agent-vault-bootstrap"  # noqa: S105
-
-_WORKER_BACKEND_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["worker_backend"]
 _NAMESPACE_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["namespace"]
 _IMAGE_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["image"]
 _IMAGE_PULL_POLICY_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["image_pull_policy"]
@@ -108,18 +103,6 @@ _DEFAULT_SCRIPT_RESOURCE_PROFILE_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_K
 _ENABLE_SERVICE_LINKS_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["enable_service_links"]
 _AUTH_SECRET_NAME_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["auth_secret_name"]
 _SECCOMP_PROFILE_JSON_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["seccomp_profile_json"]
-_AGENT_VAULT_ENABLED_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["agent_vault_enabled"]
-_AGENT_VAULT_VAULT_NAME_PREFIX_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["agent_vault_vault_name_prefix"]
-_AGENT_VAULT_CLI_IMAGE_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["agent_vault_cli_image"]
-_AGENT_VAULT_API_URL_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["agent_vault_api_url"]
-_AGENT_VAULT_PROXY_URL_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["agent_vault_proxy_url"]
-_AGENT_VAULT_OWNER_EMAIL_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY["agent_vault_owner_email"]
-_AGENT_VAULT_BOOTSTRAP_SECRET_NAME_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY[
-    "agent_vault_bootstrap_secret_name"
-]
-_AGENT_VAULT_WORKER_CA_CONFIGMAP_NAME_ENV = KUBERNETES_WORKER_BACKEND_CONFIG_ENV_BY_KEY[
-    "agent_vault_worker_ca_configmap_name"
-]
 _POD_NAMESPACE_ENV = "POD_NAMESPACE"
 _EXTRA_CONTAINER_ALLOWED_KEYS = frozenset(
     {
@@ -160,12 +143,12 @@ def _default_script_resource_profiles() -> dict[str, dict[str, dict[str, str]]]:
 
 
 def _normalized_script_resource_profiles(value: object) -> dict[str, dict[str, dict[str, str]]]:
-    if not isinstance(value, dict) or set(value) != _SCRIPT_RESOURCE_PROFILE_NAMES:
+    if not isinstance(value, dict) or set(value) != SCRIPT_RESOURCE_PROFILE_NAMES:
         msg = f"{_SCRIPT_RESOURCE_PROFILES_JSON_ENV} must define exactly small, standard, and large."
         raise WorkerBackendError(msg)
     value_mapping = cast("dict[str, object]", value)
     normalized: dict[str, dict[str, dict[str, str]]] = {}
-    for profile_name in sorted(_SCRIPT_RESOURCE_PROFILE_NAMES):
+    for profile_name in sorted(SCRIPT_RESOURCE_PROFILE_NAMES):
         profile = value_mapping[profile_name]
         if not isinstance(profile, dict) or set(profile) != {"requests", "limits"}:
             msg = f"{_SCRIPT_RESOURCE_PROFILES_JSON_ENV}.{profile_name} must define requests and limits."
@@ -354,72 +337,6 @@ def _read_extra_volumes_env(env: Mapping[str, str]) -> tuple[dict[str, object], 
 
 
 @dataclass(frozen=True, slots=True)
-class KubernetesAgentVaultConfig:
-    """Per-worker Agent Vault egress settings (no separate bridge pod).
-
-    When present, each dedicated worker pod gets an init container that mints
-    (or rotates) a proxy-role Agent Vault agent token for that worker's vault
-    and writes it to a shared in-pod volume. The sandbox runner composes
-    ``http://<token>:<vault>@<proxy host>`` for python/shell egress so Agent
-    Vault injects credentials in transit. The owner password is mounted only on the
-    init container, never on the agent-executing container.
-    """
-
-    vault_name_prefix: str
-    cli_image: str
-    api_url: str
-    proxy_url: str
-    owner_email: str
-    bootstrap_secret_name: str
-    worker_ca_configmap_name: str | None = None
-
-    @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> KubernetesAgentVaultConfig | None:
-        """Parse Agent Vault egress settings, returning ``None`` when disabled."""
-        if not read_bool_env(env, _AGENT_VAULT_ENABLED_ENV, default=False):
-            return None
-        cli_image = read_env(env, _AGENT_VAULT_CLI_IMAGE_ENV)
-        if not cli_image:
-            msg = f"{_AGENT_VAULT_CLI_IMAGE_ENV} must be set when {_AGENT_VAULT_ENABLED_ENV} is enabled."
-            raise WorkerBackendError(msg)
-        owner_email = read_env(env, _AGENT_VAULT_OWNER_EMAIL_ENV)
-        if not owner_email:
-            msg = f"{_AGENT_VAULT_OWNER_EMAIL_ENV} must be set when {_AGENT_VAULT_ENABLED_ENV} is enabled."
-            raise WorkerBackendError(msg)
-        return cls(
-            vault_name_prefix=read_env(env, _AGENT_VAULT_VAULT_NAME_PREFIX_ENV, _DEFAULT_AGENT_VAULT_VAULT_NAME_PREFIX)
-            or _DEFAULT_AGENT_VAULT_VAULT_NAME_PREFIX,
-            cli_image=cli_image,
-            api_url=read_env(env, _AGENT_VAULT_API_URL_ENV, _DEFAULT_AGENT_VAULT_API_URL)
-            or _DEFAULT_AGENT_VAULT_API_URL,
-            proxy_url=read_env(env, _AGENT_VAULT_PROXY_URL_ENV, _DEFAULT_AGENT_VAULT_PROXY_URL)
-            or _DEFAULT_AGENT_VAULT_PROXY_URL,
-            owner_email=owner_email,
-            bootstrap_secret_name=read_env(
-                env,
-                _AGENT_VAULT_BOOTSTRAP_SECRET_NAME_ENV,
-                _DEFAULT_AGENT_VAULT_BOOTSTRAP_SECRET_NAME,
-            )
-            or _DEFAULT_AGENT_VAULT_BOOTSTRAP_SECRET_NAME,
-            worker_ca_configmap_name=read_env(env, _AGENT_VAULT_WORKER_CA_CONFIGMAP_NAME_ENV) or None,
-        )
-
-    def signature(self) -> str:
-        """Return a stable signature fragment for backend cache keys."""
-        return stable_signature_json(
-            {
-                "vault_name_prefix": self.vault_name_prefix,
-                "cli_image": self.cli_image,
-                "api_url": self.api_url,
-                "proxy_url": self.proxy_url,
-                "owner_email": self.owner_email,
-                "bootstrap_secret_name": self.bootstrap_secret_name,
-                "worker_ca_configmap_name": self.worker_ca_configmap_name,
-            },
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class KubernetesWorkerBackendConfig:
     """Resolved environment-backed configuration for the Kubernetes provider."""
 
@@ -450,7 +367,6 @@ class KubernetesWorkerBackendConfig:
     )
     default_script_resource_profile: str = _DEFAULT_SCRIPT_RESOURCE_PROFILE
     reconcile_pod_templates: bool = True
-    agent_vault: KubernetesAgentVaultConfig | None = None
     extra_containers: tuple[dict[str, object], ...] = ()
     extra_volumes: tuple[dict[str, object], ...] = ()
     runtime_class_name: str | None = None
@@ -521,12 +437,12 @@ class KubernetesWorkerBackendConfig:
         namespace = read_env(env, _NAMESPACE_ENV) or read_env(env, _POD_NAMESPACE_ENV) or "default"
         image = read_env(env, _IMAGE_ENV)
         if not image:
-            msg = f"{_IMAGE_ENV} must be set when {_WORKER_BACKEND_ENV}=kubernetes."
+            msg = f"{_IMAGE_ENV} must be set when {WORKER_BACKEND_ENV}=kubernetes."
             raise WorkerBackendError(msg)
 
         storage_pvc_name = read_env(env, _STORAGE_PVC_ENV)
         if not storage_pvc_name:
-            msg = f"{_STORAGE_PVC_ENV} must be set when {_WORKER_BACKEND_ENV}=kubernetes."
+            msg = f"{_STORAGE_PVC_ENV} must be set when {WORKER_BACKEND_ENV}=kubernetes."
             raise WorkerBackendError(msg)
 
         resource_requests = {
@@ -552,7 +468,7 @@ class KubernetesWorkerBackendConfig:
             or _DEFAULT_STORAGE_MOUNT_PATH,
             storage_subpath_prefix=read_env(env, _STORAGE_SUBPATH_PREFIX_ENV, _DEFAULT_STORAGE_SUBPATH_PREFIX)
             or _DEFAULT_STORAGE_SUBPATH_PREFIX,
-            idle_timeout_seconds=read_float_env(env, _IDLE_TIMEOUT_ENV, _DEFAULT_IDLE_TIMEOUT_SECONDS),
+            idle_timeout_seconds=read_float_env(env, _IDLE_TIMEOUT_ENV, DEFAULT_IDLE_TIMEOUT_SECONDS),
             ready_timeout_seconds=read_float_env(env, _READY_TIMEOUT_ENV, _DEFAULT_READY_TIMEOUT_SECONDS),
             name_prefix=read_env(env, _NAME_PREFIX_ENV, _DEFAULT_NAME_PREFIX) or _DEFAULT_NAME_PREFIX,
             node_name=read_env(env, _NODE_NAME_ENV) or None,
@@ -578,20 +494,19 @@ class KubernetesWorkerBackendConfig:
                 or _DEFAULT_SCRIPT_RESOURCE_PROFILE
             ),
             reconcile_pod_templates=read_bool_env(env, _RECONCILE_POD_TEMPLATES_ENV, default=True),
-            agent_vault=KubernetesAgentVaultConfig.from_env(env),
             tmp_size_limit=read_env(env, _TMP_SIZE_LIMIT_ENV) or None,
             user_resources=_read_user_resources_env(env),
         )
 
 
 def kubernetes_backend_config_signature(
+    config: KubernetesWorkerBackendConfig,
     runtime_paths: RuntimePaths,
     *,
     auth_token: str | None,
-    storage_root: Path | None = None,
+    storage_root: Path,
 ) -> tuple[str, ...]:
     """Return a cache signature for one concrete Kubernetes backend config."""
-    config = KubernetesWorkerBackendConfig.from_runtime(runtime_paths)
     credentials_encryption_key = runtime_paths.env_value(CREDENTIALS_ENCRYPTION_KEY_ENV)
     credentials_encryption_key_marker = _credentials_encryption_key_hash(credentials_encryption_key) or ""
     extra_env_json = stable_signature_json(config.extra_env)
@@ -634,10 +549,9 @@ def kubernetes_backend_config_signature(
         str(config.enable_service_links),
         config.auth_secret_name or "",
         str(config.reconcile_pod_templates),
-        config.agent_vault.signature() if config.agent_vault is not None else "",
         credentials_encryption_key_marker,
         auth_token or "",
-        str(storage_root.expanduser().resolve()) if storage_root is not None else "",
+        str(storage_root),
     )
     if config.runtime_class_name is not None:
         signature = (*signature, f"runtime-class:{config.runtime_class_name}")
@@ -651,12 +565,12 @@ def kubernetes_backend_config_signature(
 
 
 def kubernetes_backend_cleanup_signature(
+    config: KubernetesWorkerBackendConfig,
     runtime_paths: RuntimePaths,
     *,
-    storage_root: Path | None = None,
+    storage_root: Path,
 ) -> tuple[str, ...]:
     """Return the stable fields needed to find and retire an existing Kubernetes worker."""
-    config = KubernetesWorkerBackendConfig.from_runtime(runtime_paths)
     return (
         "kubernetes",
         config.namespace,
@@ -665,7 +579,7 @@ def kubernetes_backend_cleanup_signature(
         config.storage_subpath_prefix,
         config.auth_secret_name or "",
         _kubernetes_cleanup_client_identity(runtime_paths),
-        str(storage_root.expanduser().resolve()) if storage_root is not None else "",
+        str(storage_root),
     )
 
 

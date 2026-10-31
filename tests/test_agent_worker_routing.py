@@ -17,11 +17,13 @@ from mindroom.shell.execution import ShellRunResult
 from mindroom.tool_system import sandbox_proxy
 from mindroom.tool_system.invocation import ToolCallContext
 from mindroom.tool_system.metadata import get_tool_by_name
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, tool_runtime_context
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget, ToolExecutionIdentity
 from mindroom.tools import shell as shell_module
 from mindroom.workers.backend import WorkerBackendError
-from tests.agent_tool_helpers import call_entrypoint, offered_function, run_offered
+from tests.agent_tool_helpers import blocking_entrypoint, call_entrypoint, offered_function, run_offered
 from tests.authorization_helpers import make_test_tool_runtime_context
 from tests.conftest import make_conversation_reader_mock, make_matrix_client_mock, make_relation_lookup
 from tests.identity_helpers import persist_entity_accounts
@@ -69,10 +71,10 @@ def _create_routing_agent(
         runtime_paths,
         execution_identity=execution_identity,
         include_interactive_questions=False,
-        persist_runtime_state=False,
         supports_native_tool_approval=True,
         knowledge=None,
         model=turn_model(config, runtime_paths, "routing"),
+        plugins=config_plugins(config, runtime_paths),
     )
 
 
@@ -320,9 +322,15 @@ def test_a_toolkit_built_without_a_placement_runs_in_a_worker_when_the_runtime_o
         worker_key=None,
     )
 
-    toolkit = get_tool_by_name("calculator", runtime_paths, runtime_config=config, worker_target=target)
+    toolkit = get_tool_by_name(
+        "calculator",
+        runtime_paths,
+        runtime_config=config,
+        worker_target=target,
+        tools=builtin_tool_registry(),
+    )
 
-    assert toolkit.functions["add"].entrypoint(a=1, b=2) == expected
+    assert blocking_entrypoint(toolkit, "add")(a=1, b=2) == expected
 
 
 @pytest.mark.asyncio
@@ -401,12 +409,12 @@ async def test_room_context_tool_uses_primary_matrix_client(
         "routing",
         config,
         runtime_paths,
-        execution_identity=build_execution_identity_from_runtime_context(context),
+        execution_identity=context.execution_identity,
         include_interactive_questions=False,
-        persist_runtime_state=False,
         supports_native_tool_approval=True,
         knowledge=None,
         model=turn_model(config, runtime_paths, "routing"),
+        plugins=config_plugins(config, runtime_paths),
     )
     with tool_runtime_context(context):
         result = await run_offered(agent, "list_schedules")

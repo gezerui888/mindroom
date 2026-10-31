@@ -7,7 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from functools import partial
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from mindroom.authorization import ReplyMembershipPendingError, is_sender_allowed_for_responder
@@ -31,9 +31,11 @@ from mindroom.tool_jobs.runtime import (
     BackgroundJob,
     BackgroundOutcome,
     JobAccessError,
+    JobGrant,
     ToolJobRuntime,
     register_background_runtime,
 )
+from mindroom.tool_system.plugins import config_plugins
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping
@@ -107,10 +109,10 @@ class ToolJobRuntimeCoordinator:
     """Own the background job runtime; replies deliver outcomes."""
 
     runtime_paths: RuntimePaths
-    config_provider: Callable[[], Config | None]
+    config_provider: Callable[[], Config]
     bot_provider: Callable[[str], AgentBot | None]
     agent_reply_memberships: AgentReplyMembershipIndex
-    # The event journal jobs are kept in; it is read only once a config exists, and outlives this coordinator.
+    # The event journal jobs are kept in; it outlives this coordinator.
     journal_provider: Callable[[], EventJournalStore]
     _instance: ToolJobInstance | None = field(default=None, init=False)
     _runtime: ToolJobRuntime | None = field(default=None, init=False)
@@ -126,8 +128,6 @@ class ToolJobRuntimeCoordinator:
         if self._initialized:
             return
         config = self.config_provider()
-        if config is None:
-            return
         self._journal = journal = self.journal_provider()
         self._instance = instance = pin_background_tool_jobs(config, self.runtime_paths)
         # With background jobs off, saved jobs wait untouched for the next enabled start, which reports them.
@@ -138,10 +138,9 @@ class ToolJobRuntimeCoordinator:
             await store.take_ownership()
             self._runtime = ToolJobRuntime(
                 store,
-                authorize=self._authorized,
+                grant=self._grant,
                 authorize_execution=self._authorize_execution,
                 cancel=self._interrupt,
-                denied=self._denied,
             )
         self._initialized = True
 
@@ -159,9 +158,6 @@ class ToolJobRuntimeCoordinator:
             # A gated tool call that runs as a job may wait on its approval card.
             return end_tool_call_approval(job)
         config = self.config_provider()
-        if config is None:
-            msg = "Cannot settle a background job without runtime configuration."
-            raise RuntimeError(msg)
         return await reconcile_delegation(
             job,
             cleanup=partial(
@@ -173,19 +169,11 @@ class ToolJobRuntimeCoordinator:
             runtime_paths=self.runtime_paths,
         )
 
-    def _authorized(self, job: BackgroundJob) -> bool:
-        """Grant access only on a proven grant; unresolved membership fails closed."""
-        return self._grant(job) == "allowed"
-
-    def _denied(self, job: BackgroundJob) -> bool:
-        """Revoke execution only on a proven denial, never while membership is still resolving."""
-        return self._grant(job) == "denied"
-
-    def _grant(self, job: BackgroundJob) -> Literal["allowed", "denied", "pending"]:
+    def _grant(self, job: BackgroundJob) -> JobGrant:
         """Recheck current delegation, team membership, and requester reply access."""
         config = self.config_provider()
         owner = job.owner
-        if config is None or owner.channel != "matrix" or owner.requester_id is None or owner.room_id is None:
+        if owner.channel != "matrix" or owner.requester_id is None or owner.room_id is None:
             return "denied"
         if owner.agent_name not in config.agents:
             return "denied"
@@ -203,6 +191,7 @@ class ToolJobRuntimeCoordinator:
         elif not locally_allowed(
             config,
             owner,
+            tools=config_plugins(config, self.runtime_paths).tools,
             tool_name=job.tool_name,
             toolkit_name=job.toolkit_name,
             origin=job.adapter.get("origin", {}),
@@ -220,7 +209,7 @@ class ToolJobRuntimeCoordinator:
         requester_id: str,
         room_id: str | None,
         entities: Iterable[str],
-    ) -> Literal["allowed", "denied", "pending"]:
+    ) -> JobGrant:
         """Whether the requester may still converse with every entity, or membership is still resolving."""
         pending = False
         for entity_name in entities:
@@ -252,9 +241,10 @@ class ToolJobRuntimeCoordinator:
         origin = function_provenance(tool, arguments)
         config = self.config_provider()
         edges = active_delegation_edges(owner)
-        if config is None or not locally_allowed(
+        if not locally_allowed(
             config,
             owner,
+            tools=config_plugins(config, self.runtime_paths).tools,
             tool_name=tool.function.name,
             toolkit_name=tool.toolkit_name,
             origin=origin,
@@ -287,10 +277,6 @@ class ToolJobRuntimeCoordinator:
     async def sync(self) -> None:
         """Recover once, publish the service, and wake it after config changes."""
         await self.initialize()
-        config = self.config_provider()
-        if config is None:
-            await self.stop()
-            return
         runtime = self._runtime
         if runtime is None:
             return
@@ -345,7 +331,7 @@ class ToolJobRuntimeCoordinator:
 
     async def _reconcile(self) -> None:
         """Stop revoked work, publish live jobs, and admit follow-ups."""
-        await self.runtime.cancel_revoked(denied=self._denied)
+        await self.runtime.cancel_revoked()
         await self._publisher.publish(self.bot_provider, self.runtime.retained_jobs())
         await self._admit_follow_ups(self.runtime)
 

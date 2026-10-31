@@ -18,14 +18,14 @@ from mindroom.tool_jobs.control import pending_human_messages_context
 from mindroom.tool_jobs.instances import pin_background_tool_jobs, release_background_tool_jobs
 from mindroom.tool_jobs.resources import execution_resources
 from mindroom.tool_jobs.runtime import ToolJobRuntime, register_background_runtime
+from mindroom.tool_system.agno_toolkits import toolkit_function_names
 from mindroom.tool_system.metadata import get_tool_by_name
-from mindroom.tool_system.plugins import isolated_plugin_runtime
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import (
-    build_execution_identity_from_runtime_context,
     get_tool_runtime_context,
     tool_runtime_context,
 )
-from tests.conftest import make_config_reload_lifecycle, test_runtime_paths
+from tests.conftest import make_config_reload_lifecycle, publish_test_plugins, test_runtime_paths
 from tests.delegation_helpers import _delegate_runtime_context, _runtime_paths
 from tests.fakes.scripted_model import ScriptedModel, answer, calls, tool_call
 from tests.tool_job_helpers import (
@@ -43,11 +43,11 @@ if TYPE_CHECKING:
 
     from mindroom.llm.runs import ToolExecution
     from mindroom.tool_jobs.execution import JobActor
-    from mindroom.tool_system.agno_toolkits import Toolkit
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
 
-type _ShellRuntime = tuple[JobActor, ToolJobRuntime, ToolExecutionIdentity, Toolkit]
+type _ShellRuntime = tuple[JobActor, ToolJobRuntime, ToolExecutionIdentity, AnyToolkit]
 
 
 @pytest_asyncio.fixture(params=["shell", "openclaw_compat"], ids=["shell", "preset"])
@@ -60,7 +60,7 @@ async def shell_runtime(tmp_path: Path, request: pytest.FixtureRequest) -> Async
         agents={"leader": AgentConfig(display_name="Leader", tools=[authored_name])},
     )
     context = _delegate_runtime_context(config, paths)
-    owner = build_execution_identity_from_runtime_context(context)
+    owner = context.execution_identity
     runtime = await tool_job_runtime(tmp_path)
     pin_background_tool_jobs(context.config, paths)
     register_background_runtime(paths, runtime)
@@ -71,6 +71,7 @@ async def shell_runtime(tmp_path: Path, request: pytest.FixtureRequest) -> Async
         runs_in_worker=False,
         tool_init_overrides={"base_dir": str(tmp_path)},
         tool_output_workspace_root=tmp_path,
+        tools=builtin_tool_registry(),
     )
     actor = job_actor(*toolkit_job_tools(toolkit, authored_name=authored_name).values())
     try:
@@ -119,7 +120,7 @@ async def test_an_excluded_shell_command_stops_at_its_timeout_without_a_job(
         with pytest.raises(ProcessLookupError):
             os.kill(int((tmp_path / "started").read_text()), 0)
         assert await runtime.list_jobs(owner=owner, depth=0) == []
-        for name in toolkit.get_async_functions():
+        for name in toolkit_function_names(toolkit):
             assert "background_after" not in schemas[name]["properties"]
         run_schema = schemas["run_shell_command"]
         assert "timeout" in run_schema["properties"]
@@ -250,14 +251,21 @@ async def test_registered_plugin_exclusion_is_pinned_for_every_function(  # noqa
     )
     paths = test_runtime_paths(tmp_path)
     context = _delegate_runtime_context(config, paths)
-    owner = build_execution_identity_from_runtime_context(context)
+    owner = context.execution_identity
     runtime = await tool_job_runtime(tmp_path)
     instance = pin_background_tool_jobs(config, paths)
     register_background_runtime(paths, runtime)
     excluded = excluded_name == "native_plugin"
+    plugins = publish_test_plugins(config, paths)
     try:
-        with isolated_plugin_runtime(config, paths), tool_runtime_context(context):
-            toolkit = get_tool_by_name("native_plugin", paths, runtime_config=config, worker_target=None)
+        with tool_runtime_context(context):
+            toolkit = get_tool_by_name(
+                "native_plugin",
+                paths,
+                runtime_config=config,
+                worker_target=None,
+                tools=plugins.tools,
+            )
             actor = job_actor(*toolkit_job_tools(toolkit, authored_name="native_plugin").values())
             async with execution_resources():
                 if not excluded:
@@ -277,7 +285,7 @@ async def test_registered_plugin_exclusion_is_pinned_for_every_function(  # noqa
                 assert step.result == "step:3"
                 status, schemas = await _invoke(actor, "native_status")
                 assert not status.is_error
-                for name in toolkit.get_async_functions():
+                for name in toolkit_function_names(toolkit):
                     properties = schemas[name]["properties"]
                     if name == "native_step":
                         assert properties["background_after"]["type"] == "integer"

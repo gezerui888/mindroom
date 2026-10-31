@@ -18,7 +18,6 @@ from mindroom.llm.runs import RunStatus, TeamRunRecord
 from mindroom.response_turn import CompletedApprovalRun
 from mindroom.teams.resume import continue_paused_team_run
 from mindroom.teams.spec import TeamMode
-from mindroom.tool_system.runtime_context import ToolDispatchContext
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.approval_continuation_helpers import approval_continuation, resumed_approval
 from tests.conftest import (
@@ -27,6 +26,7 @@ from tests.conftest import (
     test_runtime_paths,
     unwrap_extracted_collaborator,
 )
+from tests.delegation_helpers import turn_tool_context
 from tests.fakes.scripted_model import ScriptedModel
 from tests.reply_span_helpers import paused_for_approval
 from tests.response_runner_helpers import _bot, _noop_typing, _plain_request, _target
@@ -58,6 +58,7 @@ async def test_team_approval_forwards_frozen_invoking_member_functions(tmp_path:
         thread_id=target.resolved_thread_id,
         resolved_thread_id=target.resolved_thread_id,
         session_id="team-session",
+        transport_agent_name="general",
     )
     calls = tuple(
         ApprovalCall(
@@ -95,14 +96,14 @@ async def test_team_approval_forwards_frozen_invoking_member_functions(tmp_path:
     with (
         patch.object(
             runner.deps.tool_runtime,
-            "build_dispatch_context",
-            return_value=ToolDispatchContext(execution_identity=identity),
+            "build_turn_context",
+            return_value=turn_tool_context(runner.deps.runtime.config, runner.deps.runtime_paths, identity),
         ),
         patch("mindroom.approval.continuation_runner.continue_paused_team_run", new=continued),
-        patch("mindroom.response_runner.typing_indicator", _noop_typing),
+        patch("mindroom.reply_turn.request.typing_indicator", _noop_typing),
     ):
         async with resumed_approval(bot, continuation) as claimed:
-            result = await runner._approvals._continue_entity_call(
+            result = await runner.approvals._continue_entity_call(
                 claimed,
                 request=_plain_request(target, source_event_id="$source"),
                 target=target,
@@ -114,7 +115,6 @@ async def test_team_approval_forwards_frozen_invoking_member_functions(tmp_path:
     assert continued.await_args.kwargs["progress"] is progress
     assert continued.await_args.kwargs["approval_calls"] == calls
     assert continued.await_args.kwargs["member_names"] == ("alpha", "beta")
-    assert continued.await_args.kwargs["decisions"] == dict.fromkeys((call.tool_call_id for call in calls), True)
 
 
 @pytest.mark.asyncio
@@ -185,13 +185,41 @@ async def test_team_approval_failed_discovery_cancels_and_drains_siblings(
     assert sibling_settled.is_set()
 
 
+@pytest.mark.asyncio
+async def test_team_approval_restores_no_tool_for_a_denied_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A denied call never runs, so its member rebuilds no tool for it."""
+    asked: dict[str, tuple[ApprovalCall, ...]] = {}
+    barrier = asyncio.Barrier(2)
+
+    async def resolve_member_tools(name: str, calls: tuple[ApprovalCall, ...], **_kwargs: object) -> tuple[str, ...]:
+        asked[name] = calls
+        await barrier.wait()
+        raise _MemberAssemblyObservedError
+
+    with pytest.raises(ExceptionGroup):
+        await _exercise_team_member_assembly(
+            tmp_path,
+            monkeypatch,
+            required_resolver=resolve_member_tools,
+            decision=ApprovalDecision.DENIED,
+        )
+    assert asked == {"alpha": (), "beta": ()}
+
+
 async def _exercise_team_member_assembly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     required_resolver: Callable[..., Awaitable[tuple[str, ...]]] | None = None,
+    decision: ApprovalDecision = ApprovalDecision.APPROVED,
 ) -> None:
-    """Inspect the rebuilt members after the optional catalog transport boundary, before the team runs."""
+    """Inspect the rebuilt members after the optional catalog transport boundary, before the team runs.
+
+    The approval answered ``alpha``'s paused ``add`` call with ``decision``.
+    """
     paths = test_runtime_paths(tmp_path)
     config = bind_runtime_paths(
         Config.model_validate(
@@ -273,8 +301,6 @@ async def _exercise_team_member_assembly(
             user_id=identity.requester_id,
             configured_team_name="research",
             model_name="default",
-            decisions={"call-one": True},
-            denial_reasons={"call-one": None},
             refresh_scheduler=None,
             approval_calls=(
                 ApprovalCall(
@@ -283,6 +309,7 @@ async def _exercise_team_member_assembly(
                     invoking_agent="alpha",
                     toolkit_name="calculator",
                     expires_at_ns=2**62,
+                    decision=decision,
                 ),
             ),
             progress=None,

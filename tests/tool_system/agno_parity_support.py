@@ -18,12 +18,14 @@ import socket
 from contextlib import contextmanager, nullcontext
 from importlib.metadata import version
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import httpx
 from agno.tools import Toolkit
+from agno.tools import function as agno_function
 from agno.tools.function import Function
+from agno.utils import json_schema
 from packaging.version import Version
 
 from mindroom.agents import build_agent_toolkit
@@ -32,7 +34,6 @@ from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.tool_system.agent_tools import resolve_agent_tools
 from mindroom.tool_system.agno_toolkits import adapt_toolkit
-from mindroom.tool_system.catalog import TOOL_METADATA, ensure_tool_registry_loaded
 from mindroom.tool_system.dependencies import check_deps_installed, optional_dependency_environment
 from mindroom.tool_system.dynamic_toolkits import DeferredToolkit, defer_toolkit
 from mindroom.tool_system.invocation import (
@@ -42,13 +43,13 @@ from mindroom.tool_system.invocation import (
     execute_tool_call,
     parse_tool_arguments,
 )
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.sandbox_proxy import tool_placement
 from mindroom.vendor_telemetry import vendor_telemetry_env_values
 from tests.agno_parity import tool_argument_probes as probes
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
-    from typing import Any
 
     from mindroom.tool_system.tool_function import AdaptedToolkit, ToolFunction
 
@@ -115,7 +116,6 @@ DUMMY_CREDENTIALS: dict[str, dict[str, object]] = {
     "oxylabs": {"username": _KEY, "password": _KEY},
     "scrapegraph": {"api_key": _KEY},
     "searxng": {"host": _URL},
-    "spotify": {"access_token": _KEY},
     "sql": {"db_url": "sqlite://"},
     "tavily": {"api_key": _KEY},
     # The client rejects bot tokens without a colon.
@@ -124,13 +124,6 @@ DUMMY_CREDENTIALS: dict[str, dict[str, object]] = {
     "webex": {"access_token": _KEY},
     "whatsapp": {"access_token": _KEY, "phone_number_id": _KEY},
     "zep": {"api_key": _KEY},
-}
-# Settings that a tool reads from the runtime environment instead of its credentials.
-DUMMY_ENV = {
-    "MINDROOM_AGENT_VAULT_ACCESS_API_URL": _URL,
-    "MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN": _KEY,
-    "MINDROOM_AGENT_VAULT_ACCESS_UI_BASE_URL": _URL,
-    "MINDROOM_AGENT_VAULT_ACCESS_EMAIL_DOMAIN": "golden.invalid",
 }
 # SDK clients that contact their service while a toolkit is constructed, replaced so it registers its functions offline.
 OFFLINE_CLIENTS = {
@@ -201,9 +194,8 @@ def golden_runtime(root: Path) -> tuple[Config, RuntimePaths]:
     runtime_paths = resolve_runtime_paths(
         config_path=config_path,
         storage_path=root / "storage",
-        process_env={"MINDROOM_NO_AUTO_INSTALL_TOOLS": "1", **DUMMY_ENV},
+        process_env={"MINDROOM_NO_AUTO_INSTALL_TOOLS": "1"},
     )
-    ensure_tool_registry_loaded(runtime_paths)
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
     for tool_name, credentials in DUMMY_CREDENTIALS.items():
         credentials_manager.save_credentials(tool_name, credentials)
@@ -212,7 +204,7 @@ def golden_runtime(root: Path) -> tuple[Config, RuntimePaths]:
 
 def missing_dependencies(tool_name: str) -> str | None:
     """Return the declared optional dependencies of one registered tool when this environment lacks them."""
-    dependencies = TOOL_METADATA[tool_name].dependencies or []
+    dependencies = builtin_tool_registry().entries[tool_name].dependencies or []
     with optional_dependency_environment():
         installed = check_deps_installed(dependencies)
     return None if installed else ", ".join(dependencies)
@@ -220,7 +212,7 @@ def missing_dependencies(tool_name: str) -> str | None:
 
 def all_enabled_overrides(tool_name: str) -> dict[str, object]:
     """Return the authored overrides that switch on every function one registered tool can turn on."""
-    metadata = TOOL_METADATA[tool_name]
+    metadata = builtin_tool_registry().entries[tool_name]
     overrides: dict[str, object] = {
         field.name: True
         for field in (*(metadata.config_fields or ()), *(metadata.agent_override_fields or ()))
@@ -243,7 +235,7 @@ def build_toolkit(
         calculator = build_toolkit("calculator", config, runtime_paths)
         deferral, deferred = defer_toolkit(
             "calculator",
-            TOOL_METADATA["calculator"].description,
+            builtin_tool_registry().entries["calculator"].description,
             adapt_toolkit(calculator),
             portable_search=True,
         )
@@ -260,8 +252,8 @@ def build_toolkit(
     ):
         toolkit = build_agent_toolkit(
             tool_name,
-            agent_tools=resolve_agent_tools(config, AGENT_NAME),
-            placement=tool_placement(runtime_paths),
+            agent_tools=resolve_agent_tools(config, AGENT_NAME, builtin_tool_registry()),
+            placement=tool_placement(runtime_paths, builtin_tool_registry()),
             runtime_paths=runtime_paths,
             tool_config_overrides=tool_config_overrides,
             execution_identity=None,
@@ -287,8 +279,8 @@ def golden_entry(adapted: AdaptedToolkit) -> dict[str, object]:
     """Return the golden entry of one adapted toolkit: its texts for the model, then each function the adapter made.
 
     ``instructions`` is what the system prompt shows, and ``guidance`` what the agent CLI and minimal mode show, before
-    an agent drops the default ones that name a function it does not offer; the functions are in Agno's async-run
-    order, which the adapter keeps.
+    an agent drops the default ones that name a function it does not offer; the functions are in the order the toolkit
+    offers them, which the adapter keeps.
     """
     entry = {
         "instructions": adapted.instructions,
@@ -299,9 +291,7 @@ def golden_entry(adapted: AdaptedToolkit) -> dict[str, object]:
                 "description": function.description,
                 "parameters": function.parameters,
                 "strict": function.strict,
-                "requires_confirmation": function.requires_confirmation,
-                "external_execution": function.external_execution,
-                "approval_type": function.approval_type,
+                "gate": function.gate,
                 "stop_after_tool_call": function.stop_after_call,
             }
             for function in adapted.functions
@@ -313,10 +303,33 @@ def golden_entry(adapted: AdaptedToolkit) -> dict[str, object]:
 
 
 def agno_derivation(entrypoint: Callable[..., Any]) -> tuple[str | None, dict[str, Any]]:
-    """Return the description and parameter schema Agno's entrypoint processing derives for ``entrypoint``."""
+    """Return the description and parameter schema Agno's entrypoint processing derives for ``entrypoint``.
+
+    Values annotated ``Any`` or ``object`` take any JSON value, as the owned generator renders them and as
+    https://github.com/agno-agi/agno/pull/10423 proposes; Agno 3.0.9 renders an object that admits only ``{}``.
+    """
+    agno_schema = json_schema.get_json_schema_for_arg
+
+    def unconstrained_any(type_hint: object) -> dict[str, Any] | None:
+        return {} if type_hint is Any or type_hint is object else agno_schema(type_hint)
+
     function = Function(name="derived", entrypoint=entrypoint)
-    function.process_entrypoint(strict=False)
+    # Agno caches each callable's derivation, so forget it around the patch: a cached schema would skip the patch,
+    # and the patched one would reach later unpatched derivations.
+    _forget_agno_derivation(entrypoint)
+    try:
+        with patch.object(json_schema, "get_json_schema_for_arg", unconstrained_any):
+            function.process_entrypoint(strict=False)
+    finally:
+        _forget_agno_derivation(entrypoint)
     return function.description, function.parameters
+
+
+def _forget_agno_derivation(entrypoint: Callable[..., Any]) -> None:
+    """Drop Agno's cached schema derivations of ``entrypoint``."""
+    agno_function._cached_entrypoint_schema.cache_clear()
+    if (cache := agno_function._get_lifetime_cache(entrypoint)) is not None:
+        cache.clear()
 
 
 def probe_functions() -> dict[str, ToolFunction]:

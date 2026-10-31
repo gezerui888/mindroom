@@ -50,7 +50,6 @@ from mindroom.tool_system.agent_tool_calls import (
 from mindroom.tool_system.context_bound_streams import closing_async_stream
 from mindroom.tool_system.events import CollectedStreamPresentation
 from mindroom.tool_system.invocation import tool_outcome
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context
 from mindroom.tool_system.tool_access import ToolKey, UnknownToolError, search_tool_metadata, tool_definition
 from mindroom.tool_system.tool_function import ToolOutcome, ToolValue
 
@@ -149,7 +148,7 @@ class LiveTurnTools(TurnToolBridge):
         delegation_depth: int,
         refresh_scheduler: KnowledgeRefreshScheduler | None,
     ) -> None:
-        if owner.execution_identity != build_execution_identity_from_runtime_context(catalog.runtime_context):
+        if owner.execution_identity != catalog.runtime_context.execution_identity:
             msg = "CLI catalog execution identity does not match its turn owner"
             raise ValueError(msg)
         super().__init__(owner)
@@ -565,11 +564,10 @@ class LiveTurnTools(TurnToolBridge):
                 PausedAttempt(
                     session_id=self.catalog.run.session_id,
                     run_id=self.catalog.run.run_id,
-                    tools=(waiting.tool_execution,),
+                    requirements=(waiting,),
                     toolkit_owners={
                         (self.catalog.runtime_context.agent_name, binding.key.function): binding.approval_toolkit,
                     },
-                    requirements=(waiting,),
                     runtime_model_name=self.catalog.run.model_name,
                     response_text=presentation.final_text(),
                     tool_trace=tuple(presentation.tool_trace),
@@ -597,9 +595,7 @@ class LiveTurnTools(TurnToolBridge):
         parent: str,
         authorize: Callable[[], Awaitable[None]],
     ) -> AsyncIterator[AgentToolCallStep]:
-        decisions = None
-        denial_reasons = None
-        approval_calls = ()
+        approval_calls = None
         started = False
         child_toolkits: dict[str, str | None] = {}
 
@@ -620,8 +616,6 @@ class LiveTurnTools(TurnToolBridge):
                     parent_bash_call_id=parent,
                     delegation_depth=self._delegation_depth,
                     refresh_scheduler=self._refresh_scheduler,
-                    decisions=decisions,
-                    denial_reasons=denial_reasons,
                     approval_calls=approval_calls,
                     on_event=on_child_event,
                 )
@@ -643,9 +637,7 @@ class LiveTurnTools(TurnToolBridge):
                 presentation.start_tool(tool.call, origin=ToolCallOrigin(parent, child_toolkit))
             paused = replace(result, response_text=presentation.final_text(), tool_trace=tuple(presentation.tool_trace))
             resolved = await handler(paused)
-            approval_calls = approval_calls_for_cli_pause(paused, self.catalog.runtime_context.agent_name)
-            decisions = {item.tool_execution.tool_call_id: bool(item.confirmation) for item in resolved}
-            denial_reasons = {item.tool_execution.tool_call_id: item.confirmation_note for item in resolved}
+            approval_calls = approval_calls_for_cli_pause(paused, self.catalog.runtime_context.agent_name, resolved)
 
     def _check_control(self, event: AgentToolCallEvent) -> None:
         if isinstance(event, AgentToolCallStep) and event.kind == "continuation_required":
@@ -805,7 +797,7 @@ class LiveTurnTools(TurnToolBridge):
         if not self._binding_retired:
             msg = "Previous CLI catalog must retire before replacement"
             raise RuntimeError(msg)
-        if self.owner.execution_identity != build_execution_identity_from_runtime_context(catalog.runtime_context):
+        if self.owner.execution_identity != catalog.runtime_context.execution_identity:
             msg = "Replacement CLI catalog execution identity does not match its turn owner"
             raise ValueError(msg)
         self.catalog = catalog

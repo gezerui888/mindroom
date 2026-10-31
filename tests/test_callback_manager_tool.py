@@ -23,7 +23,6 @@ from mindroom.message_target import MessageTarget
 from mindroom.runtime_state import reset_runtime_state, set_api_server_address
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
-    build_execution_identity_from_runtime_context,
     tool_runtime_context,
 )
 from mindroom.tool_system.worker_routing import resolve_unscoped_worker_key, resolve_worker_key, visible_workspace_roots
@@ -35,7 +34,7 @@ from tests.conftest import make_conversation_reader_mock, make_relation_lookup
 
 
 class _Client:
-    user_id = "@mindroom_coder:example.org"
+    user_id = "@mindroom_coder:mindroom.chat"
 
 
 def _runtime_paths(tmp_path: Path, process_env: dict[str, str] | None = None) -> RuntimePaths:
@@ -132,7 +131,7 @@ def test_a_private_agent_writes_its_callback_script_into_the_requester_workspace
 
     assert payload["status"] == "ok"
     # The requester's user-scope worker mounts exactly the workspace the script landed in.
-    identity = build_execution_identity_from_runtime_context(context)
+    identity = context.execution_identity
     worker_key = resolve_worker_key("user", identity, agent_name="coder")
     assert worker_key is not None
     mounted = visible_workspace_roots(
@@ -384,17 +383,37 @@ def test_script_failure_rolls_back_record(tmp_path: Path, monkeypatch: pytest.Mo
     assert store_payload["triggers"] == {}
 
 
-def test_manager_requires_live_human_requester(tmp_path: Path) -> None:
-    """Callbacks are minted only inside a human-owned Matrix turn."""
-    tool = CallbackManagerTools()
-    no_context = _payload(tool.mint_callback("no context"))
-    with tool_runtime_context(_context(tmp_path, requester_id=_Client.user_id)):
-        bot_requester = _payload(tool.mint_callback("bot requester"))
+def test_manager_requires_live_tool_context() -> None:
+    """Callbacks are minted only inside a live Matrix tool call."""
+    payload = _payload(CallbackManagerTools().mint_callback("no context"))
 
-    assert no_context["status"] == "error"
-    assert "live Matrix tool context" in no_context["message"]
-    assert bot_requester["status"] == "error"
-    assert "human Matrix requester" in bot_requester["message"]
+    assert payload["status"] == "error"
+    assert "live Matrix tool context" in payload["message"]
+
+
+@pytest.mark.parametrize("requester_id", [_Client.user_id, "@mindroom_router:mindroom.chat"], ids=["own", "router"])
+def test_manager_refuses_a_requester_who_cannot_own_triggers(tmp_path: Path, requester_id: str) -> None:
+    """A turn of one of MindRoom's own accounts mints no callback record or script, even for an administrator."""
+    with tool_runtime_context(_context(tmp_path, requester_id=requester_id)):
+        payload = _payload(CallbackManagerTools().mint_callback("bot requester"))
+
+    assert payload["status"] == "error"
+    assert "human requester" in payload["message"]
+    assert ExternalTriggerStore(_runtime_paths(tmp_path)).list_records() == []
+    assert not _workspace(tmp_path).exists()
+
+
+def test_manager_refuses_a_runtime_without_primary_control_state(tmp_path: Path) -> None:
+    """A runtime without primary control state, such as a worker's, mints nothing and creates no workspace."""
+    context = _context(tmp_path)
+    context = replace(context, runtime_paths=replace(context.runtime_paths, control_state_root=None))
+
+    with tool_runtime_context(context):
+        payload = _payload(CallbackManagerTools().mint_callback("worker runtime"))
+
+    assert payload["status"] == "error"
+    assert "requires primary control state" in payload["message"]
+    assert not _workspace(tmp_path).exists()
 
 
 def _workspace(tmp_path: Path) -> Path:

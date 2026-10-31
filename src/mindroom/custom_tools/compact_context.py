@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from agno.tools import Toolkit
-
 from mindroom.config.main import Config  # noqa: TC001
 from mindroom.constants import RuntimePaths  # noqa: TC001
 from mindroom.history.manual import request_compaction_before_next_reply
 from mindroom.history.types import HistoryScope
-from mindroom.tool_system.invocation import current_tool_call
-from mindroom.tool_system.runtime_context import get_tool_runtime_context, resolve_current_session_id
+from mindroom.tool_system.authoring import Toolkit, current_call
+from mindroom.tool_system.runtime_context import get_tool_runtime_context
 
 if TYPE_CHECKING:
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
@@ -37,16 +35,15 @@ class CompactContextTools(Toolkit):
         """Request compaction before the next reply."""
         runtime_context = get_tool_runtime_context()
         # The scope the running entity stores to: a team member's is its team's, an agent's own is its own.
-        call = current_tool_call()
+        call = current_call()
         scope = (
-            call.context.history_scope
-            if call is not None and call.context.history_scope is not None
+            call.history_scope
+            if call is not None and call.history_scope is not None
             else HistoryScope(kind="agent", scope_id=self._agent_name)
         )
-        session_id = resolve_current_session_id(
-            execution_identity=self._execution_identity,
-            runtime_context=runtime_context,
-        )
+        # The session the toolkit was built for, else the running conversation's.
+        built_session_id = self._execution_identity.session_id if self._execution_identity is not None else None
+        session_id = built_session_id or (runtime_context.session_id if runtime_context is not None else None)
         if session_id is None:
             return "Error: No active session available. Cannot determine session."
 

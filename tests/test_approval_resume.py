@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,7 +19,7 @@ from mindroom.constants import AI_RUN_METADATA_KEY
 from mindroom.delegation.state import DELEGATION_STATE_KEY, DelegationState, child_execution_identity
 from mindroom.event_journal import approval_arguments_digest
 from mindroom.llm.provider import TurnCompleted
-from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, ToolExecution
+from mindroom.llm.runs import RunRecord, RunStatus, ToolExecution
 from mindroom.response_turn import CompletedApprovalRun
 from mindroom.session_storage.agent_storage import create_session_storage
 from tests.approval_continuation_helpers import receipt_call_ids
@@ -80,7 +81,6 @@ async def test_a_paused_approval_resumes_into_a_completed_run(
             decided=approved_call(waiting, PRODUCT),
             added=[result(call, PRODUCT)],
             answered=_answered(case.code),
-            confirmation=True,
         )
     else:
         reason = "Alice declined the multiplication."
@@ -89,8 +89,6 @@ async def test_a_paused_approval_resumes_into_a_completed_run(
             decided=denied_call(waiting, reason),
             added=[result(call, reason, is_error=True)],
             answered=_answered(case.code),
-            confirmation=False,
-            confirmation_note=reason,
         )
     expected = as_stored(expected)
     stored = run.stored()
@@ -135,7 +133,6 @@ async def test_a_paused_delegation_resumes_its_child_and_then_the_parent(
                 decided=approved_call(child_waiting, PRODUCT),
                 added=[result(child_call, PRODUCT)],
                 answered=_answered(case.helper),
-                confirmation=True,
             ),
         ),
     )
@@ -151,7 +148,6 @@ async def test_a_paused_delegation_resumes_its_child_and_then_the_parent(
             decided=replace(waiting, result=handed_over, external_execution_required=False),
             added=[result(call, handed_over, is_error=None)],
             answered=_answered(case.code),
-            external_execution_result=handed_over,
         ),
     )
     stored = run.stored()
@@ -165,7 +161,6 @@ async def test_a_paused_delegation_resumes_its_child_and_then_the_parent(
         hooks={call_id: replace(hook, after_called=True) for call_id, hook in paused_state.hooks.items()},
         pending_tools=[],
         pending_tool_sources={},
-        pending_requirements=[],
         pending_child_id=None,
         pending_agent_name=None,
     )
@@ -180,6 +175,90 @@ async def test_a_paused_delegation_resumes_its_child_and_then_the_parent(
     assert str(request.messages[-2].content).startswith("42")
     # The parent holds no such call, so it reads the card's id for the child's approved call.
     assert receipt_call_ids(request) == [call.tool_call_id for call in run.calls()]
+
+
+_RECEIPT = (
+    "[SYSTEM NOTICE — TOOL APPROVAL RECEIPT] This trusted MindRoom runtime receipt records how paused tool calls "
+    "were authorized. Do not infer approval policy from tool success alone.\n- `multiply` (tool call id `{call_id}`): "
+    "{outcome}"
+)
+_GRANTED = "approval was granted, but its approval provenance is unavailable."
+_PRODUCT_RESULT = '{"operation": "multiplication", "result": 42.0}'
+
+
+@pytest.mark.parametrize("run_id", sorted(AGENT_RESUMES))
+async def test_a_resume_sends_each_model_its_stored_request_then_its_decided_results_and_the_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_id: str,
+) -> None:
+    """Each model a resume reaches gets its paused run's stored messages, each decided call's result, then the receipt.
+
+    An approved call answers with what it returned and a denied one with the requester's reason; the receipt names
+    each decision under the id its reader knows the call by, and a delegated child's answer reaches the parent as the
+    delegation's result.
+    """
+    case = AGENT_RESUMES[run_id]
+    run = await setup_case(case, tmp_path, monkeypatch)
+    stored = {"code-model": run.paused.messages}
+    children = DelegationState.from_metadata(run.paused.metadata).children
+    for child in children:
+        child_store = create_session_storage("helper", run.config, run.paths, child_execution_identity(child))
+        paused_child = child_store.get_run(child.run_id)
+        assert isinstance(paused_child, RunRecord)
+        stored["helper-model"] = paused_child.messages
+
+    await resume_case(case, run)
+
+    sent = {}
+    for model in (run.code, run.helper):
+        for request in model.requests:
+            prefix = stored[model.identity.id]
+            assert list(request.messages[: len(prefix)]) == prefix
+            sent[model.identity.id] = [
+                (message.role, message.tool_call_id, str(message.content), message.tool_call_error)
+                for message in request.messages[len(prefix) :]
+            ]
+    receipt = partial(_RECEIPT.format, outcome=_GRANTED)
+    if run_id == "run-approved":
+        expected = {
+            "code-model": [
+                ("tool", "call-run-approved", _PRODUCT_RESULT, False),
+                ("user", None, receipt(call_id="call-run-approved"), None),
+            ],
+        }
+    elif run_id == "run-rejected":
+        expected = {
+            "code-model": [
+                ("tool", "call-run-rejected", "Alice declined the multiplication.", True),
+                (
+                    "user",
+                    None,
+                    _RECEIPT.format(
+                        call_id="call-run-rejected",
+                        outcome="approval was denied; the tool was not executed.",
+                    ),
+                    None,
+                ),
+            ],
+        }
+    else:
+        [child] = children
+        handed_over = (
+            f"42\n\nDelegation {child.delegation_id} record: helper:.mindroom/delegations/2027-01-15/"
+            f"{child.delegation_id}\nSubagent ID: {child.subagent_id}"
+        )
+        expected = {
+            "helper-model": [
+                ("tool", "call-helper-multiply-approved", _PRODUCT_RESULT, False),
+                ("user", None, receipt(call_id="call-helper-multiply-approved"), None),
+            ],
+            "code-model": [
+                ("tool", "call-delegate-approved", handed_over, None),
+                ("user", None, receipt(call_id=f"{child.delegation_id}:call-helper-multiply-approved"), None),
+            ],
+        }
+    assert sent == expected
 
 
 def _save(run: CodeResume, record: RunRecord) -> None:
@@ -215,7 +294,6 @@ async def test_a_resume_refuses_tampered_or_incomplete_decisions_before_anything
             external_execution_required=tampering == "outstanding_external",
         )
         tampered.tools = [*(tampered.tools or ()), extra]
-        tampered.requirements = [*(tampered.requirements or ()), RunRequirement(deepcopy(extra))]
         _save(run, tampered)
         run.paused = run.stored()
     elif tampering == "mismatched_digest":
@@ -242,8 +320,6 @@ async def test_a_waiting_call_marked_confirmed_in_the_store_is_refused_even_when
     run = await setup_resume(tmp_path, monkeypatch, thread="$approved", run_id="run-approved", code=code)
     [call] = run.calls()
     tampered = deepcopy(run.paused)
-    [requirement] = tampered.requirements or ()
-    requirement.tool_execution.confirmed = True
     [tool] = tampered.tools or ()
     tool.confirmed = True
     _save(run, tampered)

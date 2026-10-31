@@ -13,13 +13,14 @@ import nio
 import pytest
 from nio.durable import open_durable_sync
 
-from mindroom.config.access import ResponderAccessConfig
 from mindroom.event_journal import DeliveryProjectionPendingError, EventKind
 from mindroom.event_journal import journal as journal_ops
 from mindroom.matrix.durable_ingestion import consume_one_ingestion_batch
 from mindroom.matrix.state import MatrixState
-from tests.conftest import install_call_manager_mock, make_matrix_client_mock
-from tests.test_bot_ready_hook import _router_bot_with_orchestrator
+from tests.conftest import make_matrix_client_mock
+from tests.journal_helpers import membership_position
+from tests.matrix_state_helpers import save_matrix_state
+from tests.test_bot_ready_hook import _router_with_call_manager
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -78,12 +79,11 @@ async def test_real_member_state_and_timeline_preserve_tenure_and_hooks(  # noqa
     block_leave_once: bool,
 ) -> None:
     """State join and semantic leave/rejoin each carry their own atomic tenure effect."""
-    bot, _orchestrator = _router_bot_with_orchestrator(tmp_path)
+    bot, call_manager = await _router_with_call_manager(tmp_path)
     account = bot.agent_user.user_id
-    bot.config.router.access = ResponderAccessConfig(members_of_rooms=["grant"])
     state = MatrixState.load(runtime_paths=bot.runtime_paths)
     state.add_room("grant", ROOM, "#grant:localhost", "Grant")
-    state.save(runtime_paths=bot.runtime_paths)
+    save_matrix_state(state, bot.runtime_paths)
     principal = bot.journal_principal()
     consumer = await principal.load_or_create_ingestion_consumer(new_generation=uuid4())
     client = nio.AsyncClient("https://localhost", account, device_id="DEVICE")
@@ -91,8 +91,6 @@ async def test_real_member_state_and_timeline_preserve_tenure_and_hooks(  # noqa
     session = open_durable_sync(client, consumer_id=consumer.generation, store_path=tmp_path / "crypto")
     await principal.bind_ingestion_stream(generation=consumer.generation, stream_id=session.stream_id)
     bot.client = client
-    call_manager = AsyncMock()
-    install_call_manager_mock(bot, call_manager)
     source: asyncio.Queue[bytes] = asyncio.Queue()
 
     async def request(*_args: object, **_kwargs: object) -> bytes:
@@ -128,7 +126,7 @@ async def test_real_member_state_and_timeline_preserve_tenure_and_hooks(  # noqa
         await bot._after_ingestion_admission(record, facts, provenance)
         event = record.event
         if event is not None:
-            position = await principal.membership_position(ROOM)
+            position = await membership_position(principal, ROOM)
             allowed = bot._runtime_view.agent_reply_memberships.is_allowed(
                 SENDER,
                 ["grant"],
@@ -150,7 +148,7 @@ async def test_real_member_state_and_timeline_preserve_tenure_and_hooks(  # noqa
                         after_sync=complete,
                     )
                 except DeliveryProjectionPendingError:
-                    position = await principal.membership_position(ROOM)
+                    position = await membership_position(principal, ROOM)
                     assert (position.membership, position.membership_epoch) == ("join", 0)
                     assert await principal.load_event("$leave") is None
                     assert "$before" in [event.event_id for event in await principal.pending()]
@@ -162,7 +160,7 @@ async def test_real_member_state_and_timeline_preserve_tenure_and_hooks(  # noqa
     try:
         await source.put(_response("one", [_member("$own-state", account, "join")], []))
         await drain_until(1)
-        position = await principal.membership_position(ROOM)
+        position = await membership_position(principal, ROOM)
         assert (position.membership, position.membership_epoch) == ("join", 0)
         call_manager.on_sync_room_membership.assert_awaited_once_with(joined_room_ids={ROOM}, left_room_ids=set())
         snapshot = make_matrix_client_mock(user_id=account)
@@ -191,7 +189,7 @@ async def test_real_member_state_and_timeline_preserve_tenure_and_hooks(  # noqa
         assert ("$leave", False, "leave", 1) in observed
         assert ("$fenced", False, "leave", 1) in observed
         assert ("$rejoin", False, "join", 1) in observed
-        position = await principal.membership_position(ROOM)
+        position = await membership_position(principal, ROOM)
         assert (position.membership, position.membership_epoch) == ("join", 1)
         pending = await principal.pending()
         # Rejoining does not authorize the remaining captured history as live.
@@ -242,7 +240,7 @@ async def test_real_local_echoes_do_not_hide_later_departure(  # noqa: C901, PLR
 
     async def after(record: IngestionRecordAdmission, _facts: AdmissionFacts, _provenance: object) -> None:
         if record.membership is not None:
-            position = await principal.membership_position(ROOM)
+            position = await membership_position(principal, ROOM)
             effects.append((position.membership, position.membership_epoch))
 
     session._transport.request = request
@@ -268,7 +266,7 @@ async def test_real_local_echoes_do_not_hide_later_departure(  # noqa: C901, PLR
 
     async def local(target: str) -> None:
         await session.wait_for_membership_idle()
-        position = await principal.membership_position(ROOM)
+        position = await membership_position(principal, ROOM)
         assert await session.change_membership(
             operation_id=uuid4(),
             room_id=ROOM,
@@ -279,7 +277,7 @@ async def test_real_local_echoes_do_not_hide_later_departure(  # noqa: C901, PLR
         await consume()
 
     async def assert_fenced(epoch: int) -> None:
-        position = await principal.membership_position(ROOM)
+        position = await membership_position(principal, ROOM)
         assert (position.membership, position.membership_epoch) == ("leave", epoch)
         assert not await principal.pending()
         page = await principal.read_conversation(room_id=ROOM, thread_id=None, limit=10)

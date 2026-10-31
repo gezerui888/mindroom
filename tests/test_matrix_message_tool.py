@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import nio
 import pytest
+from pydantic import ValidationError
 
 import mindroom.tools  # noqa: F401
 from mindroom.attachments.storage import load_attachment, register_local_attachment
@@ -26,22 +27,25 @@ from mindroom.constants import (
     STREAM_VISIBLE_BODY_KEY,
 )
 from mindroom.custom_tools.attachments import AttachmentTools
+from mindroom.custom_tools.matrix_conversation_operations import MatrixMessageOperationResult
 from mindroom.custom_tools.matrix_message import MatrixMessageTools
 from mindroom.dispatch_source import TRUSTED_INTERNAL_RELAY_SOURCE_KIND
 from mindroom.interactive import parse_and_format_interactive
 from mindroom.matrix.client_delivery import build_edit_event_content
 from mindroom.matrix.client_visible_messages import trusted_visible_sender_ids
 from mindroom.matrix.conversation_hydration import HYDRATED_PROMPT_WINDOW_MESSAGES
-from mindroom.matrix.message_extras import MINDROOM_MESSAGE_EXTRAS_KEY
-from mindroom.matrix.state import MatrixState, _load_matrix_state_file_cached
+from mindroom.matrix.message_extras import MINDROOM_MESSAGE_EXTRAS_KEY, MatrixMessageExtra
+from mindroom.matrix.state import MatrixState
 from mindroom.message_target import MessageTarget
 from mindroom.session_ids import create_session_id
 from mindroom.teams.members import _as_member
 from mindroom.tool_system.agno_toolkits import adapt_toolkit
 from mindroom.tool_system.events import ToolTraceEntry, build_tool_trace_content
 from mindroom.tool_system.invocation import ToolCallContext, run_tool_call
-from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
+from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
+from tests.agent_tool_helpers import toolkit_offers
 from tests.authorization_helpers import (
     make_test_tool_runtime_context,
 )
@@ -59,12 +63,13 @@ from tests.conftest import (
     test_runtime_paths,
 )
 from tests.identity_helpers import entity_ids
+from tests.matrix_state_helpers import save_matrix_state
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
     from mindroom.config.models import FileAccess
-    from mindroom.matrix.client import DeliveredMatrixEvent
+    from mindroom.matrix.client_delivery import DeliveredMatrixEvent
 
 
 _DEFAULT_RESOLVED_THREAD_ID = object()
@@ -75,12 +80,9 @@ def _reset_matrix_message_rate_limit() -> None:
     MatrixMessageTools._recent_actions.clear()
 
 
-def _empty_async_iterator() -> AsyncIterator[object]:
-    async def iterator() -> AsyncIterator[object]:
-        if False:
-            yield None
-
-    return iterator()
+async def _empty_async_iterator() -> AsyncIterator[object]:
+    if False:
+        yield None
 
 
 def _make_context(
@@ -91,12 +93,9 @@ def _make_context(
     bot_accounts: list[str] | None = None,
     mindroom_user: MindRoomUserConfig | None = None,
     resolved_thread_id: object = _DEFAULT_RESOLVED_THREAD_ID,
-    reply_to_event_id: str | None = "$reply:localhost",
     storage_path: Path | None = None,
     attachment_ids: tuple[str, ...] = (),
     agent_thread_mode: str = "thread",
-    membership: object | None = None,
-    membership_turn_id: str | None = None,
     client_user_id: str = "@mindroom_general:localhost",
 ) -> ToolRuntimeContext:
     runtime_root = storage_path or Path(tempfile.mkdtemp())
@@ -125,17 +124,16 @@ def _make_context(
     )
     conversation_reader = make_conversation_reader_mock()
     conversation_reader.latest_thread_event_id = make_latest_thread_event_id_mock()
-    if membership is None:
-        membership = MagicMock()
-        membership.membership_epoch = AsyncMock(return_value=0)
-        membership.interactive_prompt_is_current = AsyncMock(return_value=True)
+    membership = MagicMock()
+    membership.membership_epoch = AsyncMock(return_value=0)
+    membership.interactive_prompt_is_current = AsyncMock(return_value=True)
     return make_test_tool_runtime_context(
         agent_name="general",
         target=MessageTarget(
             room_id=room_id,
             source_thread_id=thread_id,
             resolved_thread_id=thread_id if resolved_thread_id is _DEFAULT_RESOLVED_THREAD_ID else resolved_thread_id,
-            reply_to_event_id=reply_to_event_id,
+            reply_to_event_id="$reply:localhost",
             session_id=create_session_id(
                 room_id,
                 thread_id if resolved_thread_id is _DEFAULT_RESOLVED_THREAD_ID else resolved_thread_id,
@@ -151,7 +149,6 @@ def _make_context(
         storage_path=storage_path,
         attachment_ids=attachment_ids,
         membership=membership,
-        membership_turn_id=membership_turn_id,
     )
 
 
@@ -161,9 +158,14 @@ def test_matrix_message_tool_registered_and_instantiates() -> None:
         Config(agents={"general": AgentConfig(display_name="General Agent")}),
         test_runtime_paths(Path(tempfile.mkdtemp())),
     )
-    assert "matrix_message" in TOOL_METADATA
+    assert "matrix_message" in builtin_tool_registry()
     assert isinstance(
-        get_tool_by_name("matrix_message", runtime_paths_for(config), worker_target=None),
+        get_tool_by_name(
+            "matrix_message",
+            runtime_paths_for(config),
+            worker_target=None,
+            tools=builtin_tool_registry(),
+        ),
         MatrixMessageTools,
     )
 
@@ -324,8 +326,7 @@ async def test_matrix_message_send_resolves_room_alias_before_send(tmp_path: Pat
     ctx = _make_context(storage_path=tmp_path, thread_id=None)
     state = MatrixState()
     state.add_room("ops", room_id="!ops:localhost", alias="#ops:localhost", name="Ops")
-    state.save(runtime_paths=ctx.runtime_paths)
-    _load_matrix_state_file_cached.cache_clear()
+    save_matrix_state(state, ctx.runtime_paths)
 
     with (
         patch("mindroom.custom_tools.matrix_message.room_access_allowed", return_value=True) as mock_access,
@@ -344,22 +345,93 @@ async def test_matrix_message_send_resolves_room_alias_before_send(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_matrix_message_rejects_non_string_room_id_before_resolution(tmp_path: Path) -> None:
-    """Explicit room IDs should return structured type errors before alias resolution."""
-    tool = MatrixMessageTools()
-    ctx = _make_context(storage_path=tmp_path, thread_id=None)
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"action": "delete", "message": "hello"},
+        {"action": "send", "message": "hello", "room_id": 123},
+        {"action": "send", "message": "hello", "new_thread": "maybe"},
+        {"action": "send", "attachments": "att_context_file"},
+        {"action": "send", "message": "hello", "idempotency_key": 7},
+        {
+            "action": "send",
+            "message": "hello",
+            "message_extras": [{"title": "Raw", "content_type": "application/json", "content": "{}"}],
+        },
+    ],
+)
+async def test_matrix_message_rejects_malformed_arguments(kwargs: dict[str, object]) -> None:
+    """Arguments that disagree with the signature fail call validation before the tool body runs."""
+    entrypoint = toolkit_offers(MatrixMessageTools(), "matrix_message").entrypoint
+    ctx = _make_context()
 
     with (
-        patch("mindroom.custom_tools.attachment_helpers.resolve_optional_room_id") as mock_resolve,
+        patch(
+            "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
+            new_callable=AsyncMock,
+        ) as mock_send,
+        tool_runtime_context(ctx),
+        pytest.raises(ValidationError),
+    ):
+        await entrypoint(**kwargs)
+
+    mock_send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kwargs", "expected_message"),
+    [
+        ({"recipient": "  "}, "recipient must be a non-empty string when provided."),
+        ({"thread_id": ""}, "thread_id must be a non-empty string when provided."),
+        ({"action": "edit", "event_id": " "}, "event_id must be a non-empty string when provided."),
+        ({"message_extras": [MatrixMessageExtra(title="  ", content="details")]}, "requires a non-empty title"),
+    ],
+)
+async def test_matrix_message_rejects_blank_values(kwargs: dict[str, object], expected_message: str) -> None:
+    """Blank identifiers and extras titles return a tool error before anything is sent."""
+    tool = MatrixMessageTools()
+    ctx = _make_context()
+
+    with (
+        patch(
+            "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
+            new_callable=AsyncMock,
+        ) as mock_send,
+        tool_runtime_context(ctx),
+    ):
+        payload = json.loads(await tool.matrix_message(**{"message": "hello", **kwargs}))
+
+    assert payload["status"] == "error"
+    assert expected_message in payload["message"]
+    mock_send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_matrix_message_strips_targets_and_drops_blank_attachments() -> None:
+    """Thread IDs and attachment references are stripped, and blank attachment entries are dropped."""
+    tool = MatrixMessageTools()
+    ctx = _make_context()
+    dispatch = AsyncMock(return_value=MatrixMessageOperationResult(status="ok", fields={}))
+
+    with (
+        patch(
+            "mindroom.custom_tools.matrix_conversation_operations.MatrixMessageOperations.dispatch_action",
+            new=dispatch,
+        ),
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
-            await tool.matrix_message(action="send", message="hello", room_id=123),  # type: ignore[arg-type]
+            await tool.matrix_message(
+                action="send",
+                thread_id=" $other-thread ",
+                attachments=[" att_first ", "   ", "./att_second"],
+            ),
         )
 
-    mock_resolve.assert_not_called()
-    assert payload["status"] == "error"
-    assert payload["message"] == "room_id must be a non-empty string."
+    assert payload["status"] == "ok"
+    assert dispatch.await_args.kwargs["thread_id"] == "$other-thread"
+    assert dispatch.await_args.kwargs["attachments"] == ["att_first", "./att_second"]
 
 
 @pytest.mark.asyncio
@@ -376,7 +448,7 @@ async def test_matrix_message_send_includes_message_extras() -> None:
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
-            await tool.matrix_message(
+            await toolkit_offers(tool, "matrix_message").entrypoint(
                 action="send",
                 message="Short answer.",
                 message_extras=[
@@ -420,7 +492,7 @@ async def test_matrix_message_send_rejects_message_extras_without_text_event() -
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
-            await tool.matrix_message(
+            await toolkit_offers(tool, "matrix_message").entrypoint(
                 action="send",
                 attachments=["att_context_file"],
                 message_extras=[
@@ -434,38 +506,6 @@ async def test_matrix_message_send_rejects_message_extras_without_text_event() -
 
     assert payload["status"] == "error"
     assert "non-empty message" in payload["message"]
-    mock_send.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_matrix_message_rejects_invalid_message_extras() -> None:
-    """Invalid extras should return a tool error instead of sending."""
-    tool = MatrixMessageTools()
-    ctx = _make_context(thread_id="$ctx-thread:localhost")
-
-    with (
-        patch(
-            "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
-            new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
-        ) as mock_send,
-        tool_runtime_context(ctx),
-    ):
-        payload = json.loads(
-            await tool.matrix_message(
-                action="send",
-                message="Short answer.",
-                message_extras=[
-                    {
-                        "title": "Raw",
-                        "content_type": "application/json",
-                        "content": "{}",
-                    },
-                ],
-            ),
-        )
-
-    assert payload["status"] == "error"
-    assert "content_type" in payload["message"]
     mock_send.assert_not_awaited()
 
 
@@ -1084,7 +1124,7 @@ async def test_matrix_message_send_supports_attachment_file_paths(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_matrix_message_send_resolves_relative_attachment_file_paths_from_workspace(tmp_path: Path) -> None:
-    """Relative attachment_file_paths should resolve from the agent workspace root."""
+    """Relative attachment file paths should resolve from the agent workspace root."""
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()
     generated_file = workspace_root / "scratch" / "generated.txt"
@@ -1313,30 +1353,12 @@ async def test_matrix_message_accepts_register_attachment_ids_across_task_bounda
 
 
 @pytest.mark.asyncio
-async def test_matrix_message_send_defaults_to_context_thread() -> None:
-    """Send action should use current runtime thread when thread_id is omitted."""
-    tool = MatrixMessageTools()
-    ctx = _make_context(thread_id="$ctx-thread:localhost")
-
-    with (
-        patch(
-            "mindroom.custom_tools.matrix_conversation_operations.send_message_result",
-            new=AsyncMock(side_effect=delivered_matrix_side_effect("$evt")),
-        ) as mock_send,
-        tool_runtime_context(ctx),
-    ):
-        payload = json.loads(await tool.matrix_message(action="send", message="hello"))
-
-    assert payload["status"] == "ok"
-    assert payload["thread_id"] == "$ctx-thread:localhost"
-    sent_content = mock_send.await_args.args[2]
-    relates_to = sent_content.get("m.relates_to", {})
-    assert relates_to.get("event_id") == "$ctx-thread:localhost"
-
-
-@pytest.mark.asyncio
-async def test_matrix_message_react_happy_path() -> None:
-    """React action should send a Matrix annotation event to the target event."""
+@pytest.mark.parametrize(
+    ("message", "reaction"),
+    [("🔥", "🔥"), ("  🔥  ", "🔥"), (None, "👍"), ("   ", "👍")],
+)
+async def test_matrix_message_react_happy_path(message: str | None, reaction: str) -> None:
+    """React action should send a stripped Matrix annotation, defaulting to a thumbs-up."""
     tool = MatrixMessageTools()
     ctx = _make_context()
     response = MagicMock(spec=nio.RoomSendResponse)
@@ -1344,11 +1366,12 @@ async def test_matrix_message_react_happy_path() -> None:
     ctx.client.room_send.return_value = response
 
     with tool_runtime_context(ctx):
-        payload = json.loads(await tool.matrix_message(action="react", message="🔥", event_id="$target"))
+        payload = json.loads(await tool.matrix_message(action="react", message=message, event_id="$target"))
 
     assert payload["status"] == "ok"
     assert payload["action"] == "react"
     assert payload["reacted_event_id"] == "$target"
+    assert payload["reaction"] == reaction
     ctx.client.room_send.assert_awaited_once_with(
         room_id=ctx.room_id,
         message_type="m.reaction",
@@ -1356,7 +1379,7 @@ async def test_matrix_message_react_happy_path() -> None:
             "m.relates_to": {
                 "rel_type": "m.annotation",
                 "event_id": "$target",
-                "key": "🔥",
+                "key": reaction,
             },
         },
         ignore_unverified_devices=True,
@@ -1389,9 +1412,6 @@ async def test_matrix_message_edit_rejects_interactive_prompts() -> None:
     """Direct tool edits cannot durably own a prompt revision."""
     tool = MatrixMessageTools()
     ctx = _make_context(thread_id="$ctx-thread:localhost")
-    thread_messages = [
-        make_visible_message(event_id="$latest", timestamp=1, sender="@alice:localhost", body="latest"),
-    ]
     interactive_message = """Updated prompt.
 
 ``` Interactive json
@@ -1403,7 +1423,6 @@ async def test_matrix_message_edit_rejects_interactive_prompts() -> None:
   ]
 }
 ```"""
-    serve_conversation_reader(ctx.conversation_reader, thread_messages)
 
     with (
         patch(
@@ -1429,10 +1448,6 @@ async def test_matrix_message_edit_includes_message_extras_on_replacement_wrappe
     """Edit action should expose extras on both m.new_content and the outer edit event."""
     tool = MatrixMessageTools()
     ctx = _make_context(thread_id="$ctx-thread:localhost")
-    thread_messages = [
-        make_visible_message(event_id="$latest", timestamp=1, sender="@alice:localhost", body="latest"),
-    ]
-    serve_conversation_reader(ctx.conversation_reader, thread_messages)
 
     with (
         patch(
@@ -1442,7 +1457,7 @@ async def test_matrix_message_edit_includes_message_extras_on_replacement_wrappe
         tool_runtime_context(ctx),
     ):
         payload = json.loads(
-            await tool.matrix_message(
+            await toolkit_offers(tool, "matrix_message").entrypoint(
                 action="edit",
                 message="Updated answer.",
                 event_id="$target",
@@ -1474,47 +1489,10 @@ async def test_matrix_message_edit_includes_message_extras_on_replacement_wrappe
 
 
 @pytest.mark.asyncio
-async def test_matrix_message_edit_rejects_invalid_message_extras() -> None:
-    """Invalid edit extras should fail before edit delivery."""
-    tool = MatrixMessageTools()
-    ctx = _make_context(thread_id="$ctx-thread:localhost")
-
-    with (
-        patch(
-            "mindroom.custom_tools.matrix_conversation_operations.edit_message_result",
-            new=AsyncMock(side_effect=delivered_matrix_side_effect("$edit_evt")),
-        ) as mock_edit,
-        tool_runtime_context(ctx),
-    ):
-        payload = json.loads(
-            await tool.matrix_message(
-                action="edit",
-                message="Updated answer.",
-                event_id="$target",
-                message_extras=[
-                    {
-                        "title": "Raw",
-                        "content_type": "application/json",
-                        "content": "{}",
-                    },
-                ],
-            ),
-        )
-
-    assert payload["status"] == "error"
-    assert "content_type" in payload["message"]
-    mock_edit.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_matrix_message_edit_plain_text_carries_no_interactive_prompt() -> None:
     """Editing away an interactive block should leave prompt metadata off the wire."""
     tool = MatrixMessageTools()
     ctx = _make_context(thread_id="$ctx-thread:localhost")
-    thread_messages = [
-        make_visible_message(event_id="$latest", timestamp=1, sender="@alice:localhost", body="latest"),
-    ]
-    serve_conversation_reader(ctx.conversation_reader, thread_messages)
     with (
         patch(
             "mindroom.custom_tools.matrix_conversation_operations.edit_message_result",
@@ -1704,13 +1682,9 @@ async def test_matrix_message_read_room_happy_path() -> None:
 async def test_matrix_message_read_room_includes_every_msgtype_that_carries_a_body() -> None:
     """A room read keeps text, notices, emotes, and media: one rule, not a curated list.
 
-    The emote was missing, because this read kept its own copy of the visible
-    msgtype list and that copy said text and notice. Sharing one rule with the
-    thread read fixed that and left the picture missing for the same reason,
-    one msgtype further out. The journal projection holds every
-    `m.room.message` it admits, whether admission called it a message or media,
-    so an agent reading the room saw a conversation with a `/me` and an image
-    cut out of it while the same conversation watched live still had both.
+    The room read shares the thread read's visible-message rule, so it returns
+    every `m.room.message` that carries a body, the same conversation an agent
+    watching it live sees.
     """
     tool = MatrixMessageTools()
     ctx = _make_context(thread_id=None)
@@ -1791,15 +1765,11 @@ async def test_matrix_message_read_room_includes_every_msgtype_that_carries_a_bo
 
 @pytest.mark.asyncio
 async def test_matrix_message_read_room_folds_a_text_edit_onto_the_picture_it_corrects() -> None:
-    """A replacement may change the msgtype, and dropping the original invented a message.
+    """A text edit of a picture folds onto the picture instead of inventing a message.
 
-    This is the failure the other direction produced here, and it is worse than
-    an absence. The image was filtered out of the read while the text edit that
-    replaced it was not, so the fold found a replacement whose original it had
-    never seen and reconstructed one from the replacement alone: a message with
-    the edit's timestamp for a position it never had, and its placement
-    reported as unknown. A model reading the room was handed a message the room
-    does not contain, in place of the picture it does.
+    A replacement may change the msgtype. The read keeps the original, so the
+    fold reports one row at the picture's own position carrying the edit's
+    text, rather than a message reconstructed from the edit alone.
     """
     tool = MatrixMessageTools()
     ctx = _make_context(thread_id=None)
@@ -1847,7 +1817,7 @@ async def test_matrix_message_read_room_folds_a_text_edit_onto_the_picture_it_co
     assert message["body"] == "words instead"
     assert message["latest_event_id"] == "$edit"
     # The original's own position, and a placement that is a fact rather than a
-    # reconstruction. Both were lost when the picture was filtered away.
+    # reconstruction.
     assert message["timestamp"] == 1
     assert "thread_id_unknown" not in message
 
@@ -2157,7 +2127,7 @@ async def test_matrix_message_send_validates_non_empty_message() -> None:
 
 @pytest.mark.asyncio
 async def test_matrix_message_rejects_attachments_for_non_send_actions(tmp_path: Path) -> None:
-    """Attachments should be accepted only by send/reply/thread-reply actions."""
+    """Attachments should be accepted only by the send action."""
     tool = MatrixMessageTools()
     ctx = _make_context(storage_path=tmp_path)
 
@@ -2235,20 +2205,6 @@ async def test_matrix_message_explicit_room_target_requires_authorization() -> N
 
     assert payload["status"] == "error"
     assert "Not authorized" in payload["message"]
-
-
-@pytest.mark.asyncio
-async def test_matrix_message_rejects_unsupported_action() -> None:
-    """Unsupported actions should return a clear validation error."""
-    tool = MatrixMessageTools()
-    ctx = _make_context()
-
-    with tool_runtime_context(ctx):
-        payload = json.loads(await tool.matrix_message(action="delete", message="hello"))  # type: ignore[arg-type]
-
-    assert payload["status"] == "error"
-    assert "Unsupported action" in payload["message"]
-    assert "send, read, edit, or react" in payload["message"]
 
 
 @pytest.mark.asyncio

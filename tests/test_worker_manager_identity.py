@@ -13,13 +13,14 @@ import mindroom.workers.runtime as workers_runtime_module
 from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.message_target import MessageTarget
-from mindroom.tool_system.bootstrap import ensure_tool_registry_loaded
 from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, resolve_worker_target
 from mindroom.workers.backend import WorkerBackendError
-from mindroom.workers.models import WorkerHandle, WorkerLaunchConfig, WorkerSpec
+from mindroom.workers.models import ConfiguredWorkerBackend, WorkerHandle, WorkerLaunchConfig, WorkerSpec
 from mindroom.workers.runtime import bind_worker_launch_config_source
+from tests.agent_tool_helpers import blocking_entrypoint
 from tests.authorization_helpers import make_test_tool_runtime_context
 from tests.conftest import make_conversation_reader_mock, make_relation_lookup
 
@@ -118,28 +119,20 @@ def _install_fake_backend(monkeypatch: pytest.MonkeyPatch, backend: str) -> type
         specs: list[WorkerSpec] = []  # noqa: RUF012
         launches: list[WorkerLaunchConfig] = []  # noqa: RUF012
 
-        @classmethod
-        def from_runtime(
-            cls,
-            _runtime_paths: RuntimePaths,
-            *,
-            current_launch: Callable[[], WorkerLaunchConfig],
-            **_kwargs: object,
-        ) -> _Recorded:
-            cls.builds.append(backend)
-            return cls(backend, current_launch)
+    def build(current_launch: Callable[[], WorkerLaunchConfig]) -> _Recorded:
+        _Recorded.builds.append(backend)
+        return _Recorded(backend, current_launch)
 
-    signature_name = f"{backend}_backend_config_signature"
-    monkeypatch.setattr(
-        workers_runtime_module,
-        signature_name,
-        lambda _runtime_paths, **kwargs: (backend, str(kwargs.get("auth_token"))),
-    )
-    monkeypatch.setattr(
-        workers_runtime_module,
-        "DockerWorkerBackend" if backend == "docker" else "KubernetesWorkerBackend",
-        _Recorded,
-    )
+    def configure(
+        _runtime_paths: RuntimePaths,
+        *,
+        auth_token: str | None,
+        storage_root: Path,
+    ) -> ConfiguredWorkerBackend:
+        del storage_root
+        return ConfiguredWorkerBackend(signature=(backend, str(auth_token)), cleanup_signature=(backend,), build=build)
+
+    monkeypatch.setattr(workers_runtime_module, f"configure_{backend}_worker_backend", configure)
     return _Recorded
 
 
@@ -181,16 +174,14 @@ def _calculator_add(runtime_paths: RuntimePaths, config: Config) -> Any:  # noqa
         resolved_thread_id=None,
         session_id="session-1",
     )
-    ensure_tool_registry_loaded(runtime_paths, config)
     toolkit = get_tool_by_name(
         "calculator",
         runtime_paths,
         runtime_config=config,
         worker_target=resolve_worker_target("shared", "mind", execution_identity=identity),
+        tools=builtin_tool_registry(),
     )
-    entrypoint = toolkit.functions["add"].entrypoint
-    assert entrypoint is not None
-    return entrypoint
+    return blocking_entrypoint(toolkit, "add")
 
 
 def _turn_context(runtime_paths: RuntimePaths, config: Config) -> object:
@@ -208,9 +199,9 @@ def _turn_context(runtime_paths: RuntimePaths, config: Config) -> object:
 
 @pytest.fixture(autouse=True)
 def _fresh_worker_manager() -> Iterator[None]:
-    workers_runtime_module._reset_primary_worker_manager()
+    workers_runtime_module.reset_primary_worker_manager()
     yield
-    workers_runtime_module._reset_primary_worker_manager()
+    workers_runtime_module.reset_primary_worker_manager()
 
 
 class _AppliedConfig:

@@ -1,11 +1,13 @@
 """Derive a tool function's model-facing description and parameter schema from its signature and docstring.
 
-``tool_description`` and ``tool_parameters`` give the schema Agno 3.0.9's entrypoint processing derives for the
-annotations MindRoom's tools and its plugins use, byte for byte (``tests/tool_system/test_tool_schema.py`` runs every
-MindRoom-authored function through both), and ``validated_entrypoint`` coerces a call's arguments to the annotations
-the same way. The module imports no Agno code.
-Every parameter belongs to the model except ``*args`` and ``**kwargs``, which the schema leaves out; refusing
-parameters a framework would fill is the adapter's job.
+Every function whose schema its signature gives is derived here, a MindRoom toolkit's and an Agno toolkit's alike.
+``tool_description`` and ``tool_parameters`` render each kind of annotation as Agno 3.0.9's entrypoint processing does,
+byte for byte (``tests/tool_system/test_tool_schema.py`` compares them), except that a value annotated ``Any`` or
+``object`` takes any JSON value, where Agno renders an object that admits only ``{}``, and that ``*args`` and
+``**kwargs``, which no named argument fills, stay out of the schema, where Agno requires a property for each.
+``validated_entrypoint`` validates a call's arguments against the annotations, coercing what pydantic can. The module
+imports no Agno code.
+Every other parameter belongs to the model, except those the caller names as the framework's to fill.
 """
 
 from __future__ import annotations
@@ -13,14 +15,14 @@ from __future__ import annotations
 import functools
 import inspect
 from enum import Enum
-from types import NoneType, UnionType
+from types import NoneType, SimpleNamespace, UnionType
 from typing import TYPE_CHECKING, Any, Literal, Union, cast, get_args, get_origin, get_type_hints
 
 from docstring_parser import parse
 from pydantic import BaseModel, ConfigDict, validate_call
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Collection, Mapping
 
 _JSON_TYPES = {
     "int": "integer",
@@ -52,18 +54,22 @@ def tool_description(entrypoint: Callable[..., Any]) -> str:
     return "\n".join(part for part in (parsed.short_description, parsed.long_description) if part)
 
 
-def tool_parameters(entrypoint: Callable[..., Any]) -> dict[str, Any]:
+def tool_parameters(entrypoint: Callable[..., Any], *, filled: Collection[str] = ()) -> dict[str, Any]:
     """Return the JSON schema of ``entrypoint``'s parameters, each described by its docstring entry.
 
-    A parameter without a default is required. An annotation that does not resolve raises.
+    A parameter without a default is required, and one ``filled`` names, which the framework fills, is left out. Only
+    the annotations of the parameters the schema offers are read, and one of them that does not resolve raises.
     """
     signature = inspect.signature(entrypoint)
-    hints = get_type_hints(entrypoint)
+    offered = [
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind not in _UNNAMED_PARAMETERS and name not in filled
+    ]
+    hints = _resolved_annotations(entrypoint, offered)
     descriptions = _parameter_descriptions(entrypoint)
     properties: dict[str, Any] = {}
-    for name, parameter in signature.parameters.items():
-        if parameter.kind in _UNNAMED_PARAMETERS:
-            continue
+    for name in offered:
         schema = _parameter_schema(hints.get(name))
         if description := descriptions.get(name):
             schema["description"] = description
@@ -74,6 +80,21 @@ def tool_parameters(entrypoint: Callable[..., Any]) -> dict[str, Any]:
         if parameter.default is inspect.Parameter.empty and name in properties
     ]
     return {"type": "object", "properties": properties, "required": required}
+
+
+def closed_parameters(entrypoint: Callable[..., Any], parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Return ``parameters``, an authored or derived schema for ``entrypoint``'s arguments, closed.
+
+    A call's arguments are validated against the signature, so the schema says so up front: it requires each of its
+    properties the signature gives no default, and admits no other property.
+    """
+    properties = parameters.get("properties") or {}
+    required = [
+        name
+        for name, parameter in inspect.signature(entrypoint).parameters.items()
+        if parameter.default is inspect.Parameter.empty and name in properties
+    ]
+    return {**parameters, "required": required, "additionalProperties": False}
 
 
 def validated_entrypoint[F: Callable[..., Any]](entrypoint: F) -> F:
@@ -96,6 +117,21 @@ def validated_entrypoint[F: Callable[..., Any]](entrypoint: F) -> F:
             await inner.aclose()
 
     return cast("F", stream)
+
+
+def _resolved_annotations(entrypoint: Callable[..., Any], names: Collection[str]) -> dict[str, Any]:
+    """Return the resolved annotations of ``entrypoint``'s parameters ``names``, leaving its other annotations unread.
+
+    A parameter the framework fills, or a return value, may name a type its module imports only for type checking, as
+    ``RunContext`` often is. ``get_type_hints`` resolves the stand-in's annotations in the module of ``entrypoint``,
+    which it reaches through ``__wrapped__``, as it resolves those of ``entrypoint`` itself.
+    """
+    annotations = inspect.get_annotations(entrypoint)
+    stand_in = SimpleNamespace(
+        __wrapped__=entrypoint,
+        __annotations__={name: annotations[name] for name in names if name in annotations},
+    )
+    return get_type_hints(stand_in)
 
 
 def _parameter_descriptions(entrypoint: Callable[..., Any]) -> dict[str, str]:
@@ -124,7 +160,13 @@ def _parameter_schema(hint: object) -> dict[str, Any]:
 
 
 def _schema(hint: Any) -> dict[str, Any]:  # noqa: ANN401, PLR0911 - One branch per kind of annotation.
-    """Return the JSON schema of one annotation; a bare ``typing.List`` or ``typing.Dict`` holds strings."""
+    """Return the JSON schema of one annotation; a bare ``typing.List`` or ``typing.Dict`` holds strings.
+
+    ``Any`` and ``object`` take any JSON value; any other class without a JSON type renders, as Agno renders it, as an
+    object that admits no property.
+    """
+    if hint is Any or hint is object:
+        return {}
     origin = get_origin(hint)
     arguments = get_args(hint)
     if origin is Literal:
@@ -148,9 +190,6 @@ def _schema(hint: Any) -> dict[str, Any]:  # noqa: ANN401, PLR0911 - One branch 
     json_type = _JSON_TYPES.get(hint.__name__, "object")
     if json_type != "object":
         return {"type": json_type}
-    # TODO(simplify): ``Any``, ``object``, and any class without a JSON type render as an object that admits no
-    # property, which tells the model it can send only ``{}``; the AGNO_COMPAT markers in custom_tools/google_sheets.py
-    # and custom_tools/microsoft_sharepoint.py work around it. Rendering ``Any`` unconstrained changes those schemas.
     return {"type": "object", "properties": {}, "additionalProperties": False}
 
 
@@ -186,4 +225,4 @@ def _inlined(node: Any, definitions: dict[str, Any], active: frozenset[str]) -> 
     return _inlined(definitions[name], definitions, active | {name})
 
 
-__all__ = ["tool_description", "tool_parameters", "validated_entrypoint"]
+__all__ = ["closed_parameters", "tool_description", "tool_parameters", "validated_entrypoint"]

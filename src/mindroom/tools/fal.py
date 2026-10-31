@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("FAL_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -60,7 +61,7 @@ if TYPE_CHECKING:
             default=False,
         ),
     ],
-    dependencies=["fal-client"],  # From agno requirements
+    dependencies=["fal-client"],
     docs_url="https://docs.mindroom.chat/tools/ai-and-generation/#fal",
     function_names=("generate_media", "image_to_image", "on_queue_update"),
 )

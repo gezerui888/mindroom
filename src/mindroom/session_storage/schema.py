@@ -20,8 +20,9 @@ if TYPE_CHECKING:
 
     from mindroom.history.types import HistoryScope
 
-# The sessions table's columns and their types, each one a current writer or reader uses, in the order a database
-# converted from an older layout holds them. ``session_data`` holds the session's usage totals.
+# The sessions table's columns and their types, in the order a database converted from an older layout holds them.
+# ``session_data`` held the session's usage totals and no current writer fills it; it stays because older releases'
+# preflight requires it on a rollback, and the step to layout version 7 reads the totals stored there once.
 _SESSION_COLUMN_TYPES = {
     "session_id": "VARCHAR NOT NULL",
     "user_id": "VARCHAR",
@@ -36,11 +37,16 @@ _SESSION_COLUMN_SQL = ", ".join(f"{column} {column_type}" for column, column_typ
 # The layout version ``<sessions>_log_meta`` records: 2 for storage v2, 3 once an agent's session rows name that agent
 # (``legacy_agent_session_owners``), 4 once the meta row names the database's owner and each session row holds its
 # state in a column of its own (``legacy_session_columns``), 5 once every delegation child its runs' metadata holds has
-# the current shape (``delegation.legacy_snapshots``), and 6 once the paused runs earlier releases stored are rewritten
-# (``legacy_paused_runs``).
-LOG_VERSION = 6
+# the current shape (``delegation.legacy_snapshots``), 6 once the paused runs earlier releases stored are rewritten
+# (``legacy_paused_runs``), 7 once each session row holds its owner's history state in one metadata value
+# (``legacy_scope_metadata``) and the usage ledger holds the usage each session's stored totals counted beyond it
+# (``legacy_usage_totals``), and 8 once each paused call is stored once, as its tool row (``legacy_run_requirements``).
+LOG_VERSION = 8
 # The first version whose meta row names the database's owner.
 OWNER_VERSION = 4
+# The first version whose ledger rows sum to each session's totals: the step to it keeps what a session's stored totals
+# counted beyond its run rows as a row of its own (``legacy_usage_totals``).
+LEDGER_TOTALS_VERSION = 7
 _TEAM_STORAGE_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_]+")
 # The statuses of a run that does not replay as model history, as stored, and as an SQL list.
 NON_VISIBLE_RUN_STATUS_VALUES = tuple(sorted(status.value for status in NON_VISIBLE_RUN_STATUSES))
@@ -137,7 +143,8 @@ def log_schema_sql(names: TableNames) -> tuple[str, ...]:
         "next_seq INTEGER NOT NULL, owner_kind TEXT, owner_id TEXT)",
         # The JSON columns come last, the metadata a cut scans first among them, so scans of the small columns and
         # of the metadata skip the overflow pages of the larger ones. ``has_tools`` keeps a record's empty tool list
-        # apart from none; its entries are rows of their own.
+        # apart from none; its entries are rows of their own. ``requirements`` stays NULL from layout version 8 on; it
+        # stays because a release at an earlier version reads it.
         f"CREATE TABLE IF NOT EXISTS {runs} (run_id TEXT NOT NULL PRIMARY KEY, "
         f"session_id TEXT NOT NULL REFERENCES {sessions}(session_id) ON DELETE CASCADE, parent_run_id TEXT, "
         "kind TEXT NOT NULL, scope_key TEXT NOT NULL, status TEXT NOT NULL, seq INTEGER NOT NULL, "
@@ -245,6 +252,7 @@ def index_sql(table: str, *columns: str) -> str:
 
 
 __all__ = [
+    "LEDGER_TOTALS_VERSION",
     "LOG_VERSION",
     "NON_VISIBLE_RUN_STATUS_SQL",
     "NON_VISIBLE_RUN_STATUS_VALUES",

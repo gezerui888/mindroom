@@ -16,13 +16,13 @@ from mindroom.custom_tools import dynamic_workflow as workflow_module
 from mindroom.custom_tools.delegate import DelegateTools
 from mindroom.custom_tools.dynamic_workflow import DynamicWorkflowTools
 from mindroom.delegation.personas import inline_persona
+from mindroom.dynamic_workflows.spec import DynamicWorkflowError, SubagentParticipant, parse_workflow_spec
 from mindroom.dynamic_workflows.store import DynamicWorkflowStore
-from mindroom.dynamic_workflows.validation import DynamicWorkflowError
 from mindroom.llm.errors import ProviderError
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.worker_routing import agent_workspace_root_path
-from tests.delegation_helpers import _call, _delegate_runtime_context, _runtime_paths
-from tests.fakes.scripted_model import Await, ScriptedModel, answer, calls
+from tests.delegation_helpers import _delegate_runtime_context, _runtime_paths
+from tests.fakes.scripted_model import Await, ScriptedModel, answer, calls, tool_call
 from tests.identity_helpers import entity_ids
 from tests.test_delegation_direct_audit import _identity
 
@@ -239,7 +239,11 @@ def test_profile_participant_searches_no_knowledge(tmp_path: Path, monkeypatch: 
     workflow.profile("critic", "---\ndescription: Critic.\ntools: []\nknowledge: [docs]\n---\nYou criticize.\n")
     context = _delegate_runtime_context(workflow.config, workflow.paths, execution_identity=_identity())
 
-    request = workflow_module._participant_request(context, {"id": "critic", "profile": "critic"}, workflow_id="w")
+    request = workflow_module._participant_request(
+        context,
+        SubagentParticipant.model_validate({"id": "critic", "profile": "critic"}),
+        workflow_id="w",
+    )
 
     assert request.persona is not None
     assert request.persona.knowledge == ()
@@ -256,7 +260,7 @@ async def test_preapproved_participant_tool_runs(tmp_path: Path, monkeypatch: py
         tmp_path,
         monkeypatch,
         config,
-        turns=[calls(_call("add", "add-1", a=1, b=2)), answer("3")],
+        turns=[calls(tool_call("add", "add-1", a=1, b=2)), answer("3")],
     )
 
     run = await workflow.run(_spec([{"id": "adder", "system_prompt": "Add.", "tools": ["calculator"]}]))
@@ -284,7 +288,6 @@ async def test_participant_cannot_be_continued_outside_its_workflow(
     subagent_id = json.loads(record.read_text())["child"]["subagent_id"]
     toolkit = DelegateTools(
         "leader",
-        ["leader"],
         workflow.paths,
         config,
         agent_workspace_root_path(workflow.paths.storage_root, "leader"),
@@ -300,7 +303,7 @@ async def test_participant_cannot_be_continued_outside_its_workflow(
 def _write_legacy_revision(tmp_path: Path) -> DynamicWorkflowStore:
     store = DynamicWorkflowStore(tmp_path)
     store.create_workflow(
-        spec=_spec([{"id": "writer", "system_prompt": "placeholder", "tools": []}]),
+        spec=parse_workflow_spec(_spec([{"id": "writer", "system_prompt": "placeholder", "tools": []}])),
         scope="agent",
         owner_id="leader",
         created_by="leader",
@@ -332,15 +335,14 @@ def test_legacy_revision_loads_as_subagent(tmp_path: Path) -> None:
 
     spec = store.load_workflow_revision(workflow_id="review", scope="agent", owner_id="leader", revision="000001")
 
-    assert spec["participants"] == [
-        {
-            "id": "writer",
-            "kind": "subagent",
-            "system_prompt": "You are Writer.\n\nWrites\n\n- Cite sources",
-            "description": "Writes reports.",
-            "model": "haiku",
-            "tools": [],
-        },
+    assert spec.participants == [
+        SubagentParticipant(
+            id="writer",
+            system_prompt="You are Writer.\n\nWrites\n\n- Cite sources",
+            description="Writes reports.",
+            model="haiku",
+            tools=[],
+        ),
     ]
 
 
@@ -405,7 +407,7 @@ async def test_participant_runs_the_profile_validated_at_run_start(
         monkeypatch,
         config,
         turns=[
-            calls(_call("save_file", "save-1", contents=rewritten, file_name="subagents/second.md")),
+            calls(tool_call("save_file", "save-1", contents=rewritten, file_name="subagents/second.md")),
             answer("Rewrote it."),
             answer("Second answer."),
         ],
@@ -560,7 +562,7 @@ def test_participant_from_authored_child_stays_within_its_tools(tmp_path: Path) 
 
     request = workflow_module._participant_request(
         context,
-        {"id": "p", "system_prompt": "P", "tools": ["file"]},
+        SubagentParticipant.model_validate({"id": "p", "system_prompt": "P", "tools": ["file"]}),
         workflow_id="w",
     )
     assert request.persona is not None
@@ -568,7 +570,7 @@ def test_participant_from_authored_child_stays_within_its_tools(tmp_path: Path) 
     with pytest.raises(DynamicWorkflowError, match="unknown tool 'calculator'"):
         workflow_module._participant_request(
             context,
-            {"id": "p", "system_prompt": "P", "tools": ["calculator"]},
+            SubagentParticipant.model_validate({"id": "p", "system_prompt": "P", "tools": ["calculator"]}),
             workflow_id="w",
         )
 
@@ -645,10 +647,14 @@ def test_participant_from_authored_child_stays_within_its_skills(tmp_path: Path)
         persona=inline_persona("P", None, ["research"], None),
     )
 
-    unnamed = workflow_module._participant_request(context, {"id": "p", "system_prompt": "P"}, workflow_id="w")
+    unnamed = workflow_module._participant_request(
+        context,
+        SubagentParticipant.model_validate({"id": "p", "system_prompt": "P"}),
+        workflow_id="w",
+    )
     named = workflow_module._participant_request(
         context,
-        {"id": "p", "system_prompt": "P", "skills": ["research"]},
+        SubagentParticipant.model_validate({"id": "p", "system_prompt": "P", "skills": ["research"]}),
         workflow_id="w",
     )
 
@@ -659,6 +665,6 @@ def test_participant_from_authored_child_stays_within_its_skills(tmp_path: Path)
     with pytest.raises(DynamicWorkflowError, match="unknown skill 'writing'"):
         workflow_module._participant_request(
             context,
-            {"id": "p", "system_prompt": "P", "skills": ["writing"]},
+            SubagentParticipant.model_validate({"id": "p", "system_prompt": "P", "skills": ["writing"]}),
             workflow_id="w",
         )

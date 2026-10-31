@@ -33,19 +33,18 @@ import mindroom.tools.agno_compat_openai as openai_module
 import mindroom.tools.file as file_tool_module
 import mindroom.tools.path_safety as path_safety_module
 from mindroom.attachments.storage import load_attachment
-from mindroom.constants import resolve_runtime_paths
 from mindroom.credentials.manager import CredentialsManager
 from mindroom.custom_tools.agno_compat_moviepy import MindRoomMoviePyVideoTools
-from mindroom.custom_tools.attachments import AttachmentTools, resolve_send_attachments
+from mindroom.custom_tools.attachments import AttachmentTools, resolve_send_attachment
 from mindroom.custom_tools.chat_ui import ChatUITools
 from mindroom.custom_tools.coding import CodingTools
 from mindroom.custom_tools.e2b import MindRoomE2BTools
 from mindroom.custom_tools.google_drive import GoogleDriveTools
 from mindroom.custom_tools.microsoft_files import MicrosoftFilesTools
 from mindroom.custom_tools.outlook_mail import OutlookMailTools
-from mindroom.oauth.microsoft import microsoft_files_oauth_provider, outlook_mail_oauth_provider
-from mindroom.tool_system.catalog import TOOL_METADATA, ensure_tool_registry_loaded
+from mindroom.oauth.microsoft import microsoft_oauth_provider
 from mindroom.tool_system.declarations import ToolFileAccess
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tools.agno_compat_airflow import MindRoomAirflowTools
 from mindroom.tools.agno_compat_groq import MindRoomGroqTools
@@ -117,17 +116,17 @@ async def _send_attachment_path(
     file_access: FileAccess,
     raw_path: str,
 ) -> bool:
-    _attachments, _ids, newly_registered, error = resolve_send_attachments(
+    resolution = resolve_send_attachment(
         _tool_context(tmp_path),
-        attachment_ids=[],
-        attachment_file_paths=[raw_path],
+        raw_path,
         workspace_root=workspace,
         file_access=file_access,
     )
-    if error is not None or not newly_registered:
+    if isinstance(resolution, str):
         return False
-    attachment = load_attachment(tmp_path, newly_registered[0])
-    return attachment is not None and attachment.local_path.read_bytes() == _PNG
+    resolved, newly_registered = resolution
+    attachment = load_attachment(tmp_path, resolved.attachment_id)
+    return newly_registered and attachment is not None and attachment.local_path.read_bytes() == _PNG
 
 
 async def _view_file(
@@ -336,7 +335,7 @@ async def _upload_to_microsoft_files(
     )
     paths = microsoft_runtime_paths(tmp_path)
     manager = save_microsoft_client_config(paths)
-    publish_microsoft_grant(microsoft_files_oauth_provider(), manager)
+    publish_microsoft_grant(microsoft_oauth_provider("microsoft_files"), manager)
     tool = MicrosoftFilesTools(
         runtime_paths=paths,
         credentials_manager=manager,
@@ -360,7 +359,7 @@ async def _attach_with_outlook_mail(
     )
     paths = microsoft_runtime_paths(tmp_path)
     manager = save_microsoft_client_config(paths)
-    publish_microsoft_grant(outlook_mail_oauth_provider(), manager)
+    publish_microsoft_grant(microsoft_oauth_provider("outlook_mail"), manager)
     tool = OutlookMailTools(
         runtime_paths=paths,
         credentials_manager=manager,
@@ -425,10 +424,13 @@ def _probe_id(probe: _ToolProbe) -> str:
     return f"{probe.tool_name}:{probe.entry_point}"
 
 
-def test_every_agent_file_access_tool_has_a_contract_probe(tmp_path: Path) -> None:
+def test_every_agent_file_access_tool_has_a_contract_probe() -> None:
     """A tool that follows file_access must be added here, so it cannot skip the contract."""
-    ensure_tool_registry_loaded(resolve_runtime_paths(config_path=tmp_path / "config.yaml", storage_path=tmp_path))
-    declared = {name for name, metadata in TOOL_METADATA.items() if metadata.file_access is ToolFileAccess.AGENT}
+    declared = {
+        name
+        for name, metadata in builtin_tool_registry().entries.items()
+        if metadata.file_access is ToolFileAccess.AGENT
+    }
     assert declared == {probe.tool_name for probe in _PROBES}
 
 
@@ -751,6 +753,24 @@ async def test_worker_path_tool_refuses_a_file_above_the_read_cap(
         doc.truncate(65 << 20)
 
     assert not await probe.read(tmp_path, monkeypatch, workspace, "workspace", probe.filename)
+
+
+@pytest.mark.parametrize(
+    ("limit", "text"),
+    [({"max_file_length": 4}, "abcde"), ({"max_file_lines": 1}, "a\nb")],
+    ids=["characters", "lines"],
+)
+def test_file_tool_points_a_file_over_its_read_limits_to_chunked_reads(
+    workspace: Path,
+    limit: dict[str, int],
+    text: str,
+) -> None:
+    """A file over the configured character or line limit is not returned whole."""
+    (workspace / "long.txt").write_text(text)
+
+    assert file_tools()(base_dir=workspace, **limit).read_file("long.txt") == (
+        "Error reading file: file too long. Use read_file_chunk instead"
+    )
 
 
 @pytest.mark.parametrize("interrupted", [False, True], ids=["complete", "interrupted"])

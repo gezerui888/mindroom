@@ -37,11 +37,13 @@ from mindroom.providers.gemini.wire import (
     function_declarations,
     malformed_tool_call_error,
     read_chunk,
+    rejected_media,
     reply_provider_data,
     stop_reason,
     without_tool_selection,
 )
 from mindroom.providers.google_adc import with_runtime_application_credentials
+from mindroom.providers.identity import model_identity
 from mindroom.providers.tool_policy import disables_tools
 
 if TYPE_CHECKING:
@@ -54,7 +56,6 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
     from mindroom.llm.provider import ModelRequest, StreamEvent
 
-_PROVIDER = "Google"
 _SAMPLING_CONTROL_NAMES = frozenset({"temperature", "top_p", "top_k"})
 # How the SDK's ``ValueError`` begins when a Gemini API client has no API key at all.
 _NO_API_KEY_ERROR = "No API key was provided."
@@ -87,7 +88,7 @@ class GeminiProvider:
         """
         timer = TurnTimer()
         reply = GeminiReply()
-        provider = self.identity.provider_name
+        provider = self.identity.provider
         # Client construction reads credentials from disk; its failures are configuration errors, not transient.
         try:
             client = self._sdk_client()
@@ -118,7 +119,10 @@ class GeminiProvider:
             # Media and chunk failures arrive normalized.
             raise
         except Exception as error:
-            raise _provider_error(error, provider=provider) from error
+            failure = _provider_error(error, provider=provider)
+            if isinstance(error, APIError):
+                failure.rejected_media = rejected_media(error.message, request.messages)
+            raise failure from error
         if not reply.finished:
             # The stream ended before Gemini ended the reply, so the turn did not finish.
             return
@@ -127,7 +131,7 @@ class GeminiProvider:
 
     def _finished_turn(self, reply: GeminiReply, timer: TurnTimer) -> list[StreamEvent]:
         """Return the events that end a reply Gemini ended, or raise its malformed call."""
-        if (malformed := malformed_tool_call_error(reply, provider=self.identity.provider_name)) is not None:
+        if (malformed := malformed_tool_call_error(reply, provider=self.identity.provider)) is not None:
             raise malformed
         return finished_turn(
             self.identity,
@@ -323,7 +327,7 @@ def build_provider(model_config: ModelConfig, runtime_paths: RuntimePaths) -> Ge
         extra_kwargs = _vertex_kwargs(extra_kwargs, runtime_paths)
     settings = settings_from_extra_kwargs(GeminiSettings, extra_kwargs, provider=model_config.provider)
     return GeminiProvider(
-        identity=ModelIdentity(id=model_config.id, provider=_PROVIDER, provider_name=_PROVIDER),
+        identity=model_identity(model_config),
         capabilities=Capabilities(
             structured_output="native",
             # Gemini fetches Cloud Storage and HTTPS files and video links itself.

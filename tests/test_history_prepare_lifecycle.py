@@ -14,11 +14,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from mindroom.config.models import CompactionOverrideConfig
-from mindroom.execution_preparation import (
-    _prepare_bound_team_execution_context,
-    prepare_agent_execution_context,
-    prepare_bound_team_run_context,
-)
+from mindroom.config.resolution import entity_model_name
+from mindroom.execution_preparation import prepare_agent_execution_context, prepare_bound_team_run_context
 from mindroom.history.replay import estimate_prompt_visible_history_tokens, estimate_summary_tokens
 from mindroom.history.runtime import (
     PreparedScopeHistory,
@@ -31,9 +28,9 @@ from mindroom.history.session_context import (
     load_scope_session,
 )
 from mindroom.history.storage import (
-    _with_scope_state,
     read_chunk_basis,
     read_scope_state,
+    with_force_compaction,
 )
 from mindroom.history.summary_input import build_summary_input
 from mindroom.history.types import (
@@ -43,7 +40,6 @@ from mindroom.history.types import (
     CompactionOutcome,
     HistoryPolicy,
     HistoryScope,
-    HistoryScopeState,
     ResolvedHistoryExecutionPlan,
     ResolvedHistorySettings,
     ScopeSummary,
@@ -57,7 +53,7 @@ from mindroom.providers.assistant_turn import stamp_model
 from mindroom.session_ids import create_session_id
 from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.token_budget import estimate_compaction_input_tokens
-from tests.conftest import install_model_providers, prepare_history_for_run_for_test, seed_session
+from tests.conftest import delete_runs, install_model_providers, prepare_history_for_run_for_test, seed_session
 from tests.fakes.scripted_model import ScriptedModel, estimate_only_model
 from tests.fakes.summary_model import ScriptedSummaryModel, summary_model
 from tests.history_helpers import (
@@ -80,9 +76,24 @@ if TYPE_CHECKING:
     from mindroom.llm.runs import RunRecord, TeamRunRecord
 
 
+def _included_run_count(
+    previous_summary: str | None,
+    compacted_runs: list[RunRecord | TeamRunRecord],
+    budget: int,
+) -> int:
+    return len(
+        build_summary_input(
+            previous_summary=previous_summary,
+            compacted_runs=compacted_runs,
+            max_input_tokens=budget,
+            history_settings=_ALL_HISTORY_SETTINGS,
+            token_estimator=estimate_compaction_input_tokens,
+        )[1],
+    )
+
+
 def test_prepare_scope_history_boundary_does_not_accept_execution_identity() -> None:
     assert "execution_identity" not in inspect.signature(prepare_agent_execution_context).parameters
-    assert "execution_identity" not in inspect.signature(_prepare_bound_team_execution_context).parameters
     assert "execution_identity" not in inspect.signature(prepare_bound_team_run_context).parameters
     assert "execution_identity" not in inspect.signature(prepare_bound_scope_history).parameters
     assert "execution_identity" not in inspect.signature(prepare_scope_history).parameters
@@ -143,8 +154,7 @@ async def test_prepare_history_for_run_forced_compaction_rewrites_session(
             _completed_run("run-4"),
         ],
     )
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
 
     install_model_providers(monkeypatch, {"default": summary_model()})
@@ -206,8 +216,7 @@ async def test_prepare_history_for_run_required_compaction_starts_lifecycle_befo
             _completed_run("run-2"),
         ],
     )
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     lifecycle = RecordingCompactionLifecycle()
 
@@ -258,8 +267,7 @@ async def test_prepare_history_for_run_required_compaction_edits_failure_when_mo
             _completed_run("run-2"),
         ],
     )
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     lifecycle = RecordingCompactionLifecycle()
 
@@ -301,8 +309,7 @@ async def test_prepare_history_for_run_compaction_failure_notice_redacts_credent
     )
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=None)
     session = _session("session-1", runs=[_completed_run("run-1"), _completed_run("run-2")])
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     lifecycle = RecordingCompactionLifecycle()
     api_key = "sk-" + "proj" + "A1b2C3d4E5f6G7h8J9k0"
@@ -349,8 +356,7 @@ async def test_prepare_history_for_run_required_compaction_edits_failure_when_ca
             _completed_run("run-2"),
         ],
     )
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     lifecycle = RecordingCompactionLifecycle()
 
@@ -398,8 +404,7 @@ async def test_prepare_history_for_run_required_compaction_classifies_provider_t
             _completed_run("run-2"),
         ],
     )
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     lifecycle = RecordingCompactionLifecycle()
 
@@ -477,11 +482,7 @@ async def test_prepare_history_for_run_keeps_thread_session_compaction_isolated(
         ],
     )
     scope = HistoryScope(kind="agent", scope_id="test_agent")
-    thread_session.metadata = _with_scope_state(
-        thread_session.metadata,
-        scope,
-        HistoryScopeState(force_compact_before_next_run=True),
-    )
+    thread_session.metadata = with_force_compaction(thread_session.metadata)
     seed_session(storage, room_session)
     seed_session(storage, thread_session)
 
@@ -559,29 +560,12 @@ async def test_prepare_history_for_run_forced_compaction_finishes_selected_runs_
             ),
         ],
     )
-    seed_session(storage, session)
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     history_settings = config.resolve_scope("test_agent").history_settings
-    visible_runs = list(session.runs or [])
+    visible_runs = list(session.runs)
     first_summary_text = "first pass summary"
     second_summary_text = "final summary"
-
-    def _included_run_count(
-        previous_summary: str | None,
-        compacted_runs: list[RunRecord | TeamRunRecord],
-        budget: int,
-    ) -> int:
-        return len(
-            build_summary_input(
-                previous_summary=previous_summary,
-                compacted_runs=compacted_runs,
-                max_input_tokens=budget,
-                history_settings=_ALL_HISTORY_SETTINGS,
-                token_estimator=estimate_compaction_input_tokens,
-            )[1],
-        )
 
     summary_input_budget = next(
         budget
@@ -700,24 +684,9 @@ async def test_prepare_history_for_run_auto_compaction_runs_to_completion_before
     )
     seed_session(storage, session)
     history_settings = config.resolve_scope("test_agent").history_settings
-    visible_runs = list(session.runs or [])
+    visible_runs = list(session.runs)
     first_summary_text = "first pass summary"
     second_summary_text = "second pass summary"
-
-    def _included_run_count(
-        previous_summary: str | None,
-        compacted_runs: list[RunRecord | TeamRunRecord],
-        budget: int,
-    ) -> int:
-        return len(
-            build_summary_input(
-                previous_summary=previous_summary,
-                compacted_runs=compacted_runs,
-                max_input_tokens=budget,
-                history_settings=_ALL_HISTORY_SETTINGS,
-                token_estimator=estimate_compaction_input_tokens,
-            )[1],
-        )
 
     summary_input_budget = next(
         budget
@@ -842,12 +811,11 @@ async def test_prepare_scope_history_skips_trigger_compaction_when_the_summary_a
     )
     resolved_inputs = replace(
         resolve_entity_preparation_inputs(
-            entity_name="test_agent",
             history_settings=_ALL_HISTORY_SETTINGS,
             config=config,
             runtime_paths=runtime_paths,
             static_prompt_tokens=0,
-            active_model_name=None,
+            active_model_name=entity_model_name(config, "test_agent"),
             active_context_window=None,
         ),
         execution_plan=execution_plan,
@@ -940,12 +908,11 @@ async def test_prepare_scope_history_compacts_to_trigger_budget_without_a_native
     )
     resolved_inputs = replace(
         resolve_entity_preparation_inputs(
-            entity_name="test_agent",
             history_settings=_ALL_HISTORY_SETTINGS,
             config=config,
             runtime_paths=runtime_paths,
             static_prompt_tokens=0,
-            active_model_name=None,
+            active_model_name=entity_model_name(config, "test_agent"),
             active_context_window=None,
         ),
         execution_plan=execution_plan,
@@ -979,7 +946,7 @@ async def test_prepare_scope_history_compacts_to_trigger_budget_without_a_native
         assert prepared.compaction_decision.reason == "within_hard_budget"
         assert prepared.compaction_reply_outcome == "none"
         summary_mock.assert_not_awaited()
-        assert len(persisted.runs or []) == 3
+        assert len(persisted.runs) == 3
         return
 
     assert prepared.compaction_decision.mode == "required"
@@ -1027,7 +994,7 @@ async def test_prepare_history_for_run_auto_required_compaction_finishes_origina
     )
     seed_session(storage, session)
     history_settings = config.resolve_scope("test_agent").history_settings
-    visible_runs = list(session.runs or [])
+    visible_runs = list(session.runs)
     first_summary_text = "first pass summary"
     summary_inputs: list[str] = []
 
@@ -1137,7 +1104,7 @@ async def test_prepare_history_for_run_auto_required_compaction_finishes_origina
     seed_session(storage, persisted)
     current_run_session = storage.load_session("session-1")
     assert current_run_session is not None
-    assert [run.run_id for run in current_run_session.runs or []] == ["run-24"]
+    assert [run.run_id for run in current_run_session.runs] == ["run-24"]
     assert "run-24" not in folded_run_ids(storage)
     assert (
         estimate_prompt_visible_history_tokens(
@@ -1189,28 +1156,11 @@ async def test_prepare_history_for_run_persists_successful_compaction_chunks_bef
             ),
         ],
     )
-    seed_session(storage, session)
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     history_settings = config.resolve_scope("test_agent").history_settings
-    visible_runs = list(session.runs or [])
+    visible_runs = list(session.runs)
     first_summary_text = "first pass summary"
-
-    def _included_run_count(
-        previous_summary: str | None,
-        compacted_runs: list[RunRecord | TeamRunRecord],
-        budget: int,
-    ) -> int:
-        return len(
-            build_summary_input(
-                previous_summary=previous_summary,
-                compacted_runs=compacted_runs,
-                max_input_tokens=budget,
-                history_settings=_ALL_HISTORY_SETTINGS,
-                token_estimator=estimate_compaction_input_tokens,
-            )[1],
-        )
 
     summary_input_budget = next(
         budget
@@ -1250,7 +1200,7 @@ async def test_prepare_history_for_run_persists_successful_compaction_chunks_bef
         if second_chunk == "fails":
             msg = "summary failed"
             raise RuntimeError(msg)
-        storage.delete_runs(["run-3"], session_id="session-1")
+        delete_runs(storage, ["run-3"], session_id="session-1")
         return "stale second summary"
 
     summary_mock = AsyncMock(side_effect=summarize)
@@ -1279,7 +1229,7 @@ async def test_prepare_history_for_run_persists_successful_compaction_chunks_bef
     assert persisted is not None
     assert persisted.summary is not None
     assert persisted.summary.text == first_summary_text
-    assert [run.run_id for run in persisted.runs or []] == (["run-3"] if second_chunk == "fails" else [])
+    assert [run.run_id for run in persisted.runs] == (["run-3"] if second_chunk == "fails" else [])
     assert summary_mock.await_count == 2
     assert read_scope_state(persisted).force_compact_before_next_run is False
     if second_chunk == "fails":
@@ -1321,10 +1271,9 @@ async def test_prepare_history_for_run_failure_notice_reports_serving_fallback_m
             ),
         ],
     )
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
-    visible_runs = list(session.runs or [])
+    visible_runs = list(session.runs)
     first_summary_text = "first chunk summary"
 
     summary_input_budget = next(
@@ -1412,7 +1361,7 @@ async def test_prepare_history_for_run_failure_notice_reports_serving_fallback_m
     assert persisted is not None
     assert persisted.summary is not None
     assert persisted.summary.text == first_summary_text
-    assert [run.run_id for run in persisted.runs or []] == ["run-2"]
+    assert [run.run_id for run in persisted.runs] == ["run-2"]
 
 
 @pytest.mark.asyncio
@@ -1427,8 +1376,7 @@ async def test_prepare_history_for_run_compacts_on_primary_when_fallback_constru
     )
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=None)
     session = _session("session-1", runs=[_completed_run("run-1")])
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     execution_plan = ResolvedHistoryExecutionPlan(
         automatic_compaction=True,
@@ -1758,7 +1706,7 @@ async def test_prepare_history_for_run_compaction_failure_clears_force_flag(
         ],
     )
     scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     flag_at_failure_notice: list[bool] = []
 
@@ -1818,19 +1766,18 @@ async def test_a_manual_compaction_the_conversation_outran_says_so_and_stays_req
     )
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=None)
     session = _session("session-1", runs=[_completed_run("run-1"), _completed_run("run-2")])
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
     lifecycle = RecordingCompactionLifecycle()
 
     def basis_after_a_redaction_cuts_a_run(*args: object, **kwargs: object) -> object:
         if race == "before_summary":
-            storage.delete_runs(["run-1"], session_id="session-1")
+            delete_runs(storage, ["run-1"], session_id="session-1")
         return read_chunk_basis(*args, **kwargs)
 
     async def summary_while_a_redaction_cuts_a_run(**_kwargs: object) -> str:
         if race == "during_summary":
-            storage.delete_runs(["run-1"], session_id="session-1")
+            delete_runs(storage, ["run-1"], session_id="session-1")
         return "stale summary"
 
     install_model_providers(monkeypatch, {"default": summary_model()})
@@ -1855,7 +1802,7 @@ async def test_a_manual_compaction_the_conversation_outran_says_so_and_stays_req
     assert persisted.summary is None
     assert read_scope_state(persisted).force_compact_before_next_run is True
     # The reply plans with what the conversation holds now, not the run the redaction removed.
-    assert [run.run_id for run in session.runs or []] == ["run-2"]
+    assert [run.run_id for run in session.runs] == ["run-2"]
     assert prepared.compaction_reply_outcome == "failed"
     assert isinstance(lifecycle.events[-1], CompactionLifecycleFailure)
     assert lifecycle.events[-1].failure_reason == "The conversation changed during compaction."
@@ -1952,7 +1899,7 @@ def _reported_run(
                 },
             ],
         }
-    stamp_model(answer, ModelIdentity(id=model, provider="fake", provider_name="fake"))
+    stamp_model(answer, ModelIdentity(id=model, provider="fake"))
     run = _completed_run(run_id, messages=[Message(role="user", content="u" * 2_000, images=images), answer])
     run.model = model
     run.model_provider = "fake"
@@ -1992,12 +1939,11 @@ async def _prepare_with_reported_usage(
     )
     resolved_inputs = replace(
         resolve_entity_preparation_inputs(
-            entity_name="test_agent",
             history_settings=history_settings,
             config=config,
             runtime_paths=runtime_paths,
             static_prompt_tokens=0,
-            active_model_name=None,
+            active_model_name=entity_model_name(config, "test_agent"),
             active_context_window=None,
         ),
         execution_plan=_REPORTED_USAGE_PLAN,
@@ -2018,7 +1964,7 @@ async def _prepare_with_reported_usage(
             # The model that answered the stored runs, so its reported request sizes apply.
             model=ScriptedModel(
                 [],
-                identity=ModelIdentity(id="fake-model", provider="fake", provider_name="fake"),
+                identity=ModelIdentity(id="fake-model", provider="fake"),
                 replay_estimator=replay_estimator,
             ),
             resolved_inputs=resolved_inputs,

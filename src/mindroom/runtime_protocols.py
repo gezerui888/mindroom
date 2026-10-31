@@ -11,15 +11,24 @@ if TYPE_CHECKING:
 
     from mindroom.agent_cli.session import TurnToolRegistry
     from mindroom.agent_reply_membership import AgentReplyMembershipIndex
+    from mindroom.agent_reply_membership_sync import AgentReplyMembershipSync
     from mindroom.automations.runner import AutomationRunner
     from mindroom.bot import AgentBot
     from mindroom.budgets.monitor import BudgetMonitor
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.desktop.identity import DesktopControllerIdentity
-    from mindroom.hooks import HookMatrixAdmin, HookMessageSender, HookRoomStatePutter, HookRoomStateQuerier
+    from mindroom.event_journal import EventJournalStore
+    from mindroom.hooks import (
+        HookMatrixAdmin,
+        HookMessageSender,
+        HookRegistryState,
+        HookRoomStatePutter,
+        HookRoomStateQuerier,
+    )
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.orchestration.config_lifecycle import ConfigReloadLifecycle
+    from mindroom.orchestration.script_runtime import ScriptRuntimeLifecycle
     from mindroom.response_admission import ResponseAdmissionGate
     from mindroom.scheduling.runtime import ScheduledTaskRuntime
     from mindroom.skill_learning.runner import SkillReviewRunner
@@ -47,7 +56,7 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
     """Narrow orchestrator surface used by extracted runtime collaborators."""
 
     @property
-    def config(self) -> Config | None: ...  # noqa: D102
+    def config(self) -> Config: ...  # noqa: D102
 
     @property
     def runtime_paths(self) -> RuntimePaths: ...  # noqa: D102
@@ -77,10 +86,30 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
     def scheduled_tasks(self) -> ScheduledTaskRuntime: ...  # noqa: D102
 
     @property
+    def script_runtime(self) -> ScriptRuntimeLifecycle: ...  # noqa: D102
+
+    @property
     def agent_reply_memberships(self) -> AgentReplyMembershipIndex: ...  # noqa: D102
 
     @property
+    def agent_reply_membership_sync(self) -> AgentReplyMembershipSync: ...  # noqa: D102
+
+    @property
+    def response_admission_gate(self) -> ResponseAdmissionGate: ...  # noqa: D102
+
+    @property
+    def hook_registry_state(self) -> HookRegistryState: ...  # noqa: D102
+
+    @property
     def config_reload(self) -> ConfigReloadLifecycle: ...  # noqa: D102
+
+    def event_journal_store(self) -> EventJournalStore:
+        """Return the one event-journal store every bot of this runtime borrows."""
+        ...
+
+    def observe_room_activity(self, room_id: str) -> None:
+        """Note that a bot admitted a conversation event in one room."""
+        ...
 
     def hook_message_sender(self) -> HookMessageSender | None: ...  # noqa: D102
 
@@ -104,6 +133,10 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
         """Validate persisted managed Matrix identities for the live config."""
         ...
 
+    def running_entity_names(self) -> frozenset[str]:
+        """Return the entities whose current bot generation is running."""
+        ...
+
     def entity_first_sync_complete(self, entity_name: str) -> bool | None:
         """Return first-sync readiness for the current entity generation."""
         ...
@@ -116,24 +149,8 @@ class OrchestratorRuntime(SupportsRunningState, Protocol):
         """Handle a managed bot completing its first sync."""
         ...
 
-    def invalidate_agent_reply_memberships(self, *, reason: str) -> None:
-        """Revoke room-backed reply grants until the router refreshes them."""
-        ...
-
     def refresh_agent_reply_memberships(self) -> Awaitable[None]:
         """Rebuild room-backed reply grants from the router client."""
-        ...
-
-    async def reconcile_reply_authorized_calls(self) -> None:
-        """Revoke denied calls, then reconcile newly authorized joined rooms."""
-        ...
-
-    async def reconcile_pending_invites(self) -> None:
-        """Recheck cached room invites against each entity's invitation policy."""
-        ...
-
-    def revoke_reply_authorized_calls(self) -> Awaitable[None]:
-        """End active calls without running positive room reconciliation."""
         ...
 
     def send_approval_notice(
@@ -177,20 +194,17 @@ class SupportsClientConfigMemberships(SupportsClientConfig, SupportsAgentReplyMe
 
 
 class SupportsConfigOrchestrator(SupportsConfig, SupportsAgentReplyMemberships, Protocol):
-    """Expose the config plus optional orchestrator handle."""
+    """Expose the config plus the orchestrator handle."""
 
     @property
-    def orchestrator(self) -> OrchestratorRuntime | None: ...  # noqa: D102
+    def orchestrator(self) -> OrchestratorRuntime: ...  # noqa: D102
 
 
 class SupportsClientConfigOrchestrator(SupportsClientConfig, SupportsAgentReplyMemberships, Protocol):
     """Expose client/config access, orchestrator access, and runtime freshness."""
 
     @property
-    def orchestrator(self) -> OrchestratorRuntime | None: ...  # noqa: D102
-
-    @property
-    def response_admission_gate(self) -> ResponseAdmissionGate: ...  # noqa: D102
+    def orchestrator(self) -> OrchestratorRuntime: ...  # noqa: D102
 
     @property
     def runtime_started_at(self) -> float: ...  # noqa: D102

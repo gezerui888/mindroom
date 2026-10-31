@@ -18,9 +18,10 @@ from urllib.parse import urlsplit
 from mindroom.agent_cli.shell_contract import AgentCliShellEnv
 from mindroom.runtime_state import get_api_server_address
 from mindroom.tool_system.agent_tools import resolve_agent_tools
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.sandbox_proxy import tool_placement
+from mindroom.workers.backend_kinds import WorkerBackendKind, worker_backend_kind
 from mindroom.workers.backends.docker_config import DOCKER_HOST_ALIAS
-from mindroom.workers.runtime import primary_worker_backend_name
 
 if TYPE_CHECKING:
     from mindroom.config.main import Config
@@ -39,7 +40,11 @@ _LAUNCHER = (
 
 
 def _shell_runs_in_primary(config: Config, runtime_paths: RuntimePaths, agent_name: str) -> bool:
-    return not resolve_agent_tools(config, agent_name).runs_in_worker("shell", tool_placement(runtime_paths))
+    tools = config_plugins(config, runtime_paths).tools
+    return not resolve_agent_tools(config, agent_name, tools).runs_in_worker(
+        "shell",
+        tool_placement(runtime_paths, tools),
+    )
 
 
 def _local_bin_dir(runtime_paths: RuntimePaths) -> str:
@@ -109,7 +114,7 @@ def _worker_primary_url(runtime_paths: RuntimePaths) -> str | None:
         return None
     host = api_address.host
     if host in {"0.0.0.0", "::"}:  # noqa: S104
-        if primary_worker_backend_name(runtime_paths) != "docker":
+        if worker_backend_kind(runtime_paths) is not WorkerBackendKind.DOCKER:
             return None
         host = DOCKER_HOST_ALIAS
     return _safe_origin(f"http://{f'[{host}]' if ':' in host else host}:{api_address.port}")

@@ -11,6 +11,7 @@ from mindroom.config.main import Config
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.oauth import registry as oauth_registry
 from mindroom.oauth.providers import OAuthProvider
+from mindroom.tool_system.plugins import config_plugins
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -41,22 +42,30 @@ def _provider(provider_id: str) -> OAuthProvider:
     )
 
 
-def test_builtin_oauth_registry_includes_google_docs() -> None:
-    """The built-in provider registry should expose Google Docs independently from Drive."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["google_docs"].credential_service == "google_docs_oauth"
-    assert providers["google_docs"].tool_config_service == "google_docs"
-    assert providers["google_drive"].scopes[-1] == "https://www.googleapis.com/auth/drive"
-
-
-def test_builtin_oauth_registry_includes_google_cloud() -> None:
-    """Google Cloud is a built-in provider whose tools keep settings under their own tool names."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["google_cloud"].credential_service == "google_cloud_oauth"
-    assert providers["google_cloud"].tool_config_service is None
-    assert providers["google_cloud"].scopes[-1] == "https://www.googleapis.com/auth/cloud-platform.read-only"
+def test_builtin_oauth_registry_lists_every_builtin_provider_once_in_order() -> None:
+    """The built-in registry lists each built-in provider once, in a stable order."""
+    assert [provider.id for provider in oauth_registry._builtin_oauth_providers()] == [
+        "atlassian",
+        "github",
+        "google_calendar",
+        "google_cloud",
+        "google_docs",
+        "google_drive",
+        "google_gmail",
+        "google_sheets",
+        "google_tasks",
+        "microsoft_files",
+        "microsoft_sharepoint",
+        "outlook_mail",
+        "outlook_calendar",
+        "microsoft_todo",
+        "microsoft_teams",
+        "microsoft_meetings",
+        "microsoft_onenote",
+        "microsoft_people",
+        "slack",
+        "spotify",
+    ]
 
 
 def test_builtin_oauth_registry_includes_github() -> None:
@@ -65,87 +74,6 @@ def test_builtin_oauth_registry_includes_github() -> None:
 
     assert providers["github"].credential_service == "github_oauth"
     assert providers["github"].tool_config_service == "github"
-
-
-def test_builtin_oauth_registry_includes_microsoft_files() -> None:
-    """Microsoft files shares the Microsoft app client config but keeps its own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["microsoft_files"].credential_service == "microsoft_files_oauth"
-    assert providers["microsoft_files"].tool_config_service == "microsoft_files"
-    assert providers["microsoft_files"].shared_client_config_services == ("microsoft_oauth_client",)
-
-
-def test_builtin_oauth_registry_includes_microsoft_sharepoint() -> None:
-    """Microsoft SharePoint shares the Microsoft app client config but keeps its own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["microsoft_sharepoint"].credential_service == "microsoft_sharepoint_oauth"
-    assert providers["microsoft_sharepoint"].tool_config_service == "microsoft_sharepoint"
-    assert providers["microsoft_sharepoint"].shared_client_config_services == ("microsoft_oauth_client",)
-
-
-def test_builtin_oauth_registry_includes_outlook_mail() -> None:
-    """Outlook mail shares the Microsoft app client config but keeps its own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["outlook_mail"].credential_service == "outlook_mail_oauth"
-    assert providers["outlook_mail"].tool_config_service == "outlook_mail"
-    assert providers["outlook_mail"].shared_client_config_services == ("microsoft_oauth_client",)
-
-
-def test_builtin_oauth_registry_includes_outlook_calendar() -> None:
-    """Outlook calendar shares the Microsoft app client config but keeps its own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["outlook_calendar"].credential_service == "outlook_calendar_oauth"
-    assert providers["outlook_calendar"].tool_config_service == "outlook_calendar"
-    assert providers["outlook_calendar"].shared_client_config_services == ("microsoft_oauth_client",)
-
-
-def test_builtin_oauth_registry_includes_microsoft_todo() -> None:
-    """Microsoft To Do shares the Microsoft app client config but keeps its own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["microsoft_todo"].credential_service == "microsoft_todo_oauth"
-    assert providers["microsoft_todo"].tool_config_service == "microsoft_todo"
-    assert providers["microsoft_todo"].shared_client_config_services == ("microsoft_oauth_client",)
-
-
-def test_builtin_oauth_registry_includes_microsoft_teams() -> None:
-    """Microsoft Teams shares the Microsoft app client config but keeps its own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["microsoft_teams"].credential_service == "microsoft_teams_oauth"
-    assert providers["microsoft_teams"].tool_config_service == "microsoft_teams"
-    assert providers["microsoft_teams"].shared_client_config_services == ("microsoft_oauth_client",)
-
-
-def test_builtin_oauth_registry_includes_microsoft_meetings() -> None:
-    """Microsoft Teams meetings share the Microsoft app client config but keep their own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["microsoft_meetings"].credential_service == "microsoft_meetings_oauth"
-    assert providers["microsoft_meetings"].tool_config_service == "microsoft_meetings"
-    assert providers["microsoft_meetings"].shared_client_config_services == ("microsoft_oauth_client",)
-
-
-def test_builtin_oauth_registry_includes_microsoft_onenote() -> None:
-    """Microsoft OneNote shares the Microsoft app client config but keeps its own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["microsoft_onenote"].credential_service == "microsoft_onenote_oauth"
-    assert providers["microsoft_onenote"].tool_config_service == "microsoft_onenote"
-    assert providers["microsoft_onenote"].shared_client_config_services == ("microsoft_oauth_client",)
-
-
-def test_builtin_oauth_registry_includes_microsoft_people() -> None:
-    """Microsoft 365 People shares the Microsoft app client config but keeps its own token and settings services."""
-    providers = {provider.id: provider for provider in oauth_registry._builtin_oauth_providers()}
-
-    assert providers["microsoft_people"].credential_service == "microsoft_people_oauth"
-    assert providers["microsoft_people"].tool_config_service == "microsoft_people"
-    assert providers["microsoft_people"].shared_client_config_services == ("microsoft_oauth_client",)
 
 
 def test_oauth_provider_rejects_token_suffix_for_tool_config_service() -> None:
@@ -163,148 +91,59 @@ def test_oauth_provider_rejects_token_suffix_for_tool_config_service() -> None:
         )
 
 
-def test_load_oauth_provider_registry_caches_loaded_registry(
+def test_a_config_view_keeps_its_providers_and_merges_built_in_and_plugin_ones(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The shared loader should own cache reads, provider merge, validation, and cache writes."""
+    """One config's providers are built once from the built-in and plugin providers."""
     runtime_paths = _runtime_paths(tmp_path)
     config = Config()
     builtin_provider = _provider("builtin_provider")
     plugin_provider = _provider("plugin_provider")
-    load_calls: list[tuple[Config, RuntimePaths, bool]] = []
+    load_calls: list[bool] = []
 
-    def load_plugin_providers(
-        received_config: Config,
-        received_runtime_paths: RuntimePaths,
-        *,
-        skip_broken_plugins: bool,
-    ) -> list[OAuthProvider]:
-        load_calls.append((received_config, received_runtime_paths, skip_broken_plugins))
+    def plugin_providers(_plugins: object, *, skip_broken_plugins: bool) -> list[OAuthProvider]:
+        load_calls.append(skip_broken_plugins)
         return [plugin_provider]
 
     monkeypatch.setattr(oauth_registry, "_builtin_oauth_providers", lambda: (builtin_provider,))
-    monkeypatch.setattr(oauth_registry, "_load_plugin_oauth_providers", load_plugin_providers)
-    monkeypatch.setattr(oauth_registry, "_reject_tool_service_collisions", lambda _providers: None)
+    monkeypatch.setattr(oauth_registry, "_plugin_oauth_providers", plugin_providers)
+    plugins = config_plugins(config, runtime_paths)
 
-    cache_key = ("config", id(config), runtime_paths, True)
-    oauth_registry.clear_oauth_provider_cache()
-    try:
-        providers = oauth_registry._load_oauth_provider_registry(
-            config,
-            runtime_paths,
-            cache_key,
-            skip_broken_plugins=True,
-        )
-        cached_providers = oauth_registry._load_oauth_provider_registry(
-            config,
-            runtime_paths,
-            cache_key,
-            skip_broken_plugins=True,
-        )
-    finally:
-        oauth_registry.clear_oauth_provider_cache()
+    providers = plugins.oauth_providers
 
-    assert providers is cached_providers
-    assert providers == {
+    assert providers is plugins.oauth_providers
+    assert dict(providers) == {
         "builtin_provider": builtin_provider,
         "plugin_provider": plugin_provider,
     }
-    assert load_calls == [(config, runtime_paths, True)]
+    assert load_calls == [True]
 
 
-def test_load_oauth_providers_uses_config_cache_key(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Direct config loading should preserve the existing cache key shape."""
-    runtime_paths = _runtime_paths(tmp_path)
-    config = Config()
-    expected_providers = {"provider": _provider("provider")}
-    calls: list[tuple[Config, RuntimePaths, tuple[object, ...], bool]] = []
-
-    def load_registry(
-        received_config: Config,
-        received_runtime_paths: RuntimePaths,
-        cache_key: tuple[object, ...],
-        *,
-        skip_broken_plugins: bool,
-    ) -> dict[str, OAuthProvider]:
-        calls.append((received_config, received_runtime_paths, cache_key, skip_broken_plugins))
-        return expected_providers
-
-    monkeypatch.setattr(oauth_registry, "_load_oauth_provider_registry", load_registry)
-
-    providers = oauth_registry.load_oauth_providers(config, runtime_paths, skip_broken_plugins=False)
-
-    assert providers is expected_providers
-    assert calls == [(config, runtime_paths, ("config", id(config), runtime_paths, False), False)]
-
-
-def test_load_oauth_providers_for_snapshot_uses_runtime_config_and_cache_key(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Snapshot loading should pass the snapshot's runtime config and cache key shape through."""
+def test_snapshot_providers_are_the_snapshot_config_s_providers(tmp_path: Path) -> None:
+    """A snapshot's providers are its runtime config's providers."""
     runtime_paths = _runtime_paths(tmp_path)
     runtime_config = Config.validate_with_runtime({"agents": {}}, runtime_paths)
     snapshot = ApiSnapshot(
         generation=7,
         runtime_paths=runtime_paths,
-        config_data={"agents": {}},
         runtime_config=runtime_config,
     )
-    expected_providers = {"provider": _provider("provider")}
-    calls: list[tuple[Config, RuntimePaths, tuple[object, ...], bool]] = []
 
-    def load_registry(
-        received_config: Config,
-        received_runtime_paths: RuntimePaths,
-        cache_key: tuple[object, ...],
-        *,
-        skip_broken_plugins: bool,
-    ) -> dict[str, OAuthProvider]:
-        calls.append((received_config, received_runtime_paths, cache_key, skip_broken_plugins))
-        return expected_providers
+    providers = oauth_registry.snapshot_oauth_providers(snapshot)
 
-    monkeypatch.setattr(oauth_registry, "_load_oauth_provider_registry", load_registry)
-
-    providers = oauth_registry.load_oauth_providers_for_snapshot(snapshot, skip_broken_plugins=False)
-
-    assert providers is expected_providers
-    assert calls == [(runtime_config, runtime_paths, ("snapshot", 7, id(snapshot), runtime_paths, False), False)]
+    assert providers is config_plugins(runtime_config, runtime_paths).oauth_providers
 
 
-def test_load_oauth_providers_for_pre_load_snapshot_falls_back_to_empty_config(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Snapshots published before the first config load should use an empty config."""
+def test_a_snapshot_before_the_first_config_load_has_the_built_in_providers(tmp_path: Path) -> None:
+    """Snapshots published before the first config load expose built-in providers only."""
     runtime_paths = _runtime_paths(tmp_path)
     snapshot = ApiSnapshot(
         generation=0,
         runtime_paths=runtime_paths,
-        config_data={},
         runtime_config=None,
     )
-    expected_providers = {"provider": _provider("provider")}
-    calls: list[Config] = []
 
-    def load_registry(
-        received_config: Config,
-        received_runtime_paths: RuntimePaths,
-        cache_key: tuple[object, ...],
-        *,
-        skip_broken_plugins: bool,
-    ) -> dict[str, OAuthProvider]:
-        del received_runtime_paths, cache_key, skip_broken_plugins
-        calls.append(received_config)
-        return expected_providers
+    providers = oauth_registry.snapshot_oauth_providers(snapshot)
 
-    monkeypatch.setattr(oauth_registry, "_load_oauth_provider_registry", load_registry)
-
-    providers = oauth_registry.load_oauth_providers_for_snapshot(snapshot)
-
-    assert providers is expected_providers
-    assert len(calls) == 1
-    assert calls[0].authored_model_dump() == {}
+    assert set(providers) == {provider.id for provider in oauth_registry._builtin_oauth_providers()}

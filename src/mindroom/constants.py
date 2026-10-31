@@ -6,12 +6,12 @@ import os
 import re
 import shutil
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 from types import MappingProxyType
 from typing import TypeGuard, cast
-from urllib.parse import quote
 
 from dotenv import dotenv_values
 
@@ -172,12 +172,30 @@ class RuntimePaths:
             return self.env_file_values[name]
         return default
 
+    def first_env_value(self, names: Sequence[str]) -> str | None:
+        """Return the first non-blank value of ``names``, trying each in the process env before any in the `.env`.
+
+        A blank exported value does not hide a `.env` value, so settings with fallbacks treat it as unset.
+        """
+        candidates = (layer.get(name, "") for layer in (self.process_env, self.env_file_values) for name in names)
+        return next((candidate for candidate in candidates if candidate.strip()), None)
+
     def env_flag(self, name: str, *, default: bool = False) -> bool:
         """Resolve one boolean env value against this runtime context."""
         value = self.env_value(name)
         if value is None:
             return default
         return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @cached_property
+    def env_digest(self) -> str:
+        """Return a digest of every env input this snapshot resolves against, computed once per snapshot."""
+        inputs = {
+            "config_dir": str(self.config_dir),
+            "process_env": sorted(self.process_env.items()),
+            "env_file_values": sorted(self.env_file_values.items()),
+        }
+        return hashlib.sha256(json.dumps(inputs, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def resolve_session_state_root(state_root: Path, runtime_paths: RuntimePaths) -> Path:
@@ -238,9 +256,10 @@ def _configured_config_path(process_env: Mapping[str, str]) -> Path | None:
 
 
 def config_search_locations(process_env: Mapping[str, str]) -> list[Path]:
-    """Return the ordered list of locations where MindRoom looks for config.
+    """Return the resolved config locations in search order, without duplicates.
 
-    This is the single source of truth for config file discovery.
+    A set `MINDROOM_CONFIG_PATH` comes first.
+    This list owns the search order; `find_config_path` picks from it.
     """
     seen: set[Path] = set()
     locations: list[Path] = []
@@ -286,9 +305,7 @@ def resolve_runtime_paths(
     """
     resolved_config_arg = Path(config_path).expanduser().resolve() if config_path is not None else None
     resolved_process_env = _copy_process_env(process_env)
-    resolved_config_path = (
-        Path(resolved_config_arg or _find_config(process_env=resolved_process_env)).expanduser().resolve()
-    )
+    resolved_config_path = resolved_config_arg or find_config_path(process_env=resolved_process_env)
     config_dir = resolved_config_path.parent
     env_path = config_dir / ".env"
     env_file_values = _runtime_env_file_values_for_path(env_path)
@@ -753,126 +770,6 @@ def _sandbox_shell_execution_runtime_env_values(
 
 EXECUTION_ENV_TOOL_NAMES = frozenset({"python", "shell"})
 
-# Worker pod env (set by the Kubernetes backend) that lets the runner compose
-# the Agent Vault egress proxy for python/shell. The token never reaches the
-# primary; it is minted into the worker pod and read here at execution time.
-_WORKER_EGRESS_PROXY_URL_ENV = runtime_env_policy.WORKER_EGRESS_PROXY_ENV_BY_KEY["proxy_url"]
-_WORKER_EGRESS_PROXY_TOKEN_FILE_ENV = runtime_env_policy.WORKER_EGRESS_PROXY_ENV_BY_KEY["token_file"]
-_WORKER_EGRESS_PROXY_VAULT_ENV = runtime_env_policy.WORKER_EGRESS_PROXY_ENV_BY_KEY["vault"]
-_WORKER_EGRESS_PROXY_CA_FILE_ENV = runtime_env_policy.WORKER_EGRESS_PROXY_ENV_BY_KEY["ca_file"]
-WORKER_EGRESS_NO_PROXY = "localhost,127.0.0.1,::1,.svc,.cluster.local"
-
-
-def _git_config_env(process_env: Mapping[str, str], entries: list[tuple[str, str]]) -> dict[str, str]:
-    """Append entries to any well-formed environment-backed Git config.
-
-    A malformed incoming block is discarded so Git never receives an
-    inconsistent count/key/value set.
-    """
-    existing_entries: list[tuple[str, str]] = []
-    try:
-        existing_count = int(process_env.get("GIT_CONFIG_COUNT", "0"))
-    except ValueError:
-        existing_count = 0
-    if existing_count > 0:
-        for index in range(existing_count):
-            key = process_env.get(f"GIT_CONFIG_KEY_{index}")
-            value = process_env.get(f"GIT_CONFIG_VALUE_{index}")
-            if key is None or value is None:
-                existing_entries = []
-                break
-            existing_entries.append((key, value))
-
-    merged_entries = [*existing_entries, *entries]
-    env = {"GIT_CONFIG_COUNT": str(len(merged_entries))}
-    for index, (key, value) in enumerate(merged_entries):
-        env[f"GIT_CONFIG_KEY_{index}"] = key
-        env[f"GIT_CONFIG_VALUE_{index}"] = value
-    return env
-
-
-def compose_worker_proxy_env(
-    process_env: Mapping[str, str],
-    *,
-    proxy_url: str,
-    username: str,
-    password: str,
-    ca_file: str | None,
-    no_proxy: str,
-) -> dict[str, str]:
-    """Compose worker proxy execution env from explicit parameters.
-
-    Percent-encodes username and password as basic-auth userinfo, sets HTTP(S)_PROXY,
-    NO_PROXY, git proxy config, and CA bundle env vars when ca_file is given.
-
-    Returns the composed env dict (never empty when called with valid params).
-    """
-    scheme, _, rest = proxy_url.partition("://")
-    # Percent-encode proxy basic-auth userinfo so URL-significant characters
-    # (@ : / # ? % +, whitespace) cannot make HTTP clients mis-parse auth.
-    authed = f"{scheme}://{quote(username, safe='')}:{quote(password, safe='')}@{rest}"
-    env = {
-        "HTTP_PROXY": authed,
-        "HTTPS_PROXY": authed,
-        "http_proxy": authed,
-        "https_proxy": authed,
-        # Git/libcurl does not always preemptively send proxy credentials from
-        # HTTPS_PROXY userinfo on CONNECT. Environment-backed Git config makes
-        # the same proxy explicit without writing user/global git config.
-        "NO_PROXY": no_proxy,
-        "no_proxy": no_proxy,
-    }
-    env.update(
-        _git_config_env(
-            process_env,
-            [
-                ("http.proxy", authed),
-                ("http.proxyAuthMethod", "basic"),
-            ],
-        ),
-    )
-    if ca_file:
-        env["REQUESTS_CA_BUNDLE"] = ca_file
-        env["CURL_CA_BUNDLE"] = ca_file
-        env["SSL_CERT_FILE"] = ca_file
-        # git and node do not honor the bundles above: git needs GIT_SSL_CAINFO
-        # (else `git clone` over HTTPS rejects the MITM proxy's certificate)
-        # and node only *adds* roots via NODE_EXTRA_CA_CERTS.
-        env["GIT_SSL_CAINFO"] = ca_file
-        env["NODE_EXTRA_CA_CERTS"] = ca_file
-    return env
-
-
-def worker_proxy_execution_env(process_env: Mapping[str, str]) -> dict[str, str]:
-    """Return the per-worker egress proxy env overlay for python/shell, or ``{}``.
-
-    General mechanism, provider-agnostic: reads a per-worker proxy endpoint plus
-    a token file written into the worker pod and composes proxy basic-auth
-    userinfo. The token becomes the username; when configured, the vault name
-    becomes the password. Returns empty when no per-worker egress proxy is
-    configured for this worker or the token is not yet present.
-    """
-    proxy_url = (process_env.get(_WORKER_EGRESS_PROXY_URL_ENV) or "").strip()
-    token_file = (process_env.get(_WORKER_EGRESS_PROXY_TOKEN_FILE_ENV) or "").strip()
-    if not proxy_url or "://" not in proxy_url or not token_file:
-        return {}
-    try:
-        token = Path(token_file).read_text(encoding="utf-8").strip()
-    except OSError:
-        return {}
-    if not token:
-        return {}
-    vault = (process_env.get(_WORKER_EGRESS_PROXY_VAULT_ENV) or "").strip()
-    ca_file = (process_env.get(_WORKER_EGRESS_PROXY_CA_FILE_ENV) or "").strip()
-    return compose_worker_proxy_env(
-        process_env,
-        proxy_url=proxy_url,
-        username=token,
-        password=vault,
-        ca_file=ca_file or None,
-        no_proxy=WORKER_EGRESS_NO_PROXY,
-    )
-
 
 def build_execution_tool_env(
     tool_name: str,
@@ -889,17 +786,13 @@ def build_execution_tool_env(
     so it is supplied by the caller.
     """
     if tool_name == "shell":
-        env = dict(
+        return dict(
             _sandbox_shell_execution_runtime_env_values(
                 extra_env_passthrough=extra_env_passthrough,
                 process_env=shell_process_env,
             ),
         )
-        env.update(worker_proxy_execution_env(shell_process_env or runtime_paths.process_env))
-        return env
-    env = dict(_execution_tool_runtime_env_values(runtime_paths))
-    env.update(worker_proxy_execution_env(runtime_paths.process_env))
-    return env
+    return dict(_execution_tool_runtime_env_values(runtime_paths))
 
 
 def runtime_env_path(runtime_paths: RuntimePaths, name: str) -> Path | None:
@@ -1098,18 +991,16 @@ def resolve_avatar_path(
     return workspace_path
 
 
-def _find_config(*, process_env: Mapping[str, str]) -> Path:
-    """Find the first existing config file, or fall back to ~/.mindroom/config.yaml.
+def find_config_path(*, process_env: Mapping[str, str]) -> Path:
+    """Return the resolved config path without reading any `.env`.
 
-    Returns the original (possibly relative) path, not a resolved one,
-    so CLI-facing defaults still display cleanly.
+    A set `MINDROOM_CONFIG_PATH` wins even when the file is missing.
+    Otherwise the first existing search location wins, falling back to ~/.mindroom/config.yaml.
     """
-    if configured_path := _configured_config_path(process_env):
-        return configured_path
-    for path in _CONFIG_SEARCH_PATHS:
-        if path.exists():
-            return path
-    return _CONFIG_SEARCH_PATHS[-1]  # default to ~/.mindroom/config.yaml for creation
+    locations = config_search_locations(process_env)
+    if _configured_config_path(process_env) is not None:
+        return locations[0]
+    return next((path for path in locations if path.exists()), locations[-1])
 
 
 # Other constants
@@ -1139,14 +1030,16 @@ MATRIX_EVENT_ID_METADATA_KEY = "matrix_event_id"
 HOOK_SOURCE_RUN_METADATA_KEY = "hook_source"
 # Run metadata key holding the intent of the message that started the run, such as a background job follow-up.
 TURN_INTENT_RUN_METADATA_KEY = "turn_intent"
+# Run metadata key holding the usage of the attempts the run's turn spent before it, summed, as run metrics are stored.
+PRIOR_USAGE_RUN_METADATA_KEY = "mindroom_prior_usage"
 MATRIX_MESSAGE_TARGET_ENRICHMENT_KEY = "matrix_message_target"
 MATRIX_RESPONSE_EVENT_ID_METADATA_KEY = "matrix_response_event_id"
 MATRIX_SEEN_EVENT_IDS_METADATA_KEY = "matrix_seen_event_ids"
 MATRIX_SOURCE_EVENT_IDS_METADATA_KEY = "matrix_source_event_ids"
 MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY = "matrix_source_event_prompts"
 MATRIX_SOURCE_EVENT_REVISIONS_METADATA_KEY = "matrix_source_event_revisions"
-MINDROOM_COMPACTION_METADATA_KEY = "mindroom_compaction"
-MINDROOM_MATRIX_HISTORY_METADATA_KEY = "mindroom_matrix_history"
+# Session metadata key holding the database owner's history state: its force-compaction flag.
+MINDROOM_HISTORY_METADATA_KEY = "mindroom_history"
 COMPACTION_NOTICE_CONTENT_KEY = "io.mindroom.compaction"
 SKILL_REVIEW_NOTICE_CONTENT_KEY = "io.mindroom.skill_review"
 UI_ACTION_CONTENT_KEY = "io.mindroom.ui_action"
@@ -1264,12 +1157,13 @@ def safe_replace(tmp_path: Path, target_path: Path) -> None:
 
     ``Path.replace`` performs an atomic rename which fails on some filesystems
     (e.g. Docker bind mounts) with ``OSError: [Errno 16] Device or resource
-    busy``.  When that happens we fall back to a non-atomic copy.
+    busy``.  When that happens we fall back to a non-atomic copy of the content
+    only, which keeps the target's owner and mode and needs no ownership of it.
     """
     try:
         tmp_path.replace(target_path)
     except OSError:
-        shutil.copy2(tmp_path, target_path)
+        shutil.copyfile(tmp_path, target_path)
         target_fd = os.open(target_path, os.O_RDONLY)
         try:
             os.fsync(target_fd)

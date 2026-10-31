@@ -23,7 +23,7 @@ Missing Python dependencies install automatically on first use (see [Automatic D
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `key` | `password` | `null` | Google Maps API key; falls back to the `GOOGLE_MAPS_API_KEY` process environment variable. |
+| `key` | `password` | `null` | Google Maps API key; falls back to `GOOGLE_MAPS_API_KEY`. |
 | `search_places` | `boolean` | `true` | Enable `search_places()`. |
 | `get_directions` | `boolean` | `true` | Enable `get_directions()`. |
 | `validate_address` | `boolean` | `true` | Enable `validate_address()`. |
@@ -58,7 +58,7 @@ Weather lookups use the first geocoding match for the location name, so ambiguou
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `api_key` | `password` | `null` | OpenWeather API key; falls back to the `OPENWEATHER_API_KEY` process environment variable. A key is required for every call. |
+| `api_key` | `password` | `null` | OpenWeather API key; falls back to `OPENWEATHER_API_KEY`. A key is required for every call. |
 | `units` | `text` | `metric` | `standard`, `metric`, or `imperial`. |
 | `enable_current_weather` | `boolean` | `true` | Enable `get_current_weather()`. |
 | `enable_forecast` | `boolean` | `true` | Enable `get_forecast()`. |
@@ -155,7 +155,7 @@ call_service("notify", "send_message", data='{"message": "Dinner is ready"}')
 
 Connect Home Assistant in the dashboard's **Tools** tab, using either method:
 
-- **OAuth**: enter the Home Assistant URL and, as the Client ID, the MindRoom dashboard URL, such as `https://mindroom.example.com`; Home Assistant needs no application registration, but the Client ID must use the same host and port as the dashboard you connect from.
+- **OAuth**: enter the Home Assistant URL; Home Assistant needs no application registration, and after sign-in it returns you to `MINDROOM_DASHBOARD_URL` when you connect from that host, else to `MINDROOM_PUBLIC_URL`, or to the address MindRoom received the request on when that is unset, so set `MINDROOM_PUBLIC_URL` when a proxy in front of MindRoom terminates HTTPS.
 - **Access token**: in your Home Assistant profile, create a long-lived access token under **Long-Lived Access Tokens**, then enter the Home Assistant URL and the token.
 
 Expired OAuth access tokens renew automatically.

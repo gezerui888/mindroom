@@ -48,7 +48,7 @@ class TestMemoryIntegration:
         return model
 
     @pytest.fixture
-    def mock_memory_functions(self) -> Generator[AsyncMock, None, None]:
+    def mock_memory_functions(self) -> Generator[AsyncMock]:
         """Mock memory prompt splitting."""
         with patch("mindroom.ai.build_memory_prompt_parts", new_callable=AsyncMock) as mock_build:
             # Set up async side effects
@@ -95,13 +95,12 @@ class TestMemoryIntegration:
         )
 
         # Verify response
-        assert response == "Test response"
+        assert response.text == "Test response"
 
         # Verify memory enhancement was applied
         mock_build.assert_called_once_with(
             "What is 2+2?",
             "general",
-            tmp_path,
             config,
             runtime_paths,
             execution_identity=None,
@@ -142,7 +141,6 @@ class TestMemoryIntegration:
         mock_build.assert_called_once_with(
             "Hello",
             "general",
-            tmp_path,
             config,
             runtime_paths,
             execution_identity=None,
@@ -169,7 +167,7 @@ class TestMemoryIntegration:
             )
 
             # Should return user-friendly error message with the actual error
-            assert "Error: Model error" in response
+            assert "Error: Model error" in response.text
 
     @pytest.mark.asyncio
     async def test_memory_persistence_across_calls(

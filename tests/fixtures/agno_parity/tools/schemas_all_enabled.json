@@ -37,9 +37,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -70,9 +68,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -119,9 +115,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -152,9 +146,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -200,9 +192,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -240,9 +230,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -278,9 +266,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -315,9 +301,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -365,9 +349,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -416,9 +398,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -460,9 +440,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -493,9 +471,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -539,9 +515,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -572,9 +546,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -621,9 +593,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -663,9 +633,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -713,9 +681,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -754,9 +720,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -785,9 +749,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -812,9 +774,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -864,9 +824,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -907,9 +865,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -938,9 +894,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -981,9 +935,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1019,9 +971,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -1083,9 +1033,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1120,9 +1068,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1147,9 +1093,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -1159,36 +1103,9 @@
       "enable_canvas_libraries": true,
       "enable_show_canvas": true
     },
-    "instructions": "chat_ui shows parts of MindRoom Chat to the user. Each function below works on a different thing, and none of them touches the user's own computer or browser. Side panels share one place on the screen, so opening one replaces whichever is open. Each call except read_canvas_state only sends a request into the conversation: success means it was sent, not that the user saw it.\n- open_panel(panel='computer') shows the Computer panel: a live view of your own worker browser, the browser that browser_control drives with target='host'. The user can watch you on a real website or take over, for example to log in. open_panel(panel='members') shows the Members panel: the people and agents in this room.\n- show_computer() is the same as open_panel(panel='computer').\n- show_canvas(...) shows the Canvas panel: a web page you write yourself, which cannot load any website. Use it to present results (dashboards, reports, slides) or to let the user choose or fill something in; their answer comes back as their next message. For a quick choice between a few options, just ask in your reply.\n- read_canvas_state(canvas_event_id) reads what the user last did in a canvas you showed with share_state=True, such as a checklist, without them sending anything.\n- open_settings(section) opens the user's MindRoom Chat Settings dialog at one section; it changes no setting.\n- To show the user a real website, open it in your worker browser, whose first call in a conversation shows the Computer panel; a canvas cannot.\n- Canvas pages may load scripts, styles, and fonts from https://cdn.jsdelivr.net/npm/ at a pinned version, such as <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js\"></script>, or as ES modules through /+esm; no other source works. Fetching data (inline it instead), workers, and code that evaluates strings, such as Alpine or Vue in-page templates, stay blocked.",
-    "guidance": "chat_ui shows parts of MindRoom Chat to the user. Each function below works on a different thing, and none of them touches the user's own computer or browser. Side panels share one place on the screen, so opening one replaces whichever is open. Each call except read_canvas_state only sends a request into the conversation: success means it was sent, not that the user saw it.\n- open_panel(panel='computer') shows the Computer panel: a live view of your own worker browser, the browser that browser_control drives with target='host'. The user can watch you on a real website or take over, for example to log in. open_panel(panel='members') shows the Members panel: the people and agents in this room.\n- show_computer() is the same as open_panel(panel='computer').\n- show_canvas(...) shows the Canvas panel: a web page you write yourself, which cannot load any website. Use it to present results (dashboards, reports, slides) or to let the user choose or fill something in; their answer comes back as their next message. For a quick choice between a few options, just ask in your reply.\n- read_canvas_state(canvas_event_id) reads what the user last did in a canvas you showed with share_state=True, such as a checklist, without them sending anything.\n- open_settings(section) opens the user's MindRoom Chat Settings dialog at one section; it changes no setting.\n- To show the user a real website, open it in your worker browser, whose first call in a conversation shows the Computer panel; a canvas cannot.\n- Canvas pages may load scripts, styles, and fonts from https://cdn.jsdelivr.net/npm/ at a pinned version, such as <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js\"></script>, or as ES modules through /+esm; no other source works. Fetching data (inline it instead), workers, and code that evaluates strings, such as Alpine or Vue in-page templates, stay blocked.",
+    "instructions": "chat_ui shows parts of MindRoom Chat to the user. Each function below works on a different thing, and none of them touches the user's own computer or browser. Side panels share one place on the screen, so opening one replaces whichever is open. Each call except read_canvas_state only sends a request into the conversation: success means it was sent, not that the user saw it.\n- open_panel(panel='computer') shows the Computer panel: a live view of your own worker browser, the browser that browser_control drives with target='host'. The user can watch you on a real website or take over, for example to log in. open_panel(panel='members') shows the Members panel: the people and agents in this room.\n- show_canvas(...) shows the Canvas panel: a web page you write yourself, which cannot load any website. Use it to present results (dashboards, reports, slides) or to let the user choose or fill something in; their answer comes back as their next message. For a quick choice between a few options, just ask in your reply.\n- read_canvas_state(canvas_event_id) reads what the user last did in a canvas you showed with share_state=True, such as a checklist, without them sending anything.\n- open_settings(section) opens the user's MindRoom Chat Settings dialog at one section; it changes no setting.\n- To show the user a real website, open it in your worker browser, whose first call in a conversation shows the Computer panel; a canvas cannot.\n- Canvas pages may load scripts, styles, and fonts from https://cdn.jsdelivr.net/npm/ at a pinned version, such as <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js\"></script>, or as ES modules through /+esm; no other source works. Fetching data (inline it instead), workers, and code that evaluates strings, such as Alpine or Vue in-page templates, stay blocked.",
+    "guidance": "chat_ui shows parts of MindRoom Chat to the user. Each function below works on a different thing, and none of them touches the user's own computer or browser. Side panels share one place on the screen, so opening one replaces whichever is open. Each call except read_canvas_state only sends a request into the conversation: success means it was sent, not that the user saw it.\n- open_panel(panel='computer') shows the Computer panel: a live view of your own worker browser, the browser that browser_control drives with target='host'. The user can watch you on a real website or take over, for example to log in. open_panel(panel='members') shows the Members panel: the people and agents in this room.\n- show_canvas(...) shows the Canvas panel: a web page you write yourself, which cannot load any website. Use it to present results (dashboards, reports, slides) or to let the user choose or fill something in; their answer comes back as their next message. For a quick choice between a few options, just ask in your reply.\n- read_canvas_state(canvas_event_id) reads what the user last did in a canvas you showed with share_state=True, such as a checklist, without them sending anything.\n- open_settings(section) opens the user's MindRoom Chat Settings dialog at one section; it changes no setting.\n- To show the user a real website, open it in your worker browser, whose first call in a conversation shows the Computer panel; a canvas cannot.\n- Canvas pages may load scripts, styles, and fonts from https://cdn.jsdelivr.net/npm/ at a pinned version, such as <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js\"></script>, or as ES modules through /+esm; no other source works. Fetching data (inline it instead), workers, and code that evaluates strings, such as Alpine or Vue in-page templates, stay blocked.",
     "functions": [
-      {
-        "name": "show_computer",
-        "description": "Show the user the Computer panel: a live view of your own worker browser.\nThat is the browser browser_control drives with target='host'. The user starts\nout watching. They can take control, for example to log in; while they have it\nyour browser calls are blocked, and when they hand it back you get a message.\nOpening the panel does not navigate, send a prompt to ChatGPT, or take control,\nand it never opens or controls the user's own browser. Your first worker\nbrowser call in a conversation (browser_control with target='host', or any\nbrowser_mcp function) already shows the user this panel; call show_computer\nonly to show it again in a later reply, for example when the user should log\nin or after they closed it. One reply shows the panel once. Success means the\nrequest was sent, not that the client opened the panel.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "mindroom_output_path": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "default": null,
-              "description": "Optional MindRoom-managed workspace-relative path. If set, the full supported tool output is written to this file in your workspace and the tool returns only a compact receipt. Use this for large output you plan to inspect later with file, coding, python, or shell tools."
-            }
-          },
-          "required": []
-        },
-        "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
-        "stop_after_tool_call": false
-      },
       {
         "name": "open_settings",
         "description": "Open the user's MindRoom Chat Settings dialog at one section.\nThis works on the Chat app's own settings screen. It changes no setting; the\nuser decides what to do there. Success means the UI request was sent, not that\nthe client opened Settings.",
@@ -1223,9 +1140,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1258,9 +1173,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1333,9 +1246,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1366,9 +1277,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -1428,9 +1337,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -1478,9 +1385,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1505,9 +1410,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1538,9 +1441,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1576,9 +1477,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -1617,11 +1516,7 @@
                   "propertyNames": {
                     "type": "string"
                   },
-                  "additionalProperties": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                  }
+                  "additionalProperties": {}
                 },
                 {
                   "type": "null"
@@ -1635,11 +1530,7 @@
                   "propertyNames": {
                     "type": "string"
                   },
-                  "additionalProperties": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                  }
+                  "additionalProperties": {}
                 },
                 {
                   "type": "null"
@@ -1669,11 +1560,7 @@
                   "propertyNames": {
                     "type": "string"
                   },
-                  "additionalProperties": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": false
-                  }
+                  "additionalProperties": {}
                 },
                 {
                   "type": "null"
@@ -1698,9 +1585,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -1750,9 +1635,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1787,9 +1670,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1820,9 +1701,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1853,9 +1732,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1891,9 +1768,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -1938,9 +1813,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -1975,9 +1848,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -2014,9 +1885,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2051,9 +1920,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2084,9 +1951,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -2124,19 +1989,15 @@
               ],
               "default": null,
               "description": "Optional MindRoom-managed workspace-relative path. If set, the full supported tool output is written to this file in your workspace and the tool returns only a compact receipt. Use this for large output you plan to inspect later with file, coding, python, or shell tools."
-            },
-            "kwargs": {}
+            }
           },
           "required": [
             "subject",
-            "body",
-            "kwargs"
+            "body"
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -2189,9 +2050,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2225,9 +2084,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2262,9 +2119,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2299,9 +2154,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2319,11 +2172,7 @@
               "propertyNames": {
                 "type": "string"
               },
-              "additionalProperties": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-              },
+              "additionalProperties": {},
               "description": "(Optional[Dict[str, Any]]) JSON schema for structured output. If not provided, the API will auto-infer an appropriate schema."
             },
             "mindroom_output_path": {
@@ -2344,9 +2193,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -2388,9 +2235,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2432,9 +2277,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -2491,9 +2334,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2526,9 +2367,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2556,9 +2395,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2588,9 +2425,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2620,9 +2455,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2663,9 +2496,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2710,9 +2541,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2755,9 +2584,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -2827,9 +2654,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2896,9 +2721,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2937,9 +2760,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -2978,9 +2799,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3015,9 +2834,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3052,9 +2869,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3093,9 +2908,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -3139,9 +2952,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3176,9 +2987,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3209,9 +3018,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3246,9 +3053,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -3264,10 +3069,13 @@
     "functions": [
       {
         "name": "generate_image",
-        "description": null,
+        "description": "Generate an image through the Gemini content-generation API.",
         "parameters": {
           "type": "object",
           "properties": {
+            "prompt": {
+              "type": "string"
+            },
             "mindroom_output_path": {
               "anyOf": [
                 {
@@ -3281,12 +3089,12 @@
               "description": "Optional MindRoom-managed workspace-relative path. If set, the full supported tool output is written to this file in your workspace and the tool returns only a compact receipt. Use this for large output you plan to inspect later with file, coding, python, or shell tools."
             }
           },
-          "required": []
+          "required": [
+            "prompt"
+          ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3317,9 +3125,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -3360,9 +3166,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -3396,9 +3200,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3429,9 +3231,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3462,9 +3262,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -3510,9 +3308,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3549,9 +3345,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3581,9 +3375,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3623,9 +3415,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3685,9 +3475,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3731,9 +3519,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3773,9 +3559,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3819,9 +3603,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3851,9 +3633,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -3898,9 +3678,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -3935,9 +3713,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -3980,9 +3756,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4013,9 +3787,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4046,9 +3818,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -4088,9 +3858,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4121,9 +3889,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -4164,9 +3930,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4196,9 +3960,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -4243,9 +4005,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4290,9 +4050,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4327,9 +4085,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4365,9 +4121,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4407,9 +4161,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -4458,9 +4210,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -4531,9 +4281,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4590,9 +4338,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -4649,9 +4395,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4681,9 +4425,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4708,9 +4450,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4735,9 +4475,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -4785,9 +4523,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4823,9 +4559,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4888,9 +4622,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -4928,9 +4660,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4955,9 +4685,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -4982,9 +4710,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5015,9 +4741,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5058,9 +4782,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5113,9 +4835,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5151,9 +4871,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5184,9 +4902,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5229,9 +4945,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5262,9 +4976,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5295,9 +5007,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5342,9 +5052,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5375,9 +5083,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5412,9 +5118,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5445,9 +5149,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5478,9 +5180,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5524,9 +5224,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5561,9 +5259,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5594,9 +5290,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5631,9 +5325,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5666,11 +5358,7 @@
               "propertyNames": {
                 "type": "string"
               },
-              "additionalProperties": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-              },
+              "additionalProperties": {},
               "description": "The parameters to pass to the function."
             },
             "mindroom_output_path": {
@@ -5693,9 +5381,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5717,11 +5403,7 @@
               "propertyNames": {
                 "type": "string"
               },
-              "additionalProperties": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-              },
+              "additionalProperties": {},
               "description": "The parameters to pass to the operation."
             },
             "mindroom_output_path": {
@@ -5744,9 +5426,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5796,9 +5476,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5853,9 +5531,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -5904,9 +5580,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5947,9 +5621,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -5997,9 +5669,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6049,9 +5719,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6082,9 +5750,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6115,9 +5781,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6139,11 +5803,7 @@
               "propertyNames": {
                 "type": "string"
               },
-              "additionalProperties": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-              },
+              "additionalProperties": {},
               "description": "(Dict[str, Any]) JSON schema for extraction."
             },
             "max_depth": {
@@ -6174,9 +5834,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6207,9 +5865,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6255,9 +5911,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6288,9 +5942,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6338,9 +5990,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6375,9 +6025,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6412,9 +6060,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6449,9 +6095,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6518,9 +6162,7 @@
           "additionalProperties": false
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6560,9 +6202,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6609,9 +6249,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6642,9 +6280,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6679,9 +6315,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6718,9 +6352,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6751,9 +6383,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6788,9 +6418,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6833,9 +6461,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6866,9 +6492,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -6921,9 +6545,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -6960,9 +6582,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7004,9 +6624,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7043,9 +6661,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7086,9 +6702,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7125,9 +6739,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7160,9 +6772,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7198,9 +6808,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7231,9 +6839,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7269,9 +6875,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7306,9 +6910,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7333,9 +6935,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7366,9 +6966,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -7417,9 +7015,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7454,9 +7050,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7491,9 +7085,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7527,9 +7119,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7564,9 +7154,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -7619,9 +7207,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7652,9 +7238,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7683,9 +7267,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -7745,9 +7327,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7778,9 +7358,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7817,9 +7395,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7850,9 +7426,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -7890,9 +7464,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7921,9 +7493,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -7952,9 +7522,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -8002,11 +7570,7 @@
                     "propertyNames": {
                       "type": "string"
                     },
-                    "additionalProperties": {
-                      "type": "object",
-                      "properties": {},
-                      "additionalProperties": false
-                    }
+                    "additionalProperties": {}
                   }
                 },
                 {
@@ -8049,9 +7613,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8085,11 +7647,7 @@
                     "propertyNames": {
                       "type": "string"
                     },
-                    "additionalProperties": {
-                      "type": "object",
-                      "properties": {},
-                      "additionalProperties": false
-                    }
+                    "additionalProperties": {}
                   }
                 },
                 {
@@ -8132,9 +7690,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8168,11 +7724,7 @@
                     "propertyNames": {
                       "type": "string"
                     },
-                    "additionalProperties": {
-                      "type": "object",
-                      "properties": {},
-                      "additionalProperties": false
-                    }
+                    "additionalProperties": {}
                   }
                 },
                 {
@@ -8207,9 +7759,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8347,9 +7897,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8410,9 +7958,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -8457,9 +8003,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -8506,9 +8050,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8533,9 +8075,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -8591,9 +8131,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8621,11 +8159,7 @@
                 "propertyNames": {
                   "type": "string"
                 },
-                "additionalProperties": {
-                  "type": "object",
-                  "properties": {},
-                  "additionalProperties": false
-                }
+                "additionalProperties": {}
               },
               "description": "Optional list of template components (header, body, buttons)."
             },
@@ -8647,9 +8181,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8718,9 +8250,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8828,9 +8358,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8871,9 +8399,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8918,9 +8444,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -8982,9 +8506,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9024,9 +8546,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -9066,9 +8586,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -9117,9 +8635,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9150,9 +8666,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9183,9 +8697,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9216,9 +8728,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9249,9 +8759,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9282,9 +8790,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9319,9 +8825,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9356,9 +8860,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9397,9 +8899,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -9442,9 +8942,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9475,9 +8973,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9508,9 +9004,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -9550,9 +9044,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]
@@ -9600,9 +9092,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9631,9 +9121,7 @@
           "required": []
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       },
       {
@@ -9668,9 +9156,7 @@
           ]
         },
         "strict": false,
-        "requires_confirmation": false,
-        "external_execution": false,
-        "approval_type": null,
+        "gate": null,
         "stop_after_tool_call": false
       }
     ]

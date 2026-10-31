@@ -31,6 +31,7 @@ from mindroom.api.egress_status import (
     OAuthReuseRequest,
     PresetsResponse,
     PutSecretRequest,
+    agent_services,
     audit_logs_response,
     effective_services,
     egress_oauth_status,
@@ -64,9 +65,10 @@ from mindroom.egress_broker.user_services import (
     service_source,
     user_service_hosts_not_allowed,
 )
-from mindroom.oauth.credential_lifecycle import reset_oauth_credentials_blocking
-from mindroom.oauth.registry import load_oauth_providers, load_oauth_providers_for_snapshot
+from mindroom.oauth.credential_lifecycle import reset_oauth_credentials_blocking, resolve_oauth_credential_context
+from mindroom.oauth.registry import snapshot_oauth_providers
 from mindroom.requester_identity import resolve_human_requester_alias
+from mindroom.tool_system.plugins import config_plugins
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -106,7 +108,7 @@ def _egress_user_accepting(*query_names: str) -> Callable[[Request, Response], A
                 else "Query parameters are not accepted"
             )
             raise HTTPException(400, detail, headers=CONNECTIONS_HEADERS)
-        return str(auth_user["matrix_user_id"])
+        return auth_user.matrix_user_id
 
     return dependency
 
@@ -149,7 +151,7 @@ def _check_agent_eligibility(
         None,
         config,
         runtime_paths,
-        config_lifecycle.app_state(request.app).agent_reply_memberships,
+        config_lifecycle.app_state(request.app).runtime.agent_reply_memberships,
     ):
         return None
     is_shared = scope in {"shared", "unscoped"}
@@ -201,13 +203,13 @@ def _resolve_agent_and_service(
 ) -> tuple[_ResolvedAgent, EgressService]:
     """Resolve one agent and one of its services for a mutation, which needs credential management (403).
 
-    The service is one of the config's or one the requester's scope defines for itself, so a name that exists only
-    in another requester's scope is a 404.
+    The service is one of the config's that serves the agent or one the requester's scope defines for itself, so a name
+    that exists only in another requester's scope, or whose `agents` list leaves the agent out, is a 404.
     `requester_owned_oauth` is for connecting or disconnecting the service's OAuth account: a requester-scoped
     provider's connection belongs to the requester, so any user of the agent may manage it.
     """
     agent = _resolve_agent(request, requester_id, agent_name)
-    service = effective_services(agent.config, agent.manager, agent.target).get(service_name)
+    service = agent_services(agent.config, agent.manager, agent.target).get(service_name)
     if service is None:
         raise HTTPException(404, "Service is not configured", headers=CONNECTIONS_HEADERS)
 
@@ -243,7 +245,8 @@ class EgressCredentialService(EgressSourceStatus):
     editor can warn when a service of one's own sets the same one. `restrict_only` marks a service that only limits
     the paths of the other services on its hosts and never has a key or account of its own. `read_only_supported` says
     whether its account can be allowed read-only, and `separate_account` that the account is the service's own, not the
-    one the agent's tools use.
+    one the agent's tools use. `admin_key` marks a service whose one key only an administrator sets, on the dashboard,
+    so its `can_manage` is false.
     """
 
     name: str
@@ -257,6 +260,7 @@ class EgressCredentialService(EgressSourceStatus):
     restrict_only: bool
     read_only_supported: bool
     separate_account: bool
+    admin_key: bool
 
 
 class EgressCredentialAgent(BaseModel):
@@ -317,7 +321,7 @@ async def egress_services_for_agent(
     is_shared, can_manage = eligibility
     manager = get_runtime_credentials_manager(runtime_paths)
     target = build_connection_agent_target(config, runtime_paths, requester_id, agent_name)
-    services = await asyncio.to_thread(effective_services, config, manager, target)
+    services = await asyncio.to_thread(agent_services, config, manager, target)
 
     async def row(name: str, service: EgressService) -> EgressCredentialService:
         oauth_part = await egress_oauth_status(
@@ -329,13 +333,9 @@ async def egress_services_for_agent(
             runtime_paths=runtime_paths,
             manager=manager,
             can_manage=can_manage,
-            connection_status=lambda provider: oauth.agent_connection_status(
+            connection_status=lambda provider: oauth.connection_status(
                 request,
-                provider,
-                runtime_paths,
-                manager,
-                target,
-                config=config,
+                resolve_oauth_credential_context(provider, runtime_paths, manager, target, config=config),
                 refresh=False,
             ),
             reuse_target=lambda _provider: target,
@@ -346,13 +346,15 @@ async def egress_services_for_agent(
             display_name=service.display_name or name.replace("_", " ").title(),
             description=service.description,
             is_shared=is_shared,
-            can_manage=can_manage,
+            # Only an administrator changes an `admin_key` service's key, on the dashboard.
+            can_manage=can_manage and not service.admin_key,
             source=service_source(config.egress_broker, name),
             rules=rule_summaries(service),
             placeholder_names=list(service.placeholder_env),
             restrict_only=service.restrict_only,
             read_only_supported=service.read_only is not None,
             separate_account=service.oauth_separate_account,
+            admin_key=service.admin_key,
             **asdict(sources),
         )
 
@@ -427,7 +429,7 @@ async def list_egress_credentials(request: Request, requester_id: _EgressUser) -
 async def get_presets(request: Request, _requester_id: _EgressUser) -> PresetsResponse:
     """List the built-in service presets with the rules, login, and placeholders each one sets, and the providers."""
     snapshot = config_lifecycle.bind_current_request_snapshot(request)
-    return presets_response(load_oauth_providers_for_snapshot(snapshot))
+    return presets_response(snapshot_oauth_providers(snapshot))
 
 
 # Keys
@@ -441,10 +443,14 @@ def put_egress_secret(
     body: PutSecretRequest,
     requester_id: _EgressUser,
 ) -> None:
-    """Set or replace an egress service secret for one agent; a service that takes no key (`key_refusal`) is a 422."""
+    """Set or replace an egress service secret for one agent; a service that takes no key (`key_refusal`) is a 422.
+
+    An `admin_key` service's key is a 403 here for everyone (`_refuse_admin_key`).
+    """
     _require_egress_same_origin(request)
 
     agent, egress_service = _resolve_agent_and_service(request, requester_id, agent_name, service)
+    _refuse_admin_key(egress_service)
     if (refusal := key_refusal(egress_service)) is not None:
         raise _unprocessable(refusal)
 
@@ -461,11 +467,22 @@ def delete_egress_secret(
     service: str,
     requester_id: _EgressUser,
 ) -> None:
-    """Delete an egress service secret for one agent."""
+    """Delete an egress service secret for one agent; an `admin_key` service's key is a 403 (`_refuse_admin_key`)."""
     _require_egress_same_origin(request)
 
-    agent, _service = _resolve_agent_and_service(request, requester_id, agent_name, service)
+    agent, egress_service = _resolve_agent_and_service(request, requester_id, agent_name, service)
+    _refuse_admin_key(egress_service)
     delete_secret(agent.manager, agent.target, service)
+
+
+def _refuse_admin_key(service: EgressService) -> None:
+    """Refuse with 403 a change to an `admin_key` service's key, which only the dashboard makes, administrators' too."""
+    if service.admin_key:
+        raise HTTPException(
+            403,
+            "Only an administrator sets this service's key, on the dashboard",
+            headers=CONNECTIONS_HEADERS,
+        )
 
 
 # User services
@@ -556,7 +573,7 @@ def put_user_service(
         raise HTTPException(409, str(UserServiceConflictError(name)), headers=CONNECTIONS_HEADERS)
     service = _parse_user_service(body)
     _require_hosts_within_operator_policy(operator, service)
-    providers = load_oauth_providers(agent.config, agent.runtime_paths)
+    providers = config_plugins(agent.config, agent.runtime_paths).oauth_providers
     provider = providers.get(service.oauth_provider or "")
     if service.oauth_separate_account and provider is not None and provider.requester_scoped_credentials:
         # One requester's account of such a provider serves all their agents, and so would a service's own.
@@ -701,12 +718,11 @@ async def connect_egress_account(
         connecting=True,
     )
     return await masked_oauth_call(
-        oauth.connect_account(
-            provider.id,
+        oauth.start_connect(
             request,
+            provider.id,
             agent_name=agent_name,
-            # A service's own account is stored under its own name; the tools' flow stays as it was.
-            credential_service=provider.credential_service if egress_service.oauth_separate_account else None,
+            credential_service=_account_credential_service(egress_service, provider),
         ),
         "Could not start account connection",
     )
@@ -729,15 +745,19 @@ async def disconnect_egress_account(
         connecting=False,
     )
     return await masked_oauth_call(
-        oauth.disconnect_account(
-            provider.id,
+        oauth.reset_connection(
             request,
+            provider.id,
             agent_name=agent_name,
-            # A service's own account is stored under its own name; the tools' flow stays as it was.
-            credential_service=provider.credential_service if egress_service.oauth_separate_account else None,
+            credential_service=_account_credential_service(egress_service, provider),
         ),
         "Could not disconnect account",
     )
+
+
+def _account_credential_service(egress_service: EgressService, provider: OAuthProvider) -> str | None:
+    """A service's own account is stored under its own name; the tools' connection keeps the provider's."""
+    return provider.credential_service if egress_service.oauth_separate_account else None
 
 
 @router.put("/agents/{agent_name}/{service}/oauth-reuse", status_code=204)

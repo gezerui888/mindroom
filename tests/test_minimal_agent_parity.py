@@ -36,25 +36,25 @@ from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.plugin import PluginEntryConfig
 from mindroom.credentials.manager import get_runtime_credentials_manager, save_scoped_credentials
 from mindroom.history.storage import has_queued_force_compaction
-from mindroom.history.types import HistoryScope
 from mindroom.interactive import parse_and_format_interactive
 from mindroom.knowledge.read_protocol import SearchHit
 from mindroom.knowledge.search import AgentKnowledge, KnowledgeSource, KnowledgeSourceDescription
 from mindroom.mcp.config import MCPServerConfig
 from mindroom.mcp.manager import MCPServerManager
-from mindroom.mcp.registry import sync_mcp_tool_registry
 from mindroom.mcp.toolkit import bind_mcp_server_manager
 from mindroom.memory import search_agent_memories
 from mindroom.response_turn import apply_exact_approval_decisions
 from mindroom.session_storage.agent_storage import create_session_storage
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import (
-    build_execution_identity_from_runtime_context,
+    current_execution_identity,
     get_tool_runtime_context,
     tool_runtime_context,
 )
-from mindroom.tool_system.worker_routing import agent_workspace_root_path, get_tool_execution_identity
+from mindroom.tool_system.worker_routing import agent_workspace_root_path
 from tests.access_schema_support import with_responder_access
-from tests.conftest import install_model_providers
+from tests.approval_continuation_helpers import answered_calls
+from tests.conftest import install_model_providers, publish_test_plugins
 from tests.delegation_helpers import ScriptedAgents
 from tests.fakes.scripted_model import SYNTHETIC, ScriptedModel, answer
 from tests.identity_helpers import persist_entity_accounts
@@ -141,7 +141,7 @@ async def test_response_direct_cli_parity(tmp_path, monkeypatch, function) -> No
 
     def effect(value, run_context):
         context = get_tool_runtime_context()
-        identity = get_tool_execution_identity()
+        identity = current_execution_identity()
         effects.append((value, context.agent_name, context.requester_id, context.target, identity))
         run_context.session_state["parity"] = value
 
@@ -177,12 +177,12 @@ async def test_response_direct_cli_parity(tmp_path, monkeypatch, function) -> No
 
     monkeypatch.setattr(agents, "get_tool_by_name", build)
     # The build's tool policy, which runs around every call the reply makes, natively or through Bash.
-    monkeypatch.setattr(agents, "_build_agent_tool_middleware", lambda **_kwargs: hook)
+    monkeypatch.setattr(agents, "build_tool_hook_middleware", lambda *_args, **_kwargs: hook)
     shell = ProtocolShell(runtime.orchestrator.agent_cli_registry)
     install_scripted_shell(monkeypatch, shell.run_shell_command)
     provider = ScriptedProvider()
     provider.install(monkeypatch)
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     results = []
     for mode in ("standard", "minimal"):
         provider.steps = [
@@ -203,7 +203,7 @@ async def test_response_direct_cli_parity(tmp_path, monkeypatch, function) -> No
             show_tool_calls=True,
         )
         with tool_runtime_context(runtime):
-            result = await ai.ai_response(ctx, runtime.runtime_paths, runtime.config)
+            result = (await ai.ai_response(ctx, runtime.runtime_paths, runtime.config)).text
         results.append(result)
     assert effects[0][:4] == effects[1][:4]
     assert effects[1][4] == identity
@@ -214,7 +214,7 @@ async def test_response_direct_cli_parity(tmp_path, monkeypatch, function) -> No
     assert ("run_shell_command", "before") in hooks
     assert shell.receipts[0]["outcome"] == "result:7"
     assert shell.owner.catalog.run.session_state["parity"] == 7
-    assert all("done" in str(result) for result in results)
+    assert all("done" in result for result in results)
     assert len(provider.requests) == 4
     assert function in offered_tools(provider.requests[0])
     assert all(offered_tools(request) == ["bash"] for request in provider.requests[2:])
@@ -284,7 +284,7 @@ async def test_same_child_responder_direct_and_cli_provenance(tmp_path, monkeypa
                         agent_mode=mode,
                         run_id=None,
                         prompt="delegate task",
-                        execution_identity=build_execution_identity_from_runtime_context(runtime),
+                        execution_identity=runtime.execution_identity,
                         supports_native_tool_approval=True,
                     ),
                     runtime.runtime_paths,
@@ -339,20 +339,21 @@ def response_harness(tmp_path, monkeypatch) -> SimpleNamespace:
         persist_entity_accounts(runtime.config, runtime.runtime_paths)
         provider.steps = steps
         with tool_runtime_context(runtime):
-            return await ai.ai_response(
+            result = await ai.ai_response(
                 replace(
                     _turn_context(),
                     agent_mode=mode,
                     run_id=None,
                     prompt=prompt,
                     knowledge=knowledge,
-                    execution_identity=build_execution_identity_from_runtime_context(runtime),
+                    execution_identity=runtime.execution_identity,
                     supports_native_tool_approval=True,
                     show_tool_calls=True,
                 ),
                 runtime.runtime_paths,
                 runtime.config,
             )
+        return result.text
 
     h.respond = respond
     return h
@@ -373,7 +374,7 @@ async def test_durable_memory_standard_minimal_standard(response_harness) -> Non
         "helper",
         h.runtime.config,
         h.runtime.runtime_paths,
-        build_execution_identity_from_runtime_context(h.runtime),
+        h.runtime.execution_identity,
     )
     old_messages = [message.to_dict() for message in storage.load_session(h.runtime.session_id).runs[0].messages]
     await h.respond([_bash_call("memory", "add_memory", {"content": "Release parity durable lesson"}), "minimal saved"])
@@ -381,7 +382,6 @@ async def test_durable_memory_standard_minimal_standard(response_harness) -> Non
     found = await search_agent_memories(
         "Release parity durable",
         "helper",
-        h.runtime.runtime_paths.storage_root,
         h.runtime.config,
         h.runtime.runtime_paths,
         limit=5,
@@ -430,7 +430,7 @@ async def test_generated_tools_actual_minimal_response(response_harness, generat
         [_bash_call("agent", function, arguments), "done"],
         knowledge=knowledge if generated == "knowledge" else None,
     )
-    assert "done" in str(result)
+    assert "done" in result
     assert expected in str(h.shell.receipts[-1]["outcome"])
     assert expected in str(h.provider.requests[-1].messages)
     assert all(offered_tools(request) == ["bash"] for request in h.provider.requests)
@@ -446,7 +446,7 @@ async def test_deferred_toolkit_is_callable_through_bash_without_loading(respons
         tools=["shell", {"calculator": {"defer": True}}],
     )
     result = await h.respond([_bash_call("calculator", "add", {"a": 2, "b": 3}), "done"])
-    assert "done" in str(result)
+    assert "done" in result
     assert len(h.shell.receipts) == 1
     assert '"result": 5' in h.shell.receipts[0]["outcome"]
     assert len(h.provider.requests) == 2
@@ -467,10 +467,11 @@ async def test_deferred_upstream_mcp_response_filters_and_requester(
     script.write_text(
         'from mcp.server.mcpserver import MCPServer\nserver = MCPServer("echo")\n@server.tool()\ndef echo(text: str) -> str:\n return "echo:" + text\n@server.tool()\ndef secret() -> str:\n raise AssertionError("filtered tool ran")\nserver.run()\n',
     )
-    h.runtime.config.mcp_servers = {
+    config = h.runtime.config.model_copy(deep=True)
+    config.mcp_servers = {
         "echo": MCPServerConfig(transport="stdio", command=sys.executable, args=[str(script)]),
     }
-    h.runtime.config.agents["helper"] = AgentConfig(
+    config.agents["helper"] = AgentConfig(
         display_name="Helper",
         memory_backend="file",
         private=AgentPrivateConfig(per="user_agent") if private else None,
@@ -480,6 +481,8 @@ async def test_deferred_upstream_mcp_response_filters_and_requester(
             {"duckduckgo": {"defer": True}},
         ],
     )
+    # The turn starts on the edited config, so its context captures that config's tools.
+    h.runtime = replace(h.runtime, config=config, plugins=config_plugins(config, h.runtime.runtime_paths))
     manager = MCPServerManager(h.runtime.runtime_paths)
     bind_mcp_server_manager(manager)
     calls = []
@@ -492,9 +495,8 @@ async def test_deferred_upstream_mcp_response_filters_and_requester(
     monkeypatch.setattr(manager, "call_tool", call)
     try:
         await manager.sync_servers(h.runtime.config)
-        sync_mcp_tool_registry(h.runtime.config)
         result = await h.respond([_bash_call("mcp_echo", "echo_echo", {"text": "same requester"}), "done"])
-        assert "done" in str(result)
+        assert "done" in result
         assert "echo:same requester" in h.shell.receipts[-1]["outcome"]
         assert len(calls) == 1
         server, function, arguments, kwargs = calls[0]
@@ -507,7 +509,6 @@ async def test_deferred_upstream_mcp_response_filters_and_requester(
         assert not any(item.get("function") == "echo_secret" for item in metadata)
         assert all(offered_tools(request) == ["bash"] for request in h.provider.requests)
     finally:
-        sync_mcp_tool_registry(None)
         await manager.shutdown()
 
 
@@ -517,15 +518,11 @@ async def test_compaction_cli_marks_real_session_before_next_reply(response_harn
     h.runtime.config.agents["helper"].tools = ["shell", "compact_context"]
     h.runtime.config.models["default"].context_window = 128000
     result = await h.respond([_bash_call("compact_context", "compact_context", {}), "done"])
-    assert "done" in str(result)
+    assert "done" in result
     assert "before the next reply" in h.shell.receipts[-1]["outcome"]
     catalog = h.shell.owner.catalog
     assert catalog.store is not None
-    assert has_queued_force_compaction(
-        catalog.store,
-        catalog.run.session_id,
-        HistoryScope(kind="agent", scope_id="helper"),
-    )
+    assert has_queued_force_compaction(catalog.store, catalog.run.session_id)
     assert len(h.provider.requests) == 2
 
 
@@ -604,8 +601,7 @@ async def test_authored_confirmation_actual_owner_rechecks_effect_boundary(
         return tuple(
             apply_exact_approval_decisions(
                 paused.requirements,
-                decisions=dict.fromkeys(ids, decision != "deny"),
-                denial_reasons=dict.fromkeys(ids, "No"),
+                answered_calls(ids, approved=decision != "deny", reason="No"),
             ),
         )
 
@@ -636,11 +632,7 @@ async def test_self_config_cli_preserves_native_next_build_change(response_harne
         ids = [str(tool.tool_call_id) for tool in paused.tools]
         approved.extend(ids)
         return tuple(
-            apply_exact_approval_decisions(
-                paused.requirements,
-                decisions=dict.fromkeys(ids, True),
-                denial_reasons=dict.fromkeys(ids),
-            ),
+            apply_exact_approval_decisions(paused.requirements, answered_calls(ids, approved=True)),
         )
 
     h.runtime = replace(h.runtime, cli_approval_handler=approve)
@@ -669,6 +661,7 @@ async def test_concurrent_factory_owners_scoped_credentials_and_grants(tmp_path,
     )
     (plugin / "tools.py").write_text(PLUGIN)
     config.plugins = [PluginEntryConfig(path=str(plugin))]
+    publish_test_plugins(config, base.runtime_paths)
     for name in ("helper", "other"):
         config.agents[name] = AgentConfig(
             display_name=name,
@@ -717,12 +710,14 @@ async def test_concurrent_factory_owners_scoped_credentials_and_grants(tmp_path,
     for agent in config.agents:
         for requester in requesters:
             session = f"{agent}-{requester}"
+            # Each turn starts after the plugin publication, so its context captures the published plugins.
             runtime = replace(
                 base,
                 agent_name=agent,
                 requester_id=requester,
                 target=replace(base.target, session_id=session),
                 orchestrator=SimpleNamespace(agent_cli_registry=registry),
+                plugins=config_plugins(config, base.runtime_paths),
             )
             runtimes[session] = runtime
             target = runtime.resolve_worker_target()
@@ -752,11 +747,11 @@ async def test_concurrent_factory_owners_scoped_credentials_and_grants(tmp_path,
             agent_mode=mode,
             run_id=None,
             prompt="concurrent scoped integration",
-            execution_identity=build_execution_identity_from_runtime_context(runtime),
+            execution_identity=runtime.execution_identity,
             supports_native_tool_approval=True,
         )
         with tool_runtime_context(runtime):
-            return await ai.ai_response(turn, runtime.runtime_paths, config)
+            return (await ai.ai_response(turn, runtime.runtime_paths, config)).text
 
     minimal_steps = {session: provider.steps for session, provider in providers.items()}
     for session, runtime in runtimes.items():

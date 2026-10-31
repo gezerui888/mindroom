@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
-from typing import Literal
-
-from agno.tools import Toolkit
+from dataclasses import replace
+from typing import TYPE_CHECKING, Literal
 
 from mindroom.authorization import addressable_responder_names
-from mindroom.custom_tools.tool_payloads import custom_tool_payload
+from mindroom.custom_tools.tool_payloads import custom_tool_payload, tool_context_or_error
 from mindroom.thread_models import (
     clear_thread_model_override,
     resolve_thread_model_override,
     set_thread_model_override,
 )
-from mindroom.tool_system.runtime_context import ToolRuntimeContext, get_tool_runtime_context
+from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.tool_function import ToolOutcome
 from mindroom.turn_model import ModelScope, TurnBudget, resolve_turn_model
 
-_MODEL_SWITCH_WHENS = ("after-toolcall", "next-turn")
+if TYPE_CHECKING:
+    from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.tool_function import ToolFunction
 
 
 class ThreadModelTools(Toolkit):
@@ -27,9 +29,12 @@ class ThreadModelTools(Toolkit):
             name="thread_model",
             tools=[self.list_models, self.get_thread_model, self.switch_thread_model, self.reset_thread_model],
         )
-        # Toolkit's stop-after list also exposes the raw result as assistant text.
-        # The continuation owns final delivery, so only enable the control boundary.
-        self.async_functions["switch_thread_model"].stop_after_tool_call = True
+
+    def offered_function(self, function: ToolFunction) -> ToolFunction:
+        """Mark the model switch as able to stop the run, which a switch for the current response does."""
+        if function.name == "switch_thread_model":
+            return replace(function, may_stop_run=True)
+        return function
 
     @staticmethod
     def _payload(status: str, **kwargs: object) -> str:
@@ -37,9 +42,8 @@ class ThreadModelTools(Toolkit):
 
     @classmethod
     def _thread_context(cls) -> tuple[ToolRuntimeContext, str] | str:
-        context = get_tool_runtime_context()
-        if context is None:
-            return cls._payload("error", message="Thread model tool context is unavailable in this runtime path.")
+        if isinstance(context := tool_context_or_error(cls._payload, "Thread model"), str):
+            return context
         if context.resolved_thread_id is None:
             return cls._payload("error", message="Thread model switching requires an active thread context.")
         return context, context.resolved_thread_id
@@ -56,9 +60,8 @@ class ThreadModelTools(Toolkit):
 
     async def list_models(self) -> str:
         """List the configured model aliases available for selection."""
-        context = get_tool_runtime_context()
-        if context is None:
-            return self._payload("error", message="Thread model tool context is unavailable in this runtime path.")
+        if isinstance(context := tool_context_or_error(self._payload, "Thread model"), str):
+            return context
         return self._payload(
             "ok",
             action="list",
@@ -99,7 +102,7 @@ class ThreadModelTools(Toolkit):
         self,
         model_name: str,
         when: Literal["after-toolcall", "next-turn"] = "next-turn",
-    ) -> str:
+    ) -> str | ToolOutcome:
         """Switch the model that the agents and teams the requester may address use in the current thread.
 
         The override persists for this thread until reset. It can take effect
@@ -116,13 +119,6 @@ class ThreadModelTools(Toolkit):
         if isinstance(resolved, str):
             return resolved
         context, thread_id = resolved
-        if when not in _MODEL_SWITCH_WHENS:
-            return self._payload(
-                "error",
-                action="switch",
-                message=f"Unknown switch timing '{when}'.",
-                available_when=list(_MODEL_SWITCH_WHENS),
-            )
         if model_name not in context.config.models:
             return self._payload(
                 "error",
@@ -148,25 +144,34 @@ class ThreadModelTools(Toolkit):
                 log_fallback=when == "after-toolcall",
             ),
         ).model_name
-        if when == "after-toolcall" and budgeted_model_name != model_name:
-            model = context.config.models[budgeted_model_name]
-            return self._payload(
-                "ok",
-                action="switch",
-                thread_id=thread_id,
-                model=budgeted_model_name,
-                requested_model=model_name,
-                provider=model.provider,
-                model_id=model.id,
-                when=when,
-                note=(
-                    f"The requester's monthly budget is used up, so the current response continues with "
-                    f"`{budgeted_model_name}`; `{model_name}` stays selected for this thread."
-                ),
-            )
         if when == "after-toolcall":
-            note = "The current response will continue with the new model after this tool call."
-        elif budgeted_model_name != model_name:
+            fields: dict[str, object] = {
+                "note": "The current response will continue with the new model after this tool call.",
+            }
+            if budgeted_model_name != model_name:
+                fields = {
+                    "requested_model": model_name,
+                    "note": (
+                        f"The requester's monthly budget is used up, so the current response continues with "
+                        f"`{budgeted_model_name}`; `{model_name}` stays selected for this thread."
+                    ),
+                }
+            model = context.config.models[budgeted_model_name]
+            # Only this switch stops the run: the turn continues the response on the model it names.
+            return ToolOutcome(
+                content=self._payload(
+                    "ok",
+                    action="switch",
+                    thread_id=thread_id,
+                    model=budgeted_model_name,
+                    provider=model.provider,
+                    model_id=model.id,
+                    when=when,
+                    **fields,
+                ),
+                stop_after_call=True,
+            )
+        if budgeted_model_name != model_name:
             note = (
                 "The new model applies from the next message in this thread, but the requester's monthly budget "
                 f"is used up, so replies use `{budgeted_model_name}` until it resets."

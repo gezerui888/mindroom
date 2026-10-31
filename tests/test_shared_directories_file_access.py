@@ -19,7 +19,9 @@ from mindroom.shared_directories import paths as shared_paths
 from mindroom.shared_directories.paths import shared_directory_roots
 from mindroom.shared_directories.store import add_shared_directory_member, create_shared_directory
 from mindroom.shared_directories.tool_roots import SharedDirectoryRoot
+from mindroom.tool_system.authoring import toolkit_functions
 from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.worker_routing import resolve_worker_target, worker_dir_name
 from mindroom.tools.file import file_tools
 from tests.conftest import bind_runtime_paths, test_runtime_paths
@@ -231,7 +233,11 @@ def test_path_calls_cover_every_file_and_coding_tool(tmp_path: Path, monkeypatch
     _run, share = _run_directory(tmp_path, monkeypatch, share_below=True)
     toolkits = _toolkits_without_a_workspace(share)
 
-    registered = {(name, function.__name__) for name, toolkit in toolkits.items() for function in toolkit.tools}
+    registered = {
+        (name, function.__name__)
+        for name, toolkit in toolkits.items()
+        for function in toolkit_functions(toolkit).values()
+    }
 
     assert {(call.toolkit, call.method) for call in _PATH_CALLS} == registered
 
@@ -480,6 +486,7 @@ def test_built_file_and_coding_tools_reach_the_calling_agents_shares(tmp_path: P
             runtime_config=config,
             tool_init_overrides={"base_dir": workspace},
             worker_target=resolve_worker_target(None, agent_name, None),
+            tools=builtin_tool_registry(),
         )
 
     assert build("coding", "alice").write_file(str(share / "summary.md"), "shared\n").startswith("Wrote")

@@ -24,12 +24,13 @@ from mindroom.constants import (
     RuntimePaths,
     resolve_runtime_paths,
 )
+from mindroom.history import session_runs
 from mindroom.history.compaction import Summarizer, SummaryModel
 from mindroom.history.storage import (
-    _with_scope_state,
     append_compaction_chunk,
     new_scope_session,
     read_chunk_basis,
+    with_force_compaction,
 )
 from mindroom.history.summary_input import build_summary_input
 from mindroom.history.types import (
@@ -39,11 +40,11 @@ from mindroom.history.types import (
     CompactionOutcome,
     HistoryPolicy,
     HistoryScope,
-    HistoryScopeState,
     ResolvedHistorySettings,
     owner_scope,
 )
 from mindroom.hooks import (
+    HookBindings,
     HookRegistry,
 )
 from mindroom.llm.messages import Message
@@ -65,6 +66,7 @@ from mindroom.message_target import MessageTarget
 from mindroom.native_compaction import NATIVE_CHECKPOINT_KEY, native_checkpoint_state
 from mindroom.prompts import COMPACTION_SUMMARY_PROMPT
 from mindroom.providers.assistant_turn import stamp_model
+from mindroom.session_storage import store as store_module
 from mindroom.session_storage import summary_rows
 from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.session_storage.schema import NON_VISIBLE_RUN_STATUS_SQL, quote_identifier
@@ -86,7 +88,10 @@ from tests.fakes.summary_model import summary_model
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    import pytest
+
     from mindroom.history.request_messages import TurnMessages
+    from mindroom.history.session_runs import DueConversation
     from mindroom.history.types import ScopeSummary
     from mindroom.llm.provider import ModelProvider
     from mindroom.llm.runs import AnyRunRecord
@@ -230,16 +235,6 @@ def completed_outcome(lifecycle: RecordingCompactionLifecycle) -> CompactionOutc
     """Return the one compaction outcome the lifecycle reported as completed."""
     [outcome] = [event for event in lifecycle.events if isinstance(event, CompactionOutcome)]
     return outcome
-
-
-@dataclass
-class FailingStartCompactionLifecycle(RecordingCompactionLifecycle):
-    """Lifecycle test double whose initial notice delivery fails."""
-
-    async def start(self, event: CompactionLifecycleStart) -> str | None:
-        self.events.append(event)
-        message = "matrix unavailable"
-        raise RuntimeError(message)
 
 
 def _runtime_paths(tmp_path: Path) -> RuntimePaths:
@@ -391,7 +386,7 @@ def _hook_runtime_context(
         runtime_paths=runtime_paths,
         relations=make_relation_lookup(),
         conversation_reader=make_conversation_reader_mock(),
-        hook_registry=registry,
+        hooks=HookBindings(registry=registry),
         correlation_id="corr-compaction",
     )
 
@@ -420,7 +415,7 @@ def _forced_compaction_context(
     )
     storage = create_session_storage("test_agent", config, runtime_paths, execution_identity=None)
     scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     persist_session(storage, session)
     runtime_context = _hook_runtime_context(
         config=config,
@@ -635,7 +630,7 @@ BIG_TOOL = ToolSpec(
     parameters={},
     strict=None,
 )
-_TEST_MODEL = ModelIdentity(id="test-model", provider="test", provider_name="test")
+_TEST_MODEL = ModelIdentity(id="test-model", provider="test")
 
 
 @dataclass
@@ -775,3 +770,36 @@ def seeded_storage(config: Config, runtime_paths: RuntimePaths) -> ConversationS
         ),
     )
     return storage
+
+
+def unreadable_conversations(unreadable: Callable[[str], bool]) -> Callable[..., DueConversation]:
+    """Return a stand-in for ``session_runs._read_conversation`` that fails for each session ``unreadable`` names."""
+    real = session_runs._read_conversation
+
+    def read_conversation(
+        storage: ConversationStore,
+        session_id: str,
+        *,
+        agent_name: str,
+        updated_at: int,
+    ) -> DueConversation:
+        if unreadable(session_id):
+            msg = "corrupt session row"
+            raise ValueError(msg)
+        return real(storage, session_id, agent_name=agent_name, updated_at=updated_at)
+
+    return read_conversation
+
+
+def trace_store_statements(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Return the list that collects every SQL statement the conversation store runs from now on."""
+    statements: list[str] = []
+    connect = store_module.connect_conversation_database
+
+    def traced_connect(path: Path) -> sqlite3.Connection:
+        connection = connect(path)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(store_module, "connect_conversation_database", traced_connect)
+    return statements

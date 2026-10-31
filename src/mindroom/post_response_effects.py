@@ -10,8 +10,8 @@ from mindroom.background_tasks import create_background_task
 from mindroom.interactive_models import InteractivePrompt
 from mindroom.matrix.conversation_reads import DeliveredResponse
 from mindroom.runtime_protocols import SupportsClientConfigMemberships  # noqa: TC001
-from mindroom.thread_summary import maybe_generate_thread_summary
-from mindroom.thread_summary import should_queue_thread_summary as should_queue_thread_summary_check
+from mindroom.thread_summary.automatic import maybe_generate_thread_summary
+from mindroom.thread_summary.schedule import should_queue_thread_summary as should_queue_thread_summary_check
 from mindroom.timing import timed
 from mindroom.tool_system.events import strip_visible_tool_markers
 
@@ -207,9 +207,8 @@ async def apply_post_response_effects(
     if (
         response_event_id is not None
         and deps.add_interactive_buttons is not None
-        and final_delivery_outcome.terminal_status == "completed"
+        and final_delivery_outcome.completed
         and final_delivery_outcome.final_visible_body is not None
-        and not final_delivery_outcome.suppressed
         and final_delivery_outcome.interactive_metadata is not None
     ):
         await deps.add_interactive_buttons(
@@ -224,9 +223,8 @@ async def apply_post_response_effects(
             "Interactive question buttons skipped",
             response_event_id=response_event_id,
             add_interactive_buttons_is_none=deps.add_interactive_buttons is None,
-            terminal_status=final_delivery_outcome.terminal_status,
+            ending=type(final_delivery_outcome.ending).__name__,
             final_visible_body_is_none=final_delivery_outcome.final_visible_body is None,
-            suppressed=final_delivery_outcome.suppressed,
             interactive_metadata_is_none=final_delivery_outcome.interactive_metadata is None,
         )
 
@@ -269,9 +267,8 @@ async def apply_post_response_effects(
     target = outcome.response_target
     if (
         outcome.run_succeeded
-        and final_delivery_outcome.terminal_status == "completed"
+        and final_delivery_outcome.completed
         and response_event_id is not None
-        and not final_delivery_outcome.suppressed
         and target is not None
         and target.resolved_thread_id is not None
         and (

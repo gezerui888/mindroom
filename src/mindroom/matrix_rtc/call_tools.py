@@ -32,10 +32,10 @@ from mindroom.agent_loop.build import prompt_for_turn
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.agents import create_agent
 from mindroom.approval.tool_approval import tool_may_require_approval
-from mindroom.background_tasks import wait_for_future_until_complete
+from mindroom.background_tasks import drain_tasks, wait_for_future_until_complete
 from mindroom.helper_usage import HelperUsageOwner, helper_usage_owner_context, record_helper_usage
 from mindroom.history.interrupted_replay import persist_interrupted_replay
-from mindroom.history.session_context import create_scope_session_storage, load_scope_session
+from mindroom.history.storage import new_scope_session
 from mindroom.history.turn_recorder import TurnRecorder
 from mindroom.history.types import HistoryScope
 from mindroom.hooks import EnrichmentItem
@@ -46,19 +46,17 @@ from mindroom.llm.usage import HelperUsage, MessageMetrics, ModelMetrics, Reques
 from mindroom.logging_config import get_logger
 from mindroom.matrix_rtc.voice_agent import CallAgentResponse
 from mindroom.message_target import MessageTarget
+from mindroom.providers.names import ROUTE_PROVIDERS
 from mindroom.session_ids import create_session_id
 from mindroom.session_storage.agent_storage import create_session_storage
+from mindroom.session_storage.lanes import run_session_storage_operation
 from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_jobs.execution import agent_tool_middleware
 from mindroom.tool_system.agent_tools import room_turn_offers
-from mindroom.tool_system.agno_toolkits import AGNO_EMPTY_PARAMETERS
-from mindroom.tool_system.declarations import (
-    MATRIX_ROOM_RUNTIME_APPROVAL_TYPE,
-    MATRIX_ROOM_RUNTIME_TOOL_NAMES,
-)
+from mindroom.tool_system.declarations import is_matrix_room_runtime_function
 from mindroom.tool_system.invocation import CallResult, ToolCallContext, client_tool_result, run_tool_call
 from mindroom.tool_system.runtime_context import tool_runtime_context
-from mindroom.tool_system.tool_function import close_toolkits, connect_toolkits
+from mindroom.tool_system.tool_function import ToolGate, close_toolkits, connect_toolkits
 from mindroom.turn_model import ModelScope, TurnBudget, resolve_turn_model
 
 if TYPE_CHECKING:
@@ -68,11 +66,13 @@ if TYPE_CHECKING:
     from livekit.agents.llm import RawFunctionTool
 
     from mindroom.agent_loop.build import AgentBuild
+    from mindroom.ai import TurnResult
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.knowledge.search import AgentKnowledge
     from mindroom.matrix_rtc.voice_agent import LiveVoiceUsage, RealtimeCallUsage
+    from mindroom.session_storage.store import ConversationStore
     from mindroom.tool_system.events import ToolTraceEntry
     from mindroom.tool_system.invocation import ToolCall, ToolMiddleware, ToolNext
     from mindroom.tool_system.runtime_context import ToolRuntimeContext, ToolRuntimeSupport
@@ -184,7 +184,7 @@ async def record_call_voice_usage(
         HelperUsage(
             run_id=usage.provider_session_id,
             model=usage.model,
-            provider="OpenAI",
+            provider=ROUTE_PROVIDERS["openai"],
             metrics=RunMetrics(),
             voice=VoiceDuration(seconds=usage.duration_seconds, finalized=usage.finalized),
             created_at=usage.created_at,
@@ -207,18 +207,18 @@ async def record_call_token_usage(
 
     The call's model has its entry under ``details`` even before any response, so stored usage names it from the start.
     """
-    metrics = RunMetrics(details={"model": [ModelMetrics(id=usage.model, provider="OpenAI")]})
-    model = ModelProvenance(model_id=usage.model, provider="OpenAI")
+    metrics = RunMetrics(details={"model": [ModelMetrics(id=usage.model, provider=ROUTE_PROVIDERS["openai"])]})
+    model = ModelProvenance(model_id=usage.model, provider=ROUTE_PROVIDERS["openai"])
     requests: list[RequestUsage] = []
     for response in usage.responses:
         response_metrics = MessageMetrics(tokens=response.tokens.with_totals())
-        metrics.add(response_metrics, model_id=usage.model, provider="OpenAI")
+        metrics.add(response_metrics, model_id=usage.model, provider=ROUTE_PROVIDERS["openai"])
         requests.append(RequestUsage(created_at=int(response.created_at), metrics=response_metrics, model=model))
     await _save_call_usage(
         HelperUsage(
             run_id=usage.usage_id,
             model=usage.model,
-            provider="OpenAI",
+            provider=ROUTE_PROVIDERS["openai"],
             metrics=metrics,
             requests=tuple(requests),
             created_at=int(usage.created_at),
@@ -299,11 +299,7 @@ class _CallResponseTracker:
 
     async def wait_for_settlements(self) -> None:
         """Do not start another persisted run while playout reconciliation is active."""
-        while self.settlements:
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tuple(self.settlements)),
-                return_exceptions=True,
-            )
+        await drain_tasks(self.settlements)
 
     async def persist_unspoken(self, state: _CallAgentRunState, *, default_status: RunStatus) -> None:
         """Persist a terminal generation before LiveKit received any text."""
@@ -317,23 +313,36 @@ class _CallResponseTracker:
         original_status: RunStatus,
     ) -> None:
         async with self.settlement_lock:
-            await asyncio.to_thread(self._persist, state, spoken_text, original_status)
+            await run_session_storage_operation(
+                functools.partial(
+                    create_session_storage,
+                    self.agent_name,
+                    self.config,
+                    self.runtime_paths,
+                    self.execution_identity,
+                ),
+                functools.partial(self._persist, state, spoken_text, original_status),
+            )
 
     def _pop(self, token: str | None) -> _CallAgentRunState | None:
         if token is not None:
             return self.pending.pop(token, None)
         return self.pending.pop(next(iter(self.pending))) if self.pending else None
 
-    def _persist(self, state: _CallAgentRunState, spoken_text: str, original_status: RunStatus) -> None:
-        scope_context = load_scope_session(
-            scope=HistoryScope(kind="agent", scope_id=self.agent_name),
-            session_id=state.session_id,
-            runtime_paths=self.runtime_paths,
-            config=self.config,
-            execution_identity=self.execution_identity,
-        )
+    def _persist(
+        self,
+        state: _CallAgentRunState,
+        spoken_text: str,
+        original_status: RunStatus,
+        storage: ConversationStore,
+    ) -> None:
         persist_interrupted_replay(
-            scope_context=scope_context,
+            storage=storage,
+            # The session only names the run's row, which the save creates when the call's conversation has none yet.
+            session=new_scope_session(
+                session_id=state.session_id,
+                scope=HistoryScope(kind="agent", scope_id=self.agent_name),
+            ),
             run_id=state.run_id,
             user_message=state.user_message,
             user_message_is_structured=False,
@@ -353,7 +362,6 @@ class _CallAgentCache:
     config: Config
     runtime_paths: RuntimePaths
     context: ToolRuntimeContext
-    execution_identity: ToolExecutionIdentity
     active_model_name: str | None
     build: AgentBuild | None = None
     knowledge_identity: tuple[int, ...] = ()
@@ -370,7 +378,7 @@ class _CallAgentCache:
             self.config,
             self.runtime_paths,
             refresh_scheduler=scheduler,
-            execution_identity=self.execution_identity,
+            execution_identity=self.context.execution_identity,
         )
 
         async def render(build: AgentBuild) -> str:
@@ -383,14 +391,14 @@ class _CallAgentCache:
             operation=render,
         )
 
-    async def run(
+    async def run[T](
         self,
         *,
         knowledge: AgentKnowledge | None,
         refresh_scheduler: KnowledgeRefreshScheduler | None,
         active_model_name: str | None,
-        operation: Callable[[AgentBuild], Awaitable[str]],
-    ) -> str:
+        operation: Callable[[AgentBuild], Awaitable[T]],
+    ) -> T:
         """Run one turn, rebuilding only when call dependencies or the turn's model change."""
         knowledge_identity = knowledge_runtime_identity(knowledge)
         async with self.lock:
@@ -420,23 +428,16 @@ class _CallAgentCache:
         knowledge: AgentKnowledge | None,
         refresh_scheduler: KnowledgeRefreshScheduler | None,
     ) -> AgentBuild:
-        """Build the call's agent with canonical prompt-sanitizing history storage."""
-        history_storage = create_scope_session_storage(
-            scope=HistoryScope(kind="agent", scope_id=self.agent_name),
-            config=self.config,
-            runtime_paths=self.runtime_paths,
-            execution_identity=self.execution_identity,
-        )
+        """Build the call's agent."""
         # Build the same tools and system prompt as text chat, less its Markdown output format, which a call speaks.
         # The shell's mindroom-agent CLI stays off: call turns have no turn identity to own it.
         build = create_agent(
             self.agent_name,
             self.config,
             self.runtime_paths,
-            execution_identity=self.execution_identity,
-            hook_registry=self.context.hook_registry,
+            execution_identity=self.context.execution_identity,
             knowledge=knowledge,
-            history_storage=history_storage,
+            plugins=self.context.plugins,
             model=resolve_turn_model(
                 self.config,
                 self.runtime_paths,
@@ -503,11 +504,7 @@ async def build_call_tools(
             agent_name=agent_name,
         ),
     )
-    execution_identity = tool_support.build_execution_identity(
-        target=target,
-        user_id=requester_id,
-        agent_name=agent_name,
-    )
+    execution_identity = context.execution_identity
     if enable_responder:
         voice_enrichment_items: tuple[EnrichmentItem, ...] = ()
         if voice_instructions:
@@ -528,7 +525,6 @@ async def build_call_tools(
             config=config,
             runtime_paths=runtime_paths,
             context=context,
-            execution_identity=execution_identity,
             active_model_name=active_model_name,
         )
         responder = functools.partial(
@@ -536,9 +532,7 @@ async def build_call_tools(
             agent_name=agent_name,
             config=config,
             runtime_paths=runtime_paths,
-            tool_support=tool_support,
             context=context,
-            execution_identity=execution_identity,
             room_id=room_id,
             requester_id=requester_id,
             session_id=session_id,
@@ -575,8 +569,8 @@ async def build_call_tools(
                 config,
                 runtime_paths,
                 execution_identity,
-                hook_registry=context.hook_registry,
                 knowledge=knowledge_resolution.knowledge,
+                plugins=context.plugins,
                 include_interactive_questions=False,
                 tool_function_filter=context.tool_function_filter,
                 refresh_scheduler=refresh_scheduler,
@@ -663,9 +657,7 @@ async def _run_call_agent(
     agent_name: str,
     config: Config,
     runtime_paths: RuntimePaths,
-    tool_support: ToolRuntimeSupport,
     context: ToolRuntimeContext,
-    execution_identity: ToolExecutionIdentity,
     room_id: str,
     requester_id: str,
     session_id: str,
@@ -687,9 +679,7 @@ async def _run_call_agent(
             agent_name=agent_name,
             config=config,
             runtime_paths=runtime_paths,
-            tool_support=tool_support,
             context=context,
-            execution_identity=execution_identity,
             room_id=room_id,
             requester_id=requester_id,
             session_id=session_id,
@@ -708,9 +698,7 @@ async def _run_authorized_call_agent(
     agent_name: str,
     config: Config,
     runtime_paths: RuntimePaths,
-    tool_support: ToolRuntimeSupport,
     context: ToolRuntimeContext,
-    execution_identity: ToolExecutionIdentity,
     room_id: str,
     requester_id: str,
     session_id: str,
@@ -735,7 +723,6 @@ async def _run_authorized_call_agent(
         context = replace(context, active_model_name=active_model_name)
     # Seeded here too: a cancellation before the turn driver starts still stores the transcript it answered.
     recorder = TurnRecorder(user_message=transcript)
-    run_metadata: dict[str, Any] = {}
     fallback_run_id = f"{session_id}:turn:{uuid4().hex}"
     try:
         refresh_scheduler = (
@@ -746,7 +733,7 @@ async def _run_authorized_call_agent(
             config,
             runtime_paths,
             refresh_scheduler=refresh_scheduler,
-            execution_identity=execution_identity,
+            execution_identity=context.execution_identity,
         )
         transient_enrichment_items = append_knowledge_availability_enrichment(
             (),
@@ -768,46 +755,51 @@ async def _run_authorized_call_agent(
             inline_tools=True,
             prompt=transcript,
             show_tool_calls=False,
-            execution_identity=execution_identity,
+            execution_identity=context.execution_identity,
             refresh_scheduler=refresh_scheduler,
             knowledge=knowledge_resolution.knowledge,
             eager_deferred_tools=True,
         )
 
-        async def _respond(build: AgentBuild) -> str:
+        async def _respond(build: AgentBuild) -> TurnResult:
             return await ai_response(
                 replace(turn, reusable_build=build),
                 runtime_paths,
                 config,
                 # The call stores what it spoke of an interrupted reply itself.
-                sinks=TurnSinks(turn_recorder=recorder, run_metadata_collector=run_metadata, persist_interrupted=False),
+                sinks=TurnSinks(turn_recorder=recorder, persist_interrupted=False),
             )
 
-        async def _run_with_build(build: AgentBuild) -> str:
-            return await tool_support.run_in_context(
-                tool_context=context,
-                operation=functools.partial(_respond, build),
-            )
+        async def _run_with_build(build: AgentBuild) -> TurnResult:
+            with tool_runtime_context(context):
+                return await _respond(build)
 
-        response = await agent_cache.run(
+        result = await agent_cache.run(
             knowledge=knowledge_resolution.knowledge,
             refresh_scheduler=refresh_scheduler,
             active_model_name=active_model_name,
             operation=_run_with_build,
         )
     except asyncio.CancelledError:
-        state = _call_agent_run_state(recorder, run_metadata, session_id=session_id, fallback_run_id=fallback_run_id)
+        # A turn that raises returns no result, so its row has no run metadata of an attempt that ended the turn.
+        state = _call_agent_run_state(recorder, {}, session_id=session_id, fallback_run_id=fallback_run_id)
         await response_tracker.persist_unspoken(state, default_status=RunStatus.cancelled)
         raise
     except Exception:
-        state = _call_agent_run_state(recorder, run_metadata, session_id=session_id, fallback_run_id=fallback_run_id)
+        state = _call_agent_run_state(recorder, {}, session_id=session_id, fallback_run_id=fallback_run_id)
         await response_tracker.persist_unspoken(state, default_status=RunStatus.error)
         raise
     finally:
         tool_names = tuple(dict.fromkeys(entry.tool_name for entry in recorder.completed_tools))
         if on_tools_executed is not None and tool_names:
             on_tools_executed(list(tool_names))
-    state = _call_agent_run_state(recorder, run_metadata, session_id=session_id, fallback_run_id=fallback_run_id)
+    state = _call_agent_run_state(
+        recorder,
+        result.run_metadata,
+        session_id=session_id,
+        fallback_run_id=fallback_run_id,
+    )
+    response = result.text
     # Live commentary can be paraphrased or omitted; only cascaded TTS owns a
     # one-to-one mapping between this answer and the eventual spoken turn.
     turn_id = response_tracker.register(state) if response and reconcile_spoken_response else None
@@ -869,15 +861,11 @@ def _normalize_tool_result(result: object) -> str:
 
 def _function_requires_text_chat(function: ToolFunction, config: Config) -> bool:
     """Return whether a function needs text-chat UI that a voice call lacks."""
-    is_matrix_room_runtime_function = (
-        function.name in MATRIX_ROOM_RUNTIME_TOOL_NAMES and function.approval_type == MATRIX_ROOM_RUNTIME_APPROVAL_TYPE
-    )
-    return bool(
-        function.requires_confirmation
-        or function.external_execution
-        or function.approval_type == "required"
+    room_runtime = is_matrix_room_runtime_function(function.registered_toolkit, function.name)
+    return (
+        function.gate is not None
         or function.name in _CALL_UNAVAILABLE_COMPOSITE_FUNCTIONS
-        or (not is_matrix_room_runtime_function and tool_may_require_approval(config, function.name)),
+        or (not room_runtime and tool_may_require_approval(config, function.name))
     )
 
 
@@ -886,14 +874,14 @@ def _refuse_text_chat_functions(build: AgentBuild, config: Config) -> AgentBuild
     refused: set[str] = set()
 
     def callable_in_a_call(function: ToolFunction) -> ToolFunction:
-        if function.external_execution_silent:
+        if function.gate is ToolGate.DELEGATION:
             # Chat hands delegation to its driver; calls run the child turn directly.
-            function = replace(function, external_execution=False, external_execution_silent=False)
+            function = replace(function, gate=None)
         if not _function_requires_text_chat(function, config):
             return function
         refused.add(function.name)
-        # The loop pauses a run for these flags before any tool-call policy can refuse the call.
-        return replace(function, requires_confirmation=False, external_execution=False, approval_type=None)
+        # A gate pauses the run, or asks as the call's job, before any tool-call policy can refuse the call.
+        return replace(function, gate=None)
 
     async def refuse(call: ToolCall, call_next: ToolNext) -> object:
         if call.function.name in refused:
@@ -932,20 +920,8 @@ def _function_available_during_call(
 
 
 def _realtime_parameters(function: ToolFunction) -> dict[str, Any]:
-    """Return the realtime model's parameters schema: the function's schema after a second Agno processing pass.
-
-    A second pass closes a schema Agno's processing produced to other keys once it differs from Agno's empty schema,
-    which the voice_call_realtime golden pins, and leaves a schema the tool supplies as is
-    (``skip_entrypoint_processing``, as MCP tools do) unchanged. An empty schema becomes an object without properties.
-    """
-    schema = dict(function.parameters)
-    if not schema:
-        return {"type": "object", "properties": {}}
-    # TODO(simplify): `additionalProperties: false` here reproduces a second pass of Agno's entrypoint processing.
-    # Offer the function's schema as it is. The realtime model would see tool schemas without it; the golden pins it.
-    if function.entrypoint_processed and schema != AGNO_EMPTY_PARAMETERS:
-        schema["additionalProperties"] = False
-    return schema
+    """Return the realtime model's parameters schema: the function's own, or an object without properties for none."""
+    return dict(function.parameters) or {"type": "object", "properties": {}}
 
 
 def _wrap_tool_function(

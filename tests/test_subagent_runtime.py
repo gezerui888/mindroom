@@ -14,19 +14,18 @@ from agno.tools import Toolkit
 from agno.tools.function import Function
 
 import mindroom.orchestration.tool_job_runtime as runtime_module
-import mindroom.tool_system.metadata as metadata_module
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.agents import create_agent
 from mindroom.approval import manager as approval_manager
 from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig, ToolConfigEntry
+from mindroom.constants import subagent_sessions_dir
 from mindroom.delegation import recovery as delegation_recovery
 from mindroom.delegation.background import delegation_child, start_delegation
 from mindroom.delegation.lifecycle import child_run_context, start_child_turn
 from mindroom.event_journal import JOB_ENDED_REASON, BackgroundApprovalDecision, tool_job_run_id
 from mindroom.matrix import state as matrix_state
-from mindroom.mcp.registry import sync_mcp_tool_registry
 from mindroom.mcp.toolkit import MindRoomMCPToolkit
 from mindroom.orchestration.tool_job_runtime import ToolJobRuntimeCoordinator
 from mindroom.tool_jobs.authorization import authority_snapshot
@@ -42,10 +41,11 @@ from mindroom.tool_jobs.runtime import (
 from mindroom.tool_system.construction import ToolConstruction, bind_toolkit_construction, tool_config_signature
 from mindroom.tool_system.invocation import ToolCallContext
 from mindroom.tool_system.metadata import get_tool_by_name
-from mindroom.tool_system.registry_state import TOOL_REGISTRY, tool_registry_origin
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.worker_routing import serialize_tool_execution_identity
-from tests.conftest import test_runtime_paths
+from tests.conftest import replace_test_tool_factory, test_runtime_paths
 from tests.delegation_helpers import _delegate_runtime_context
 from tests.test_mcp_toolkit import _oauth_server_config
 from tests.tool_job_helpers import (
@@ -89,12 +89,12 @@ def test_completion_authority_uses_latest_config_and_team_membership(tmp_path: P
         journal_provider=partial(tool_job_journal, test_runtime_paths(tmp_path).storage_root),
     )
     job = completed_delegation_job()
-    assert coordinator._authorized(job)
+    assert coordinator._grant(job) == "allowed"
     config.agents["lead"].delegate_to = []
-    assert not coordinator._authorized(job)
+    assert coordinator._grant(job) == "denied"
     config.agents["lead"].delegate_to = ["worker"]
     config.teams["team"].agents = ["worker"]
-    assert not coordinator._authorized(job)
+    assert coordinator._grant(job) == "denied"
 
 
 def test_completion_authority_checks_requester_for_target_and_recipient(tmp_path: Path) -> None:
@@ -108,9 +108,9 @@ def test_completion_authority_checks_requester_for_target_and_recipient(tmp_path
         journal_provider=partial(tool_job_journal, test_runtime_paths(tmp_path).storage_root),
     )
     job = completed_delegation_job()
-    assert not coordinator._authorized(replace(job, owner=replace(job.owner, requester_id="@stranger:localhost")))
+    assert coordinator._grant(replace(job, owner=replace(job.owner, requester_id="@stranger:localhost"))) == "denied"
     config.agents["worker"].access = ResponderAccessConfig(current_room_members=False)
-    assert not coordinator._authorized(job)
+    assert coordinator._grant(job) == "denied"
 
 
 class _ResolvingMembership(AgentReplyMembershipIndex):
@@ -155,7 +155,7 @@ async def test_revocation_waits_for_resolving_room_membership(tmp_path: Path) ->
         agent_reply_memberships=membership,
         journal_provider=partial(tool_job_journal, test_runtime_paths(tmp_path).storage_root),
     )
-    runtime = await tool_job_runtime(tmp_path, authorize=coordinator._authorized)
+    runtime = await tool_job_runtime(tmp_path, grant=coordinator._grant)
     fixture = completed_delegation_job()
     release = asyncio.Event()
 
@@ -166,10 +166,15 @@ async def test_revocation_waits_for_resolving_room_membership(tmp_path: Path) ->
     try:
         membership.state = "member"
         await start_delegation_job(runtime, delegation_child(fixture), owner=fixture.owner, operation=operation)
-        for state, running in (("pending", True), ("member", True), ("pending", True), ("stranger", False)):
+        for state, grant, running in (
+            ("pending", "pending", True),
+            ("member", "allowed", True),
+            ("pending", "pending", True),
+            ("stranger", "denied", False),
+        ):
             membership.state = state
-            assert coordinator._authorized(fixture) is (state == "member")
-            await runtime.cancel_revoked(denied=coordinator._denied)
+            assert coordinator._grant(fixture) == grant, state
+            await runtime.cancel_revoked()
             status = runtime._entries[fixture.job_id].job.status
             assert (status == "running") is running, state
     finally:
@@ -277,6 +282,8 @@ async def test_stop_withdraws_service_and_interrupts_live_execution(
         raise AssertionError
 
     fixture = completed_delegation_job()
+    # A parent's liveness claim on its child creates the sessions directory before any job starts the child.
+    subagent_sessions_dir(coordinator.runtime_paths).mkdir(parents=True)
     await start_delegation_job(coordinator.runtime, delegation_child(fixture), owner=fixture.owner, operation=operation)
     await started.wait()
     assert get_background_runtime(coordinator.runtime_paths) is coordinator.runtime
@@ -316,15 +323,15 @@ def test_ordinary_job_authority_tracks_tool_grant_and_filters(tmp_path: Path) ->
                 **authority_snapshot(config, "lead"),
                 "construction": {
                     "name": "calculator",
-                    "factory_origin": tool_registry_origin("calculator"),
+                    "factory_origin": builtin_tool_registry().origin("calculator"),
                     "config_signature": tool_config_signature(None),
                 },
             },
         },
     )
-    assert coordinator._authorized(job)
+    assert coordinator._grant(job) == "allowed"
     config.agents["lead"].tools = []
-    assert not coordinator._authorized(job)
+    assert coordinator._grant(job) == "denied"
 
 
 @pytest.mark.asyncio
@@ -426,7 +433,10 @@ async def test_retained_child_leaf_checks_current_grant_and_native_ancestry(tmp_
     )
     toolkit = Toolkit(name="calculator", auto_register=False)
     toolkit.functions["add"] = Function(name="add", entrypoint=lambda: None)
-    bind_toolkit_construction(toolkit, ToolConstruction.from_factory("calculator", TOOL_REGISTRY["calculator"]))
+    bind_toolkit_construction(
+        toolkit,
+        ToolConstruction.from_factory("calculator", builtin_tool_registry().factory("calculator")),
+    )
     tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "worker"))["add"]
     register_background_runtime(coordinator.runtime_paths, coordinator.runtime)
     try:
@@ -471,7 +481,10 @@ async def test_accepted_execution_continues_while_room_membership_resolves(tmp_p
     )
     toolkit = Toolkit(name="calculator", auto_register=False)
     toolkit.functions["add"] = Function(name="add", entrypoint=lambda: None)
-    bind_toolkit_construction(toolkit, ToolConstruction.from_factory("calculator", TOOL_REGISTRY["calculator"]))
+    bind_toolkit_construction(
+        toolkit,
+        ToolConstruction.from_factory("calculator", builtin_tool_registry().factory("calculator")),
+    )
     tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "worker"))["add"]
     register_background_runtime(coordinator.runtime_paths, coordinator.runtime)
     try:
@@ -495,7 +508,6 @@ async def test_retained_oauth_bridge_rechecks_current_remote_filters(tmp_path: P
     config = managed_team_config(tmp_path)
     config.mcp_servers = {"demo": _oauth_server_config()}
     config.agents["lead"].tools = ["mcp_demo"]
-    sync_mcp_tool_registry(config)
     coordinator = team_coordinator(tmp_path, config)
     await coordinator.initialize()
     owner = completed_delegation_job().owner
@@ -506,7 +518,8 @@ async def test_retained_oauth_bridge_rechecks_current_remote_filters(tmp_path: P
         tool_name="mcp_demo",
         server_config=config.mcp_servers["demo"],
     )
-    bind_toolkit_construction(toolkit, ToolConstruction.from_factory("mcp_demo", TOOL_REGISTRY["mcp_demo"]))
+    mcp_factory = config_plugins(config, coordinator.runtime_paths).tools.factory("mcp_demo")
+    bind_toolkit_construction(toolkit, ToolConstruction.from_factory("mcp_demo", mcp_factory))
     tools = toolkit_job_tools(toolkit, authored_name="mcp_demo", snapshot=authority_snapshot(config, "lead"))
     tool = next(item for name, item in tools.items() if name.endswith("_call_tool"))
     call = JobCall(
@@ -533,7 +546,6 @@ async def test_retained_oauth_bridge_rechecks_current_remote_filters(tmp_path: P
                 check_current_execution_authority()
     finally:
         await coordinator.stop()
-        sync_mcp_tool_registry(None)
 
 
 @pytest.mark.asyncio
@@ -574,9 +586,9 @@ async def test_expanded_tool_authority_retains_exact_construction(
                 config,
                 coordinator.runtime_paths,
                 execution_identity=owner,
-                persist_runtime_state=False,
                 knowledge=None,
                 model=turn_model(config, coordinator.runtime_paths, "lead"),
+                plugins=config_plugins(config, coordinator.runtime_paths),
             )
             assert build.tool_jobs is not None
             tool = build.tool_jobs.tools[function_name]
@@ -591,26 +603,24 @@ async def test_expanded_tool_authority_retains_exact_construction(
                 ),
             )
             coordinator._authorize_execution(owner, tool)
-            assert coordinator._authorized(stored)
+            assert coordinator._grant(stored) == "allowed"
             if authored == "openclaw_compat":
 
                 def replaced_factory() -> type[Toolkit]:
                     pytest.fail("Current authority must not construct replacement tools")
 
-                monkeypatch.setitem(TOOL_REGISTRY, "shell", replaced_factory)
+                replace_test_tool_factory(monkeypatch, "shell", replaced_factory)
                 with pytest.raises(JobAccessError):
                     coordinator._authorize_execution(owner, tool)
-                assert not coordinator._authorized(stored)
+                assert coordinator._grant(stored) == "denied"
     finally:
         await coordinator.stop()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("wrapped", [False, True])
 async def test_factory_replaced_during_constructor_cannot_relabel_old_tool(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    wrapped: bool,
 ) -> None:
     """Registry mutation inside construction cannot authorize the old implementation as its replacement."""
     config = managed_team_config(tmp_path)
@@ -626,24 +636,18 @@ async def test_factory_replaced_during_constructor_cannot_relabel_old_tool(
         def __init__(self, **_kwargs: object) -> None:
             super().__init__(name="calculator", auto_register=False)
             self.functions["add"] = Function(name="add", entrypoint=lambda: None)
-            monkeypatch.setitem(TOOL_REGISTRY, "calculator", replacement_factory)
+            replace_test_tool_factory(monkeypatch, "calculator", replacement_factory)
 
     def original_factory() -> type[Toolkit]:
         return SlowConstruction
 
-    def wrap(_name: str, toolkit: Toolkit, **_kwargs: object) -> Toolkit:
-        proxy = Toolkit(name="proxy", auto_register=False)
-        proxy.functions = toolkit.functions.copy()
-        return proxy
-
-    monkeypatch.setitem(TOOL_REGISTRY, "calculator", original_factory)
-    if wrapped:
-        monkeypatch.setattr(metadata_module, "wrap_toolkit_for_sandbox_proxy", wrap)
+    replace_test_tool_factory(monkeypatch, "calculator", original_factory)
     toolkit = get_tool_by_name(
         "calculator",
         coordinator.runtime_paths,
-        runs_in_worker=wrapped,
+        runs_in_worker=False,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
     tool = toolkit_job_tools(toolkit, authored_name="calculator", snapshot=authority_snapshot(config, "lead"))["add"]
     stored = replace(
@@ -660,28 +664,24 @@ async def test_factory_replaced_during_constructor_cannot_relabel_old_tool(
         ):
             with pytest.raises(JobAccessError):
                 coordinator._authorize_execution(owner, tool)
-            assert not coordinator._authorized(stored)
+            assert coordinator._grant(stored) == "denied"
     finally:
         await coordinator.stop()
 
 
 @pytest.mark.asyncio
-async def test_initialize_reads_the_journal_only_once_configured(tmp_path: Path) -> None:
-    """An initialize before configuration needs no journal; a disabled instance leaves saved jobs untouched."""
-    config: Config | None = None
+async def test_a_disabled_instance_leaves_saved_jobs_untouched(tmp_path: Path) -> None:
+    """A sync without background jobs opens the journal once and never reads its saved jobs."""
     paths = test_runtime_paths(tmp_path)
     journal = MagicMock()
     journal_provider = MagicMock(return_value=journal)
     coordinator = ToolJobRuntimeCoordinator(
         paths,
-        lambda: config,
+        Config,
         lambda _name: None,
         AgentReplyMembershipIndex(),
         journal_provider,
     )
-    await coordinator.initialize()
-    journal_provider.assert_not_called()
-    config = Config()
     await coordinator.sync()
     try:
         journal_provider.assert_called_once()
@@ -743,6 +743,8 @@ async def test_recovered_child_records_a_restart_only_when_the_restart_stopped_i
     control = JobControl()
     control.cancel(shutdown=restart)
     job = replace(completed_delegation_job(), status="running", result=None)
+    # A parent's liveness claim on its child creates the sessions directory before any job starts the child.
+    subagent_sessions_dir(test_runtime_paths(tmp_path)).mkdir(parents=True)
     coordinator._runtime = await tool_job_runtime(tmp_path)
     try:
         with job_control_context(control), patch.object(delegation_recovery, "interrupt_child", new=interrupt):

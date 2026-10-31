@@ -7,22 +7,24 @@ observables, they take the same further random actions, and both must report the
 observables after each one. A sequence whose native run stored something else, through a deliberate change that
 comparison 1 masks, starts apart: ``_APART`` pins those, and each one's comparison 1 pin names such a change.
 Compaction summary requests compare without the model they name (comparison 1's ``summary_requests_name_their_model``):
-a converted database keeps the untagged requests it stored, which usage reports attribute to the same model.
+a converted database keeps the untagged requests it stored, which usage reports attribute to the same model. Rows
+compare without the usage totals a converted row still holds in ``session_data``, which nothing reads since the ledger
+became the only usage owner, and a session without metadata compares as one with empty metadata, which an Agno-layout
+redaction rewrote it to (comparison 1's ``preserved_seen_ids_not_read``).
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
-from contextlib import closing
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from tests.session_storage.agno_layout import replacing_database
 from tests.storage_oracle.actions import Scenario, draw
 from tests.storage_oracle.determinism import deterministic
-from tests.storage_oracle.masks import untag_summary_requests
+from tests.storage_oracle.masks import drop_inert_session_totals, empty_missing_metadata, untag_summary_requests
 from tests.storage_oracle.record import SEQUENCES, decode, first_difference, sequence_id
 from tests.storage_oracle.store_backend import StoreBackend
 
@@ -45,13 +47,14 @@ _STORED_DIFFERENTLY = frozenset(
         "delegation_state_is_a_key_patch",
         "folded_calls_go_with_their_run",
         "force_request_only_in_metadata",
+        "queued_notices_stored_once",
     },
 )
 # The sequences whose native end state differs from their converted recorded one.
 _APART = frozenset(
     {
-        *(f"generated/{seed}" for seed in (2, 3, 5, 8, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 25)),
-        *(f"generated/{seed}" for seed in (27, 28, 29, 31, 32, 34, 35, 36, 38, 39)),
+        *(f"generated/{seed}" for seed in (2, 3, 4, 5, 8, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22, 23, 25)),
+        *(f"generated/{seed}" for seed in (27, 28, 29, 31, 32, 34, 35, 36, 37, 38, 39)),
         "named/delegation_state_after_continuation",
         "named/interrupted_after_fold",
         "named/interrupted_voice_playout",
@@ -74,8 +77,7 @@ def _pair(path: Path, root: Path, determinism: Determinism) -> tuple[Scenario, S
     for action in scenario.actions:
         native.apply(action)
         converted.apply(action)
-    converted.database.unlink()
-    with closing(sqlite3.connect(converted.database)) as connection:
+    with replacing_database(converted.database) as connection:
         connection.executescript(path.with_suffix(".sql").read_text(encoding="utf-8"))
     converted.open_store()
     return scenario, native, converted
@@ -88,6 +90,8 @@ def _observed(determinism: Determinism, native: StoreBackend, converted: StoreBa
     shown = _json(converted.observe())
     for observed in (seen, shown):
         untag_summary_requests(observed["ledger"])
+        drop_inert_session_totals(observed)
+        empty_missing_metadata(observed)
     return seen, shown
 
 

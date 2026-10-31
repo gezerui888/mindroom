@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from mindroom.ai_run_metadata import build_ai_run_metadata_content
 from mindroom.budgets.pricing import model_prices
+from mindroom.history.interrupted_replay import stored_turn_input
 from mindroom.llm.events import TextDelta, ToolCompleted, ToolStarted
 from mindroom.llm.runs import RunStatus, TeamRunRecord
 from mindroom.response_turn import TurnPartialSnapshot
@@ -22,10 +23,12 @@ from mindroom.timing import emit_timing_event
 from mindroom.tool_system.events import StructuredStreamChunk
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from mindroom.config.main import Config
-    from mindroom.constants import RuntimePaths
     from mindroom.history.types import PreparedHistoryState
     from mindroom.llm.runs import AnyRunRecord, ToolExecution
+    from mindroom.llm.usage import RunMetrics
     from mindroom.teams.members import ResolvedExactTeamMembers
     from mindroom.teams.presentation import TeamStreamPresentation
     from mindroom.teams.runtime import TeamRunEvent
@@ -83,11 +86,13 @@ class TeamAttempt:
     def partial_snapshot(self) -> TurnPartialSnapshot:
         """Return the live partial-output view of this attempt: what a stopped or failed turn records."""
         tracker = self.presentation.tool_tracker
+        record = self.records.record
         return TurnPartialSnapshot(
             assistant_text=self.interrupted_text(),
             completed_tools=tuple(tracker.completed_tools),
             interrupted_tools=tuple(pending.trace_entry for pending in tracker.pending_tools),
             attempt_run_id=self.run_id,
+            turn_input=stored_turn_input(record.messages) if record is not None else None,
         )
 
     def interrupted_text(self) -> str:
@@ -172,18 +177,19 @@ class TeamAttempt:
         self,
         config: Config,
         *,
-        runtime_paths: RuntimePaths,
         session_id: str,
         status: RunStatus,
+        prior_usage: Sequence[RunMetrics] = (),
     ) -> dict[str, Any]:
         """Return the stored run's metadata payload: the leader's identity, the team's usage, and the prepared history.
 
-        The context reported is the leader's last request's, since each member's requests held a context of their own.
+        The usage adds ``prior_usage``, the usage of the turn's attempts before this one. The context reported is the
+        leader's last request's, since each member's requests held a context of their own.
         """
         record = self.terminal_record()
         return build_ai_run_metadata_content(
             config=config,
-            prices=model_prices(config, runtime_paths),
+            prices=model_prices(config),
             model_name=self.runtime_model_name,
             run_id=record.run_id,
             session_id=session_id,
@@ -191,6 +197,7 @@ class TeamAttempt:
             model=record.model,
             model_provider=record.model_provider,
             metrics=team_usage(record),
+            prior_usage=prior_usage,
             context_run=record,
             tool_count=len(team_tool_executions(record)),
             prepared_history=self.prepared_history,

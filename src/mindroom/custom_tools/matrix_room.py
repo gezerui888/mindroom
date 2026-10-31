@@ -5,18 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from threading import Lock
-from typing import Any, ClassVar, Literal, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 
 import nio
-from agno.tools import Toolkit
 from aiohttp import ClientError
 
 from mindroom.custom_tools.attachment_helpers import resolve_requested_room_id, room_access_allowed
 from mindroom.custom_tools.matrix_agent_discovery import available_room_agents
 from mindroom.custom_tools.matrix_helpers import check_rate_limit
-from mindroom.custom_tools.tool_payloads import custom_tool_payload
+from mindroom.custom_tools.tool_payloads import custom_tool_payload, tool_context_or_error
 from mindroom.logging_config import get_logger
 from mindroom.matrix.client_visible_messages import (
     message_preview,
@@ -24,21 +23,13 @@ from mindroom.matrix.client_visible_messages import (
     trusted_visible_sender_ids,
 )
 from mindroom.matrix.room_history_reads import RoomThreadsPageError, get_room_threads_page
-from mindroom.thread_summary import current_thread_summary
-from mindroom.tool_system.runtime_context import ToolRuntimeContext, get_tool_runtime_context
+from mindroom.thread_summary.state import current_thread_summary
+from mindroom.tool_system.authoring import Toolkit
+
+if TYPE_CHECKING:
+    from mindroom.tool_system.runtime_context import ToolRuntimeContext
 
 logger = get_logger(__name__)
-
-
-@dataclass(frozen=True)
-class _MatrixRoomRequest:
-    action: str
-    room_id: str | None
-    limit: int | None
-    event_type: str | None
-    state_key: str | None
-    page_token: str | None
-    include_summaries: bool
 
 
 class MatrixRoomTools(Toolkit):
@@ -53,9 +44,6 @@ class MatrixRoomTools(Toolkit):
     # Each summary reads a whole thread, which is a homeserver walk the first time; a few at once keep a full page fast.
     _SUMMARY_READ_CONCURRENCY: ClassVar[int] = 6
     _MAX_STATE_EVENTS: ClassVar[int] = 100
-    _VALID_ACTIONS: ClassVar[frozenset[str]] = frozenset(
-        {"room-info", "members", "agents", "threads", "state"},
-    )
 
     def __init__(self) -> None:
         super().__init__(
@@ -68,13 +56,6 @@ class MatrixRoomTools(Toolkit):
         return custom_tool_payload("matrix_room", status, **kwargs)
 
     @classmethod
-    def _context_error(cls) -> str:
-        return cls._payload(
-            "error",
-            message="Matrix room tool context is unavailable in this runtime path.",
-        )
-
-    @classmethod
     def _thread_limit(cls, limit: int | None) -> int:
         """Clamp thread limit to [1, 50], defaulting to 20."""
         if limit is None:
@@ -82,40 +63,12 @@ class MatrixRoomTools(Toolkit):
         return max(1, min(limit, cls._MAX_THREAD_LIMIT))
 
     @staticmethod
-    def _thread_reply_count(event: nio.Event) -> int:
-        source = event.source
-        if not isinstance(source, dict):
-            return 0
-        unsigned = source.get("unsigned", {})
-        if not isinstance(unsigned, dict):
-            return 0
-        relations = unsigned.get("m.relations", {})
-        if not isinstance(relations, dict):
-            return 0
-        thread_metadata = relations.get("m.thread", {})
-        if not isinstance(thread_metadata, dict):
-            return 0
-        count = thread_metadata.get("count")
-        return count if isinstance(count, int) and not isinstance(count, bool) else 0
-
-    @staticmethod
-    def _thread_latest_activity_ts(event: nio.Event) -> int | None:
-        unsigned = event.source.get("unsigned", {})
-        if not isinstance(unsigned, dict):
-            return None
-        relations = unsigned.get("m.relations", {})
-        if not isinstance(relations, dict):
-            return None
-        thread_metadata = relations.get("m.thread", {})
-        if not isinstance(thread_metadata, dict):
-            return None
-        latest_event = thread_metadata.get("latest_event")
-        if not isinstance(latest_event, dict):
-            return None
-        latest_activity_ts = latest_event.get("origin_server_ts")
-        if not isinstance(latest_activity_ts, int) or isinstance(latest_activity_ts, bool):
-            return None
-        return latest_activity_ts
+    def _thread_metadata(source: dict[str, Any]) -> dict[str, Any]:
+        """Return the event's bundled `m.thread` aggregation, empty when any level of it is malformed."""
+        unsigned = source.get("unsigned")
+        relations = unsigned.get("m.relations") if isinstance(unsigned, dict) else None
+        thread_metadata = relations.get("m.thread") if isinstance(relations, dict) else None
+        return thread_metadata if isinstance(thread_metadata, dict) else {}
 
     async def _serialize_thread_root(
         self,
@@ -150,15 +103,18 @@ class MatrixRoomTools(Toolkit):
             trusted_sender_ids=trusted_sender_ids,
         )
 
+        thread_metadata = self._thread_metadata(source)
+        reply_count = thread_metadata.get("count")
+        latest_event = thread_metadata.get("latest_event")
+        latest_activity_ts = latest_event.get("origin_server_ts") if isinstance(latest_event, dict) else None
         payload: dict[str, object] = {
             "thread_id": event_id,
             "sender": sender,
             "timestamp": timestamp,
             "body_preview": body_preview,
-            "reply_count": self._thread_reply_count(event),
+            "reply_count": reply_count if isinstance(reply_count, int) and not isinstance(reply_count, bool) else 0,
         }
-        latest_activity_ts = self._thread_latest_activity_ts(event)
-        if latest_activity_ts is not None:
+        if isinstance(latest_activity_ts, int) and not isinstance(latest_activity_ts, bool):
             payload["latest_activity_ts"] = latest_activity_ts
         return payload
 
@@ -214,111 +170,43 @@ class MatrixRoomTools(Toolkit):
         suffix = f": {detail}" if detail else ""
         return f"Matrix request failed ({type(exc).__name__}){suffix}."
 
-    @classmethod
-    def _input_error(cls, action: str, message: str) -> str:
-        return cls._payload("error", action=action, message=message)
-
-    @classmethod
-    def _normalize_optional_str_fields(
-        cls,
-        action: str,
-        *,
-        room_id: object,
-        event_type: object,
-        state_key: object,
-        page_token: object,
-    ) -> tuple[str | None, str | None, str | None, str | None] | str:
-        normalized: dict[str, str | None] = {}
-        for name, value in {
-            "room_id": room_id,
-            "event_type": event_type,
-            "state_key": state_key,
-            "page_token": page_token,
-        }.items():
-            if value is None:
-                normalized[name] = None
-                continue
-            if not isinstance(value, str):
-                return cls._input_error(action, f"{name} must be a string when provided.")
-            normalized[name] = value.strip()
-        return (
-            normalized["room_id"],
-            normalized["event_type"],
-            normalized["state_key"],
-            normalized["page_token"],
-        )
-
-    @classmethod
-    def _normalize_request(
-        cls,
-        *,
-        action: object,
-        room_id: object,
-        limit: object,
-        event_type: object,
-        state_key: object,
-        page_token: object,
-        include_summaries: object,
-    ) -> _MatrixRoomRequest | str:
-        if not isinstance(action, str):
-            return cls._input_error("invalid", "action must be a string.")
-        normalized_action = action.strip().lower()
-        normalized_fields = cls._normalize_optional_str_fields(
-            normalized_action,
-            room_id=room_id,
-            event_type=event_type,
-            state_key=state_key,
-            page_token=page_token,
-        )
-        if isinstance(normalized_fields, str):
-            return normalized_fields
-        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool)):
-            return cls._input_error(normalized_action, "limit must be an integer when provided.")
-        if not isinstance(include_summaries, bool):
-            return cls._input_error(normalized_action, "include_summaries must be a boolean.")
-        normalized_room_id, normalized_event_type, normalized_state_key, normalized_page_token = normalized_fields
-        return _MatrixRoomRequest(
-            action=normalized_action,
-            room_id=normalized_room_id,
-            limit=cast("int | None", limit),
-            event_type=normalized_event_type,
-            state_key=normalized_state_key,
-            page_token=normalized_page_token,
-            include_summaries=include_summaries,
-        )
-
     async def _dispatch_action(
         self,
         context: ToolRuntimeContext,
         *,
-        request: _MatrixRoomRequest,
-        resolved_room_id: str,
+        action: str,
+        room_id: str,
+        limit: int | None,
+        event_type: str | None,
+        state_key: str | None,
+        page_token: str | None,
+        include_summaries: bool,
     ) -> str:
-        if request.action == "room-info":
-            return await self._room_info(context, room_id=resolved_room_id)
-        if request.action == "members":
-            return await self._members(context, room_id=resolved_room_id)
-        if request.action == "agents":
-            agents = await available_room_agents(context, resolved_room_id)
+        if action == "room-info":
+            return await self._room_info(context, room_id=room_id)
+        if action == "members":
+            return await self._members(context, room_id=room_id)
+        if action == "agents":
+            agents = await available_room_agents(context, room_id)
             return self._payload(
                 "ok",
                 action="agents",
-                room_id=resolved_room_id,
+                room_id=room_id,
                 agents=[asdict(agent) for agent in agents],
             )
-        if request.action == "threads":
+        if action == "threads":
             return await self._threads(
                 context,
-                room_id=resolved_room_id,
-                limit=self._thread_limit(request.limit),
-                page_token=request.page_token or None,
-                include_summaries=request.include_summaries,
+                room_id=room_id,
+                limit=self._thread_limit(limit),
+                page_token=(page_token or "").strip() or None,
+                include_summaries=include_summaries,
             )
         return await self._state(
             context,
-            room_id=resolved_room_id,
-            event_type=request.event_type or None,
-            state_key=request.state_key,
+            room_id=room_id,
+            event_type=(event_type or "").strip() or None,
+            state_key=(state_key or "").strip(),
         )
 
     async def _room_info(
@@ -450,13 +338,6 @@ class MatrixRoomTools(Toolkit):
             if exc.retry_after_ms is not None:
                 error_payload["retry_after_ms"] = exc.retry_after_ms
             return self._payload("error", **error_payload)
-        except (ClientError, TimeoutError) as exc:
-            return self._payload(
-                "error",
-                action="threads",
-                room_id=room_id,
-                message=self._transport_error_message(exc),
-            )
 
         threads_list: list[dict[str, object]] = []
         trusted_sender_ids = trusted_visible_sender_ids(context.config, context.runtime_paths)
@@ -493,14 +374,14 @@ class MatrixRoomTools(Toolkit):
         *,
         room_id: str,
         event_type: str | None,
-        state_key: str | None,
+        state_key: str,
     ) -> str:
         if event_type is not None:
             try:
                 response = await context.client.room_get_state_event(
                     room_id,
                     event_type,
-                    state_key or "",
+                    state_key,
                 )
             except (ClientError, TimeoutError) as exc:
                 return self._payload(
@@ -508,7 +389,7 @@ class MatrixRoomTools(Toolkit):
                     action="state",
                     room_id=room_id,
                     event_type=event_type,
-                    state_key=state_key or "",
+                    state_key=state_key,
                     message=self._transport_error_message(exc),
                 )
             if isinstance(response, nio.RoomGetStateEventResponse):
@@ -517,7 +398,7 @@ class MatrixRoomTools(Toolkit):
                     action="state",
                     room_id=room_id,
                     event_type=event_type,
-                    state_key=state_key or "",
+                    state_key=state_key,
                     content=response.content,
                 )
             return self._payload(
@@ -525,7 +406,7 @@ class MatrixRoomTools(Toolkit):
                 action="state",
                 room_id=room_id,
                 event_type=event_type,
-                state_key=state_key or "",
+                state_key=state_key,
                 message=f"Failed to fetch state event: {response}",
             )
 
@@ -575,7 +456,7 @@ class MatrixRoomTools(Toolkit):
             events=state_events,
         )
 
-    async def matrix_room(  # noqa: PLR0911
+    async def matrix_room(
         self,
         action: Literal["room-info", "members", "agents", "threads", "state"] = "room-info",
         room_id: str | None = None,
@@ -604,36 +485,17 @@ class MatrixRoomTools(Toolkit):
 
         room_id defaults to the current room. limit (default 20, max 50) and include_summaries apply to threads.
         """
-        context = get_tool_runtime_context()
-        if context is None:
-            return self._context_error()
+        if isinstance(context := tool_context_or_error(self._payload, "Matrix room"), str):
+            return context
 
         context = replace(context, config=context.current_config, config_provider=None)
-        request = self._normalize_request(
-            action=action,
-            room_id=room_id,
-            limit=limit,
-            event_type=event_type,
-            state_key=state_key,
-            page_token=page_token,
-            include_summaries=include_summaries,
-        )
-        if isinstance(request, str):
-            return request
-        if request.action not in self._VALID_ACTIONS:
-            return self._payload(
-                "error",
-                action=request.action,
-                message="Unsupported action. Use room-info, members, agents, threads, or state.",
-            )
-
-        resolved_room_id, room_error = resolve_requested_room_id(context, request.room_id)
+        resolved_room_id, room_error = resolve_requested_room_id(context, room_id)
         if room_error is not None or resolved_room_id is None:
-            return self._payload("error", action=request.action, message=room_error)
+            return self._payload("error", action=action, message=room_error)
         if not await room_access_allowed(context, resolved_room_id):
             return self._payload(
                 "error",
-                action=request.action,
+                action=action,
                 room_id=resolved_room_id,
                 message="Not authorized to access the target room.",
             )
@@ -641,13 +503,18 @@ class MatrixRoomTools(Toolkit):
         if (limit_error := self._check_rate_limit(context, resolved_room_id)) is not None:
             return self._payload(
                 "error",
-                action=request.action,
+                action=action,
                 room_id=resolved_room_id,
                 message=limit_error,
             )
 
         return await self._dispatch_action(
             context,
-            request=request,
-            resolved_room_id=resolved_room_id,
+            action=action,
+            room_id=resolved_room_id,
+            limit=limit,
+            event_type=event_type,
+            state_key=state_key,
+            page_token=page_token,
+            include_summaries=include_summaries,
         )

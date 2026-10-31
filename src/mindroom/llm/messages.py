@@ -18,7 +18,9 @@ from mindroom.llm.usage import MessageMetrics
 from mindroom.logging_config import get_logger
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
+
+    from mindroom.llm.provider import MediaKind
 
 logger = get_logger(__name__)
 
@@ -49,7 +51,7 @@ MODEL_PROVENANCE_KEY = "mindroom_model"
 
 @dataclass(frozen=True, slots=True)
 class ModelProvenance:
-    """The model that answered a message: its id and the metrics provider string usage rows and pricing key by."""
+    """The model that answered a message: its id and its route's provider name, which usage rows and prices key by."""
 
     model_id: str
     provider: str
@@ -58,7 +60,7 @@ class ModelProvenance:
 def model_provenance(model_id: str, provider: str) -> dict[str, Any]:
     """Return the provider data recording that ``model_id`` answered a message, under ``MODEL_PROVENANCE_KEY``.
 
-    ``provider`` is the metrics provider string (``ModelIdentity.provider_name``) that usage rows and pricing key by.
+    ``provider`` is the route's provider name (``ModelIdentity.provider``), which usage rows and prices key by.
     """
     return {MODEL_PROVENANCE_KEY: {"id": model_id, "provider": provider}}
 
@@ -300,6 +302,18 @@ def system_text(messages: Sequence[Message]) -> str:
     return "\n\n".join(system_texts(messages))
 
 
+def media_items(message: Message) -> Iterator[tuple[MediaKind, Image | Audio | Video | File]]:
+    """Yield each media item of ``message`` with its kind: its images, audio, videos, then files, each in their order."""
+    for image in message.images or ():
+        yield "image", image
+    for clip in message.audio or ():
+        yield "audio", clip
+    for video in message.videos or ():
+        yield "video", video
+    for file in message.files or ():
+        yield "file", file
+
+
 def with_joined_system(messages: Sequence[Message]) -> list[Message]:
     """Return ``messages`` with their system messages joined into one (``system_text``), in the first one's place.
 
@@ -366,6 +380,7 @@ __all__ = [
     "ModelProvenance",
     "ToolResultView",
     "is_own_model_message",
+    "media_items",
     "model_provenance",
     "read_model_provenance",
     "system_text",

@@ -1,10 +1,11 @@
 # Adapted from Agno (https://github.com/agno-agi/agno), Copyright 2025-2026 Agno Inc., Apache License 2.0; modified by MindRoom.
 """Agent runs and approval resumes over the model loop.
 
-A run assembles its messages, drives the loop, and ends in exactly one terminal record: ``COMPLETED`` or ``PAUSED``
-through ``RunFinished``, ``CANCELLED`` or ``ERROR`` through the exception that ended it. Each terminal record is
-handed to the persist callback once, before the run yields or raises its ending, so a caller that writes its own
-record for the same run afterwards always writes last.
+A run assembles its messages, drives the loop, and ends in exactly one terminal record. Its stream ends with
+``RunFinished`` carrying a ``COMPLETED``, ``PAUSED``, or ``ERROR`` record, and after an ``ERROR`` record raises the
+exception that ended the run; a cancelled run stores a ``CANCELLED`` record and its cancellation propagates. Each
+terminal record is handed to the persist callback once, before the run yields or raises its ending, so a caller that
+writes its own record for the same run afterwards always writes last.
 
 ``drive_run``, ``resumed_record``, and ``decide_requirements`` are the pieces an agent run and a resume are made of;
 the team runtime drives a team leader's record through the same pieces.
@@ -108,9 +109,9 @@ def run_agent(
     share with the team run while their records store none of it.
     The returned stream yields the loop's events and finally ``RunFinished`` with the ``COMPLETED`` or ``PAUSED``
     record, after ``persist`` stored it. Cancellation stores a ``CANCELLED`` record and re-raises; closing the stream
-    before it finished stores one before ``aclose`` returns; any other exception stores an ``ERROR`` record, then
-    re-raises. The ``ERROR`` record's ``content`` keeps what the model wrote, and its ``error`` holds the exception's
-    text with credentials redacted.
+    before it finished stores one before ``aclose`` returns; any other exception stores an ``ERROR`` record, ends the
+    stream with it as ``RunFinished``, then re-raises. The ``ERROR`` record's ``content`` keeps what the model wrote,
+    and its ``error`` holds the exception's text with credentials redacted.
     """
     record = RunRecord(
         **started_run_fields(ctx, spec.model, metadata=metadata),
@@ -259,13 +260,7 @@ def resumed_record[R: AnyRunRecord](paused: R) -> R:
     the model writes after the resume to it: a team leader or delegating parent reads both, while the reply the resume
     continues, which already shows the text written before the pause, adds only the rest (``new_handover_content``).
     The copy is deep, so no field it carries is shared with ``paused`` and a refused resume changes nothing; a team
-    record keeps its own copy of the member runs that ended before the pause. A tool entry that one of the copy's own
-    requirements waits on is that requirement's execution of the same call, so a decision recorded on a requirement
-    shows on the run's tools too. A team run also holds its members' requirements, whose call ids come from other
-    provider requests and may equal a leader call's id; those belong to the member's run and never replace the
-    leader's entries. A member record resumed on its own owns its requirements too: the team runtime names them with
-    that record's run id (``_plan_member_resumes``), so the ``member_run_id`` half of the check keeps the aliasing on
-    the member's tools.
+    record keeps its own copy of the member runs that ended before the pause and of its paused member runs.
     """
     if paused.status is not RunStatus.paused:
         msg = f"Only a paused run can be resumed; run {paused.run_id!r} is {paused.status.value}"
@@ -273,15 +268,8 @@ def resumed_record[R: AnyRunRecord](paused: R) -> R:
     record = deepcopy(replace(paused, messages=[]))
     record.carried_content = record.content
     record.status = RunStatus.running
-    record.requirements = record.requirements or []
     if record.metrics is None:
         record.metrics = RunMetrics()
-    by_call = {
-        requirement.tool_execution.tool_call_id: requirement.tool_execution
-        for requirement in record.requirements
-        if requirement.member_agent_id is None or requirement.member_run_id == paused.run_id
-    }
-    record.tools = [by_call.get(tool.tool_call_id) or tool for tool in record.tools or []]
     return record
 
 
@@ -292,14 +280,13 @@ def decide_requirements(
     denied: Mapping[str, str | None],
     external_results: Mapping[str, str],
 ) -> list[RunRequirement]:
-    """Apply the decisions to the calls the record waits for and return their requirements, in record order.
+    """Record the decisions on the calls the record waits for and return their requirements, in record order.
 
     Anything but exact coverage of the waiting calls is refused before any decision is recorded.
     """
-    requirements = {requirement.tool_execution.tool_call_id: requirement for requirement in record.requirements or ()}
-    waiting = [*(record.tools or ()), *(requirement.tool_execution for requirement in record.requirements or ())]
-    confirmations = {tool.tool_call_id for tool in waiting if tool.requires_confirmation}
-    externals = {tool.tool_call_id for tool in waiting if tool.external_execution_required}
+    requirements = {requirement.tool_execution.tool_call_id: requirement for requirement in record.requirements}
+    confirmations = {call_id for call_id, item in requirements.items() if item.tool_execution.requires_confirmation}
+    externals = {call_id for call_id, item in requirements.items() if item.tool_execution.external_execution_required}
     approved_ids = [call.tool_call_id for call in approved]
     decided = {*approved_ids, *denied}
     if (
@@ -307,13 +294,11 @@ def decide_requirements(
         or set(approved_ids) & set(denied)
         or decided != confirmations
         or set(external_results) != externals
-        or not (confirmations | externals) <= set(requirements)
     ):
         msg = f"Decisions do not cover exactly the calls run {record.run_id!r} waits for; retry the request"
         raise ValueError(msg)
     for call in approved:
-        requirement = requirements[call.tool_call_id]
-        tool = requirement.tool_execution
+        tool = requirements[call.tool_call_id].tool_execution
         if tool.tool_name != call.tool_name or not call.binds_arguments(tool.tool_args):
             msg = f"Approved call {call.tool_call_id!r} no longer matches the paused call; retry the request"
             raise ValueError(msg)
@@ -323,8 +308,7 @@ def decide_requirements(
         requirements[call_id].reject(note)
     for call_id, result in external_results.items():
         requirements[call_id].set_external_execution_result(result)
-    waited_for = confirmations | externals
-    return [requirement for call_id, requirement in requirements.items() if call_id in waited_for]
+    return list(requirements.values())
 
 
 async def drive_run[R: AnyRunRecord](
@@ -345,8 +329,8 @@ async def drive_run[R: AnyRunRecord](
     or team run the loop fills; ``entry`` is work the run does before the loop (a team resume's paused members), and
     ``resumed`` holds a resume's decided requirements, which the loop answers before its first request. The spec's
     toolkits that hold a connection for one run are connected before ``entry`` and closed after the run reports its
-    end, once the consumer reads past ``RunFinished`` or closes the stream; a run that fails or is cancelled closes
-    them once its record is stored.
+    end, once the consumer reads past ``RunFinished`` (into the failure, for a run that failed) or closes the stream;
+    a cancelled run closes them once its record is stored.
     """
     # The clock reading the run's duration counts from: a resume continues the paused run's duration, and however this
     # leg ends, once or again after a terminal store fails, its duration is the time since then.
@@ -385,6 +369,9 @@ async def drive_run[R: AnyRunRecord](
         raise
     except Exception as error:
         await _store_interrupted(record, messages, started, persist, error=error)
+        # A failed run's record ends its stream as a finished run's does, so a reader such as a delegated child's
+        # observer takes every record it can report from the stream; the failure follows on the next read.
+        yield RunFinished(record)
         raise
     else:
         # Reported before the toolkits close, so a consumer handles the finished run before a slow close, such as a
@@ -405,15 +392,13 @@ async def _store_interrupted[R: AnyRunRecord](
 ) -> None:
     """End a cancelled (``error`` None) or failed run and store it before its ending propagates.
 
-    Cancellation wins over a pause: unresolved requirements leave and paused tool entries stop waiting. A failed
-    run records its ``failure_text`` in ``error``, redacted, which is what its caller reports, and keeps in its content
-    what its model wrote. The store finishes even if the waiter is cancelled again, so a record the caller writes for
-    the same run afterwards is never overwritten by this one.
+    Cancellation wins over a pause: paused tool entries stop waiting. A failed run records its ``failure_text`` in
+    ``error``, redacted, which is what its caller reports, and keeps in its content what its model wrote. The store
+    finishes even if the waiter is cancelled again, so a record the caller writes for the same run afterwards is never
+    overwritten by this one.
     """
     if error is None:
         _end(record, messages, started, RunStatus.cancelled)
-        if record.requirements:
-            record.requirements = [requirement for requirement in record.requirements if requirement.is_resolved()]
         for tool in record.tools or ():
             if tool.is_paused:
                 tool.requires_confirmation = False
@@ -422,10 +407,8 @@ async def _store_interrupted[R: AnyRunRecord](
         _end(record, messages, started, RunStatus.error)
         record.error = redact_sensitive_text(failure_text(error))
     # A failed or cancelled approval resume stores this record over the paused run's row on purpose. Such a resume
-    # ends its approval anyway: its cards expire and the approval is finished. A row kept paused would hold back memory
-    # auto-flush and knowledge-graph ingestion, which wait on a paused run, until its approval window passes
-    # (``finished_runs`` in ``history/session_runs.py``), and approving it again would rerun a call this record shows
-    # already ran.
+    # ends its approval anyway: its cards expire and the approval is finished. A row kept paused would stay a turn
+    # waiting for approval, and approving it again would rerun a call this record shows already ran.
     if persist is not None:
         await run_coroutine_until_complete(_persist_quietly(persist, record))
 

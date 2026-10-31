@@ -16,7 +16,7 @@ from mindroom.config.main import Config
 from mindroom.config.models import BackgroundToolJobsConfig, DefaultsConfig, ModelConfig
 from mindroom.custom_tools.delegate import DelegateTools
 from mindroom.delegation import sessions
-from mindroom.delegation.recovery import resolve_subagent
+from mindroom.delegation.recovery import load_settled_subagent
 from mindroom.delegation.state import DelegationState
 from mindroom.llm.runs import RunStatus
 from mindroom.response_turn import PausedAttempt
@@ -74,7 +74,8 @@ async def test_followup_reuses_child_history_after_parent_reconstruction(  # noq
     )
     paths = _runtime_paths(tmp_path)
     entity_ids(config, paths)
-    identity = _identity()
+    # The reply answers through the leader's own account, as every bot-built context names it.
+    identity = replace(_identity(), transport_agent_name="leader")
     child = ScriptedModel(
         [
             answer("First answer: cobalt"),
@@ -91,7 +92,6 @@ async def test_followup_reuses_child_history_after_parent_reconstruction(  # noq
     async def invoke(name: str, **args: object) -> str:
         toolkit = DelegateTools(
             "leader",
-            ["leader"],
             paths,
             config,
             agent_workspace_root_path(paths.storage_root, "leader"),
@@ -129,9 +129,10 @@ async def test_followup_reuses_child_history_after_parent_reconstruction(  # noq
                     handle = json.loads(handle_path.read_text())
                     handle["child"]["status"] = "running"
                     handle_path.write_text(json.dumps(handle))
-                    restored = await resolve_subagent(
+                    restored = await load_settled_subagent(
                         str(paused_child.subagent_id),
-                        owner=identity,
+                        # A team member's subagent belongs to the member answering through the team.
+                        owner=replace(identity, transport_agent_name="squad") if execution == "team" else identity,
                         config=config,
                         runtime_paths=paths,
                         depth=0,
@@ -197,7 +198,6 @@ async def test_followup_reuses_child_history_after_parent_reconstruction(  # noq
     foreign_identity = replace(identity, session_id="another-parent-session")
     toolkit = DelegateTools(
         "leader",
-        ["leader"],
         paths,
         config,
         agent_workspace_root_path(paths.storage_root, "leader"),
@@ -205,11 +205,17 @@ async def test_followup_reuses_child_history_after_parent_reconstruction(  # noq
     )
     with tool_runtime_context(_delegate_runtime_context(config, paths, execution_identity=foreign_identity)):
         assert "not available" in await toolkit.continue_subagent(subagent_id=subagent_id, message="Leak the word")
-    config.agents["leader"].delegate_to = []
-    with tool_runtime_context(_delegate_runtime_context(config, paths, execution_identity=identity)):
+    # A reload revokes the leader's own grant; the toolkit its earlier build made still lists it.
+    reloaded = config.model_copy(deep=True)
+    reloaded.agents["leader"].delegate_to = []
+    # The subagent's caller asks again: the leader, inside the team answering through the team's account.
+    caller_context = replace(
+        _delegate_runtime_context(reloaded, paths, execution_identity=identity),
+        transport_agent_name="squad" if execution == "team" else None,
+    )
+    with tool_runtime_context(caller_context):
         toolkit = DelegateTools(
             "leader",
-            ["leader"],
             paths,
             config,
             agent_workspace_root_path(paths.storage_root, "leader"),
@@ -245,7 +251,6 @@ async def test_cancellation_during_direct_reservation_settles_claim(
     monkeypatch.setattr(sessions, "write_json_file_durable", blocked_write)
     toolkit = DelegateTools(
         "leader",
-        ["leader"],
         paths,
         config,
         agent_workspace_root_path(paths.storage_root, "leader"),

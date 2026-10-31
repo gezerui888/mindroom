@@ -43,7 +43,7 @@ from mindroom.egress_broker.oauth_source import broker_credential_context
 from mindroom.egress_broker.secrets import PERSONAL_WORKER_SCOPES, delete_secret, save_secret
 from mindroom.egress_broker.service import active_audit_log, active_ca_pem
 from mindroom.egress_broker.user_services import ServiceSource, service_source
-from mindroom.oauth.registry import load_oauth_providers_for_snapshot
+from mindroom.oauth.registry import snapshot_oauth_providers
 
 if TYPE_CHECKING:
     from mindroom.api.credentials_target import RequestCredentialsTarget
@@ -65,7 +65,9 @@ class _ServiceStatus(EgressSourceStatus):
     `source` is `config` for the administrator's services and `user` for services the selected scope defines for
     itself, which the panel shows read-only: they are edited on the personal egress page. `restrict_only` marks a
     service that only limits the paths of the other services on its hosts and never has a key or account.
-    `read_only_supported` says whether its account can be allowed read-only.
+    `read_only_supported` says whether its account can be allowed read-only. `admin_key` marks a service whose one key
+    serves every scope, which this panel sets whichever scope is selected, and `agents` lists the agents the service
+    serves (null for every agent); the panel lists it for the other agents too.
     """
 
     name: str
@@ -75,6 +77,8 @@ class _ServiceStatus(EgressSourceStatus):
     rules: list[EgressRuleSummary]
     restrict_only: bool
     read_only_supported: bool
+    admin_key: bool
+    agents: list[str] | None
 
 
 class ServicesResponse(BaseModel):
@@ -100,7 +104,7 @@ async def _load_service_statuses_for_target(
     target: RequestCredentialsTarget,
 ) -> list[_ServiceStatus]:
     """Build service status list for one target."""
-    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
+    config = config_lifecycle.last_good_runtime_config(request)
     if config is None:
         return []
 
@@ -118,11 +122,9 @@ async def _load_service_statuses_for_target(
             runtime_paths=target.runtime_paths,
             manager=target.base_manager,
             can_manage=True,
-            # The router's dependency has authenticated the request, so the dashboard's status helper can read it.
-            connection_status=lambda provider: oauth.authenticated_connection_status(
-                provider.id,
+            connection_status=lambda provider: oauth.connection_status(
                 request,
-                agent_name=target.agent_name,
+                oauth.dashboard_oauth_context(request, provider.id, agent_name=target.agent_name),
                 refresh=False,
             ),
             reuse_target=lambda provider: _oauth_reuse_target(request, target, worker_target, provider),
@@ -136,6 +138,8 @@ async def _load_service_statuses_for_target(
             rules=rule_summaries(service_config),
             restrict_only=service_config.restrict_only,
             read_only_supported=service_config.read_only is not None,
+            admin_key=service_config.admin_key,
+            agents=service_config.agents,
             **asdict(sources),
         )
 
@@ -152,7 +156,7 @@ def _resolve_scope_and_service(
     agent_name: str | None,
 ) -> tuple[RequestCredentialsTarget, ResolvedWorkerTarget | None, EgressService]:
     """Resolve the selected scope and the service, which must be one it uses: a config service or its own."""
-    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
+    config = config_lifecycle.last_good_runtime_config(request)
     if config is None:
         raise HTTPException(status_code=404, detail=f"Service '{name}' is not configured")
     target = resolve_request_credentials_target(request, agent_name=agent_name)
@@ -177,7 +181,7 @@ def _config_service_provider(
     """
     target = resolve_request_credentials_target(request, agent_name=agent_name)
     worker_target = worker_target_for_credentials_target(target)
-    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
+    config = config_lifecycle.last_good_runtime_config(request)
     service = config.egress_broker.services.get(name) if config is not None else None
     if service is None:
         raise HTTPException(404, "Service is not configured")
@@ -219,7 +223,7 @@ async def _set_service_account_reuse(
     Allowing takes `access`, which a service must offer (`require_access_offered`).
     """
     target, worker_target, provider = _config_service_provider(request, name, agent_name, connecting=False)
-    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
+    config = config_lifecycle.last_good_runtime_config(request)
     assert config is not None  # `_config_service_provider` found the service in it.
     if enabled:
         require_access_offered(config.egress_broker.services[name], access)
@@ -254,7 +258,7 @@ async def get_services(
     target = resolve_request_credentials_target(request, agent_name=agent_name)
 
     services = await _load_service_statuses_for_target(request, target)
-    config = config_lifecycle.bind_current_request_snapshot(request).runtime_config
+    config = config_lifecycle.last_good_runtime_config(request)
     scopes = (
         {name: egress_agent_scope(config, name, target.runtime_paths) for name in config.agents}
         if config is not None
@@ -272,7 +276,7 @@ async def get_services(
 @router.get("/presets", response_model=PresetsResponse)
 def get_presets(request: Request) -> PresetsResponse:
     """List the built-in service presets with the rules, login, and placeholders each one sets, and the providers."""
-    return presets_response(load_oauth_providers_for_snapshot(config_lifecycle.bind_current_request_snapshot(request)))
+    return presets_response(snapshot_oauth_providers(config_lifecycle.bind_current_request_snapshot(request)))
 
 
 @router.put("/services/{name}/secret", status_code=204)
@@ -282,7 +286,7 @@ def put_service_secret(
     body: PutSecretRequest,
     agent_name: Annotated[str | None, Query()] = None,
 ) -> None:
-    """Set an egress service secret.
+    """Set an egress service secret: the selected scope's, or an `admin_key` service's one key whatever the scope.
 
     Raises 404 if the service is neither configured nor one of the selected scope's own services, 422 if the
     secret is invalid or the service takes no key (`key_refusal`).
@@ -292,7 +296,7 @@ def put_service_secret(
         raise HTTPException(status_code=422, detail=refusal)
 
     try:
-        save_secret(target.base_manager, worker_target, name, body.secret)
+        save_secret(target.base_manager, worker_target, name, body.secret, admin_key=service.admin_key)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -303,9 +307,9 @@ def delete_service_secret(
     name: str,
     agent_name: Annotated[str | None, Query()] = None,
 ) -> None:
-    """Delete an egress service secret."""
-    target, worker_target, _service = _resolve_scope_and_service(request, name, agent_name)
-    delete_secret(target.base_manager, worker_target, name)
+    """Delete an egress service secret: the selected scope's, or an `admin_key` service's one key whatever the scope."""
+    target, worker_target, service = _resolve_scope_and_service(request, name, agent_name)
+    delete_secret(target.base_manager, worker_target, name, admin_key=service.admin_key)
 
 
 @router.post("/services/{name}/connect")
@@ -321,7 +325,7 @@ async def connect_service_account(
     broker never uses a requester's own account unless the service opts in.
     """
     *_scope, provider = _config_service_provider(request, name, agent_name, connecting=True)
-    return await oauth.connect(provider.id, request, agent_name=agent_name)
+    return await oauth.start_connect(request, provider.id, agent_name=agent_name)
 
 
 @router.post("/services/{name}/disconnect")
@@ -335,7 +339,7 @@ async def disconnect_service_account(
     Raises 404 like the connect route, and 409 where the scope's sandbox is shared by several requesters.
     """
     *_scope, provider = _config_service_provider(request, name, agent_name, connecting=False)
-    return await oauth.disconnect(provider.id, request, agent_name=agent_name)
+    return await oauth.reset_connection(request, provider.id, agent_name=agent_name)
 
 
 @router.put("/services/{name}/oauth-reuse", status_code=204)

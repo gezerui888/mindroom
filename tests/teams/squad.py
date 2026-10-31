@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any
 from mindroom.agent_loop.model_loop import EMPTY_REQUEST, NO_HOOKS
 from mindroom.agent_loop.spec import AgentSpec, RunContext, UnstoredSession
 from mindroom.config.main import Config
+from mindroom.constants import resolve_runtime_paths
 from mindroom.custom_tools.calculator import CalculatorTools
 from mindroom.event_journal.approval_calls import ApprovalCall, approval_arguments_digest
 from mindroom.llm.events import RunFinished
@@ -29,6 +30,8 @@ from mindroom.teams.members import BuiltTeam, ResolvedExactTeamMembers
 from mindroom.teams.runtime import TeamDecisions, continue_team, run_team
 from mindroom.teams.spec import MemberBuild, TeamMember, TeamMode, TeamSpec
 from mindroom.tool_system.agno_toolkits import adapt_toolkit
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.tool_function import ToolGate
 from tests.fakes.scripted_model import ScriptedModel
 from tests.run_record_helpers import PROVIDER
 from tests.session_storage.goldens import STORAGE, golden_stores
@@ -72,7 +75,7 @@ def pre_resume_runs(dump: str) -> dict[str, dict[str, Any]]:
 
 def scripted(model_id: str, *turns: list[Any]) -> ScriptedModel:
     """Return a scripted model with the capture's provider identity."""
-    return ScriptedModel(list(turns), identity=ModelIdentity(id=model_id, provider=PROVIDER, provider_name=PROVIDER))
+    return ScriptedModel(list(turns), identity=ModelIdentity(id=model_id, provider=PROVIDER))
 
 
 def calculator(*, gate_multiply: bool) -> AdaptedToolkit:
@@ -83,9 +86,7 @@ def calculator(*, gate_multiply: bool) -> AdaptedToolkit:
     return replace(
         adapted,
         functions=tuple(
-            replace(function, requires_confirmation=True, approval_type="mindroom_policy")
-            if function.name == "multiply"
-            else function
+            replace(function, gate=ToolGate.POLICY) if function.name == "multiply" else function
             for function in adapted.functions
         ),
     )
@@ -121,6 +122,7 @@ def resolved_members(display_names: Mapping[str, str], *, model_name: str = "def
         requested_agent_names=list(display_names),
         display_names=list(display_names.values()),
         model_names=dict.fromkeys(display_names, model_name),
+        plugins=config_plugins(Config(), resolve_runtime_paths(config_path=Path("config.yaml"), process_env={})),
         build=build,
     )
 
@@ -270,7 +272,7 @@ def resume_team(
 
     The members whose paused runs the resume continues are built first, as a saved approval's resume builds them.
     """
-    paused_members = {requirement.member_agent_id for requirement in paused.requirements or ()}
+    paused_members = {member.agent_id for member in paused.member_responses}
     for member in team.members:
         if member.id in paused_members and member.built is None:
             member.built = member.build()

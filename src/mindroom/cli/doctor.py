@@ -6,6 +6,7 @@ import asyncio
 import ipaddress
 import os
 import tempfile
+from collections import Counter
 from collections.abc import Mapping
 from functools import partial
 from pathlib import Path
@@ -19,7 +20,9 @@ from rich.markup import escape
 from mindroom import constants
 from mindroom.config.resolution import memory_backend
 from mindroom.constants import RuntimePaths, env_key_for_provider, runtime_env_values
-from mindroom.credentials.sync import get_secret_from_env, get_stored_provider_key, sync_env_to_credentials
+from mindroom.credentials.environment import get_secret_from_env
+from mindroom.credentials.manager import get_runtime_credentials_manager
+from mindroom.credentials.sync import provider_key_with_source
 from mindroom.embeddings.embedder_health import probe_embedder, semantic_embedder_configured
 from mindroom.embeddings.errors import EMBEDDER_UNREACHABLE_DETAIL
 from mindroom.embeddings.factory import resolve_embedder_settings
@@ -46,7 +49,13 @@ from mindroom.providers.ollama.settings import ollama_client_options
 from mindroom.runtime_env_policy import VERTEXAI_CLAUDE_ENV_BY_KEY
 from mindroom.startup_errors import PermanentStartupError
 
-from .config import activate_cli_runtime, console, load_config_quiet
+from .config import (
+    activate_cli_runtime,
+    automation_reference_issues,
+    console,
+    find_missing_env_variables,
+    load_config_quiet,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -75,15 +84,13 @@ def doctor(config_path: Path | None = None, storage_path: Path | None = None) ->
     config_path = runtime_paths.config_path
     console.print(f"[dim]Config directory: {runtime_paths.config_dir}[/dim]")
 
-    # Resolve credentials the way `mindroom run` will: seed/update env-backed
-    # services (EMBEDDER_API_KEY, provider keys, ...) into the shared store so
-    # preflight probes validate the keys the runtime will actually use.
+    # Open the credential store before the checks so a failure to open it is reported once, here.
     # Credential-store failures must not abort the remaining diagnostics, but
     # they are counted because the general storage check may target another path.
     try:
-        sync_env_to_credentials(runtime_paths=runtime_paths)
+        get_runtime_credentials_manager(runtime_paths)
     except (OSError, ValueError) as exc:
-        console.print(f"[yellow]![/yellow] Could not sync env credentials into the store ({exc})")
+        console.print(f"[yellow]![/yellow] Could not open the credential store ({exc})")
         add((0, 0, 1))
 
     # 1. Config file exists
@@ -120,13 +127,19 @@ def doctor(config_path: Path | None = None, storage_path: Path | None = None) ->
 
 
 def _check_e2ee_stores(runtime_paths: RuntimePaths) -> tuple[int, int, int]:
-    """Check persisted Matrix devices have their encryption stores on disk."""
-    from mindroom.matrix.client_session import olm_store_exists  # noqa: PLC0415
-    from mindroom.matrix.state import MatrixState  # noqa: PLC0415
+    """Check bots' persisted Matrix devices have their encryption stores on disk.
 
-    state = MatrixState.load(runtime_paths=runtime_paths)
+    The internal user joins rooms through an HTTP-only client, so its device never has a store.
+    """
+    from mindroom.matrix.client_session import olm_store_exists  # noqa: PLC0415
+    from mindroom.matrix.state import matrix_state_for_runtime  # noqa: PLC0415
+    from mindroom.matrix.users import INTERNAL_USER_ACCOUNT_KEY  # noqa: PLC0415
+
+    state = matrix_state_for_runtime(runtime_paths)
     accounts_with_devices = [
-        (key, account) for key, account in state.accounts.items() if account.device_id and account.domain
+        (key, account)
+        for key, account in state.accounts.items()
+        if key != INTERNAL_USER_ACCOUNT_KEY and account.device_id and account.domain
     ]
     if not accounts_with_devices:
         console.print("[green]✓[/green] Encryption stores: no persisted Matrix devices yet")
@@ -146,7 +159,7 @@ def _check_e2ee_stores(runtime_paths: RuntimePaths) -> tuple[int, int, int]:
         console.print(
             f"[yellow]⚠[/yellow] Encryption store missing for {key} "
             f"(@{account.username}:{account.domain}, device {account.device_id}); "
-            "MindRoom will log in as a fresh device on next start and old encrypted messages stay unreadable",
+            "that bot does not start until its store is restored from a backup",
         )
     return 0, 0, len(missing)
 
@@ -170,7 +183,11 @@ def _check_config_exists(config_path: Path) -> tuple[int, int, int]:
 
 
 def _check_config_valid(runtime_paths: RuntimePaths) -> tuple[Config | None, int, int, int]:
-    """Validate config file. Returns (config_or_none, passed, failed, warnings)."""
+    """Validate the config file. Returns (config, passed, failed, warnings).
+
+    The config is None when it does not load. A config with bad automation references still comes back, with one
+    failure, so the remaining checks run against it.
+    """
     try:
         config = load_config_quiet(runtime_paths=runtime_paths)
     except CONFIG_LOAD_USER_ERROR_TYPES as exc:
@@ -178,6 +195,10 @@ def _check_config_valid(runtime_paths: RuntimePaths) -> tuple[Config | None, int
         # A message can quote a config key, which may contain brackets Rich reads as markup.
         console.print(f"[red]✗[/red] Config invalid: {escape(issues)}")
         return None, 0, 1, 0
+    if reference_issues := automation_reference_issues(config, runtime_paths):
+        # The config loads, so the remaining checks still run against it.
+        console.print(f"[red]✗[/red] Config invalid: {escape('; '.join(reference_issues))}")
+        return config, 0, 1, 0
     agents = len(config.agents)
     teams = len(config.teams)
     models = len(config.models)
@@ -206,17 +227,15 @@ def _models_reading_shared_key(config: Config, env_key: str, runtime_paths: Runt
 def _shared_key(provider: str, env_key: str, runtime_paths: RuntimePaths) -> tuple[str | None, str]:
     """Return the shared key the runtime reads for ``provider``, if any, and the name doctor reports it by.
 
-    The runtime reads it from the credential store, which doctor's startup import fills from the environment. The name
-    is the variable the import copies the key from, which may be a credential seed's, or says that the key was saved in
-    the dashboard or imported by an earlier start. Without the store, doctor reads ``env_key`` itself.
+    The runtime reads it from the credential store, where a key saved in the dashboard wins over the environment. The
+    name is the variable that supplies the key, which may be a credential seed's, or says that the key was saved in the
+    dashboard. Without the store, doctor reads ``env_key`` itself.
     """
     try:
-        key = get_stored_provider_key(provider, runtime_paths)
+        api_key, variable = provider_key_with_source(provider, runtime_paths)
     except (OSError, ValueError):
         return get_secret_from_env(env_key, runtime_paths=runtime_paths), env_key
-    if not key.imported:
-        return key.api_key, "key saved in the dashboard"
-    return key.api_key, key.import_variable or "key imported earlier from the environment"
+    return api_key, variable or "key saved in the dashboard"
 
 
 def _endpoint_settings(value: object, path: str) -> list[str]:
@@ -503,24 +522,21 @@ def _check_ollama_models(config: Config, runtime_paths: RuntimePaths) -> tuple[i
 
 def _check_providers(config: Config, runtime_paths: RuntimePaths) -> tuple[int, int, int]:
     """Print the providers by route and validate their API keys. Returns (passed, failed, warnings)."""
-    provider_models: dict[str, list[str]] = {}
-    for name, model in config.models.items():
-        provider_models.setdefault(provider_route(model.provider), []).append(name)
-
+    provider_models = Counter(provider_route(model.provider) for model in config.models.values())
     if not provider_models:
         return 0, 0, 0
 
-    # Print provider summary
-    parts = []
-    for provider in sorted(provider_models):
-        n = len(provider_models[provider])
-        parts.append(f"{provider} ({n} model{'s' if n != 1 else ''})")
+    parts = [f"{provider} ({n} model{'s' if n != 1 else ''})" for provider, n in sorted(provider_models.items())]
     console.print(f"  Providers: {', '.join(parts)}")
+
+    # A variable a model reads but nothing sets is reported once, as `config validate` reports it.
+    missing = find_missing_env_variables(config, runtime_paths)
+    for variable in missing:
+        console.print(f"[yellow]![/yellow] {variable.message}")
 
     passed = 0
     failed = 0
-    warnings = 0
-
+    warnings = len(missing)
     for provider in sorted(provider_models):
         p, f, w = _check_single_provider(provider, config, runtime_paths)
         passed += p
@@ -589,22 +605,21 @@ def _check_shared_key(provider: str, env_key: str, config: Config, runtime_paths
     not checked, and checks the key unless every model that reads it was skipped. A provider without a key check is
     never probed, so it gets one "no key check" warning whatever its settings.
     """
-    # Models with their own credential never read the shared key.
-    shared_key_models = _models_reading_shared_key(config, env_key, runtime_paths)
     api_key, key_name = _shared_key(provider, env_key, runtime_paths)
     if not api_key:
-        if shared_key_models:
-            console.print(f"[yellow]![/yellow] {provider}: {env_key} not set")
-        return 0, 0, int(bool(shared_key_models))
+        # `_check_providers` already warned about the missing variable.
+        return 0, 0, 0
+    # Models with their own credential never read the shared key.
+    shared_key_models = _models_reading_shared_key(config, env_key, runtime_paths)
     if _report_key_not_checked(provider, provider, key_name, _endpoint_variables(env_key, runtime_paths)):
         return 0, 0, 1
-    skipped: list[str] = []
+    skipped = 0
     for name, model in shared_key_models.items():
         settings = _endpoint_settings({"host": model.host, "extra_kwargs": model.extra_kwargs}, f"models.{name}")
         if _report_key_not_checked(provider, provider, key_name, settings):
-            skipped.append(name)
-    if shared_key_models and len(skipped) == len(shared_key_models):
-        return 0, 0, len(skipped)
+            skipped += 1
+    if shared_key_models and skipped == len(shared_key_models):
+        return 0, 0, skipped
     valid, detail = _validate_provider_key(provider, api_key)
     passed, failed, warnings = _print_validation(
         valid,
@@ -613,7 +628,7 @@ def _check_shared_key(provider: str, env_key: str, config: Config, runtime_paths
         f"{provider}: {key_name} invalid",
         f"{provider}: could not validate {key_name}",
     )
-    return passed, failed, warnings + len(skipped)
+    return passed, failed, warnings + skipped
 
 
 def _check_memory_config(config: Config, runtime_paths: RuntimePaths) -> tuple[int, int, int]:

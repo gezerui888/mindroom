@@ -36,7 +36,6 @@ from tests.test_docker_worker_backend import _spec as _docker_spec
 from tests.test_kubernetes_worker_backend import (
     _answer_worker_health,
     _materialize_private_workspace,
-    _test_agent_vault_config,
 )
 from tests.test_kubernetes_worker_backend import _backend as _kubernetes_test_backend
 from tests.test_kubernetes_worker_backend import _spec as _kubernetes_spec
@@ -148,20 +147,18 @@ def _manifest_text(storage_root: Path, worker_key: str) -> object:
 
 _KUBERNETES_CASES = {
     "shared_with_knowledge": {"worker_key": _SHARED_KEY},
-    "shared_with_agent_vault": {"worker_key": _SHARED_KEY, "agent_vault": True},
     "user": {"worker_key": _USER_KEY},
     "user_agent_private": {"worker_key": _USER_AGENT_KEY, "private": True},
     "unscoped": {"worker_key": _UNSCOPED_KEY},
-    "script_scoped_with_agent_vault": {
+    "script_scoped": {
         "worker_key": _SCRIPT_KEY,
         "state_scope_worker_key": _USER_AGENT_KEY,
         "private": True,
-        "agent_vault": True,
     },
 }
 
 
-def _kubernetes_backend(tmp_path: Path, *, agent_vault: bool) -> KubernetesWorkerBackend:
+def _kubernetes_backend(tmp_path: Path) -> KubernetesWorkerBackend:
     config_path = _write_config(tmp_path)
     storage_root = tmp_path / "storage"
     applied_config = load_config(resolve_primary_runtime_paths(config_path=config_path, storage_path=storage_root))
@@ -174,7 +171,6 @@ def _kubernetes_backend(tmp_path: Path, *, agent_vault: bool) -> KubernetesWorke
         runtime_paths=runtime_paths,
         applied_config=applied_config,
         extra_env=dict(_EXTRA_ENV),
-        agent_vault=_test_agent_vault_config(worker_ca_configmap_name="agent-vault-ca") if agent_vault else None,
     )
     return backend
 
@@ -184,7 +180,7 @@ def test_kubernetes_worker_deployment_matches_its_golden(tmp_path: Path, case: s
     """The Deployment body, its readiness patch, and the startup manifest of each worker kind are unchanged."""
     options = _KUBERNETES_CASES[case]
     worker_key = str(options["worker_key"])
-    backend = _kubernetes_backend(tmp_path, agent_vault=bool(options.get("agent_vault")))
+    backend = _kubernetes_backend(tmp_path)
     apps_api = backend._resources.apps_api
     if options.get("private"):
         _materialize_private_workspace(backend.storage_root, _USER_AGENT_KEY, "@alice:example.org")
@@ -211,7 +207,7 @@ def test_kubernetes_worker_deployment_matches_its_golden(tmp_path: Path, case: s
 
 def test_kubernetes_worker_lifecycle_annotations_match_their_golden(tmp_path: Path) -> None:
     """Cold start, a warm re-check, a cached touch, and a stale-protocol replacement write the same annotations."""
-    backend = _kubernetes_backend(tmp_path, agent_vault=False)
+    backend = _kubernetes_backend(tmp_path)
     apps_api = backend._resources.apps_api
     spec = _kubernetes_spec(_SHARED_KEY)
 
@@ -265,7 +261,7 @@ def _docker_backend_for(
         tmp_path,
         config_text=config_path.read_text(encoding="utf-8"),
         runtime_paths=runtime_paths,
-        storage_path=storage_root,
+        storage_root=storage_root,
         host_config_path=config_path,
     )
     config = replace(base_backend.config, extra_env=dict(_EXTRA_ENV))
@@ -274,14 +270,10 @@ def _docker_backend_for(
     backend = _docker_backend(
         config=config,
         auth_token=base_backend.auth_token,
-        storage_path=storage_root,
+        storage_root=storage_root,
         runtime_paths=runtime_paths,
     )
-    monkeypatch.setattr(
-        backend,
-        "_wait_for_ready",
-        lambda container: f"http://127.0.0.1:{backend._container_host_port(container)}/api/sandbox-runner/execute",
-    )
+    monkeypatch.setattr(backend, "_wait_for_ready", lambda _container, **_kwargs: None)
     return backend, fake_client
 
 
@@ -314,8 +306,12 @@ def test_docker_worker_run_arguments_match_their_golden(
     environment[token_name] = "<WORKER_TOKEN>"
     # Docker sets the environment as a mapping, so its order carries no meaning.
     run_call["environment"] = dict(sorted(environment.items()))
+    manifest_path = sandbox_startup_manifest_path(Path(str(handle.debug_metadata["state_root"])))
     labels = dict(run_call["labels"])
     labels["mindroom.ai/launch-config-hash"] = "<LAUNCH_CONFIG_HASH>"
+    # The manifest the worker boots from is pinned below, so the label pins only that it names that manifest.
+    assert labels["mindroom.ai/startup-manifest-hash"] == hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    labels["mindroom.ai/startup-manifest-hash"] = "<STARTUP_MANIFEST_HASH>"
     run_call["labels"] = labels
     # The seccomp profile is long and owned by its own tests, so the golden pins its digest.
     if "security_opt" in run_call:
@@ -329,7 +325,6 @@ def test_docker_worker_run_arguments_match_their_golden(
     run_call["volumes"] = [
         re.sub(r"config-projection-[0-9a-f]+", "config-projection-<DIGEST>", volume) for volume in run_call["volumes"]
     ]
-    manifest_path = sandbox_startup_manifest_path(Path(str(handle.debug_metadata["state_root"])))
     _assert_matches_golden(
         f"docker_{case}",
         _normalized(

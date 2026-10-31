@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 from contextlib import nullcontext, suppress
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
@@ -19,6 +20,7 @@ from mindroom.api import computers
 from mindroom.config.main import Config
 from mindroom.tool_system.media_transport import encode_media_result
 from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_routing import parse_tool_execution_identity_payload
 from mindroom.workers.backend import WorkerBackendError
@@ -152,9 +154,9 @@ async def test_background_shell_leaves_a_process_running_after_the_call_returns(
         runs_in_worker=False,
         worker_target=None,
         tool_init_overrides={"base_dir": str(tmp_path)},
+        tools=builtin_tool_registry(),
     )
-    entrypoint = toolkit.async_functions["run_shell_command"].entrypoint
-    assert entrypoint is not None
+    entrypoint = toolkit.functions["run_shell_command"]
 
     async def execute(tool: str, function: str, kwargs: dict[str, object], *, user: str | None = None) -> dict:
         assert (tool, function, user) == ("shell", "run_shell_command", None)
@@ -278,7 +280,11 @@ async def test_acceptance_reconciles_config_before_browser_continuity(
     )
     fixture = object.__new__(module.Fixture)
     fixture.config = Config.model_validate(yaml.safe_load(config_text))
-    fixture.paths = backend._runtime_paths
+    # The live fixture selects the Docker backend whose manager the patched lease returns.
+    fixture.paths = replace(
+        backend._runtime_paths,
+        process_env={**backend._runtime_paths.process_env, "MINDROOM_WORKER_BACKEND": "docker"},
+    )
     fixture.viewer = "@alice:example.org"
     fixture.room = "!room:example.org"
     fixture.agent = "@writer:example.org"

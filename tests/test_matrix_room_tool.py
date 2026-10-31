@@ -11,18 +11,21 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 import nio
 import pytest
 from aiohttp import ClientError
+from pydantic import ValidationError
 
 import mindroom.tools  # noqa: F401
 from mindroom.agent_reply_membership import AgentReplyMembershipIndex
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.custom_tools.matrix_room import MatrixRoomTools
-from mindroom.matrix.client import RoomThreadsPageError
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
+from mindroom.matrix.room_history_reads import RoomThreadsPageError
 from mindroom.message_target import MessageTarget
-from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
+from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from tests.access_schema_support import membership_config
+from tests.agent_tool_helpers import toolkit_offers
 from tests.authorization_helpers import (
     make_test_tool_runtime_context,
 )
@@ -76,22 +79,14 @@ def _make_context(
     )
 
 
-def _make_cached_room(
-    room_id: str = "!room:localhost",
-    *,
-    name: str = "Test Room",
-    topic: str = "A test room",
-    encrypted: bool = False,
-    member_count: int = 3,
-    join_rule: str = "invite",
-) -> MagicMock:
+def _make_cached_room(room_id: str = "!room:localhost") -> MagicMock:
     room = MagicMock(spec=nio.MatrixRoom)
     room.room_id = room_id
-    room.name = name
-    room.topic = topic
-    room.encrypted = encrypted
-    room.member_count = member_count
-    room.join_rule = join_rule
+    room.name = "Test Room"
+    room.topic = "A test room"
+    room.encrypted = False
+    room.member_count = 3
+    room.join_rule = "invite"
     room.canonical_alias = "#test:localhost"
     room.room_version = "10"
     room.guest_access = "forbidden"
@@ -117,17 +112,16 @@ def test_matrix_room_tool_registered_and_instantiates() -> None:
         Config(agents={"general": AgentConfig(display_name="General Agent")}),
         test_runtime_paths(Path(tempfile.mkdtemp())),
     )
-    assert "matrix_room" in TOOL_METADATA
+    assert "matrix_room" in builtin_tool_registry()
     assert isinstance(
-        get_tool_by_name("matrix_room", runtime_paths_for(config), worker_target=None),
+        get_tool_by_name("matrix_room", runtime_paths_for(config), worker_target=None, tools=builtin_tool_registry()),
         MatrixRoomTools,
     )
 
 
 def test_matrix_room_schema_exposes_supported_actions() -> None:
     """Agents must receive the allowed actions as a schema enum, not an unrestricted string."""
-    function = MatrixRoomTools().async_functions["matrix_room"]
-    function.process_entrypoint(strict=False)
+    function = toolkit_offers(MatrixRoomTools(), "matrix_room")
     assert function.parameters["properties"]["action"]["enum"] == [
         "room-info",
         "members",
@@ -149,46 +143,29 @@ async def test_matrix_room_requires_runtime_context() -> None:
     assert "context" in payload["message"]
 
 
-# --- Unknown action ---
-
-
-@pytest.mark.asyncio
-async def test_matrix_room_rejects_unsupported_action() -> None:
-    """Unsupported actions should return a clear validation error."""
-    tool = MatrixRoomTools()
-    ctx = _make_context()
-    with tool_runtime_context(ctx):
-        payload = json.loads(await tool.matrix_room(action="delete"))
-    assert payload["status"] == "error"
-    assert payload["action"] == "delete"
-    assert "Unsupported action" in payload["message"]
+# --- Argument validation ---
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("kwargs", "expected_action", "expected_message"),
+    "kwargs",
     [
-        ({"action": None}, "invalid", "action must be a string"),
-        ({"action": "threads", "limit": "3"}, "threads", "limit must be an integer"),
-        ({"action": "room-info", "room_id": 123}, "room-info", "room_id must be a string"),
-        ({"action": "threads", "include_summaries": "yes"}, "threads", "include_summaries must be a boolean"),
+        {"action": "delete"},
+        {"action": None},
+        {"action": "threads", "limit": "many"},
+        {"action": "room-info", "room_id": 123},
+        {"action": "threads", "include_summaries": "maybe"},
     ],
 )
-async def test_matrix_room_rejects_malformed_arguments(
-    kwargs: dict[str, object],
-    expected_action: str,
-    expected_message: str,
-) -> None:
-    """Malformed arguments should return structured validation errors."""
-    tool = MatrixRoomTools()
+async def test_matrix_room_rejects_malformed_arguments(kwargs: dict[str, object]) -> None:
+    """Arguments that disagree with the signature fail call validation before the tool body runs."""
+    entrypoint = toolkit_offers(MatrixRoomTools(), "matrix_room").entrypoint
     ctx = _make_context()
 
-    with tool_runtime_context(ctx):
-        payload = json.loads(await tool.matrix_room(**kwargs))
+    with tool_runtime_context(ctx), pytest.raises(ValidationError):
+        await entrypoint(**kwargs)
 
-    assert payload["status"] == "error"
-    assert payload["action"] == expected_action
-    assert expected_message in payload["message"]
+    ctx.client.room_get_state_event.assert_not_called()
 
 
 # --- Authorization ---
@@ -754,13 +731,6 @@ async def test_threads_respects_limit() -> None:
     assert payload["next_token"] == _NEXT_BATCH_PAGE_TOKEN
 
 
-def test_threads_max_limit_enforced() -> None:
-    """Threads should enforce max limit of 50."""
-    assert MatrixRoomTools._thread_limit(999) == 50
-    assert MatrixRoomTools._thread_limit(None) == 20
-    assert MatrixRoomTools._thread_limit(0) == 1
-
-
 @pytest.mark.asyncio
 async def test_threads_encrypted_event_preview() -> None:
     """Threads should show [encrypted] for MegolmEvent thread roots."""
@@ -780,33 +750,55 @@ async def test_threads_encrypted_event_preview() -> None:
 
 
 @pytest.mark.asyncio
-async def test_threads_malformed_thread_metadata_falls_back_to_zero_reply_count() -> None:
-    """Malformed m.thread metadata should not crash thread serialization."""
+@pytest.mark.parametrize(
+    "unsigned",
+    [
+        [],
+        {"m.relations": []},
+        {"m.relations": {"m.thread": "malformed"}},
+        {"m.relations": {"m.thread": {"count": True, "latest_event": "malformed"}}},
+        {"m.relations": {"m.thread": {"count": "3", "latest_event": {"origin_server_ts": True}}}},
+    ],
+)
+async def test_threads_malformed_thread_metadata_falls_back_to_zero_reply_count(unsigned: object) -> None:
+    """Malformed m.thread metadata at any level should not crash thread serialization."""
     tool = MatrixRoomTools()
     ctx = _make_context()
 
     event = _thread_event("$thread1", body="Thread root")
-    event.source["unsigned"] = {"m.relations": {"m.thread": []}}
+    event.source["unsigned"] = unsigned
 
     with tool_runtime_context(ctx), patch(_MOCK_TARGET, return_value=([event], None)):
         payload = json.loads(await tool.matrix_room(action="threads"))
 
     assert payload["status"] == "ok"
     assert payload["threads"][0]["reply_count"] == 0
+    assert "latest_activity_ts" not in payload["threads"][0]
 
 
 @pytest.mark.asyncio
-async def test_threads_pagination_token_passthrough() -> None:
-    """page_token should be forwarded to get_room_threads_page."""
+@pytest.mark.parametrize(
+    ("page_token", "expected_page_token"),
+    [
+        (None, None),
+        (_THREAD_PAGE_TOKEN, _THREAD_PAGE_TOKEN),
+        (f"  {_THREAD_PAGE_TOKEN}  ", _THREAD_PAGE_TOKEN),
+        ("   ", None),
+    ],
+)
+async def test_threads_page_token_is_forwarded_stripped(
+    page_token: str | None,
+    expected_page_token: str | None,
+) -> None:
+    """page_token reaches get_room_threads_page stripped; an omitted or blank one starts from the first page."""
     tool = MatrixRoomTools()
     ctx = _make_context()
 
     with tool_runtime_context(ctx), patch(_MOCK_TARGET, return_value=([], None)) as mock:
-        payload = json.loads(await tool.matrix_room(action="threads", page_token=_THREAD_PAGE_TOKEN))
+        payload = json.loads(await tool.matrix_room(action="threads", page_token=page_token))
 
-    mock.assert_awaited_once_with(ctx.client, "!room:localhost", limit=20, page_token=_THREAD_PAGE_TOKEN)
+    mock.assert_awaited_once_with(ctx.client, "!room:localhost", limit=20, page_token=expected_page_token)
     assert payload["status"] == "ok"
-    assert payload["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -821,23 +813,6 @@ async def test_threads_empty_room() -> None:
     assert payload["status"] == "ok"
     assert payload["count"] == 0
     assert payload["threads"] == []
-    assert payload["next_token"] is None
-    assert payload["has_more"] is False
-
-
-@pytest.mark.asyncio
-async def test_threads_last_page() -> None:
-    """Last page should have next_token=None and has_more=False."""
-    tool = MatrixRoomTools()
-    ctx = _make_context()
-
-    e1 = _thread_event("$last", body="Last thread")
-
-    with tool_runtime_context(ctx), patch(_MOCK_TARGET, return_value=([e1], None)):
-        payload = json.loads(await tool.matrix_room(action="threads"))
-
-    assert payload["status"] == "ok"
-    assert payload["count"] == 1
     assert payload["next_token"] is None
     assert payload["has_more"] is False
 
@@ -882,27 +857,16 @@ async def test_threads_error_with_retry() -> None:
 
 
 @pytest.mark.asyncio
-async def test_threads_limit_clamping_end_to_end() -> None:
-    """Limit of 999 should be clamped to 50 before reaching get_room_threads_page."""
+@pytest.mark.parametrize(("limit", "expected_limit"), [(None, 20), (0, 1), (999, 50)])
+async def test_threads_limit_clamping_end_to_end(limit: int | None, expected_limit: int) -> None:
+    """The thread limit defaults to 20 and is clamped to [1, 50] before reaching get_room_threads_page."""
     tool = MatrixRoomTools()
     ctx = _make_context()
 
     with tool_runtime_context(ctx), patch(_MOCK_TARGET, return_value=([], None)) as mock:
-        await tool.matrix_room(action="threads", limit=999)
+        await tool.matrix_room(action="threads", limit=limit)
 
-    mock.assert_awaited_once_with(ctx.client, "!room:localhost", limit=50, page_token=None)
-
-
-@pytest.mark.asyncio
-async def test_threads_first_page_forwards_none_token() -> None:
-    """First-page requests should explicitly forward page_token=None."""
-    tool = MatrixRoomTools()
-    ctx = _make_context()
-
-    with tool_runtime_context(ctx), patch(_MOCK_TARGET, return_value=([], None)) as mock:
-        await tool.matrix_room(action="threads")
-
-    mock.assert_awaited_once_with(ctx.client, "!room:localhost", limit=20, page_token=None)
+    mock.assert_awaited_once_with(ctx.client, "!room:localhost", limit=expected_limit, page_token=None)
 
 
 # --- state ---
@@ -954,6 +918,40 @@ async def test_state_specific_event_with_state_key() -> None:
         "m.room.member",
         "@alice:localhost",
     )
+
+
+@pytest.mark.asyncio
+async def test_state_strips_event_type_and_state_key() -> None:
+    """Padded event_type and state_key are stripped before the state lookup."""
+    tool = MatrixRoomTools()
+    ctx = _make_context()
+    state_resp = MagicMock(spec=nio.RoomGetStateEventResponse)
+    state_resp.content = {"name": "Room"}
+    ctx.client.room_get_state_event = AsyncMock(return_value=state_resp)
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await tool.matrix_room(action="state", event_type=" m.room.name ", state_key="  "))
+
+    assert payload["status"] == "ok"
+    assert payload["state_key"] == ""
+    ctx.client.room_get_state_event.assert_awaited_once_with("!room:localhost", "m.room.name", "")
+
+
+@pytest.mark.asyncio
+async def test_state_blank_event_type_reads_whole_room_state() -> None:
+    """A blank event_type reads the room state summary instead of one state event."""
+    tool = MatrixRoomTools()
+    ctx = _make_context()
+    state_resp = MagicMock(spec=nio.RoomGetStateResponse)
+    state_resp.events = []
+    ctx.client.room_get_state = AsyncMock(return_value=state_resp)
+
+    with tool_runtime_context(ctx):
+        payload = json.loads(await tool.matrix_room(action="state", event_type="   "))
+
+    assert payload["status"] == "ok"
+    ctx.client.room_get_state.assert_awaited_once_with("!room:localhost")
+    ctx.client.room_get_state_event.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1063,23 +1061,6 @@ async def test_state_full_dump_transport_error_returns_structured_error() -> Non
 
 
 # --- Default room_id ---
-
-
-@pytest.mark.asyncio
-async def test_matrix_room_defaults_to_context_room() -> None:
-    """Actions should default room_id to the context room."""
-    tool = MatrixRoomTools()
-    ctx = _make_context()
-    cached_room = _make_cached_room()
-    ctx.client.rooms = {"!room:localhost": cached_room}
-    create_resp = MagicMock(spec=nio.RoomGetStateEventResponse)
-    create_resp.content = {"creator": "@admin:localhost"}
-    ctx.client.room_get_state_event = AsyncMock(return_value=create_resp)
-
-    with tool_runtime_context(ctx):
-        payload = json.loads(await tool.matrix_room(action="room-info"))
-
-    assert payload["room_id"] == "!room:localhost"
 
 
 # --- Implied tool auto-include ---
@@ -1409,8 +1390,7 @@ def _human_pin_context(tmp_path: Path, *, sender: str, room_cached: bool) -> Too
         room=None,
         agent_reply_memberships=AgentReplyMembershipIndex(),
     )
-    notice = _summary_notice("$human", "Human title", 3000, model="manual", pinned=True)
-    notice.sender = sender
+    notice = _summary_notice("$human", "Human title", 3000, model="manual", pinned=True, sender=sender)
     history = [_thread_message("$thread1", "Thread root", 1000), notice]
     serve_conversation_reader(ctx.conversation_reader, history, room_id="!room:x", thread_id="$thread1")
     return ctx

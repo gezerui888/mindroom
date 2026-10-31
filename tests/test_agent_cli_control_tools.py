@@ -33,9 +33,8 @@ from mindroom.custom_tools.memory import MemoryTools
 from mindroom.delegation.state import DelegationState
 from mindroom.interactive import parse_and_format_interactive
 from mindroom.llm.events import ReportedCall, ToolCallOrigin
-from mindroom.llm.runs import RunRecord, RunStatus
+from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus
 from mindroom.mcp.manager import MCPServerManager
-from mindroom.mcp.registry import sync_mcp_tool_registry
 from mindroom.mcp.toolkit import bind_mcp_server_manager
 from mindroom.memory import search_agent_memories
 from mindroom.prompts import INTERACTIVE_QUESTION_PROMPT
@@ -48,18 +47,20 @@ from mindroom.response_turn import (
 from mindroom.run_storage import RunStorage
 from mindroom.session_storage.agent_storage import create_agent_state_storage, create_session_storage
 from mindroom.tool_system.agent_tool_calls import AgentToolCallWaiting, DeferredAgentToolkit, execute_agent_tool_call
-from mindroom.tool_system.agno_toolkits import adapt_function, adapt_toolkit
+from mindroom.tool_system.agno_toolkits import adapt_toolkit
 from mindroom.tool_system.events import CollectedStreamPresentation
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.output_files import ToolOutputFilePolicy
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, tool_runtime_context
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.skills import Skill, SkillsToolkit
 from mindroom.tool_system.tool_access import ToolKey
-from mindroom.tool_system.tool_function import AdaptedToolkit
+from mindroom.tool_system.tool_function import AdaptedToolkit, ToolGate
 from mindroom.tool_system.worker_routing import agent_workspace_root_path
 from mindroom.turn_continuation import continuation_decision_from_tools
 from tests.access_schema_support import with_responder_access
-from tests.approval_continuation_helpers import approval_continuation
+from tests.agent_tool_helpers import offered_agno_function
+from tests.approval_continuation_helpers import answered_calls, approval_continuation
 from tests.conftest import bind_runtime_paths, live_turn_tools_for_test, seed_session_row
 from tests.delegation_helpers import ScriptedAgents, _delegate_runtime_context, _runtime_paths, registered_report_tool
 from tests.fakes.scripted_model import ScriptedModel, answer, calls, tool_call
@@ -87,21 +88,27 @@ def _owner(catalog, **options) -> LiveTurnTools:
         return None
 
     return live_turn_tools_for_test(
-        CliTurnOwner(build_execution_identity_from_runtime_context(catalog.runtime_context), "turn", "run"),
+        CliTurnOwner(catalog.runtime_context.execution_identity, "turn", "run"),
         catalog=catalog,
         authorize=authorize,
         **({"output_file_policy": _output_policy(catalog)} | options),
     )
 
 
-def _flagged(name: str, *entrypoints: Callable[..., object], **flags: object) -> AdaptedToolkit:
-    """Return a toolkit named ``name`` whose functions all carry ``flags``."""
+def _flagged(
+    name: str,
+    *entrypoints: Callable[..., object],
+    gate: ToolGate | None = None,
+    **flags: object,
+) -> AdaptedToolkit:
+    """Return a toolkit named ``name`` whose Agno functions all carry ``flags``; ``gate`` replaces the gate they give."""
     functions = []
     for entrypoint in entrypoints:
         function = Function.from_callable(entrypoint)
         for flag, value in flags.items():
             setattr(function, flag, value)
-        functions.append(adapt_function(function))
+        adapted = offered_agno_function(function)
+        functions.append(adapted if gate is None else replace(adapted, gate=gate))
     return AdaptedToolkit(name=name, functions=tuple(functions), instructions=None)
 
 
@@ -125,7 +132,7 @@ async def _delegation_catalog(
         cli_approval_handler=approval_handler,
     )
     catalog.runtime_context = runtime
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     store = create_session_storage("helper", config, paths, identity)
     catalog.store = store
     seed_session_row(store, catalog.session)
@@ -209,8 +216,9 @@ async def test_control_stops_batch_and_settles_admitted_work(tmp_path, control, 
             original_prompt="task",
             continuation_count=0,
         )
-        assert decision.should_continue
-        assert decision.model_switch_name == (None if raises else "next")
+        # Only the switch that succeeded continues the turn, on its model.
+        continued = decision.continuation
+        assert (None if continued is None else continued.model_name) == (None if raises else "next")
     else:
         assert effects == ["outer-0", "outer-1"]
         assert not owner.control_calls
@@ -281,7 +289,7 @@ async def test_hidden_delegation_uses_native_child_owner(
         tmp_path,
         config,
         paths,
-        [_flagged("delegate", run_subagent, continue_subagent, external_execution=True)],
+        [_flagged("delegate", run_subagent, continue_subagent, gate=ToolGate.DELEGATION)],
         max_tool_calls_per_turn=limit,
     )
     children = []
@@ -327,7 +335,7 @@ async def test_hidden_delegation_uses_native_child_owner(
         assert catalog.store is not None
         saved = catalog.store.get_run("run")
         assert saved is not None
-        assert saved.requirements is None
+        assert saved.requirements == []
         followup_id = uuid4()
         async with owner._window("bash-followup"):
             await owner.operation(
@@ -383,8 +391,7 @@ async def test_hidden_delegation_never_inherits_an_approval_under_a_reused_call_
         return tuple(
             apply_exact_approval_decisions(
                 paused.requirements,
-                decisions=dict.fromkeys(asked, approved),
-                denial_reasons=dict.fromkeys(asked, "denied"),
+                answered_calls(asked, approved=approved, reason="denied"),
             ),
         )
 
@@ -392,7 +399,7 @@ async def test_hidden_delegation_never_inherits_an_approval_under_a_reused_call_
         tmp_path,
         config,
         paths,
-        [_flagged("delegate", run_subagent, external_execution=True)],
+        [_flagged("delegate", run_subagent, gate=ToolGate.DELEGATION)],
         approval_handler=decide,
     )
     call_id = uuid4()
@@ -465,19 +472,15 @@ async def test_hidden_child_pause_reuses_native_resume(tmp_path, monkeypatch, mo
             "code",
             users=["@alice:example.org"],
         )
-        ScriptedAgents(
-            {
-                "helper": ScriptedModel([]),
-                "code": ScriptedModel(
-                    [
-                        calls(tool_call("write_report", "child-write")),
-                        calls(tool_call("write_report", "child-write-again"))
-                        if mode == "recover_again"
-                        else answer("child done"),
-                    ],
-                ),
-            },
-        ).install(monkeypatch)
+        code = ScriptedModel(
+            [
+                calls(tool_call("write_report", "child-write")),
+                calls(tool_call("write_report", "child-write-again"))
+                if mode == "recover_again"
+                else answer("child done"),
+            ],
+        )
+        ScriptedAgents({"helper": ScriptedModel([]), "code": code}).install(monkeypatch)
         approval_ids = []
 
         async def approve(paused):
@@ -501,8 +504,7 @@ async def test_hidden_child_pause_reuses_native_resume(tmp_path, monkeypatch, mo
             return tuple(
                 apply_exact_approval_decisions(
                     paused.requirements,
-                    decisions=dict.fromkeys(approval_ids, mode != "deny"),
-                    denial_reasons=dict.fromkeys(approval_ids, "denied"),
+                    answered_calls(approval_ids, approved=mode != "deny", reason="denied"),
                 ),
             )
 
@@ -511,7 +513,7 @@ async def test_hidden_child_pause_reuses_native_resume(tmp_path, monkeypatch, mo
             config,
             paths,
             [
-                _flagged("delegate", run_subagent, external_execution=True),
+                _flagged("delegate", run_subagent, gate=ToolGate.DELEGATION),
                 _flagged("control", switch_thread_model, stop_after_tool_call=True),
             ],
             approval_handler=approve,
@@ -546,23 +548,23 @@ async def test_hidden_child_pause_reuses_native_resume(tmp_path, monkeypatch, mo
             binding = await catalog.bind(ToolKey("delegate", "run_subagent"))
             events = [event async for event in execute_agent_tool_call(binding, str(call_id), arguments)]
             requirement = next(event.requirement for event in events if isinstance(event, AgentToolCallWaiting))
-            with catalog.execution_context():
+            with tool_runtime_context(catalog.runtime_context):
                 paused = await advance_cli_delegation(
                     binding,
                     requirement,
                     parent_bash_call_id="bash-parent",
                     delegation_depth=0,
                     refresh_scheduler=None,
-                    decisions=None,
-                    denial_reasons=None,
-                    approval_calls=(),
+                    approval_calls=None,
                     on_event=lambda _event: None,
                 )
             assert isinstance(paused, PausedAttempt)
             assert paused.cli_call is not None
             assert paused.runtime_model_name == "parent-model"
-            approval_calls = approval_calls_for_cli_pause(paused, "helper")
-            decisions = {call.tool_call_id: True for call in approval_calls}
+            approved = [
+                RunRequirement(replace(waiting.tool_execution, confirmed=True)) for waiting in paused.requirements
+            ]
+            approval_calls = approval_calls_for_cli_pause(paused, "helper", approved)
 
             presentation = CollectedStreamPresentation(show_tool_calls=True, track_hidden_tools=True)
             presentation.start_tool(
@@ -595,10 +597,10 @@ async def test_hidden_child_pause_reuses_native_resume(tmp_path, monkeypatch, mo
                 paths,
                 identity,
                 agent_mode="minimal",
-                history_storage=catalog.store,
                 supports_native_tool_approval=True,
                 knowledge=None,
                 model=turn_model(config, paths, "helper"),
+                plugins=config_plugins(config, paths),
             )
 
             async def authorize_binding(binding):
@@ -616,8 +618,6 @@ async def test_hidden_child_pause_reuses_native_resume(tmp_path, monkeypatch, mo
                         tool_trace=tuple(presentation.tool_trace),
                     ),
                     runtime_context=runtime,
-                    decisions=decisions,
-                    denial_reasons=dict.fromkeys(decisions),
                     tool_trace_collector=[],
                     refresh_scheduler=None,
                     authorize=authorize_binding,
@@ -682,6 +682,13 @@ async def test_hidden_child_pause_reuses_native_resume(tmp_path, monkeypatch, mo
                 receipt = await owner.get_call(str(call_id))
                 assert receipt["status"] == "completed", receipt
                 assert "child done" in receipt["outcome"]
+                if mode == "deny":
+                    # The child's model is answered with the reason the requester denied its call with.
+                    assert [
+                        (message.tool_call_id, str(message.content))
+                        for message in code.requests[-1].messages
+                        if message.role == "tool"
+                    ] == [("child-write", "denied")]
                 assert len(approval_ids) == 1
                 assert approval_ids[0].endswith(":child-write")
                 text, trace = running.result()
@@ -720,9 +727,9 @@ async def test_hidden_memory_write_standard_read_and_live_compaction(tmp_path) -
     config.agents["helper"] = AgentConfig(display_name="Helper", memory_backend="file")
     config.memory.backend = "file"
     bind_runtime_paths(config, paths)
-    memory = adapt_toolkit(MemoryTools("helper", paths.storage_root, config, paths))
+    memory = adapt_toolkit(MemoryTools("helper", config, paths))
     catalog = await _catalog(tmp_path, [memory])
-    identity = build_execution_identity_from_runtime_context(catalog.runtime_context)
+    identity = catalog.runtime_context.execution_identity
     await catalog.prepare(
         [adapt_toolkit(CompactContextTools("helper", config, paths, identity), key="compact_context")],
     )
@@ -732,7 +739,7 @@ async def test_hidden_memory_write_standard_read_and_live_compaction(tmp_path) -
         async for event in execute_agent_tool_call(binding, "memory-write", {"content": "Canonical hidden memory"})
     ]
     assert events[-1].call.result == "Memorized: Canonical hidden memory"
-    memories = await search_agent_memories("Canonical hidden", "helper", paths.storage_root, config, paths, limit=5)
+    memories = await search_agent_memories("Canonical hidden", "helper", config, paths, limit=5)
     assert any(item["memory"] == "Canonical hidden memory" for item in memories.results)
     catalog.run.session_state["sentinel"] = "kept"
     original = catalog.run.session_state
@@ -754,7 +761,7 @@ async def test_hidden_unsupported_requirement_never_runs_body(tmp_path) -> None:
         effects.append(answer)
         return answer
 
-    catalog = await _catalog(tmp_path, [_flagged("tools", unsupported, external_execution=True)])
+    catalog = await _catalog(tmp_path, [_flagged("tools", unsupported, gate=ToolGate.DELEGATION)])
     owner = _owner(catalog)
     with pytest.raises(ExceptionGroup) as error:
         async with owner._window("bash-parent"):
@@ -771,6 +778,38 @@ async def test_hidden_unsupported_requirement_never_runs_body(tmp_path) -> None:
     assert "unsupported non-confirmation requirement" in str(error.value.exceptions[0])
     assert not effects
     await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_a_waiting_delegation_whose_function_no_longer_delegates_is_refused(tmp_path) -> None:
+    """Only a delegate function that still pauses for the delegation driver may advance a waiting delegation."""
+    config = _delegation_config()
+    paths = _runtime_paths(tmp_path)
+    catalog, _runtime, _identity = await _delegation_catalog(
+        tmp_path,
+        config,
+        paths,
+        [_flagged("delegate", run_subagent, gate=ToolGate.DELEGATION)],
+    )
+    binding = await catalog.bind(ToolKey("delegate", "run_subagent"))
+    arguments = {"agent_name": "code", "task": "work"}
+    events = [event async for event in execute_agent_tool_call(binding, "delegation-call", arguments)]
+    requirement = next(event.requirement for event in events if isinstance(event, AgentToolCallWaiting))
+    changed = replace(binding, function=replace(binding.function, gate=None))
+
+    with (
+        tool_runtime_context(catalog.runtime_context),
+        pytest.raises(ValueError, match="not owned by the delegate toolkit"),
+    ):
+        await advance_cli_delegation(
+            changed,
+            requirement,
+            parent_bash_call_id="bash-parent",
+            delegation_depth=0,
+            refresh_scheduler=None,
+            approval_calls=None,
+            on_event=lambda _event: None,
+        )
 
 
 @pytest.mark.asyncio
@@ -805,8 +844,9 @@ async def test_generated_skills_and_deferred_upstream_mcp_keep_live_catalog(tmp_
     async def materialize():
         materialized.append(True)
         await manager.sync_servers(config)
-        sync_mcp_tool_registry(config)
-        return adapt_toolkit(get_tool_by_name("mcp_echo", paths, worker_target=None))
+        return adapt_toolkit(
+            get_tool_by_name("mcp_echo", paths, worker_target=None, tools=config_plugins(config, paths).tools),
+        )
 
     catalog.add_deferred(DeferredAgentToolkit("upstream", "Echo", materialize))
     assert not materialized
@@ -818,7 +858,6 @@ async def test_generated_skills_and_deferred_upstream_mcp_keep_live_catalog(tmp_
     assert binding.catalog is catalog
     assert materialized == [True]
     await catalog.close()
-    sync_mcp_tool_registry(None)
     await manager.shutdown()
 
 

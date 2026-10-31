@@ -25,7 +25,9 @@ from mindroom.tool_jobs.runtime import (
     get_background_runtime,
 )
 from mindroom.tool_jobs.settings import background_tool_jobs_enabled, pending_background_tool_jobs_restart
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.worker_routing import agent_workspace_root_path
+from tests.agent_tool_helpers import toolkit_offers
 from tests.conftest import make_config_reload_lifecycle, make_turn_context, test_runtime_paths
 from tests.delegation_helpers import ScriptedAgents
 from tests.fakes.scripted_model import ScriptedModel, answer
@@ -91,6 +93,7 @@ async def test_authority_stays_out_of_saved_metadata_with_startup_feature_settin
             include_interactive_questions=False,
             knowledge=None,
             model=turn_model(config, paths, "lead"),
+            plugins=config_plugins(config, paths),
         )
         record = await run_built_turn(build, config=config, runtime_paths=paths, prompt="hello")
         assert "mindroom_tool_authority" not in (record.metadata or {})
@@ -147,9 +150,9 @@ def test_disabled_delegation_describes_only_available_tools(tmp_path: Path) -> N
     """Default delegation must not promise a job API or reserved wait argument."""
     config = Config(agents={"lead": AgentConfig(display_name="Lead", delegate_to=["lead"])})
     paths = test_runtime_paths(tmp_path)
-    toolkit = DelegateTools("lead", ["lead"], paths, config, agent_workspace_root_path(paths.storage_root, "lead"))
+    toolkit = DelegateTools("lead", paths, config, agent_workspace_root_path(paths.storage_root, "lead"))
     instructions = toolkit.instructions or ""
-    description = toolkit.async_functions["run_subagent"].description or ""
+    description = toolkit_offers(toolkit, "run_subagent").description or ""
     assert "background_after" not in instructions + description
     assert "job(action=" not in instructions + description
     assert "continue_subagent" in instructions + description
@@ -238,9 +241,9 @@ async def test_an_agent_admits_its_calls_as_jobs_only_when_enabled(
         config,
         paths,
         execution_identity=None,
-        persist_runtime_state=False,
         knowledge=None,
         model=turn_model(config, paths, "lead"),
+        plugins=config_plugins(config, paths),
     )
     assert (build.tool_jobs is not None) is enabled
     if build.tool_jobs is not None:
@@ -267,7 +270,7 @@ async def test_a_team_leader_gets_job_controls_only_when_enabled(tmp_path: Path,
     )
     try:
         await coordinator.sync()
-        jobs = team_background_jobs(config, paths, job_owner())
+        jobs = team_background_jobs(config, paths, job_owner(), config_plugins(config, paths))
         assert (jobs is not None) is enabled
         if jobs is not None:
             offered = {function.name: function for function in jobs.controls.functions}
@@ -279,7 +282,7 @@ async def test_a_team_leader_gets_job_controls_only_when_enabled(tmp_path: Path,
                 tool.function is offered[name] and tool.toolkit_name == "job" for name, tool in jobs.actor.tools.items()
             )
         # A team without a Matrix owner has no jobs to collect.
-        assert team_background_jobs(config, paths, None) is None
+        assert team_background_jobs(config, paths, None, config_plugins(config, paths)) is None
     finally:
         await coordinator.stop()
 

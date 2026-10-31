@@ -2,17 +2,17 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import stat
-import sys
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast, get_type_hints
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import BaseModel
 
@@ -20,15 +20,11 @@ from mindroom.atomic_file import atomic_write_bytes_at
 from mindroom.constants import DEFAULT_TOOL_OUTPUT_AUTO_SAVE_THRESHOLD_BYTES, DEFAULT_TOOL_OUTPUT_MAX_BYTES
 from mindroom.logging_config import get_logger
 from mindroom.path_confinement import is_git_metadata_path, open_directory_within_root
-from mindroom.tool_system.agno_toolkits import AGNO_EMPTY_PARAMETERS, Function, Toolkit, read_tool_value
-from mindroom.tool_system.declarations import declare_tool_schema_finisher, declare_tool_schema_source
 from mindroom.workspaces import resolve_relative_path_within_root_preserving_leaf
-
-if sys.version_info >= (3, 14):
-    from annotationlib import Format, type_repr
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
+    from mindroom.tool_system.tool_function import ToolFunction
 
 logger = get_logger(__name__)
 
@@ -41,7 +37,6 @@ _OUTPUT_PATH_ARGUMENT_DESCRIPTION = (
 )
 _MAX_BYTES_ENV = "MINDROOM_TOOL_OUTPUT_REDIRECT_MAX_BYTES"
 _AUTO_SAVE_PREVIEW_BYTES = 8192
-_WRAPPED_ATTR = "__mindroom_output_file_wrapped__"
 _AUTO_SAVE_ROOT = "mindroom_tool_outputs"
 _AUTO_SAVE_READ_HINT = (
     "Do not read this whole file: it is over threshold_bytes, so the result would be saved to a file again. "
@@ -213,15 +208,8 @@ def _output_path_schema() -> dict[str, object]:
     }
 
 
-def _has_output_path_argument(function: Function) -> bool:
-    if function.entrypoint is not None and OUTPUT_PATH_ARGUMENT in inspect.signature(function.entrypoint).parameters:
-        return True
-    properties = function.parameters.get("properties")
-    return isinstance(properties, dict) and OUTPUT_PATH_ARGUMENT in properties
-
-
-def _with_optional_output_path(parameters: Mapping[str, Any]) -> dict[str, Any]:
-    """Return a copy of ``parameters`` offering MindRoom's reserved output-path argument as an optional property."""
+def with_optional_output_path(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``parameters`` offering MindRoom's reserved output-path argument as its last, optional property."""
     finished = dict(parameters)
     properties = dict(finished.get("properties") or {})
     properties[OUTPUT_PATH_ARGUMENT] = _output_path_schema()
@@ -232,11 +220,6 @@ def _with_optional_output_path(parameters: Mapping[str, Any]) -> dict[str, Any]:
         [name for name in required if name != OUTPUT_PATH_ARGUMENT] if isinstance(required, list) else []
     )
     return finished
-
-
-def ensure_output_path_schema_optional(function: Function) -> None:
-    """Keep MindRoom's reserved output-path argument optional in one tool schema."""
-    function.parameters = _with_optional_output_path(function.parameters)
 
 
 def normalize_output_path_argument(raw_path: object) -> object | None:
@@ -357,6 +340,9 @@ def _normalize_json_value(value: object) -> object:  # noqa: PLR0911 - One branc
 
 
 def _serialize_tool_output(result: object) -> _SerializedToolOutput | str:
+    # Deferred because the toolkit adapter, which reads a vendor tool's value, imports this module.
+    from mindroom.tool_system.agno_toolkits import read_tool_value  # noqa: PLC0415
+
     if (value := read_tool_value(result)) is not None:
         if any(value.media()):
             return "Tool media results cannot be redirected to workspace files."
@@ -504,12 +490,7 @@ def _auto_save_large_result(
     if isinstance(serialized, str) or len(serialized.payload) <= policy.auto_save_threshold_bytes:
         return result
     try:
-        return _write_auto_saved_result(
-            serialized,
-            policy=policy,
-            tool_name=tool_name,
-            byte_count=len(serialized.payload),
-        )
+        return _write_auto_saved_result(serialized, policy=policy, tool_name=tool_name)
     except Exception as exc:
         logger.warning("tool_output_auto_save_write_failed", error_type=type(exc).__name__)
         return result
@@ -520,8 +501,8 @@ def _write_auto_saved_result(
     *,
     policy: ToolOutputFilePolicy,
     tool_name: str,
-    byte_count: int,
 ) -> object:
+    byte_count = len(serialized.payload)
     if byte_count > policy.max_bytes:
         return _error_receipt(
             f"Tool output is {byte_count} bytes, which exceeds the {policy.max_bytes} byte auto-save limit.",
@@ -549,46 +530,6 @@ def _write_auto_saved_result(
     )
 
 
-def _signature_with_output_path(entrypoint: Callable[..., object]) -> inspect.Signature:
-    signature = inspect.signature(entrypoint)
-    parameters = list(signature.parameters.values())
-    output_parameter = inspect.Parameter(
-        OUTPUT_PATH_ARGUMENT,
-        inspect.Parameter.KEYWORD_ONLY,
-        default=None,
-        annotation=str | None,
-    )
-    var_keyword_index = next(
-        (index for index, parameter in enumerate(parameters) if parameter.kind is inspect.Parameter.VAR_KEYWORD),
-        len(parameters),
-    )
-    parameters.insert(var_keyword_index, output_parameter)
-    return signature.replace(parameters=parameters)
-
-
-def _copy_annotations_with_output_path(
-    wrapper: Callable[..., object],
-    original_entrypoint: Callable[..., object],
-) -> None:
-    try:
-        annotations = dict(get_type_hints(original_entrypoint))
-    except Exception:
-        annotations = dict(getattr(original_entrypoint, "__annotations__", {}) or {})
-    annotations[OUTPUT_PATH_ARGUMENT] = str | None
-    if sys.version_info < (3, 14):
-        wrapper.__annotations__ = annotations
-        return
-
-    # Python 3.14 functools.wraps copies __annotate__, which assigning __annotations__ sets to None,
-    # so outer wrappers such as the sandbox proxy would expose no types and skip argument validation.
-    def annotate(annotation_format: Format) -> dict[str, object]:
-        if annotation_format == Format.STRING:
-            return {name: type_repr(value) for name, value in annotations.items()}
-        return dict(annotations)
-
-    wrapper.__annotate__ = annotate
-
-
 def prepare_tool_output_file(
     policy: ToolOutputFilePolicy,
     *,
@@ -612,16 +553,49 @@ def finalize_tool_output_file(request: ToolOutputFileRequest, result: object) ->
     return _redirect_result_to_file(result, policy=request.policy, validated_path=request.path)
 
 
-def _wrap_entrypoint(
+def with_output_files(function: ToolFunction, policy: ToolOutputFilePolicy) -> ToolFunction:
+    """Return ``function`` also taking and handling ``mindroom_output_path``, its unset ``strict`` made False.
+
+    Its schema offers the argument as its last, optional property. The entrypoint takes the argument out of each call,
+    runs the call with the rest, and saves or redirects its output. A strict function keeps its schema as its author
+    made it, and a function that takes the argument itself, by its entrypoint or its schema, stays as it is too. So does
+    a function that can stop the run (``controls_run``): its result answers the run, and a saved one would be a receipt
+    that no longer stops it.
+    """
+    parameters = inspect.signature(function.entrypoint).parameters
+    properties = function.parameters.get("properties")
+    if function.strict or function.controls_run:
+        return function
+    if OUTPUT_PATH_ARGUMENT in parameters or (isinstance(properties, Mapping) and OUTPUT_PATH_ARGUMENT in properties):
+        logger.debug(
+            "tool_output_path_argument_collision",
+            function_name=function.name,
+            argument_name=OUTPUT_PATH_ARGUMENT,
+        )
+        return function
+    return replace(
+        function,
+        parameters=with_optional_output_path(function.parameters),
+        strict=False,
+        entrypoint=_handling_output_files(function.entrypoint, policy, tool_name=function.name),
+    )
+
+
+def _handling_output_files(
     entrypoint: Callable[..., object],
     policy: ToolOutputFilePolicy,
     *,
     tool_name: str,
 ) -> Callable[..., object]:
+    """Return ``entrypoint`` taking ``mindroom_output_path`` out of each call and saving or redirecting its output.
+
+    A synchronous entrypoint stays synchronous, so preparing the path, the call, and writing the file share its thread.
+    """
     if inspect.iscoroutinefunction(entrypoint):
         async_entrypoint = cast("Callable[..., Awaitable[object]]", entrypoint)
 
-        async def async_wrapper(*args: object, mindroom_output_path: str | None = None, **kwargs: object) -> object:
+        @functools.wraps(entrypoint)
+        async def async_wrapper(*args: object, mindroom_output_path: object = None, **kwargs: object) -> object:
             request = prepare_tool_output_file(policy, tool_name=tool_name, output_path=mindroom_output_path)
             if isinstance(request, dict):
                 return request
@@ -632,69 +606,18 @@ def _wrap_entrypoint(
                 _active_output_request.reset(token)
             return finalize_tool_output_file(request, result)
 
-        wrapper = async_wrapper
-    else:
+        return async_wrapper
 
-        def sync_wrapper(*args: object, mindroom_output_path: str | None = None, **kwargs: object) -> object:
-            request = prepare_tool_output_file(policy, tool_name=tool_name, output_path=mindroom_output_path)
-            if isinstance(request, dict):
-                return request
-            token = _active_output_request.set(request)
-            try:
-                result = entrypoint(*args, **kwargs)
-            finally:
-                _active_output_request.reset(token)
-            return finalize_tool_output_file(request, result)
+    @functools.wraps(entrypoint)
+    def sync_wrapper(*args: object, mindroom_output_path: object = None, **kwargs: object) -> object:
+        request = prepare_tool_output_file(policy, tool_name=tool_name, output_path=mindroom_output_path)
+        if isinstance(request, dict):
+            return request
+        token = _active_output_request.set(request)
+        try:
+            result = entrypoint(*args, **kwargs)
+        finally:
+            _active_output_request.reset(token)
+        return finalize_tool_output_file(request, result)
 
-        wrapper = sync_wrapper
-
-    wrapper.__name__ = getattr(entrypoint, "__name__", "tool_entrypoint")
-    # The schema finisher describes the output path, so the docstring, whose Args describe the other arguments, stays.
-    wrapper.__doc__ = entrypoint.__doc__
-    wrapper.__module__ = getattr(entrypoint, "__module__", __name__)
-    wrapper.__dict__["__signature__"] = _signature_with_output_path(entrypoint)
-    _copy_annotations_with_output_path(wrapper, entrypoint)
-    declare_tool_schema_source(wrapper, entrypoint)
-    # Agno derives the argument from the forged signature without the default the model is shown.
-    declare_tool_schema_finisher(wrapper, _with_optional_output_path)
-    setattr(wrapper, _WRAPPED_ATTR, True)
-    return wrapper
-
-
-def wrap_function_for_output_files(function: Function, policy: ToolOutputFilePolicy) -> Function:
-    """Expose and handle ``mindroom_output_path`` on one Agno function."""
-    if function.entrypoint is None or getattr(function.entrypoint, _WRAPPED_ATTR, False):
-        return function
-    if _has_output_path_argument(function):
-        logger.debug(
-            "tool_output_path_argument_collision",
-            function_name=function.name,
-            argument_name=OUTPUT_PATH_ARGUMENT,
-        )
-        return function
-
-    uses_custom_parameters = function.skip_entrypoint_processing or function.parameters != AGNO_EMPTY_PARAMETERS
-    function.entrypoint = _wrap_entrypoint(function.entrypoint, policy, tool_name=function.name)
-    function.strict = False
-    if uses_custom_parameters:
-        # Agno keeps an authored schema as it is, so the argument joins it here; a derived one gets it from the
-        # wrapper's signature.
-        ensure_output_path_schema_optional(function)
-    return function
-
-
-def wrap_toolkit_for_output_files(
-    toolkit: Toolkit,
-    policy: ToolOutputFilePolicy | None,
-) -> Toolkit:
-    """Wrap every eligible function in a freshly-built toolkit."""
-    if policy is None:
-        return toolkit
-
-    seen_functions: set[int] = set()
-    for function in (*toolkit.functions.values(), *toolkit.async_functions.values()):
-        if id(function) in seen_functions:
-            continue
-        seen_functions.add(id(function))
-        wrap_function_for_output_files(function, policy)
-    return toolkit
+    return sync_wrapper

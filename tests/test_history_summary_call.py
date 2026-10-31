@@ -19,12 +19,11 @@ from mindroom.constants import (
     AI_RUN_METADATA_KEY,
     DEFAULT_COMPACTION_TIMEOUT_SECONDS,
     MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY,
-    MINDROOM_COMPACTION_METADATA_KEY,
-    MINDROOM_MATRIX_HISTORY_METADATA_KEY,
+    PRIOR_USAGE_RUN_METADATA_KEY,
 )
 from mindroom.history.storage import (
-    _with_scope_state,
     read_scope_state,
+    with_force_compaction,
 )
 from mindroom.history.summary_call import (
     SummaryRetryPolicy,
@@ -33,13 +32,10 @@ from mindroom.history.summary_call import (
     is_summary_timeout,
 )
 from mindroom.history.summary_input import _compaction_replay_messages, build_summary_input
-from mindroom.history.types import (
-    HistoryScope,
-    HistoryScopeState,
-)
 from mindroom.llm.media import Image
 from mindroom.llm.messages import Message
 from mindroom.llm.provider import RequestOverrides
+from mindroom.llm.usage import MessageMetrics
 from mindroom.prompts import COMPACTION_SUMMARY_PROMPT
 from mindroom.providers.errors import classify_provider_error, provider_failure
 from mindroom.session_storage.agent_storage import create_session_storage
@@ -47,7 +43,7 @@ from mindroom.session_storage.schema import TableNames
 from mindroom.token_budget import estimate_compaction_input_tokens
 from tests.conftest import install_model_providers, prepare_history_for_run_for_test, seed_session
 from tests.fakes.scripted_model import Await
-from tests.fakes.summary_model import summary_model, summary_steps
+from tests.fakes.summary_model import summary_model, summary_steps, summary_turn
 from tests.history_helpers import (
     _ALL_HISTORY_SETTINGS,
     _completed_run,
@@ -94,6 +90,25 @@ async def test_compaction_summary_uses_configured_system_prompt() -> None:
         ("system", "Custom compaction instructions."),
         ("user", "Current prompt"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_summary_whose_provider_reported_no_usage_records_none() -> None:
+    """A response that is timed but carries no counters reported no usage, so the summary records none."""
+    recorded: list[MessageMetrics] = []
+
+    async def on_usage(usage: MessageMetrics) -> None:
+        recorded.append(usage)
+
+    await generate_compaction_summary(
+        model=summary_model(summary_turn("merged summary", usage=MessageMetrics(duration=0.4))),
+        summary_input="Current prompt",
+        summary_prompt=COMPACTION_SUMMARY_PROMPT,
+        timeout_seconds=DEFAULT_COMPACTION_TIMEOUT_SECONDS,
+        on_usage=on_usage,
+    )
+
+    assert recorded == []
 
 
 @pytest.mark.asyncio
@@ -362,8 +377,7 @@ async def test_compaction_call_timeout_falls_back_in_runtime(
             _completed_run("run-4"),
         ],
     )
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
-    session.metadata = _with_scope_state(session.metadata, scope, HistoryScopeState(force_compact_before_next_run=True))
+    session.metadata = with_force_compaction(session.metadata)
     seed_session(storage, session)
 
     install_model_providers(monkeypatch, {"default": summary_model([Await(slow), *summary_steps("merged summary")])})
@@ -514,13 +528,12 @@ def test_build_summary_input_normal_run_omits_non_summary_metadata() -> None:
     )
     metadata = {
         AI_RUN_METADATA_KEY: {"compaction": {"decision": "required"}},
-        MINDROOM_COMPACTION_METADATA_KEY: {"states": {"agent:test": {"compacted_run_ids": ["old-run"]}}},
-        MINDROOM_MATRIX_HISTORY_METADATA_KEY: {"states": {"agent:test": {"seen_event_ids": ["$old"]}}},
         MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY: {"$request": "Look up the deployment outcome."},
         "matrix_event_id": "$request",
         "started_at": "2026-07-17T20:00:00Z",
         "durable_outcome": {"state": "delivered"},
         "model_params": {"temperature": 0.2},
+        PRIOR_USAGE_RUN_METADATA_KEY: {"input_tokens": 100, "output_tokens": 5},
     }
     run.metadata = metadata.copy()
 
@@ -535,9 +548,8 @@ def test_build_summary_input_normal_run_omits_non_summary_metadata() -> None:
     assert included_runs == [run]
     assert run.metadata == metadata
     assert "model_params" not in summary_input
+    assert PRIOR_USAGE_RUN_METADATA_KEY not in summary_input
     assert AI_RUN_METADATA_KEY not in summary_input
-    assert MINDROOM_COMPACTION_METADATA_KEY not in summary_input
-    assert MINDROOM_MATRIX_HISTORY_METADATA_KEY not in summary_input
     assert MATRIX_SOURCE_EVENT_PROMPTS_METADATA_KEY not in summary_input
     assert "$request" in summary_input
     assert "2026-07-17T20:00:00Z" in summary_input

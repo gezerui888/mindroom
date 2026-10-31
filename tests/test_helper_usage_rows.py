@@ -25,18 +25,18 @@ import pytest
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 from openai.types import CompletionUsage
 
-from mindroom import routing, thread_summary, topic_generator
+from mindroom import routing, topic_generator
 from mindroom.agents import create_agent
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import CompactionOverrideConfig, ModelConfig
+from mindroom.config.resolution import entity_model_name
 from mindroom.config.voice import VoiceConfig, VoiceSTTConfig
 from mindroom.custom_tools import claude_agent
 from mindroom.custom_tools.dynamic_workflow import _run_room_agent_turn
 from mindroom.helper_usage import HelperUsageOwner, helper_usage_owner_context
 from mindroom.history.runtime import _compact_before_reply, resolve_entity_preparation_inputs
-from mindroom.history.storage import _with_scope_state, read_scope_state
-from mindroom.history.types import HistoryScope, HistoryScopeState
+from mindroom.history.storage import read_scope_state, with_force_compaction
 from mindroom.knowledge.chunk_context import chunk_contexts
 from mindroom.knowledge_graph.clients import MindRoomLLMClient
 from mindroom.knowledge_graph.usage import UsageTarget, usage_target
@@ -56,7 +56,8 @@ from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.skill_learning.reviewer import review_conversation
 from mindroom.skill_learning.tools import ReviewProgress
 from mindroom.teams.formation import select_ad_hoc_team_mode
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context
+from mindroom.thread_summary.generation import generate_summary
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from mindroom.voice import handler as voice_handler
 from tests.conftest import bind_runtime_paths, install_model_providers, seed_session, test_runtime_paths
@@ -71,8 +72,7 @@ if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
 
 GOLDEN = Path(__file__).parent / "fixtures" / "helper_usage_rows.json"
-# A run's ``model_provider`` and its requests' model provenance use different provider names, so the rows show each.
-_IDENTITY = ModelIdentity(id="scripted-model", provider="Scripted", provider_name="Scripted Chat")
+_IDENTITY = ModelIdentity(id="scripted-model", provider="Scripted")
 # Not a whole second, so a row shows whether its time was truncated to an integer.
 NOW = 1_790_000_000.5
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -127,7 +127,7 @@ def _system_config(paths: RuntimePaths) -> Config:
 
 
 def _scripted(monkeypatch: pytest.MonkeyPatch, text: str, *, sums_attempts: bool = False) -> None:
-    """Answer the default model's one request with ``text``, as a route whose two provider names differ."""
+    """Answer the default model's one request with ``text``."""
     turn = answer(text, usage(20, 2, cache_read_tokens=3))
     if sums_attempts:
         # The retrying stage marks a finished turn whose usage adds up failed attempts.
@@ -171,13 +171,12 @@ async def _thread_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     paths = test_runtime_paths(tmp_path)
     config = _system_config(paths)
     _scripted(monkeypatch, json.dumps({"summary": "A summary"}))
-    await thread_summary._generate_summary(
+    await generate_summary(
         [ResolvedVisibleMessage.synthetic(sender="@person:localhost", body="Help", event_id="$message")],
         config,
         paths,
         model_name="default",
         tag_vocabulary=None,
-        trusted_sender_ids=frozenset(),
     )
     return paths.storage_root
 
@@ -253,7 +252,7 @@ async def _memory_auto_flush(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
         session_id="session",
         lines=["Synthetic conversation excerpt."],
         existing_context="",
-        execution_identity=build_execution_identity_from_runtime_context(context),
+        execution_identity=context.execution_identity,
     )
     return paths.storage_root
 
@@ -311,7 +310,7 @@ async def _claude_agent(tmp_path: Path, _monkeypatch: pytest.MonkeyPatch) -> Pat
 async def _dynamic_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     config, paths, owner, context = _conversation(tmp_path)
     _scripted(monkeypatch, "Sample helper output.")
-    identity = build_execution_identity_from_runtime_context(context)
+    identity = context.execution_identity
     build = create_agent(
         "test_agent",
         config,
@@ -319,6 +318,7 @@ async def _dynamic_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
         identity,
         knowledge=None,
         model=turn_model(config, paths, "test_agent"),
+        plugins=config_plugins(config, paths),
     )
     with helper_usage_owner_context(owner):
         await _run_room_agent_turn(context, build, "Sample task.")
@@ -345,7 +345,6 @@ async def _compaction_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     """Compact a stored run before the next reply, with one summary request to the scripted model."""
     config, paths = _make_config(tmp_path, compaction=CompactionOverrideConfig(enabled=True))
     storage = create_session_storage("test_agent", config, paths, execution_identity=None)
-    scope = HistoryScope(kind="agent", scope_id="test_agent")
     run = RunRecord(
         run_id="run-1",
         agent_id="test_agent",
@@ -356,17 +355,16 @@ async def _compaction_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     session = _session(
         "session",
         runs=[run],
-        metadata=_with_scope_state(None, scope, HistoryScopeState(force_compact_before_next_run=True)),
+        metadata=with_force_compaction(None),
     )
     seed_session(storage, session)
     _scripted(monkeypatch, "A summary of the conversation.")
     inputs = resolve_entity_preparation_inputs(
         config=config,
         runtime_paths=paths,
-        entity_name="test_agent",
         history_settings=config.resolve_scope("test_agent").history_settings,
         static_prompt_tokens=0,
-        active_model_name=None,
+        active_model_name=entity_model_name(config, "test_agent"),
         active_context_window=None,
     )
     outcome = await _compact_before_reply(

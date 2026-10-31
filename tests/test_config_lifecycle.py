@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,11 +15,13 @@ import mindroom.orchestration.config_lifecycle as lifecycle_module
 from mindroom.api import config_lifecycle as api_config_lifecycle
 from mindroom.api.main import initialize_api_app
 from mindroom.config.agent import AgentConfig
+from mindroom.config.load_attempt import load_config_attempt
 from mindroom.config.main import Config, load_config
 from mindroom.config.reload_status import ConfigReloadStatus
 from mindroom.orchestration.config_lifecycle import _ReplacementDrainState
 from mindroom.orchestration.runtime import create_logged_task
 from mindroom.response_admission import ResponseAdmissionGate
+from tests.api.conftest import request_for, save_config
 from tests.conftest import (
     bind_runtime_paths,
     make_config_reload_lifecycle,
@@ -1224,7 +1226,7 @@ async def test_reload_that_loses_to_a_dashboard_save_adopts_nothing_and_stays_pe
 
     def load_then_lose_to_dashboard_save(paths: object) -> object:
         attempt = real_load_attempt(paths)
-        api_config_lifecycle._build_and_commit_replacement(api_app, saved_payload, error_prefix="save")
+        save_config(request_for(api_app), saved_payload)
         return attempt
 
     monkeypatch.setattr(api_config_lifecycle, "load_config_attempt", load_then_lose_to_dashboard_save)
@@ -1238,9 +1240,8 @@ async def test_reload_that_loses_to_a_dashboard_save_adopts_nothing_and_stays_pe
     await lifecycle._apply_queued_config_reload()
 
     snapshot = api_config_lifecycle.require_api_state(api_app).snapshot
-    assert snapshot.config_load_result is not None
-    assert snapshot.config_load_result.success
-    assert snapshot.config_data["agents"]["agent1"]["display_name"] == "Saved From Dashboard"
+    assert snapshot.load_error is None
+    assert snapshot.runtime_config.agents["agent1"].display_name == "Saved From Dashboard"
     lifecycle.apply_update_plan.assert_not_awaited()
     assert lifecycle.status == ConfigReloadStatus(status="pending")
     assert lifecycle.watched_source_files == frozenset()
@@ -1294,3 +1295,27 @@ async def test_failed_reload_load_reports_failure_and_watches_files_it_read(tmp_
     lifecycle.apply_update_plan.assert_not_awaited()
     assert lifecycle.status == ConfigReloadStatus(status="failed")
     assert lifecycle.watched_source_files == frozenset({runtime_paths.config_path.resolve()})
+
+
+def test_load_attempt_keeps_an_unexpected_error_for_the_reload_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A load failing with a non-config error reports that error instead of raising it or publishing config."""
+    runtime_paths = test_runtime_paths(tmp_path)
+    runtime_paths.config_path.write_text(_AGENT1_YAML, encoding="utf-8")
+    failure = RuntimeError("plugin import failed")
+
+    def fail_validation(*_args: object, **_kwargs: object) -> NoReturn:
+        raise failure
+
+    monkeypatch.setattr("mindroom.config.load_attempt.validate_loaded_config_source", fail_validation)
+
+    attempt = load_config_attempt(runtime_paths)
+
+    assert attempt.config is None
+    assert attempt.error is failure
+    assert attempt.source_files == frozenset({runtime_paths.config_path.resolve()})
+    assert attempt.uses_includes is False
+    with pytest.raises(RuntimeError, match="plugin import failed"):
+        attempt.loaded_config()

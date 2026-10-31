@@ -24,7 +24,7 @@ from mindroom.config.access import ResponderAccessConfig
 from mindroom.config.agent import AgentConfig, TeamConfig
 from mindroom.config.main import Config
 from mindroom.config.models import BackgroundToolJobsConfig
-from mindroom.delegation.background import delegation_child, start_delegation
+from mindroom.delegation.background import start_delegation
 from mindroom.delegation.execution import _drive_delegations
 from mindroom.delegation.state import DelegationChild
 from mindroom.event_journal import (
@@ -57,11 +57,13 @@ from mindroom.tool_jobs.runtime import (
     TERMINAL_STATUSES,
     BackgroundJob,
     BackgroundOutcome,
+    JobGrant,
     ToolJobRuntime,
     _parse_saved_job,
 )
 from mindroom.tool_system.agno_toolkits import Toolkit, adapt_toolkit
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.tool_function import AdaptedToolkit
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 from tests.conftest import bind_runtime_paths, test_runtime_paths
@@ -96,8 +98,8 @@ JOB_TEST_TIMEOUT = 30
 _LEADER_SCOPE = HistoryScope(kind="agent", scope_id="leader")
 
 
-def _authorize_all(_job: BackgroundJob) -> bool:
-    return True
+def _grant_all(_job: BackgroundJob) -> JobGrant:
+    return "allowed"
 
 
 def _allow_execution(_owner: ToolExecutionIdentity, _tool: JobTool, _arguments: Mapping[str, Any]) -> None:
@@ -125,18 +127,15 @@ class ProcessRuntime(ToolJobRuntime):
         self,
         journal: EventJournalStore,
         *,
-        authorize: Callable[[BackgroundJob], bool],
+        grant: Callable[[BackgroundJob], JobGrant],
         authorize_execution: Callable[[ToolExecutionIdentity, JobTool, Mapping[str, Any]], None],
         cancel: Callable[[BackgroundJob], Awaitable[BackgroundOutcome | None]],
-        denied: Callable[[BackgroundJob], bool] | None = None,
     ) -> None:
         super().__init__(
             journal.tool_jobs(uuid4().hex),
-            authorize=authorize,
+            grant=grant,
             authorize_execution=authorize_execution,
             cancel=cancel,
-            # Without its own denial rule, a test treats every unauthorized job as proven denied.
-            denied=denied or (lambda job: not authorize(job)),
         )
         self._journal = journal
 
@@ -192,10 +191,9 @@ async def job_card_decision(journal: EventJournalStore, run_id: str, call_id: st
 async def tool_job_runtime(
     storage_root: Path,
     *,
-    authorize: Callable[[BackgroundJob], bool] = _authorize_all,
+    grant: Callable[[BackgroundJob], JobGrant] = _grant_all,
     authorize_execution: Callable[[ToolExecutionIdentity, JobTool, Mapping[str, Any]], None] = _allow_execution,
     cancel: Callable[[BackgroundJob], Awaitable[BackgroundOutcome | None]] = _no_cleanup,
-    denied: Callable[[BackgroundJob], bool] | None = None,
 ) -> ProcessRuntime:
     """Start one process's runtime whose grants allow every job and call and whose adapters need no extra cleanup.
 
@@ -203,10 +201,9 @@ async def tool_job_runtime(
     """
     runtime = ProcessRuntime(
         tool_job_journal(storage_root),
-        authorize=authorize,
+        grant=grant,
         authorize_execution=authorize_execution,
         cancel=cancel,
-        denied=denied,
     )
     await runtime._store.take_ownership()
     return runtime
@@ -324,7 +321,7 @@ def pending_outcomes(runtime: ToolJobRuntime) -> list[BackgroundJob]:
         if entry.job.status in TERMINAL_STATUSES
         and not entry.job.consumed
         and entry.claim is None
-        and runtime._authorize(entry.job)
+        and runtime._grant(entry.job) == "allowed"
     ]
 
 
@@ -675,6 +672,7 @@ def completed_delegation_job() -> BackgroundJob:
         requested_model_name="default",
         depth=1,
         execution_identity={},
+        subagent_id="c" * 32,
         agent_mode="standard",
         persona=None,
     )
@@ -702,24 +700,6 @@ def team_coordinator(tmp_path: Path, config: Config) -> ToolJobRuntimeCoordinato
         agent_reply_memberships=AgentReplyMembershipIndex(),
         journal_provider=partial(tool_job_journal, paths.storage_root),
     )
-
-
-async def finish_delegation_job(coordinator: ToolJobRuntimeCoordinator) -> BackgroundJob:
-    """Run `completed_delegation_job` to a saved outcome whose claim is released."""
-    fixture = completed_delegation_job()
-
-    async def operation() -> BackgroundOutcome:
-        return BackgroundOutcome("completed", "Saved answer")
-
-    job = await start_delegation_job(
-        coordinator.runtime,
-        delegation_child(fixture),
-        owner=fixture.owner,
-        operation=operation,
-    )
-    result = await coordinator.runtime.wait(job.job_id, owner=job.owner, depth=0)
-    await coordinator.runtime.release_wait(job.job_id, result.claim)
-    return result.job
 
 
 async def awaiting_approval(runtime: ToolJobRuntime, job_id: str) -> BackgroundOutcome:
@@ -754,7 +734,7 @@ def job_coordinator(tmp_path: Path, runtime: ToolJobRuntime, bot: MagicMock) -> 
     paths = test_runtime_paths(tmp_path)
     coordinator = ToolJobRuntimeCoordinator(
         runtime_paths=paths,
-        config_provider=lambda: None,
+        config_provider=Config,
         bot_provider=lambda _name: bot,
         agent_reply_memberships=MagicMock(),
         journal_provider=lambda: tool_job_journal(paths.storage_root),
@@ -827,12 +807,12 @@ class DelegatingLeader:
             self.config,
             self.paths,
             self.identity,
-            history_storage=self.store,
             delegation_depth=self.depth,
             supports_native_tool_approval=True,
             include_interactive_questions=False,
             knowledge=None,
             model=turn_model(self.config, self.paths, "leader"),
+            plugins=config_plugins(self.config, self.paths),
         )
         hooks = agent_loop_hooks(
             build,

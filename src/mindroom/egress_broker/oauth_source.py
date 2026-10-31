@@ -35,19 +35,19 @@ from mindroom.oauth.credential_lifecycle import (
     OAuthCredentialUnreadableError,
     load_oauth_credentials_snapshot_sync,
     oauth_account_label,
-    oauth_credential_store_exists,
+    oauth_credentials_may_exist,
     oauth_credentials_usable,
     refresh_oauth_credentials_blocking,
     resolve_oauth_credential_context,
 )
 from mindroom.oauth.providers import OAuthProviderError, OAuthRefreshRejectedError
-from mindroom.oauth.registry import load_oauth_providers
 from mindroom.oauth.service import (
     OAUTH_REFRESH_REJECTED_REASON,
     oauth_connection_required,
     oauth_provider_service_account_configured,
 )
-from mindroom.workers.runtime import primary_worker_backend_is_dedicated
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.workers.backend_kinds import worker_backend_kind
 
 if TYPE_CHECKING:
     from mindroom.config.egress_broker import EgressReadOnly
@@ -223,10 +223,10 @@ def oauth_connection_for_display(context: OAuthCredentialContext) -> tuple[bool,
 
     Only the egress pages call this, to show an account a user may allow or disconnect; the broker reads through
     `resolve_oauth_token` and `oauth_status`, which never read a connection Agent Keys may not use. A scope without a
-    store reads as not connected, and listing it creates none.
+    store or legacy tokens reads as not connected, and listing it creates no store.
     """
     credentials = None
-    if oauth_credential_store_exists(context):
+    if oauth_credentials_may_exist(context):
         with contextlib.suppress(OAuthCredentialUnreadableError):
             credentials = load_oauth_credentials_snapshot_sync(context).credentials
     connected = oauth_credentials_usable(context.provider, context.runtime_paths, credentials)
@@ -264,7 +264,7 @@ def shared_worker_oauth(
     """
     if not provider.requester_scoped_credentials:
         return None
-    if is_personal_target(worker_target) and primary_worker_backend_is_dedicated(runtime_paths):
+    if is_personal_target(worker_target) and worker_backend_kind(runtime_paths).dedicated:
         return None
     return "allowed" if opted_in else "refused"
 
@@ -298,7 +298,7 @@ def _registered_provider(
     *,
     separate_account: bool,
 ) -> OAuthProvider | None:
-    provider = load_oauth_providers(config, runtime_paths).get(provider_id)
+    provider = config_plugins(config, runtime_paths).oauth_providers.get(provider_id)
     if provider is None:
         with _warned_unknown_providers_lock:
             first = (service, provider_id) not in _warned_unknown_providers

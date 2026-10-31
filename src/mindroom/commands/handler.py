@@ -36,6 +36,7 @@ from mindroom.matrix.room_membership import cached_member_ids, room_membership_i
 from mindroom.message_target import MessageTarget
 from mindroom.model_selection import MODEL_SELECTION_CONTENT_KEY
 from mindroom.requester_identity import resolve_human_requester_alias
+from mindroom.scheduling.errors import SchedulingError
 from mindroom.scheduling.tasks import (
     SchedulingRuntime,
     cancel_all_scheduled_tasks,
@@ -53,6 +54,8 @@ from mindroom.tool_jobs.client_cancel import (
     person_may_cancel,
 )
 from mindroom.tool_jobs.runtime import get_background_runtime
+from mindroom.tool_system.agent_tools import resolve_agent_tools
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.turn_record import TurnRecord
 
 if TYPE_CHECKING:
@@ -71,6 +74,7 @@ if TYPE_CHECKING:
     from mindroom.scheduling.runtime import ScheduledTaskRuntime
     from mindroom.tool_jobs.runtime import BackgroundJob
     from mindroom.tool_system.plugins import PluginReloadResult
+    from mindroom.tool_system.registry import ToolRegistry
 
 logger = get_logger(__name__)
 
@@ -90,18 +94,12 @@ COMMAND_TYPES_WITH_SIDE_EFFECTS = frozenset(
         CommandType.ENCRYPT,
     },
 )
+_SCHEDULE_COMMAND_TYPES = frozenset(
+    {CommandType.SCHEDULE, CommandType.LIST_SCHEDULES, CommandType.EDIT_SCHEDULE, CommandType.CANCEL_SCHEDULE},
+)
 # Commands an agent may post for a human; Desktop pairing, confirmations, and admin changes need the human in person.
 _COMMAND_TYPES_AN_ENTITY_MAY_RUN_FOR_A_HUMAN = frozenset(
-    {
-        CommandType.HELP,
-        CommandType.MODE,
-        CommandType.MODEL,
-        CommandType.SCHEDULE,
-        CommandType.LIST_SCHEDULES,
-        CommandType.CANCEL_SCHEDULE,
-        CommandType.EDIT_SCHEDULE,
-        CommandType.UNKNOWN,
-    },
+    {CommandType.HELP, CommandType.MODE, CommandType.MODEL, CommandType.UNKNOWN, *_SCHEDULE_COMMAND_TYPES},
 )
 
 
@@ -199,17 +197,17 @@ class CommandHandlerContext:
     send_response: _CommandResponseSender
     agent_reply_memberships: AgentReplyMembershipIndex
     responder_candidates_for_room: Callable[[nio.MatrixRoom, str], Awaitable[list[MatrixID]]]
-    reload_plugins: Callable[[], Awaitable[PluginReloadResult]] | None = None
-    controller_identity: Callable[[str], DesktopControllerIdentity] | None = None
-    # Runs saved schedules; None without an orchestrator, where schedules are saved but not run.
-    scheduled_tasks: ScheduledTaskRuntime | None = None
+    reload_plugins: Callable[[], Awaitable[PluginReloadResult]]
+    controller_identity: Callable[[str], DesktopControllerIdentity]
+    # Runs saved schedules.
+    scheduled_tasks: ScheduledTaskRuntime
 
 
-def _format_agent_description(agent_name: str, config: Config) -> str:
+def _format_agent_description(agent_name: str, config: Config, tools: ToolRegistry) -> str:
     """Format a concise agent description for the welcome message."""
     if agent_name in config.agents:
         agent_config = config.agents[agent_name]
-        tool_names = config.resolve_agent(agent_name).tools.tool_names
+        tool_names = resolve_agent_tools(config, agent_name, tools).tool_names
         desc_parts = []
 
         # Add role first
@@ -248,12 +246,13 @@ def _format_welcome_message(
     entity_list = []
     candidate_entity_ids = list(candidate_entities)
     registry = entity_identity_registry(config, runtime_paths) if candidate_entity_ids else None
+    tools = config_plugins(config, runtime_paths).tools
     for entity_id in candidate_entity_ids:
         assert registry is not None
         entity_name = registry.current_entity_name_for_user_id(entity_id.full_id, include_router=False)
         if entity_name is None:
             continue
-        description = _format_agent_description(entity_name, config)
+        description = _format_agent_description(entity_name, config, tools)
         entity_entry = f"• **{config.entity_display_name(entity_name)}** (alias `{entity_name}`)"
         if description:
             entity_entry += f": {description}"
@@ -322,7 +321,13 @@ def _format_plugin_reload_summary(result: PluginReloadResult) -> str:
     task_label = "task" if result.cancelled_task_count == 1 else "tasks"
     plugin_label = "plugin" if plugin_count == 1 else "plugins"
     active_plugins = ", ".join(result.active_plugin_names) if result.active_plugin_names else "none"
-    return f"✅ Reloaded {plugin_count} {plugin_label}; cancelled {result.cancelled_task_count} {task_label}; active: {active_plugins}"
+    summary = (
+        f"✅ Reloaded {plugin_count} {plugin_label}; cancelled {result.cancelled_task_count} {task_label}; "
+        f"active: {active_plugins}"
+    )
+    if result.skipped:
+        summary += "; skipped: " + "; ".join(f"{plugin.path} ({plugin.error})" for plugin in result.skipped)
+    return summary
 
 
 def _room_admin_sender(context: CommandHandlerContext, event: _CommandEvent, requester_user_id: str) -> str:
@@ -394,6 +399,63 @@ async def _desktop_agent_for_room(
     return agent_name
 
 
+async def _run_schedule_command(
+    context: CommandHandlerContext,
+    room: nio.MatrixRoom,
+    event: _CommandEvent,
+    command: Command,
+    requester_user_id: str,
+) -> str:
+    """Run one schedule command and return its reply, raising ``SchedulingError`` when the operation did not happen."""
+    thread_id = context.stable_target.resolved_thread_id
+    if command.type == CommandType.SCHEDULE:
+        mentioned_agents, _, _ = check_agent_mentioned(
+            event.source,
+            None,
+            context.config,
+            context.runtime_paths,
+            room=room,
+        )
+        return await schedule_task(
+            runtime=_scheduling_runtime(context, room),
+            room_id=room.room_id,
+            thread_id=thread_id,
+            scheduled_by=requester_user_id,
+            full_text=command.args["full_text"],
+            mentioned_agents=mentioned_agents,
+        )
+    if command.type == CommandType.LIST_SCHEDULES:
+        return await list_scheduled_tasks(
+            client=context.client,
+            room_id=room.room_id,
+            runtime_paths=context.runtime_paths,
+            thread_id=thread_id,
+            config=context.config,
+        )
+    if command.type == CommandType.EDIT_SCHEDULE:
+        return await edit_scheduled_task(
+            runtime=_scheduling_runtime(context, room),
+            room_id=room.room_id,
+            task_id=command.args["task_id"],
+            full_text=command.args["full_text"],
+            scheduled_by=requester_user_id,
+        )
+    if command.args.get("cancel_all", False):
+        return await cancel_all_scheduled_tasks(
+            client=context.client,
+            room_id=room.room_id,
+            runtime_paths=context.runtime_paths,
+            task_runtime=context.scheduled_tasks,
+        )
+    return await cancel_scheduled_task(
+        client=context.client,
+        room_id=room.room_id,
+        task_id=command.args["task_id"],
+        runtime_paths=context.runtime_paths,
+        task_runtime=context.scheduled_tasks,
+    )
+
+
 async def handle_command(  # noqa: C901, PLR0912, PLR0915
     *,
     context: CommandHandlerContext,
@@ -421,8 +483,6 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
     elif command.type == CommandType.RELOAD_PLUGINS:
         if not is_platform_administrator(requester_user_id, context.config, context.runtime_paths):
             response_text = "❌ Admin only."
-        elif context.reload_plugins is None:
-            response_text = "❌ Plugin reload unavailable."
         else:
             try:
                 response_text = _format_plugin_reload_summary(await context.reload_plugins())
@@ -456,8 +516,6 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
                 "❌ Use `!desktop` in a private room containing only you, the serving bot, "
                 "and exactly one Desktop-enabled agent."
             )
-        elif context.controller_identity is None:
-            response_text = "❌ Desktop setup is unavailable until the target agent is running."
         else:
             response_text = handle_desktop_command(
                 command.args.get("args_text", ""),
@@ -470,73 +528,16 @@ async def handle_command(  # noqa: C901, PLR0912, PLR0915
                 ),
             )
 
-    elif command.type == CommandType.SCHEDULE:
-        full_text = command.args["full_text"]
-
-        mentioned_agents, _, _ = check_agent_mentioned(
-            event.source,
-            None,
-            context.config,
-            context.runtime_paths,
-            room=room,
-        )
-
-        _, response_text = await schedule_task(
-            runtime=_scheduling_runtime(context, room),
-            room_id=room.room_id,
-            thread_id=effective_thread_id,
-            scheduled_by=requester_user_id,
-            full_text=full_text,
-            mentioned_agents=mentioned_agents,
-        )
-
-    elif command.type == CommandType.LIST_SCHEDULES:
-        response_text = await list_scheduled_tasks(
-            client=context.client,
-            room_id=room.room_id,
-            runtime_paths=context.runtime_paths,
-            thread_id=effective_thread_id,
-            config=context.config,
-        )
-
-    elif command.type == CommandType.CANCEL_SCHEDULE:
-        cancel_all = command.args.get("cancel_all", False)
-
-        if cancel_all:
-            # Cancel all scheduled tasks
-            response_text = await cancel_all_scheduled_tasks(
-                client=context.client,
-                room_id=room.room_id,
-                runtime_paths=context.runtime_paths,
-                task_runtime=context.scheduled_tasks,
-            )
-        else:
-            # Cancel specific task
-            task_id = command.args["task_id"]
-            response_text = await cancel_scheduled_task(
-                client=context.client,
-                room_id=room.room_id,
-                task_id=task_id,
-                runtime_paths=context.runtime_paths,
-                task_runtime=context.scheduled_tasks,
-            )
+    elif command.type in _SCHEDULE_COMMAND_TYPES:
+        try:
+            response_text = await _run_schedule_command(context, room, event, command, requester_user_id)
+        except SchedulingError as error:
+            response_text = f"❌ {error}"
 
     elif command.type in {CommandType.JOBS, CommandType.CANCEL_JOB}:
         # A command sent outside any thread speaks for the whole room, though its reply opens a thread.
         thread_id = context.stable_target.source_thread_id
         response_text = await _background_jobs_command(context, room, command, requester_user_id, thread_id)
-
-    elif command.type == CommandType.EDIT_SCHEDULE:
-        task_id = command.args["task_id"]
-        full_text = command.args["full_text"]
-        response_text = await edit_scheduled_task(
-            runtime=_scheduling_runtime(context, room),
-            room_id=room.room_id,
-            task_id=task_id,
-            full_text=full_text,
-            scheduled_by=requester_user_id,
-            thread_id=effective_thread_id,
-        )
 
     elif command.type == CommandType.CONFIG:
         authorization = context.config.authorization

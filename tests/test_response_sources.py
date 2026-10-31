@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mindroom.constants import MATRIX_SOURCE_EVENT_IDS_METADATA_KEY
-from mindroom.llm.runs import ToolExecution
+from mindroom.llm.runs import RunRequirement, ToolExecution
 from mindroom.response_sources import ResponseSources
 from mindroom.response_turn import PausedAttempt
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
@@ -64,7 +64,11 @@ async def test_explicit_edit_sources_ignore_unrelated_model_metadata(tmp_path: P
         PausedAttempt(
             session_id="session-1",
             run_id="run-paused",
-            tools=(ToolExecution(tool_call_id="call-1", tool_name="read_document", requires_confirmation=True),),
+            requirements=(
+                RunRequirement(
+                    ToolExecution(tool_call_id="call-1", tool_name="read_document", requires_confirmation=True),
+                ),
+            ),
             toolkit_owners={("general", "read_document"): "test_toolkit"},
         ),
     )
@@ -84,7 +88,7 @@ async def test_explicit_edit_sources_ignore_unrelated_model_metadata(tmp_path: P
         patch("mindroom.approval.response.evaluate_tool_approval", new=AsyncMock(return_value=(True, 60.0))),
     ):
         async with _in_reply_span(runner, request, placeholder_event_id=None):
-            await runner._approvals.suspend_for_approval(
+            await runner.approvals.suspend_for_approval(
                 paused,
                 request=request,
                 target=request.response_envelope.target,
@@ -98,7 +102,7 @@ async def test_explicit_edit_sources_ignore_unrelated_model_metadata(tmp_path: P
     assert continuation is not None
     assert continuation.source_event_ids == ("$edit",)
     assert continuation.sources == request.sources
-    resumed = runner._approvals._approval_response_request(
+    resumed = runner.approvals.approval_response_request(
         continuation,
         target=request.response_envelope.target,
     )

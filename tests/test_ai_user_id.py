@@ -20,6 +20,7 @@ from structlog.testing import capture_logs
 from mindroom import ai, ai_run_metadata
 from mindroom.agent_run_context import append_knowledge_availability_enrichment
 from mindroom.ai import (
+    TurnResult,
     _compose_current_turn_prompt,
     _prepare_agent_and_prompt,
     _stream_completed_without_visible_output,
@@ -63,7 +64,7 @@ from mindroom.llm.events import ToolStarted
 from mindroom.llm.media import File
 from mindroom.llm.messages import Message, model_provenance
 from mindroom.llm.provider import TextDelta, TurnCompleted, UsageReported
-from mindroom.llm.runs import RunRecord, RunStatus, ToolExecution
+from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, ToolExecution
 from mindroom.llm.usage import MessageMetrics, ModelMetrics, RunMetrics, TokenCounts
 from mindroom.media_inputs import MediaInputs
 from mindroom.memory import MemoryPromptParts
@@ -85,18 +86,19 @@ from mindroom.response_turn import (
 )
 from mindroom.session_storage.agent_storage import create_session_storage
 from mindroom.session_storage.types import ConversationSession
-from mindroom.tool_system.events import CollectedStreamPresentation
+from mindroom.tool_system.context_bound_streams import context_bound_async_stream
+from mindroom.tool_system.events import CollectedStreamPresentation, FailedReply
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import (
-    LiveToolDispatchContext,
     ToolRuntimeContext,
+    current_execution_identity,
+    detached_tool_scope,
     get_tool_runtime_context,
     tool_runtime_context,
 )
 from mindroom.tool_system.worker_routing import (
+    bind_detached_execution_identity,
     build_tool_execution_identity,
-    get_tool_execution_identity,
-    stream_with_tool_execution_identity,
-    tool_execution_identity,
 )
 from mindroom.turn_continuation import TURN_CONTINUATION_LIMIT
 from tests.ai_user_id_helpers import (
@@ -229,8 +231,8 @@ async def _respond(
     *,
     sinks: TurnSinks = TurnSinks(),  # noqa: B008 - an immutable value
     **turn_inputs: Any,  # noqa: ANN401
-) -> str:
-    """Run one reply of ``test``, with the other turn inputs ``turn_inputs`` name, and return its collected text."""
+) -> TurnResult:
+    """Run one reply of ``test``, with the other turn inputs ``turn_inputs`` name, and return how its turn ended."""
     return await ai_response(replace(ctx, prompt="test", **turn_inputs), runtime_paths, config, sinks=sinks)
 
 
@@ -259,6 +261,7 @@ def _model_runtime_context(
         client=AsyncMock(),
         config=config,
         runtime_paths=runtime_paths,
+        plugins=config_plugins(config, runtime_paths),
         conversation_reader=MagicMock(),
         relations=MagicMock(),
         active_model_name=active_model_name,
@@ -286,12 +289,11 @@ def _execution_identity(
 
 
 def test_reply_usage_publishes_its_keys_in_order_with_fractions_as_decimal_strings() -> None:
-    """The ``usage`` object lists the counters, then cost and timing, then the uncached input, zero included."""
+    """The ``usage`` object lists the counters, then the timings, then the uncached input, zero included."""
     counts = TokenCounts(**{name: index for index, name in enumerate(TokenCounts().to_dict(), start=1)})
 
     payload = ReplyUsage(
         tokens=counts,
-        cost=0.5,
         time_to_first_token=0.25,
         duration=1 / 3,
         uncached_input_tokens=0,
@@ -307,19 +309,22 @@ def test_reply_usage_publishes_its_keys_in_order_with_fractions_as_decimal_strin
         ("cache_read_tokens", 4),
         ("cache_write_tokens", 5),
         ("reasoning_tokens", 6),
-        ("cost", "0.5"),
         ("time_to_first_token", "0.25"),
         ("duration", "0.333333333333"),
         ("uncached_input_tokens", 0),
     ]
-    nothing_reported = ReplyUsage(
-        tokens=TokenCounts(),
-        cost=None,
-        time_to_first_token=None,
-        duration=None,
-        uncached_input_tokens=5,
-    )
+    nothing_reported = ReplyUsage.of(RunMetrics(), provider="OpenAI Chat", configured_provider="openai", model_id="m")
     assert nothing_reported.to_wire() == {}
+
+
+def test_reply_usage_publishes_no_uncached_input_when_the_provider_reported_no_usage() -> None:
+    """A request whose provider reported no usage still counts under its model, timed, but splits no input."""
+    metrics = RunMetrics(duration=1.5)
+    metrics.add(MessageMetrics(duration=1.5), model_id="m", provider="OpenAI Chat")
+
+    usage = ReplyUsage.of(metrics, provider="OpenAI Chat", configured_provider="openai", model_id="m")
+
+    assert usage.to_wire() == {"duration": "1.5"}
 
 
 def test_reply_usage_publishes_a_counter_its_order_omits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -332,20 +337,18 @@ def test_reply_usage_publishes_a_counter_its_order_omits(monkeypatch: pytest.Mon
 
     payload = ReplyUsage(
         tokens=TokenCounts(input_tokens=5, output_tokens=2),
-        cost=0.5,
-        time_to_first_token=None,
+        time_to_first_token=0.5,
         duration=None,
         uncached_input_tokens=None,
     ).to_wire()
 
-    assert list(payload.items()) == [("output_tokens", 2), ("input_tokens", 5), ("cost", "0.5")]
+    assert list(payload.items()) == [("output_tokens", 2), ("input_tokens", 5), ("time_to_first_token", "0.5")]
 
 
 def test_reply_usage_leaves_out_zero_counters() -> None:
     """A zero counter is left out of the published usage."""
     payload = ReplyUsage(
         tokens=TokenCounts(input_tokens=6, output_tokens=0, cache_read_tokens=46449),
-        cost=None,
         time_to_first_token=None,
         duration=None,
         uncached_input_tokens=None,
@@ -553,7 +556,7 @@ def test_an_agent_reply_on_a_priced_model_publishes_its_cost(tmp_path: Path) -> 
     metrics.add(
         MessageMetrics(tokens=TokenCounts(input_tokens=1_000, output_tokens=10)),
         model_id=identity.id,
-        provider=identity.provider_name,
+        provider=identity.provider,
     )
     record = RunRecord(
         run_id="run-1",
@@ -567,7 +570,6 @@ def test_an_agent_reply_on_a_priced_model_publishes_its_cost(tmp_path: Path) -> 
     content = agent_run_metadata_content(
         config,
         record,
-        runtime_paths=paths,
         model_name="default",
         run_id="run-1",
         session_id="session-1",
@@ -578,14 +580,9 @@ def test_an_agent_reply_on_a_priced_model_publishes_its_cost(tmp_path: Path) -> 
     assert content[AI_RUN_METADATA_KEY]["cost"] == {"usd": "0.00208"}
 
 
-def test_an_agent_reply_publishes_how_many_tool_calls_its_run_made(tmp_path: Path) -> None:
+def test_an_agent_reply_publishes_how_many_tool_calls_its_run_made() -> None:
     """The metadata an agent reply publishes counts the tool calls its run record holds."""
     config = Config(models={"default": ModelConfig(provider="openai", id="gpt-6.1-sol", api_key="key")})
-    paths = resolve_runtime_paths(
-        config_path=tmp_path / "config.yaml",
-        storage_path=tmp_path / "storage",
-        process_env={},
-    )
     record = RunRecord(
         run_id="run-1",
         session_id="session-1",
@@ -596,7 +593,6 @@ def test_an_agent_reply_publishes_how_many_tool_calls_its_run_made(tmp_path: Pat
     content = agent_run_metadata_content(
         config,
         record,
-        runtime_paths=paths,
         model_name="default",
         run_id="run-1",
         session_id="session-1",
@@ -719,7 +715,7 @@ async def test_stream_with_request_log_context_closes_wrapped_stream_on_early_cl
     """Closing the wrapper should immediately close the provider stream."""
     closed = False
 
-    async def source() -> AsyncGenerator[str, None]:
+    async def source() -> AsyncGenerator[str]:
         nonlocal closed
         try:
             yield "first"
@@ -910,16 +906,16 @@ class TestUserIdPassthrough:
         async def source() -> AsyncIterator[str]:
             try:
                 assert get_tool_runtime_context() is tool_context
-                assert get_tool_execution_identity() == execution_identity
+                assert current_execution_identity() == execution_identity
                 yield "chunk"
                 await asyncio.Future()
             finally:
                 observed_final_contexts.append(
-                    (get_tool_runtime_context(), get_tool_execution_identity()),
+                    (get_tool_runtime_context(), current_execution_identity()),
                 )
 
-        stream = coordinator._stream_in_tool_context(
-            tool_dispatch=LiveToolDispatchContext.from_runtime_context(tool_context),
+        stream = coordinator.deps.tool_runtime.stream_in_context(
+            tool_context=tool_context,
             stream_factory=source,
         )
 
@@ -929,9 +925,10 @@ class TestUserIdPassthrough:
         assert observed_final_contexts == [(tool_context, execution_identity)]
 
     @pytest.mark.asyncio
-    async def test_execution_identity_stream_factory_masks_outer_context(self, tmp_path: Path) -> None:
-        """Factory setup should not inherit an outer execution identity when None is explicit."""
+    async def test_a_detached_stream_factory_masks_the_outer_context_and_identity(self, tmp_path: Path) -> None:
+        """Factory setup inherits neither an outer tool runtime context nor an outer execution identity."""
         runtime_paths = _runtime_paths(tmp_path)
+        outer_context = _model_runtime_context(_config(), runtime_paths, active_model_name="default")
         outer_identity = build_tool_execution_identity(
             channel="matrix",
             agent_name="outer",
@@ -942,46 +939,22 @@ class TestUserIdPassthrough:
             resolved_thread_id=None,
             session_id="outer-session",
         )
-        observed_identity: list[object | None] = []
+        observed: list[tuple[object | None, object | None]] = []
 
         def factory() -> AsyncIterator[str]:
-            observed_identity.append(get_tool_execution_identity())
+            observed.append((get_tool_runtime_context(), current_execution_identity()))
             msg = "factory boom"
             raise RuntimeError(msg)
 
-        with tool_execution_identity(outer_identity):
-            stream = stream_with_tool_execution_identity(None, stream_factory=factory)
-            with pytest.raises(RuntimeError, match="factory boom"):
-                await anext(stream)
-
-        assert observed_identity == [None]
-
-    @pytest.mark.asyncio
-    async def test_tool_runtime_stream_factory_masks_outer_context(self, tmp_path: Path) -> None:
-        """Factory setup should not inherit an outer tool runtime context when None is explicit."""
-        coordinator = unwrap_extracted_collaborator(_bot(tmp_path)._response_runner)
-        target = _target()
-        outer_context = coordinator.deps.tool_runtime.build_context(
-            target,
-            user_id="@outer:localhost",
-        )
-        assert outer_context is not None
-        observed_context: list[object | None] = []
-
-        def factory() -> AsyncIterator[str]:
-            observed_context.append(get_tool_runtime_context())
-            msg = "factory boom"
-            raise RuntimeError(msg)
-
-        with tool_runtime_context(outer_context):
-            stream = coordinator.deps.tool_runtime.stream_in_context(
-                tool_context=None,
+        with tool_runtime_context(outer_context), bind_detached_execution_identity(outer_identity):
+            stream = context_bound_async_stream(
+                context_factory=lambda: detached_tool_scope(None),
                 stream_factory=factory,
             )
             with pytest.raises(RuntimeError, match="factory boom"):
                 await anext(stream)
 
-        assert observed_context == [None]
+        assert observed == [(None, None)]
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("probe")
@@ -1313,6 +1286,8 @@ class TestUserIdPassthrough:
         config, runtime_paths = _bound(tmp_path)
         _install(monkeypatch, *turns)
         completed: list[CompletedAttempt] = []
+        built: list[object] = []
+        monkeypatch.setattr("mindroom.ai.agent_run_metadata_content", lambda *args, **_kwargs: built.append(args))
 
         await collect_streamed_response_content(
             stream_agent_response(
@@ -1325,7 +1300,8 @@ class TestUserIdPassthrough:
         )
 
         assert [attempt.status for attempt in completed] == [status]
-        assert all(attempt.metadata_content is None for attempt in completed)
+        # A caller that collects no run metadata never has it built.
+        assert built == []
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("probe")
@@ -1383,7 +1359,6 @@ class TestUserIdPassthrough:
             },
             "reply_to_event_id": "e1",
             "correlation_id": "e1",
-            "model_params": {},
             "matrix_event_id": "e1",
             "matrix_seen_event_ids": ["e1"],
             "mindroom_original_status": "cancelled",
@@ -1449,7 +1424,7 @@ class TestUserIdPassthrough:
             monkeypatch,
             calls(
                 tool_call("inspect", "call-1", path="report.txt"),
-                tool_call("switch_thread_model", "call-switch", model_name="large", when="next-turn"),
+                tool_call("switch_thread_model", "call-switch", model_name="default", when="after-toolcall"),
             ),
             [stop_turn()],
         )
@@ -1615,7 +1590,7 @@ class TestUserIdPassthrough:
             runtime_paths,
         )
 
-        assert response == get_user_friendly_error_message(error, "general", runtime_paths=runtime_paths)
+        assert response.text == get_user_friendly_error_message(error, "general", runtime_paths=runtime_paths)
         [stored] = stored_runs(config, runtime_paths, "session1")
         assert stored.metadata is not None
         assert stored.metadata["mindroom_original_status"] == "error"
@@ -1633,7 +1608,7 @@ class TestUserIdPassthrough:
                 _config_with_team(),
             )
 
-        assert response == "friendly-error"
+        assert response.text == "friendly-error"
         error = mock_friendly_error.call_args.args[0]
         assert isinstance(error, ValueError)
         assert "configured team" in str(error)
@@ -1655,8 +1630,8 @@ class TestUserIdPassthrough:
                 )
             ]
 
-        assert chunks == ["friendly-error"]
         error = mock_friendly_error.call_args.args[0]
+        assert chunks == [FailedReply("friendly-error", error)]
         assert isinstance(error, ValueError)
         assert "configured team" in str(error)
         assert "team/ultimate" in str(error)
@@ -1705,7 +1680,7 @@ class TestUserIdPassthrough:
             media=MediaInputs(files=[document_file]),
         )
 
-        assert response == (
+        assert response.text == (
             "[general] ⚠️ This model's safeguards blocked the request. "
             "Choose a different model (`!model list`) or revise the prompt, then try again."
         )
@@ -1776,17 +1751,15 @@ class TestUserIdPassthrough:
             calls(tool_call("run_shell_command", "call-1", cmd="pwd"), metrics=usage(500, 60)),
             [raising(ProviderError("provider failed", provider="Synthetic"))],
         )
-        run_metadata: dict[str, Any] = {}
 
         response = await _respond(
             make_turn_context("general", session_id="session1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
-        assert "provider failed" in response
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        assert "provider failed" in response.text
+        payload = response.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["status"] == "error"
         assert payload["usage"]["input_tokens"] == 500
         assert payload["usage"]["output_tokens"] == 60
@@ -1815,16 +1788,14 @@ class TestUserIdPassthrough:
             ],
         )
         install_model_providers(monkeypatch, {"default": model})
-        run_metadata: dict[str, Any] = {}
 
-        await _respond(
+        result = await _respond(
             make_turn_context("general", session_id="session1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["status"] == "error"
         assert payload["context"] == {"input_tokens": 500, "window_tokens": 100_000}
 
@@ -1845,7 +1816,7 @@ class TestUserIdPassthrough:
             show_tool_calls=False,
         )
 
-        assert response == "Done."
+        assert response.text == "Done."
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("probe")
@@ -1864,18 +1835,18 @@ class TestUserIdPassthrough:
             show_tool_calls=True,
         )
 
-        assert response.strip() == "🔧 `read_file` [1]\n\nDone."
+        assert response.text.strip() == "🔧 `read_file` [1]\n\nDone."
 
     @pytest.mark.asyncio
     @pytest.mark.usefixtures("probe")
-    async def test_a_reply_continues_after_next_turn_model_switch(
+    async def test_a_reply_continues_after_a_model_switch_for_the_current_response(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A next-turn model switch rebuilds the agent and continues the same task under a fresh run id."""
+        """A switch for the current response rebuilds the agent and continues the same task under a fresh run id."""
         config, runtime_paths = _bound(tmp_path)
-        _install(monkeypatch, _switch("call-switch", "large", "next-turn"), answer("Finished the task."))
+        _install(monkeypatch, _switch("call-switch", "default", "after-toolcall"), answer("Finished the task."))
         run_ids: list[str] = []
 
         with patch("mindroom.ai._prepare_agent_and_prompt", new=AsyncMock(wraps=_prepare_agent_and_prompt)) as prepare:
@@ -1888,7 +1859,7 @@ class TestUserIdPassthrough:
                 sinks=TurnSinks(on_attempt_start=lambda run_id, _model_name: run_ids.append(run_id)),
             )
 
-        assert response == "Finished the task."
+        assert response.text == "Finished the task."
         assert prepare.await_count == 2
         assert prepare.await_args_list[0].args[0].model_prompt == "test\n\nUse attachment att_1."
         assert prepare.await_args_list[1].args[0].model_prompt == "Use attachment att_1."
@@ -1951,7 +1922,7 @@ class TestUserIdPassthrough:
                 show_tool_calls=False,
             )
 
-        assert response == "Finished."
+        assert response.text == "Finished."
         assert prepare.await_count == 2
         assert prepare.await_args_list[1].args[0].active_model_name == "large"
         assert built == ["default", "large"]
@@ -1968,7 +1939,7 @@ class TestUserIdPassthrough:
         config, runtime_paths = _bound(tmp_path)
         _install(
             monkeypatch,
-            _switch("call-switch", "large", "next-turn"),
+            _switch("call-switch", "default", "after-toolcall"),
             calls(tool_call("run_shell_command", "call-1", cmd="pwd"), content="Half done"),
             [stop_turn()],
         )
@@ -1995,12 +1966,12 @@ class TestUserIdPassthrough:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Repeated rejected model switches end with visible fallback text after the continuation limit."""
+        """Repeated model switches for the current response end with visible fallback text after the continuation limit."""
         config, runtime_paths = _bound(tmp_path)
         attempts = TURN_CONTINUATION_LIMIT + 1
         model = _install(
             monkeypatch,
-            *(_switch(f"call-switch-{index}", "missing", "next-turn") for index in range(attempts)),
+            *(_switch(f"call-switch-{index}", "default", "after-toolcall") for index in range(attempts)),
         )
 
         with patch("mindroom.ai._prepare_agent_and_prompt", new=AsyncMock(wraps=_prepare_agent_and_prompt)) as prepare:
@@ -2011,7 +1982,7 @@ class TestUserIdPassthrough:
                 show_tool_calls=False,
             )
 
-        assert "Model switching did not produce a final answer" in response
+        assert "Model switching did not produce a final answer" in response.text
         assert prepare.await_count == attempts
         assert len(model.requests) == attempts
 
@@ -2033,16 +2004,14 @@ class TestUserIdPassthrough:
         metrics = usage(800, 120, cache_read_tokens=640, cache_write_tokens=32, reasoning_tokens=24)
         model = _scripted_like(config, runtime_paths, [answer("Response", metrics)])
         install_model_providers(monkeypatch, {"default": model})
-        run_metadata: dict[str, Any] = {}
 
-        await _respond(
+        result = await _respond(
             make_turn_context("general", session_id="session1", run_id="run-1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["version"] == 1
         assert payload["run_id"] == "run-1"
         assert payload["status"] == "completed"
@@ -2110,16 +2079,14 @@ class TestUserIdPassthrough:
         metrics = usage(3000, 120, cache_read_tokens=20_000, cache_write_tokens=500)
         model = _scripted_like(config, runtime_paths, [answer("Response", metrics)])
         install_model_providers(monkeypatch, {"default": model})
-        run_metadata: dict[str, Any] = {}
 
-        await _respond(
+        result = await _respond(
             make_turn_context("general", session_id="session1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["usage"]["input_tokens"] == 3000
         assert payload["usage"]["cache_read_tokens"] == 20_000
         assert payload["usage"]["cache_write_tokens"] == 500
@@ -2144,7 +2111,6 @@ class TestUserIdPassthrough:
 
         assert metadata == {
             "reply_to_event_id": "$primary",
-            "model_params": {},
             MATRIX_EVENT_ID_METADATA_KEY: "$primary",
             MATRIX_SEEN_EVENT_IDS_METADATA_KEY: ["$primary", "$first", "$selection", "$unseen"],
             MATRIX_SOURCE_EVENT_IDS_METADATA_KEY: ["$first", "$primary"],
@@ -2163,7 +2129,6 @@ class TestUserIdPassthrough:
                 "reply_to_event_id": "$reply",
                 "requester_id": "@alice:localhost",
                 "correlation_id": "corr-existing",
-                "model_params": {"temperature": 0.3},
             },
         )
 
@@ -2173,7 +2138,6 @@ class TestUserIdPassthrough:
         assert metadata["reply_to_event_id"] == "$reply"
         assert metadata["requester_id"] == "@alice:localhost"
         assert metadata["correlation_id"] == "corr-existing"
-        assert metadata["model_params"] == {"temperature": 0.3}
 
     def test_stream_completed_without_visible_output_accepts_final_body_only_completion(self) -> None:
         """A run that completed with only a final body still produced visible text."""
@@ -2241,18 +2205,16 @@ class TestUserIdPassthrough:
         built: list[str] = []
         large = _scripted_like(config, runtime_paths, [answer("Response", usage(800, 50))], "large")
         _install_by_name(monkeypatch, {"large": large}, built)
-        run_metadata: dict[str, Any] = {}
 
         with patch("mindroom.matrix.state.get_room_alias_from_id", return_value="lobby"):
-            await _respond(
+            result = await _respond(
                 make_turn_context("general", session_id="session1", room_id="!test:localhost"),
                 config,
                 runtime_paths,
-                sinks=TurnSinks(run_metadata_collector=run_metadata),
             )
 
         assert built == ["large"]
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["model"]["config"] == "large"
         assert payload["model"]["id"] == "large-model"
         assert payload["context"]["window_tokens"] == 48000
@@ -2350,7 +2312,7 @@ class TestUserIdPassthrough:
             PausedAttempt(
                 session_id="session-1",
                 run_id="run-paused",
-                tools=(tool,),
+                requirements=(RunRequirement(tool),),
                 toolkit_owners={("general", "inspect"): "test_toolkit"},
             ),
         )
@@ -2381,6 +2343,7 @@ class TestUserIdPassthrough:
         ],
         ids=["another-tool", "same-named-tool"],
     )
+    @pytest.mark.parametrize("batch", ["earlier-batch", "same-batch"])
     async def test_a_stopped_stream_persists_its_finished_and_running_tools(
         self,
         tmp_path: Path,
@@ -2388,14 +2351,18 @@ class TestUserIdPassthrough:
         probe: type[ProbeTools],
         running: dict[str, Any],
         running_preview: tuple[str, str],
+        batch: str,
     ) -> None:
-        """A stream stopped while a tool runs records the finished call and the running one by their own identity."""
+        """A stream stopped while a tool runs records the finished call and the running one by their own identity.
+
+        The finished call may be a sibling of the running one, which the model asked for in the same message.
+        """
         config, runtime_paths = _bound(tmp_path)
-        _install(
-            monkeypatch,
-            calls(tool_call("run_shell_command", "call-1", cmd="pwd"), content="Half done"),
-            calls(running),
-        )
+        finished = tool_call("run_shell_command", "call-1", cmd="pwd")
+        if batch == "same-batch":
+            _install(monkeypatch, calls(finished, running, content="Half done"))
+        else:
+            _install(monkeypatch, calls(finished, content="Half done"), calls(running))
 
         async def consume() -> None:
             async for _chunk in stream_agent_response(
@@ -2412,6 +2379,8 @@ class TestUserIdPassthrough:
         reply = asyncio.create_task(consume())
         async with asyncio.timeout(10):
             await probe.running.wait()
+        for _ in range(5):
+            await asyncio.sleep(0)
         reply.cancel()
         with pytest.raises(asyncio.CancelledError):
             await reply
@@ -2542,16 +2511,14 @@ class TestUserIdPassthrough:
             ],
         )
         install_model_providers(monkeypatch, {"default": model})
-        run_metadata: dict[str, Any] = {}
 
-        await _respond(
+        result = await _respond(
             make_turn_context("general", session_id="session1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["status"] == "completed"
         assert payload["usage"]["input_tokens"] == 820
         assert payload["usage"]["output_tokens"] == 70
@@ -2592,16 +2559,14 @@ class TestUserIdPassthrough:
             ],
         )
         install_model_providers(monkeypatch, {"default": model})
-        run_metadata: dict[str, Any] = {}
 
-        await _respond(
+        result = await _respond(
             make_turn_context("general", session_id="session1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["usage"]["cache_read_tokens"] == 512
         assert payload["usage"]["cache_write_tokens"] == 32
         assert payload["context"] == {"input_tokens": 120, "window_tokens": 1000}
@@ -2634,9 +2599,7 @@ class TestUserIdPassthrough:
         first = usage(3000, 50, cache_read_tokens=20_000)
         compacted = MessageMetrics(
             tokens=TokenCounts(input_tokens=5000, output_tokens=40, total_tokens=5040, cache_read_tokens=30_000),
-            provider_metrics={
-                "context_usage": {"input_tokens": 400, "cache_read_tokens": 1200, "cache_write_tokens": 0},
-            },
+            context=TokenCounts(input_tokens=400, cache_read_tokens=1200),
         )
         model = _scripted_like(
             config,
@@ -2647,16 +2610,14 @@ class TestUserIdPassthrough:
             ],
         )
         install_model_providers(monkeypatch, {"default": model})
-        run_metadata: dict[str, Any] = {}
 
-        await _respond(
+        result = await _respond(
             make_turn_context("general", session_id="session1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["usage"]["input_tokens"] == 8000
         assert payload["usage"]["cache_read_tokens"] == 50_000
         assert payload["context"] == {
@@ -2697,17 +2658,15 @@ class TestUserIdPassthrough:
             [[UsageReported(usage(700, 0), final=False), Await(drop)], answer("Response", usage(720, 20))],
         )
         install_model_providers(monkeypatch, {"default": pipeline_provider(model)})
-        run_metadata: dict[str, Any] = {}
 
-        await _respond(
+        result = await _respond(
             make_turn_context("general", session_id="session1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
         assert len(model.requests) == 2
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["usage"]["input_tokens"] == 1420
         estimate = payload["prepared_context"]["tokens"]
         assert payload["context"] == {"input_tokens": estimate, "window_tokens": 100_000}
@@ -2743,17 +2702,15 @@ class TestUserIdPassthrough:
             [calls(tool_call("run_shell_command", "call-1", cmd="pwd"), metrics=usage(500, 60)), *[dropped] * 5],
         )
         install_model_providers(monkeypatch, {"default": pipeline_provider(model)})
-        run_metadata: dict[str, Any] = {}
 
-        await _respond(
+        result = await _respond(
             make_turn_context("general", session_id="session1"),
             config,
             runtime_paths,
-            sinks=TurnSinks(run_metadata_collector=run_metadata),
         )
 
         assert len(model.requests) == 6
-        payload = run_metadata[AI_RUN_METADATA_KEY]
+        payload = result.run_metadata[AI_RUN_METADATA_KEY]
         assert payload["status"] == "error"
         assert payload["usage"]["input_tokens"] == 4000
         estimate = payload["prepared_context"]["tokens"]

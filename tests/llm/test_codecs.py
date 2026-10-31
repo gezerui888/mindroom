@@ -18,17 +18,16 @@ import pytest
 from structlog.testing import capture_logs
 
 from mindroom.history.message_content import render_message_content
-from mindroom.llm import usage as llm_usage
 from mindroom.llm.media import Audio, File, Image, Video
 from mindroom.llm.messages import Message
 from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
-from mindroom.llm.usage import MessageMetrics, ModelMetrics, RunMetrics, SessionMetrics, TokenCounts
+from mindroom.llm.usage import MessageMetrics, ModelMetrics, RunMetrics, TokenCounts
 from tests.llm.agno_dict_helpers import (
-    DROPPED_METRICS_KEYS,
     DROPPED_RUN_KEYS,
     DROPPED_TOOL_EXECUTION_KEYS,
     expected_message_dict,
-    expected_requirement_dict,
+    expected_metrics_dict,
+    expected_request_metrics_dict,
     expected_run_dict,
     expected_tool_dict,
     stored_run_record,
@@ -110,10 +109,61 @@ def test_media_from_dict_ignores_agno_only_keys() -> None:
 # --- metrics ---------------------------------------------------------------------------------------------------
 
 
-def test_message_metrics_round_trip_agno_dict() -> None:
-    expected = agno("message_metrics")
+def test_message_metrics_round_trip_agno_dict_minus_dropped_keys() -> None:
+    expected = expected_request_metrics_dict(agno("message_metrics"))
 
-    assert MessageMetrics.from_dict(expected).to_dict() == expected
+    assert MessageMetrics.from_dict(agno("message_metrics")).to_dict() == expected
+
+
+def test_claude_context_usage_stored_under_provider_metrics_reads_as_context() -> None:
+    """A Claude response stored before ``context`` existed reads its final iteration's counters as its context."""
+    stored = {
+        "input_tokens": 12,
+        "output_tokens": 5,
+        "total_tokens": 17,
+        "cache_read_tokens": 3000,
+        "cache_write_tokens": 40,
+        "duration": 1.5,
+        "provider_metrics": {
+            "server_tool_use": {"web_search_requests": 1},
+            "service_tier": "standard",
+            "context_usage": {"input_tokens": 8, "cache_read_tokens": 2000, "cache_write_tokens": 0},
+        },
+    }
+
+    metrics = MessageMetrics.from_dict(stored)
+
+    assert metrics.context == TokenCounts(input_tokens=8, cache_read_tokens=2000)
+    assert metrics.to_dict() == {
+        **{key: value for key, value in stored.items() if key != "provider_metrics"},
+        "context": {"input_tokens": 8, "cache_read_tokens": 2000},
+    }
+    assert MessageMetrics.from_dict(metrics.to_dict()) == metrics
+    # A stored ``context`` is the one a later release wrote, and it wins over any copy under ``provider_metrics``.
+    assert MessageMetrics.from_dict({**stored, "context": {"input_tokens": 9}}).context == TokenCounts(input_tokens=9)
+
+
+def test_usage_stored_with_provider_extras_and_a_cost_reads_without_them() -> None:
+    """Request, run, and per-model usage an earlier release stored with provider extras or a cost read without them.
+
+    A message and a run holding them load, and write back only what the owned metrics model.
+    """
+    counters = {"input_tokens": 42, "output_tokens": 12, "total_tokens": 54}
+    request = {**counters, "cost": 0.00021, "duration": 0.5, "provider_metrics": {"total_duration": 812000000}}
+    entry = {**counters, "cost": 0.00021, "id": "m", "provider": "OpenRouter", "provider_metrics": {"traffic": "x"}}
+    run = {**counters, "cost": 0.00021, "duration": 0.5, "details": {"model": [entry]}}
+
+    assert MessageMetrics.from_dict(request).to_dict() == {**counters, "duration": 0.5}
+    assert RunMetrics.from_dict(run).to_dict() == {
+        **counters,
+        "duration": 0.5,
+        "details": {"model": [{**counters, "id": "m", "provider": "OpenRouter"}]},
+    }
+    message = Message.from_dict({"role": "assistant", "content": "hi", "id": "a", "metrics": request, "created_at": 1})
+    assert message.to_dict()["metrics"] == {**counters, "duration": 0.5}
+    record = RunRecord.from_dict({"run_id": "r", "agent_id": "code", "metrics": run, "messages": [message.to_dict()]})
+    assert record.metrics == RunMetrics.from_dict(run)
+    assert record.to_dict()["metrics"] == RunMetrics.from_dict(run).to_dict()
 
 
 def test_message_metrics_from_dict_ignores_timer_and_unknown_keys() -> None:
@@ -123,16 +173,16 @@ def test_message_metrics_from_dict_ignores_timer_and_unknown_keys() -> None:
 
 
 def test_run_metrics_round_trip_agno_dict_minus_dropped_keys() -> None:
-    expected = without(agno("run_metrics"), DROPPED_METRICS_KEYS)
+    expected = expected_metrics_dict(agno("run_metrics"))
 
     assert RunMetrics.from_dict(agno("run_metrics")).to_dict() == expected
     assert RunMetrics().to_dict() == {}
 
 
-def test_model_metrics_round_trip_agno_dict() -> None:
-    expected = agno("model_metrics")
+def test_model_metrics_round_trip_agno_dict_minus_dropped_keys() -> None:
+    expected = expected_metrics_dict(agno("model_metrics"))
 
-    assert ModelMetrics.from_dict(expected).to_dict() == expected
+    assert ModelMetrics.from_dict(agno("model_metrics")).to_dict() == expected
 
 
 # --- messages --------------------------------------------------------------------------------------------------
@@ -227,7 +277,7 @@ def test_a_message_whose_result_and_call_ids_are_both_malformed_logs_one_line() 
     ]
 
 
-# --- tool executions and requirements --------------------------------------------------------------------------
+# --- tool executions --------------------------------------------------------------------------------------------
 
 
 def test_tool_execution_round_trips_agno_dict_minus_dropped_keys() -> None:
@@ -238,6 +288,23 @@ def test_tool_execution_round_trips_agno_dict_minus_dropped_keys() -> None:
 
     assert owned == expected
     assert set(agno_dict) - set(owned) == DROPPED_TOOL_EXECUTION_KEYS
+
+
+def test_a_paused_delegation_stored_with_agnos_silence_flag_still_loads() -> None:
+    """Every release stored a paused delegation with ``external_execution_silent``; it reads, waits, and drops the key."""
+    stored = {
+        "tool_call_id": "c1",
+        "tool_name": "run_subagent",
+        "tool_args": {"agent_name": "code", "task": "work"},
+        "external_execution_required": True,
+        "external_execution_silent": True,
+    }
+
+    execution = ToolExecution.from_dict(stored)
+
+    assert execution.is_paused
+    assert RunRequirement(execution).needs_external_execution
+    assert execution.to_dict() == without(stored, {"external_execution_silent"})
 
 
 @pytest.mark.parametrize("stored_id", [None, "", "absent"])
@@ -283,22 +350,6 @@ def test_a_run_whose_tool_executions_have_no_call_ids_still_loads() -> None:
     assert written == expected
 
 
-def test_run_requirement_round_trips_agno_dict() -> None:
-    expected = expected_requirement_dict(agno("run_requirement"))
-
-    assert RunRequirement.from_dict(expected).to_dict() == expected
-
-
-def test_run_requirement_from_dict_ignores_user_input_schemas() -> None:
-    stored = agno("run_requirement")
-    stored["user_input_schema"] = [{"name": "x", "field_type": "str", "description": None, "value": None}]
-    stored["user_feedback_schema"] = [
-        {"question": "q", "header": None, "multi_select": False, "selected_options": None},
-    ]
-
-    assert RunRequirement.from_dict(stored).to_dict() == expected_requirement_dict(agno("run_requirement"))
-
-
 # --- run records -----------------------------------------------------------------------------------------------
 
 
@@ -315,7 +366,7 @@ def test_run_record_round_trips_agno_dict_minus_dropped_keys() -> None:
 
 def test_a_run_agno_stored_with_empty_tools_and_requirements_and_no_metrics_reads_as_stored() -> None:
     # Agno's loop left ``tools = []`` on runs without tool calls and ``requirements = []`` after resolving a
-    # pause; MindRoom's interrupted-turn records never set ``metrics``. Each key must survive as stored.
+    # pause; MindRoom's interrupted-turn records never set ``metrics``. Each key the record models survives as stored.
     agno_dict = agno("agent_run_with_empty_tools_and_requirements")
     assert (agno_dict["tools"], agno_dict["requirements"]) == ([], [])
     assert "metrics" not in agno_dict
@@ -351,59 +402,6 @@ def test_run_record_reads_every_status_agno_could_store(status: str) -> None:
     assert record.to_dict() == {**expected_run_dict(agno_dict), "status": "ERROR"}
 
 
-def test_run_requirement_reads_rows_agno_read_leniently() -> None:
-    """A requirement without a tool execution or with an unreadable timestamp still reads, as with Agno."""
-    stored = {"id": "req-9", "created_at": "not a timestamp", "confirmation": True}
-
-    owned = RunRequirement.from_dict(stored)
-
-    assert (owned.tool_execution.tool_name, owned.tool_execution.tool_args) == ("unknown", {})
-    agno_dict, owned_dict = expected_requirement_dict(agno("run_requirement_read_leniently")), owned.to_dict()
-    # Agno's placeholder had no call id; the owned one reads with an id, the same on every read.
-    assert agno_dict["tool_execution"]["tool_call_id"] is None
-    assert owned_dict["tool_execution"]["tool_call_id"] == owned.tool_execution.tool_call_id
-    assert owned.tool_execution.tool_call_id
-    assert RunRequirement.from_dict(stored).tool_execution.tool_call_id == owned.tool_execution.tool_call_id
-    for result in (agno_dict, owned_dict):
-        del result["tool_execution"]["tool_call_id"]
-    assert owned_dict == agno_dict
-
-
-# Stored requirement keys beside a pending tool execution, by case.
-DECISIONS_ON_THE_REQUIREMENT: dict[str, dict[str, Any]] = {
-    "rejection": {"confirmation": False, "confirmation_note": "No."},
-    "approval": {"confirmation": True},
-    "external-result": {"external_execution_result": "done"},
-    "explicit-tool-decision-wins": {
-        "confirmation": False,
-        "tool_execution": {
-            "tool_call_id": "call-1",
-            "tool_name": "t",
-            "requires_confirmation": True,
-            "confirmed": True,
-            "created_at": 3,
-        },
-    },
-}
-
-
-@pytest.mark.parametrize("case", list(DECISIONS_ON_THE_REQUIREMENT))
-def test_run_requirement_moves_a_decision_on_the_requirement_onto_its_tool_execution(case: str) -> None:
-    data = {
-        "id": "req-1",
-        "created_at": "2026-01-02T03:04:05+00:00",
-        "tool_execution": {"tool_call_id": "call-1", "tool_name": "t", "requires_confirmation": True, "created_at": 3},
-        **DECISIONS_ON_THE_REQUIREMENT[case],
-    }
-
-    owned = RunRequirement.from_dict(data).to_dict()
-
-    # Agno's goldens were recorded for these entries without a call id.
-    expected = expected_requirement_dict(agno("run_requirement_decision_moved")[case])
-    expected["tool_execution"]["tool_call_id"] = "call-1"
-    assert owned == expected
-
-
 @pytest.mark.parametrize(
     "stored",
     [{"id": "provider-file"}, {"id": "gemini-file", "external": {"uri": "gemini://f"}, "mime_type": "application/pdf"}],
@@ -432,11 +430,14 @@ FIXTURE_CODECS: dict[str, tuple[Callable[[dict[str, Any]], Any], Callable[[dict[
     "video": (Video.from_dict, dict),
     "file": (File.from_dict, dict),
     "tool_execution": (ToolExecution.from_dict, expected_tool_dict),
-    "run_requirement": (RunRequirement.from_dict, expected_requirement_dict),
-    "message_metrics": (MessageMetrics.from_dict, dict),
-    "run_metrics": (RunMetrics.from_dict, dict),
-    "model_metrics": (ModelMetrics.from_dict, dict),
-    "session_metrics": (SessionMetrics.from_dict, dict),
+    # A stored requirement copies its call, which reads as the call's own tool execution does.
+    "run_requirement": (
+        lambda stored: ToolExecution.from_dict(stored["tool_execution"]),
+        lambda stored: expected_tool_dict(stored["tool_execution"]),
+    ),
+    "message_metrics": (MessageMetrics.from_dict, expected_request_metrics_dict),
+    "run_metrics": (RunMetrics.from_dict, expected_metrics_dict),
+    "model_metrics": (ModelMetrics.from_dict, expected_metrics_dict),
 }
 
 
@@ -465,61 +466,14 @@ def test_stored_fixture_dicts_round_trip_minus_dropped_keys(fixture: str) -> Non
     assert mismatches == {}
 
 
-_METRIC_CODECS: dict[str, Callable[[dict[str, Any]], Any]] = {
-    "message_metrics": MessageMetrics.from_dict,
-    "run_metrics": RunMetrics.from_dict,
-    "model_metrics": ModelMetrics.from_dict,
-    "session_metrics": SessionMetrics.from_dict,
-}
-
-
-@pytest.mark.parametrize("fixture", sorted(_METRIC_CODECS))
+@pytest.mark.parametrize("fixture", ["message_metrics", "model_metrics", "run_metrics"])
 def test_stored_metrics_keep_agno_key_order_at_every_level(fixture: str) -> None:
     """The counters sit first in Agno's order, in run totals and in each per-model entry alike."""
     stored = list(json.loads((FIXTURE_RUNS / f"{fixture}.json").read_text()).values())
     for key, value in AGNO.items():
         if key.startswith(fixture):
-            stored.extend(
-                without(item, DROPPED_METRICS_KEYS) for item in (value if isinstance(value, list) else [value])
-            )
+            stored.extend(value if isinstance(value, list) else [value])
+    read, expected_for = FIXTURE_CODECS[fixture]
 
     for value in stored:
-        assert json.dumps(_METRIC_CODECS[fixture](value).to_dict()) == json.dumps(value)
-
-
-# --- session totals --------------------------------------------------------------------------------------------
-
-
-def _run_metrics_cases() -> list[dict[str, Any]]:
-    return [
-        agno("run_metrics"),
-        agno("run_metrics_with_empty_details"),
-        {},
-        *json.loads((FIXTURE_RUNS / "run_metrics.json").read_text()).values(),
-    ]
-
-
-def _counted_totals(totals: dict[str, Any]) -> dict[str, Any]:
-    """Return the token counters of stored session totals, in total and for each model entry."""
-    counters = set(llm_usage.TOKEN_FIELDS)
-    counted: dict[str, Any] = {key: value for key, value in totals.items() if key in counters}
-    if "details" in totals:
-        counted["details"] = {
-            model_type: [
-                {key: value for key, value in entry.items() if key in counters | {"id", "provider"}}
-                for entry in entries
-            ]
-            for model_type, entries in totals["details"].items()
-        }
-    return counted
-
-
-def test_session_metrics_count_token_counters_as_agno_accumulated_them() -> None:
-    """The session totals add each run's token counters, in total and per model, as Agno summed them."""
-    totals = agno("session_metrics_totals")
-    owned = SessionMetrics()
-    for case, agno_totals in zip(_run_metrics_cases(), totals, strict=True):
-        owned.count_run(RunMetrics.from_dict(case), replacing=None)
-
-        assert owned.to_dict() == _counted_totals(agno_totals)
-    assert SessionMetrics.from_dict(totals[-1]).to_dict() == without(totals[-1], DROPPED_METRICS_KEYS)
+        assert json.dumps(read(value).to_dict()) == json.dumps(expected_for(value))

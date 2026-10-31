@@ -11,17 +11,19 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from mindroom import agents
 from mindroom.ai import run_delegated_child_response
 from mindroom.approval.response import require_ordered_pause_presentation
 from mindroom.config.agent import AgentConfig, AgentPrivateConfig
 from mindroom.config.main import Config
-from mindroom.config.models import DefaultsConfig
+from mindroom.config.models import DefaultsConfig, ModelConfig
 from mindroom.custom_tools.delegate import DelegateTools
 from mindroom.delegation import execution
 from mindroom.delegation.lifecycle import authorize_delegation
@@ -33,18 +35,20 @@ from mindroom.history.types import HistoryScope
 from mindroom.llm.errors import ModelOutputLimitError, ProviderError
 from mindroom.llm.events import ToolCompleted
 from mindroom.llm.provider import TurnCompleted
-from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, ToolExecution
+from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
 from mindroom.llm.usage import RunMetrics, TokenCounts
 from mindroom.response_turn import CompletedApprovalRun, PausedAttempt
-from mindroom.session_storage.agent_storage import create_session_storage
+from mindroom.session_storage.agent_storage import create_session_storage, create_state_storage
 from mindroom.session_storage.lanes import run_session_storage_operation
-from mindroom.session_storage.schema import quote_identifier
+from mindroom.session_storage.schema import TableNames, quote_identifier
 from mindroom.session_storage.store import ConversationStore, persist_to
 from mindroom.tool_system.progress import tool_progress_reporter
 from mindroom.tool_system.runtime_context import tool_runtime_context
+from mindroom.tool_system.tool_function import ToolGate
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity, agent_workspace_root_path
 from tests.access_schema_support import with_responder_access
-from tests.approval_continuation_helpers import approval_continuation, repeats_each_request
+from tests.approval_continuation_helpers import answered_calls, approval_continuation, repeats_each_request
+from tests.conftest import record_store_threads
 from tests.delegation_helpers import (
     RECALLED_MEMORY,
     ScriptedAgents,
@@ -61,17 +65,19 @@ from tests.delegation_helpers import (
     respond,
     resume,
 )
-from tests.fakes.scripted_model import Await, ScriptedModel, ScriptStep, answer, calls, tool_call
+from tests.fakes.scripted_model import Await, ScriptedModel, ScriptStep, answer, calls, tool_call, usage
 from tests.identity_helpers import entity_ids
 from tests.test_delegation_direct_audit import _identity
 from tests.tool_approval_helpers import gated_functions
+from tests.usage_helpers import counted_total
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Awaitable, Callable, Sequence
     from pathlib import Path
 
     from mindroom.constants import RuntimePaths
     from mindroom.delegation.state import DelegationChild
+    from mindroom.llm.runs import AnyRunRecord
     from mindroom.session_storage.store import SaveOutcome
     from mindroom.session_storage.types import ConversationSession
 
@@ -91,6 +97,8 @@ def _config(paths: RuntimePaths, *, child_tools: Sequence[str] = ("report",), ga
             },
             defaults=DefaultsConfig(tools=[]),
             memory={"backend": "none"},
+            # A configured model the child's ``switch_thread_model`` calls can switch to.
+            models={"default": ModelConfig(provider="openai", id="test-model")},
             tool_approval={"rules": rules},
         ),
         "code",
@@ -101,7 +109,7 @@ def _config(paths: RuntimePaths, *, child_tools: Sequence[str] = ("report",), ga
 
 
 def _leader_identity() -> ToolExecutionIdentity:
-    return ToolExecutionIdentity("matrix", "leader", REQUESTER, "!room:example.org", None, None, "parent")
+    return ToolExecutionIdentity("matrix", "leader", REQUESTER, "!room:example.org", "$thread", "$thread", "parent")
 
 
 def _provider_failure(text: str) -> Await:
@@ -167,6 +175,72 @@ def _distinct_markers(paused: PausedAttempt) -> int:
 
 
 @pytest.mark.asyncio
+async def test_a_child_resume_whose_session_is_gone_stops_before_rebuilding_the_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An approved child whose stored session can no longer be loaded stops with that reason, its agent unbuilt."""
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths)
+    identity = _leader_identity()
+    leader = ScriptedModel(
+        [
+            calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")),
+            answer("parent result"),
+        ],
+    )
+    code = ScriptedModel(_child_script(nested=False, retry=False, siblings=1))
+    ScriptedAgents({"leader": leader, "code": code}).install(monkeypatch)
+    executor = approval_executor(config, paths)
+
+    with registered_report_tool() as report:
+        paused = await respond(
+            "leader",
+            "delegate",
+            config=config,
+            runtime_paths=paths,
+            identity=identity,
+            run_id="parent-run",
+        )
+        assert isinstance(paused, PausedAttempt)
+        state = DelegationState.from_metadata(_parent_record(config, paths, identity, "parent-run").metadata)
+        [child] = state.children
+        call_id = str(state.pending_tools[0]["tool_call_id"])
+        load_session = ConversationStore.load_session
+
+        def child_session_gone(self: ConversationStore, session_id: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            return None if session_id == child.session_id else load_session(self, session_id, *args, **kwargs)
+
+        monkeypatch.setattr(ConversationStore, "load_session", child_session_gone)
+        built: list[str] = []
+        create_agent = agents.create_agent
+
+        def recorded_build(agent_name: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            built.append(agent_name)
+            return create_agent(agent_name, *args, **kwargs)
+
+        monkeypatch.setattr(agents, "create_agent", recorded_build)
+        result = await resume(
+            executor,
+            paused,
+            _saved_approval_calls(state),
+            agent_name="leader",
+            identity=identity,
+            config=config,
+            runtime_paths=paths,
+            decisions={call_id: True},
+            approval_id="card-0",
+        )
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert (built, report.written) == ([], [])
+    resumed = _parent_record(config, paths, identity, "parent-run")
+    result_message = next(message.content for message in resumed.messages if message.tool_call_id == "delegate-0")
+    assert isinstance(result_message, str)
+    assert "Delegated run's session is no longer available" in result_message
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("outcome", ["approve", "deny", "cancel", "cancel_removed", "cancel_completed", "revoke"])
 @pytest.mark.parametrize(
     ("siblings", "nested", "retry"),
@@ -224,7 +298,7 @@ async def test_child_approval_survives_parent_reconstruction(  # noqa: PLR0915
         assert card_id.startswith(f"{state.children[0].delegation_id}:")
         assert card_id.endswith(":same-call")
         assert card_id.count(":") == (2 if nested else 1)
-        assert [tool.tool_call_id for tool in paused.tools] == [state.pending_tools[0]["tool_call_id"]]
+        assert [tool.tool_call_id for tool in paused.tools] == [card_id]
         assert paused.toolkit_owners[("code", "write_report")] == "report"
 
         if outcome in {"cancel", "cancel_removed", "cancel_completed"}:
@@ -241,10 +315,10 @@ async def test_child_approval_survives_parent_reconstruction(  # noqa: PLR0915
                 completed.status = RunStatus.completed
                 completed.content = "Saved result"
                 completed.tools = []
-                completed.requirements = []
                 storage.save_run(session, completed, record_usage=False)
             if outcome == "cancel_removed":
                 config.agents.clear()
+            threads = record_store_threads(monkeypatch, "get_run", "save_run", "patch_run_metadata")
             await cancel_approval_delegations(
                 approval_continuation(
                     run_id="parent-run",
@@ -266,6 +340,12 @@ async def test_child_approval_survives_parent_reconstruction(  # noqa: PLR0915
                 runtime_paths=paths,
                 reason="Cancelled by requester",
             )
+            # The parent's run is read and patched, and its child's read and saved, each in its database's lane.
+            cancel_threads = {name: list(calls) for name, calls in threads.items()}
+            assert cancel_threads["patch_run_metadata"]
+            assert all(name.startswith("conversation-store") for names in cancel_threads.values() for name in names), (
+                cancel_threads
+            )
             expected = RunStatus.completed if outcome == "cancel_completed" else RunStatus.cancelled
             storage = create_session_storage("code", original_config, paths, child_identity)
             assert storage.get_run(child.run_id).status is expected  # type: ignore[union-attr]
@@ -285,6 +365,14 @@ async def test_child_approval_survives_parent_reconstruction(  # noqa: PLR0915
         if outcome == "revoke":
             config.agents["leader"].delegate_to = []
         observed_ids: set[str] = set()
+        child_loads: defaultdict[str, list[str]] = defaultdict(list)
+        load_session = ConversationStore.load_session
+
+        def recording_load(self: ConversationStore, session_id: str, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+            child_loads[session_id].append(threading.current_thread().name)
+            return load_session(self, session_id, *args, **kwargs)
+
+        monkeypatch.setattr(ConversationStore, "load_session", recording_load)
         result: CompletedApprovalRun | PausedAttempt = paused
         shown = _distinct_markers(paused)
         for index in range(siblings):
@@ -295,6 +383,8 @@ async def test_child_approval_survives_parent_reconstruction(  # noqa: PLR0915
             assert call_id not in observed_ids
             observed_ids.add(call_id)
             assert sum(child.status == "completed" for child in state.children) == index
+            pending = next(child for child in state.children if child.status != "completed")
+            earlier_loads = len(child_loads[pending.session_id])
             result = await resume(
                 executor,
                 result,
@@ -304,9 +394,12 @@ async def test_child_approval_survives_parent_reconstruction(  # noqa: PLR0915
                 config=config,
                 runtime_paths=paths,
                 decisions={call_id: outcome == "approve"},
-                denial_reasons={call_id: None},
                 approval_id=f"card-{index}",
             )
+            # A resumed child's session loads in its database's lane, behind the child's other storage work.
+            resumed_loads = child_loads[pending.session_id][earlier_loads:]
+            assert resumed_loads or outcome != "approve"
+            assert all(name.startswith("conversation-store") for name in resumed_loads), resumed_loads
             if isinstance(result, CompletedApprovalRun):
                 break
             require_ordered_pause_presentation(result, show_tool_calls=True)
@@ -330,8 +423,10 @@ async def test_child_approval_survives_parent_reconstruction(  # noqa: PLR0915
             assert "Cannot delegate" in result_message
         else:
             assert "child result" in result_message
-        # Every delegation's requirement holds its child's answer as the external result the parent continued with.
-        assert all(requirement.external_execution_result for requirement in resumed.requirements or ())
+        # Every delegation call holds its child's answer as the external result the parent continued with.
+        delegations = [tool for tool in resumed.tools or () if tool.tool_name == "run_subagent"]
+        assert delegations
+        assert all(tool.result for tool in delegations)
         assert all(not tool.is_paused for tool in resumed.tools or ())
 
 
@@ -364,21 +459,8 @@ async def test_a_child_resumed_after_its_approval_reports_its_activity_as_progre
             run_id="parent-run",
         )
         assert isinstance(paused, PausedAttempt)
-        state = DelegationState.from_metadata(_parent_record(config, paths, identity, "parent-run").metadata)
-        call_id = str(state.pending_tools[0]["tool_call_id"])
         with tool_progress_reporter(reports.append):
-            result = await resume(
-                approval_executor(config, paths),
-                paused,
-                _saved_approval_calls(state),
-                agent_name="leader",
-                identity=identity,
-                config=config,
-                runtime_paths=paths,
-                decisions={call_id: True},
-                denial_reasons={call_id: None},
-                approval_id="card-0",
-            )
+            result = await _approve_the_child_s_pending_call(config, paths, paused, "card-0")
 
     assert isinstance(result, CompletedApprovalRun)
     assert report.written == ["written"]
@@ -435,20 +517,7 @@ async def test_a_child_resumed_after_its_approval_hands_its_parent_everything_it
             run_id="parent-run",
         )
         assert isinstance(paused, PausedAttempt)
-        state = DelegationState.from_metadata(_parent_record(config, paths, identity, "parent-run").metadata)
-        call_id = str(state.pending_tools[0]["tool_call_id"])
-        result = await resume(
-            approval_executor(config, paths),
-            paused,
-            _saved_approval_calls(state),
-            agent_name="leader",
-            identity=identity,
-            config=config,
-            runtime_paths=paths,
-            decisions={call_id: True},
-            denial_reasons={call_id: None},
-            approval_id="card-0",
-        )
+        result = await _approve_the_child_s_pending_call(config, paths, paused, "card-0")
 
     assert isinstance(result, CompletedApprovalRun)
     assert report.written == ["written"]
@@ -641,19 +710,7 @@ async def test_a_call_gated_two_delegations_down_keeps_the_toolkit_of_the_agent_
         )
         assert isinstance(paused, PausedAttempt)
         assert paused.toolkit_owners == {("writer", "write_report"): "report"}
-        state = DelegationState.from_metadata(_parent_record(config, paths, identity, "parent-run").metadata)
-        call_id = str(state.pending_tools[0]["tool_call_id"])
-        result = await resume(
-            approval_executor(config, paths),
-            paused,
-            _saved_approval_calls(state),
-            agent_name="leader",
-            identity=identity,
-            config=config,
-            runtime_paths=paths,
-            decisions={call_id: True},
-            denial_reasons={call_id: None},
-        )
+        result = await _approve_the_child_s_pending_call(config, paths, paused, "approval")
 
     assert isinstance(result, CompletedApprovalRun)
     assert result.response_text.endswith("parent result")
@@ -708,7 +765,6 @@ async def test_a_completed_sibling_keeps_its_result_when_the_policy_changes_befo
                 config=config,
                 runtime_paths=paths,
                 decisions={call_id: True},
-                denial_reasons={call_id: None},
                 approval_id=f"card-{index}",
             )
 
@@ -789,6 +845,58 @@ async def test_delegated_approval_preserves_redacted_provider_failure(
     [record] = _record_files(tmp_path)
     assert record["status"] == "failed"
     assert "example-secret" not in json.dumps(record)
+    # The failed resume's record ends its stream, so the audit record keeps why it failed and what it used, as a fresh
+    # child's failure does.
+    *_, output = (event for event in _record_events(tmp_path) if event["kind"] == "output")
+    assert output["data"] == {"content": record["error"]}
+    assert record["usage"] is not None
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_child_hands_its_parent_the_record_its_run_ended_with_not_its_stored_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent and the child's audit record read what the child's run handed over, not the row stored for it."""
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths, child_tools=())
+    identity = _leader_identity()
+    leader = ScriptedModel(
+        [
+            calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")),
+            answer("Parent done"),
+        ],
+    )
+    ScriptedAgents({"leader": leader, "code": ScriptedModel([answer("Report written")])}).install(monkeypatch)
+
+    def planting_persist_to(
+        store: ConversationStore,
+        session: ConversationSession,
+        *,
+        replays: Callable[[AnyRunRecord], bool] | None = None,
+    ) -> Callable[[AnyRunRecord], Awaitable[None]]:
+        persist = persist_to(store, session, replays=replays)
+
+        async def plant(record: AnyRunRecord) -> None:
+            # Stands in for a stored row that differs from the record the child's run handed over.
+            if isinstance(record, RunRecord) and record.agent_id == "code" and record.status is RunStatus.completed:
+                record = replace(record, content="Planted answer")
+            await persist(record)
+
+        return plant
+
+    monkeypatch.setattr("mindroom.run_storage.persist_to", planting_persist_to)
+
+    await respond("leader", "delegate", config=config, runtime_paths=paths, identity=identity, run_id="parent-run")
+
+    parent = _parent_record(config, paths, identity, "parent-run")
+    [child] = DelegationState.from_metadata(parent.metadata).children
+    assert _child_record(child, config, paths).content == "Planted answer"
+    result = next(message.content for message in parent.messages if message.tool_call_id == "delegate-0")
+    assert isinstance(result, str)
+    assert result.startswith("Report written")
+    [record] = _record_files(tmp_path)
+    assert record["output"] == "Report written"
 
 
 @pytest.mark.asyncio
@@ -835,6 +943,60 @@ async def test_a_fresh_child_s_provider_failure_reaches_its_parent_as_the_redact
 
 
 @pytest.mark.asyncio
+async def test_a_child_that_fails_continuing_after_its_own_child_hands_its_parent_the_run_s_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A child whose continuation after a grandchild fails settles from that run's record, as a failed first run does."""
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths, child_tools=())
+    identity = _leader_identity()
+    failure = "provider connection lost: api_key=example-secret"
+    leader = ScriptedModel(
+        [
+            calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")),
+            answer("parent result"),
+        ],
+    )
+    # The child delegates, the grandchild answers, and the child's continuation fails.
+    code = ScriptedModel(
+        [
+            calls(tool_call("run_subagent", "nested-0", agent_name="code", task="Nested report")),
+            answer("grandchild result"),
+            [_provider_failure(failure)],
+        ],
+    )
+    ScriptedAgents({"leader": leader, "code": code}).install(monkeypatch)
+
+    await respond("leader", "delegate", config=config, runtime_paths=paths, identity=identity, run_id="parent-run")
+
+    parent = _parent_record(config, paths, identity, "parent-run")
+    result = next(message.content for message in parent.messages if message.tool_call_id == "delegate-0")
+    assert isinstance(result, str)
+    assert result.startswith("Delegation to 'code' failed: provider connection lost: api_key=")
+    assert "example-secret" not in result
+    [child] = DelegationState.from_metadata(parent.metadata).children
+    stored = _child_record(child, config, paths)
+    # The loop's own record stands: nothing rewrote the failed run's row after it was stored.
+    assert stored.status is RunStatus.error
+    assert stored.error is not None
+    assert stored.error.startswith("provider connection lost: api_key=")
+    # The grandchild's answer stands on the child's own call.
+    assert [(tool.tool_call_id, tool.is_paused) for tool in stored.tools or ()] == [("nested-0", False)]
+    [record_dir] = (
+        path.parent
+        for path in tmp_path.glob("agents/*/workspace/.mindroom/delegations/*/*/run.json")
+        if json.loads(path.read_text(encoding="utf-8"))["task"] == "Write report"
+    )
+    record = json.loads((record_dir / "run.json").read_text(encoding="utf-8"))
+    assert (record["status"], record["error"]) == ("failed", stored.error)
+    assert record["usage"] is not None
+    events = [json.loads(line) for line in (record_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    *_, output = (event for event in events if event["kind"] == "output")
+    assert output["data"] == {"content": stored.error}
+
+
+@pytest.mark.asyncio
 async def test_failed_nested_resume_settles_descendants_and_visible_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -866,21 +1028,13 @@ async def test_failed_nested_resume_settles_descendants_and_visible_tools(
             run_id="parent-run",
         )
         assert isinstance(paused, PausedAttempt)
-        state = DelegationState.from_metadata(_parent_record(config, paths, identity, "parent-run").metadata)
-        call_id = str(state.pending_tools[0]["tool_call_id"])
         monkeypatch.setattr(execution, "_continue_child", failed_resume)
-        result = await resume(
-            approval_executor(config, paths),
-            paused,
-            _saved_approval_calls(state),
-            agent_name="leader",
-            identity=identity,
-            config=config,
-            runtime_paths=paths,
-            decisions={call_id: True},
-        )
+        result = await _approve_the_child_s_pending_call(config, paths, paused, "approval")
 
     assert isinstance(result, CompletedApprovalRun)
+    # The child call the approval was about closes in the parent's reply instead of staying pending.
+    assert "`write_report` [2]\n" in result.response_text
+    assert "⏳" not in result.response_text
     assert report.written == []
     resumed = _parent_record(config, paths, identity, "parent-run")
     result_message = next(message.content for message in resumed.messages if message.tool_call_id == "delegate-0")
@@ -897,7 +1051,7 @@ async def test_failed_nested_resume_settles_descendants_and_visible_tools(
     assert not nested.requirements
 
 
-def test_native_delegate_uses_external_execution() -> None:
+def test_native_delegate_pauses_for_its_driver() -> None:
     """A native parent must pause before entering the child call stack."""
     from agno.tools import Toolkit  # noqa: PLC0415 - the Agno toolkit is the authoring API the flags live on
 
@@ -906,7 +1060,7 @@ def test_native_delegate_uses_external_execution() -> None:
 
     toolkit = Toolkit(name="delegate", tools=[run_subagent])
     functions = gated_functions(toolkit, Config(), registered_tool_name="delegate")
-    assert functions["run_subagent"].external_execution is True
+    assert functions["run_subagent"].gate is ToolGate.DELEGATION
 
 
 def test_detached_delegate_retains_inline_execution() -> None:
@@ -918,7 +1072,7 @@ def test_detached_delegate_retains_inline_execution() -> None:
 
     toolkit = Toolkit(name="delegate", tools=[run_subagent])
     functions = gated_functions(toolkit, Config(), registered_tool_name="delegate", resumable=False)
-    assert not functions["run_subagent"].external_execution
+    assert functions["run_subagent"].gate is None
 
 
 @pytest.mark.asyncio
@@ -996,7 +1150,6 @@ async def test_member_delegation_gate_and_card_keep_the_member_call_id(tmp_path:
         session_id="parent",
         status=RunStatus.paused,
         tools=[requirement.tool_execution],
-        requirements=[requirement],
     )
     persisted: list[DelegationState] = []
 
@@ -1017,7 +1170,6 @@ async def test_member_delegation_gate_and_card_keep_the_member_call_id(tmp_path:
         "execution_identity": identity,
         "delegation_depth": 0,
         "refresh_scheduler": None,
-        "approval_calls": (),
         "on_event": events.append,
     }
     with tool_runtime_context(_delegate_runtime_context(config, paths, execution_identity=identity)):
@@ -1025,41 +1177,35 @@ async def test_member_delegation_gate_and_card_keep_the_member_call_id(tmp_path:
             response,
             agent_name="leader",
             config=config,
-            decisions=None,
-            denial_reasons=None,
+            approval_calls=None,
         )
         asked = await execution.advance_delegation_call(
             requirement,
             state=state,
             previous_state=previous,
-            decisions=None,
-            denial_reasons=None,
+            approval_calls=None,
             **options,
         )
         assert asked is None
         assert state.pending_agent_name == "code"
         assert state.pending_tools[0]["tool_call_id"] == "code:call"
-        assert RunRequirement.from_dict(state.pending_requirements[0]).tool_execution.tool_call_id == "code:call"
         assert persisted[-1].pending_tools == state.pending_tools
 
         # The answer to that card is kept as the gate of the same key, which settles the call without a child.
         response.metadata = {DELEGATION_STATE_KEY: state.to_dict()}
-        decisions = {"code:call": False}
-        denial_reasons = {"code:call": "No"}
+        card = answered_calls(["code:call"], approved=False, reason="No")
         state, previous, _own = execution.prepare_delegation_state(
             response,
             agent_name="leader",
             config=config,
-            decisions=decisions,
-            denial_reasons=denial_reasons,
+            approval_calls=card,
         )
         assert state.gates == {"code:call": False}
         denied = await execution.advance_delegation_call(
             requirement,
             state=state,
             previous_state=previous,
-            decisions=decisions,
-            denial_reasons=denial_reasons,
+            approval_calls=card,
             **options,
         )
 
@@ -1101,10 +1247,8 @@ async def test_copied_delegation_call_never_starts_twice_from_one_approval(
     session = storage.load_session("parent")
     assert session is not None
     planted = deepcopy(stored)
-    assert planted.requirements is not None
-    copy = RunRequirement.from_dict(planted.requirements[0].to_dict())
-    copy.id = "copied-requirement"
-    planted.requirements.append(copy)
+    [waiting] = planted.requirements
+    planted.tools = [*(planted.tools or ()), replace(waiting.tool_execution, pause_id="copied-call")]
     storage.save_run(session, planted, record_usage=False)
 
     with pytest.raises(RuntimeError, match="same delegation call more than once"):
@@ -1121,6 +1265,47 @@ async def test_copied_delegation_call_never_starts_twice_from_one_approval(
 
     assert DelegationState.from_metadata(storage.get_run("parent-run").metadata).children == []  # type: ignore[union-attr]
     assert _record_files(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_a_child_paused_for_approval_waits_when_its_parent_is_driven_without_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Driving a parent again with no approval leaves its paused child as it waits: nothing resumes or fails it."""
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths)
+    identity = _leader_identity()
+    code = ScriptedModel([calls(tool_call("write_report", "same-call"))])
+    ScriptedAgents(
+        {
+            "leader": ScriptedModel([calls(tool_call("run_subagent", "delegate", agent_name="code", task="Report"))]),
+            "code": code,
+        },
+    ).install(monkeypatch)
+    parent = await pause_parent("leader", "delegate", config=config, runtime_paths=paths, identity=identity)
+
+    with (
+        registered_report_tool() as report,
+        tool_runtime_context(_delegate_runtime_context(config, paths, execution_identity=identity)),
+    ):
+        for _ in range(2):
+            driven = await execution._drive_delegations(
+                _parent_record(config, paths, identity, "parent-run"),
+                continue_parent=parent.runner,
+                agent_name="leader",
+                run_child=run_delegated_child_response,
+                config=config,
+                runtime_paths=paths,
+                execution_identity=identity,
+            )
+            assert driven.status is RunStatus.paused
+
+    [child] = DelegationState.from_metadata(_parent_record(config, paths, identity, "parent-run").metadata).children
+    assert child.status == "paused"
+    assert _child_record(child, config, paths).status is RunStatus.paused
+    assert len(code.requests) == 1
+    assert report.written == []
 
 
 @pytest.mark.asyncio
@@ -1213,6 +1398,44 @@ async def test_the_driver_rewrites_the_parent_without_touching_its_recorded_usag
     stored = store.get_run("parent-run")
     assert stored is not None
     assert DELEGATION_STATE_KEY in (stored.metadata or {})
+
+
+@pytest.mark.asyncio
+async def test_the_driver_saves_a_paused_team_s_member_whose_delegation_it_answered(tmp_path: Path) -> None:
+    """A member's delegation call is stored once, on the member's row, so the answer the driver records reaches it."""
+    scope = HistoryScope(kind="team", scope_id="squad")
+    store = create_state_storage(TableNames.of_team(scope).storage_name, tmp_path, scope)
+    session = new_scope_session(session_id="team-session", scope=scope)
+    delegation = ToolExecution(tool_call_id="sub", tool_name="run_subagent", external_execution_required=True)
+    member = RunRecord(
+        run_id="member-run",
+        agent_id="checker",
+        session_id="team-session",
+        parent_run_id="team-run",
+        status=RunStatus.paused,
+        tools=[delegation],
+    )
+    team = TeamRunRecord(
+        run_id="team-run",
+        team_id="squad",
+        session_id="team-session",
+        status=RunStatus.paused,
+        member_responses=[member],
+    )
+    await persist_to(store, session)(member)
+    await persist_to(store, session)(team)
+    [requirement] = team.requirements
+    requirement.set_external_execution_result("Helper says 42")
+    delegation.pause_id = "pause-1"
+
+    await execution.persist_delegation_state(store, session, team, DelegationState())
+
+    stored_member = store.get_run("member-run")
+    assert stored_member is not None
+    assert stored_member.tools == [delegation]
+    loaded = store.get_run("team-run")
+    assert isinstance(loaded, TeamRunRecord)
+    assert execution.answered_delegation_calls(loaded) == {("checker", "sub"): "Helper says 42"}
 
 
 @pytest.mark.asyncio
@@ -1320,7 +1543,9 @@ def test_workflow_grant_authorizes_without_delegate_to(tmp_path: Path) -> None:
         )
 
     assert isinstance(granted, Config)
-    assert isinstance(other_agent, str)
+    assert other_agent == (
+        "Cannot author a subagent for 'child': system_prompt, tools, skills, knowledge, and profile apply only to yourself."
+    )
     assert isinstance(delegate_rule, str)
     assert isinstance(revoked, str)
 
@@ -1351,24 +1576,23 @@ def test_workflow_grant_runs_for_requester_the_caller_already_serves(
     assert delegate == "Cannot delegate to 'leader': that agent is not allowed to reply to you."
 
 
-def test_adapted_delegate_functions_carry_the_external_execution_flags(tmp_path: Path) -> None:
-    """The adapted delegate functions carry the external-execution flags the approval capability sets."""
+def test_adapted_delegate_functions_carry_the_delegation_gate(tmp_path: Path) -> None:
+    """The adapted delegate functions carry the delegation gate the approval capability sets."""
     paths = _runtime_paths(tmp_path)
     config = _config(paths, child_tools=())
     toolkit = DelegateTools(
         "leader",
-        ["code"],
         paths,
         config,
         agent_workspace_root_path(paths.storage_root, "leader"),
         execution_identity=_leader_identity(),
     )
 
-    flags = {
-        function.name: (function.external_execution, function.external_execution_silent)
+    gates = {
+        function.name: function.gate
         for function in gated_functions(toolkit, config, registered_tool_name="delegate").values()
     }
-    assert flags == {"run_subagent": (True, True), "continue_subagent": (True, True)}
+    assert gates == {"run_subagent": ToolGate.DELEGATION, "continue_subagent": ToolGate.DELEGATION}
 
 
 def _cut_off_turn(call_id: str) -> list[ScriptStep]:
@@ -1426,3 +1650,271 @@ async def test_a_run_keeps_its_hooks_across_its_delegation_continuations(
                 execution_identity=identity,
             )
     assert len(leader.requests) == 5
+
+
+# A switch of the current response to the model it runs on, which ends the attempt for a continuation.
+_SWITCH = tool_call("switch_thread_model", "call-switch", model_name="default", when="after-toolcall")
+
+
+def _child_turn_usage(tmp_path: Path, config: Config, paths: RuntimePaths) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Return the input and output tokens the leader's child's ``run.json`` reports and those the ledger counts for it."""
+    parent = _parent_record(config, paths, _leader_identity(), "parent-run")
+    [child] = DelegationState.from_metadata(parent.metadata).children
+    [record] = (record for record in _record_files(tmp_path) if record["delegation_id"] == child.delegation_id)
+    usage = record["usage"]
+    assert isinstance(usage, dict)
+    storage = create_session_storage("code", config, paths, _child_identity(child))
+    return (usage["input_tokens"], usage["output_tokens"]), counted_total(storage, child.session_id)
+
+
+def _run_usage_events(tmp_path: Path) -> list[tuple[int, int]]:
+    """Return the input and output tokens of each ``usage`` event of the child's ``events.jsonl``."""
+    return [
+        (event["data"]["input_tokens"], event["data"]["output_tokens"])  # type: ignore[index]
+        for event in _record_events(tmp_path)
+        if event["kind"] == "usage"
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempts", ["empty_retry", "model_switch", "switch_then_retry"])
+async def test_a_child_record_reports_the_usage_of_every_attempt_its_turn_ran(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attempts: str,
+) -> None:
+    """A child whose empty answer was retried, or whose model switch continued, reports every attempt, as counted.
+
+    Each ``usage`` event of ``events.jsonl`` stays the usage of the one attempt it records.
+    """
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths, child_tools=("thread_model",))
+    leader = ScriptedModel(
+        [calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")), answer("Parent done")],
+    )
+    spent = {
+        "empty_retry": [answer("", usage(100, 5))],
+        "model_switch": [calls(_SWITCH, metrics=usage(100, 5))],
+        "switch_then_retry": [calls(_SWITCH, metrics=usage(100, 5)), answer("", usage(40, 2))],
+    }[attempts]
+    code = ScriptedModel([*spent, answer("Report written", usage(120, 9))])
+    ScriptedAgents({"leader": leader, "code": code}).install(monkeypatch)
+
+    await respond(
+        "leader",
+        "delegate",
+        config=config,
+        runtime_paths=paths,
+        identity=_leader_identity(),
+        run_id="parent-run",
+    )
+
+    per_attempt = [(100, 5), (40, 2), (120, 9)] if attempts == "switch_then_retry" else [(100, 5), (120, 9)]
+    assert _run_usage_events(tmp_path) == per_attempt
+    reported, counted = _child_turn_usage(tmp_path, config, paths)
+    assert counted == (sum(tokens[0] for tokens in per_attempt), sum(tokens[1] for tokens in per_attempt))
+    assert reported == counted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after", ["answered", "continued", "delegated"])
+async def test_a_child_record_reports_the_usage_of_its_resumed_run_and_the_attempt_after_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    after: str,
+) -> None:
+    """An approved child reports every leg of its resumed run once, with the attempt a model switch continued it with.
+
+    That is what the ledger counts: the resumed run replaced its paused row each time it stopped, and the continuation
+    ran apart. A resumed child that delegates stops on that call too, and its grandchild's usage is its own record's.
+    """
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths, child_tools=("report", "thread_model"))
+    identity = _leader_identity()
+    leader = ScriptedModel(
+        [calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")), answer("Parent done")],
+    )
+    gated = calls(tool_call("write_report", "same-call"), metrics=usage(10, 1))
+    resumed = {
+        "answered": [answer("child result", usage(20, 2))],
+        "continued": [calls(_SWITCH, metrics=usage(20, 2)), answer("child result", usage(30, 3))],
+        "delegated": [
+            calls(tool_call("run_subagent", "nested-0", agent_name="code", task="Nested"), metrics=usage(20, 2)),
+            answer("nested result", usage(5, 1)),
+            calls(_SWITCH, metrics=usage(30, 3)),
+            answer("child result", usage(40, 4)),
+        ],
+    }[after]
+    code = ScriptedModel([gated, *resumed])
+    ScriptedAgents({"leader": leader, "code": code}).install(monkeypatch)
+
+    with registered_report_tool() as report:
+        paused = await respond(
+            "leader",
+            "delegate",
+            config=config,
+            runtime_paths=paths,
+            identity=identity,
+            run_id="parent-run",
+        )
+        assert isinstance(paused, PausedAttempt)
+        result = await _approve_the_child_s_pending_call(config, paths, paused, "card-0")
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert report.written == ["written"]
+    assert len(code.requests) == 1 + len(resumed)
+    reported, counted = _child_turn_usage(tmp_path, config, paths)
+    assert counted == {"answered": (30, 3), "continued": (60, 6), "delegated": (100, 10)}[after]
+    assert reported == counted
+
+
+async def _approve_the_child_s_pending_call(
+    config: Config,
+    paths: RuntimePaths,
+    paused: PausedAttempt,
+    approval_id: str,
+) -> CompletedApprovalRun | PausedAttempt:
+    """Approve the child's call the leader's pause waits on, through an executor built after it, as after a restart.
+
+    The executor reads the leader's and the child's paused runs from storage alone.
+    """
+    identity = _leader_identity()
+    state = DelegationState.from_metadata(_parent_record(config, paths, identity, "parent-run").metadata)
+    [tool] = state.pending_tools
+    call_id = str(tool["tool_call_id"])
+    return await resume(
+        approval_executor(config, paths),
+        paused,
+        _saved_approval_calls(state),
+        agent_name="leader",
+        identity=identity,
+        config=config,
+        runtime_paths=paths,
+        decisions={call_id: True},
+        approval_id=approval_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_approved_child_s_switch_for_the_current_response_continues_it_on_the_new_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The resumed run stops after the switch, and the child's continuation runs on the model the switch names."""
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths, child_tools=("report", "thread_model"))
+    config.models["alternate"] = ModelConfig(provider="openai", id="alternate-model")
+    leader = ScriptedModel(
+        [calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")), answer("Parent done")],
+    )
+    switch = tool_call("switch_thread_model", "call-switch", model_name="alternate", when="after-toolcall")
+    code = ScriptedModel([calls(tool_call("write_report", "same-call")), calls(switch), answer("child result")])
+    agents = ScriptedAgents({"leader": leader, "code": code})
+    agents.install(monkeypatch)
+
+    with registered_report_tool():
+        paused = await respond(
+            "leader",
+            "delegate",
+            config=config,
+            runtime_paths=paths,
+            identity=_leader_identity(),
+            run_id="parent-run",
+        )
+        assert isinstance(paused, PausedAttempt)
+        result = await _approve_the_child_s_pending_call(config, paths, paused, "card-0")
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert len(code.requests) == 3
+    assert agents.built_models[-1] == "alternate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before", ["empty_retry", "model_switch"])
+@pytest.mark.parametrize("after", ["answered", "continued"])
+async def test_a_child_record_reports_the_usage_of_the_attempt_its_turn_spent_before_its_approval_pause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    before: str,
+    after: str,
+) -> None:
+    """A child whose empty answer was retried, or whose model switch continued, before it paused counts that attempt.
+
+    That is what the ledger counts: the earlier attempt, the paused run's both legs, and any attempt a model switch
+    continued the resumed run with.
+    """
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths, child_tools=("report", "thread_model"))
+    leader = ScriptedModel(
+        [calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")), answer("Parent done")],
+    )
+    spent = answer("", usage(100, 5)) if before == "empty_retry" else calls(_SWITCH, metrics=usage(100, 5))
+    gated = calls(tool_call("write_report", "same-call"), metrics=usage(10, 1))
+    resumed = [answer("child result", usage(20, 2))]
+    if after == "continued":
+        resumed = [calls(_SWITCH, metrics=usage(20, 2)), answer("child result", usage(30, 3))]
+    code = ScriptedModel([spent, gated, *resumed])
+    ScriptedAgents({"leader": leader, "code": code}).install(monkeypatch)
+
+    with registered_report_tool() as report:
+        paused = await respond(
+            "leader",
+            "delegate",
+            config=config,
+            runtime_paths=paths,
+            identity=_leader_identity(),
+            run_id="parent-run",
+        )
+        assert isinstance(paused, PausedAttempt)
+        result = await _approve_the_child_s_pending_call(config, paths, paused, "card-0")
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert report.written == ["written"]
+    reported, counted = _child_turn_usage(tmp_path, config, paths)
+    assert counted == ((130, 8) if after == "answered" else (160, 11))
+    assert reported == counted
+
+
+@pytest.mark.asyncio
+async def test_a_child_paused_again_after_its_resumed_run_continued_reports_every_run_of_its_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resumed child that a model switch continued into a second pause reports the resumed run at the second resume.
+
+    The run that paused the second time started after the resumed run, so its record carries that run's usage.
+    """
+    paths = _runtime_paths(tmp_path)
+    config = _config(paths, child_tools=("report", "thread_model"))
+    leader = ScriptedModel(
+        [calls(tool_call("run_subagent", "delegate-0", agent_name="code", task="Write report")), answer("Parent done")],
+    )
+    code = ScriptedModel(
+        [
+            calls(tool_call("write_report", "first-call"), metrics=usage(10, 1)),
+            calls(_SWITCH, metrics=usage(20, 2)),
+            calls(tool_call("write_report", "second-call"), metrics=usage(5, 1)),
+            answer("child result", usage(30, 3)),
+        ],
+    )
+    ScriptedAgents({"leader": leader, "code": code}).install(monkeypatch)
+
+    with registered_report_tool() as report:
+        paused = await respond(
+            "leader",
+            "delegate",
+            config=config,
+            runtime_paths=paths,
+            identity=_leader_identity(),
+            run_id="parent-run",
+        )
+        assert isinstance(paused, PausedAttempt)
+        again = await _approve_the_child_s_pending_call(config, paths, paused, "card-0")
+        assert isinstance(again, PausedAttempt)
+        result = await _approve_the_child_s_pending_call(config, paths, again, "card-1")
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert report.written == ["written", "written"]
+    reported, counted = _child_turn_usage(tmp_path, config, paths)
+    assert counted == (65, 7)
+    assert reported == counted

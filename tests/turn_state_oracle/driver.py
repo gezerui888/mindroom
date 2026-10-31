@@ -47,6 +47,10 @@ def event_ids(value: object) -> set[str]:
 async def _attempt(call: Awaitable[object]) -> object:
     try:
         return await call
+    except AssertionError:
+        # A failed check, such as the adapter's on what a pending write returns, fails the test instead of becoming
+        # an outcome that a recording's divergence step could stop comparing.
+        raise
     except Exception as error:
         return {"error": type(error).__name__, "message": str(error)}
 
@@ -84,14 +88,17 @@ async def _run(scenario: dict[str, Any], root: Path) -> list[dict[str, Any]]:
     adapter = TurnStateAdapter(root, legacy_ledger=legacy_ledger)
     ids = scenario["ids"]
     with controlled_clock(adapter.clock):
-        steps = [{"outcome": await _attempt(adapter.open()), "state": await observe(adapter, ids)}]
-        for action in scenario["actions"]:
-            op = action["op"]
-            assert op in ACTIONS, f"unknown action {op!r}"
-            params = {key: value for key, value in action.items() if key != "op"}
-            outcome = await _attempt(getattr(adapter, op)(**params))
-            steps.append({"outcome": outcome, "state": await observe(adapter, ids)})
-        await adapter.close()
+        try:
+            steps = [{"outcome": await _attempt(adapter.open()), "state": await observe(adapter, ids)}]
+            for action in scenario["actions"]:
+                op = action["op"]
+                assert op in ACTIONS, f"unknown action {op!r}"
+                params = {key: value for key, value in action.items() if key != "op"}
+                outcome = await _attempt(getattr(adapter, op)(**params))
+                steps.append({"outcome": outcome, "state": await observe(adapter, ids)})
+        finally:
+            # A failed check escapes mid-run; the journal still closes.
+            await adapter.close()
     return steps
 
 

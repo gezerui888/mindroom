@@ -3,20 +3,21 @@
 The seam is ``run_team`` fed by scripted providers behind the production member and leader builders: what a team
 reply streams and renders, what it stores, how a member's approval pauses and resumes it, which scope its members'
 tools address, and how it ends when a member is stopped. The last tests drive turns through ``ResponseRunner``, the
-lifecycle owner: it dates a turn in the zone of the entity whose bot runs it, it writes the interrupted-turn record
-after the loop stored its own terminal record, and it posts the approval cards of a member's gated delegations and
-resumes the turn they approve.
+lifecycle owner: it dates a turn in the zone of the entity whose bot runs it, and it posts the approval cards of a
+member's gated delegations and resumes the turn they approve. Under it, the turn driver writes the interrupted-turn
+record after the loop stored its own terminal record.
 """
 # ruff: noqa: D103
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 from contextlib import asynccontextmanager
-from dataclasses import replace
-from typing import TYPE_CHECKING, Any
+from dataclasses import asdict, replace
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import AsyncMock, patch
 
 import nio
@@ -24,7 +25,7 @@ import pytest
 from agno.tools import Toolkit
 from structlog.testing import capture_logs
 
-from mindroom import agents, ai_runtime, loop_hooks, response_turn
+from mindroom import ai_runtime, loop_hooks, response_turn
 from mindroom.agent_loop.model_loop import LoopHooks
 from mindroom.approval.manager import get_approval_store
 from mindroom.approval.receipt import build_approval_receipt
@@ -32,14 +33,22 @@ from mindroom.approval.receipt_readers import approval_receipt_context
 from mindroom.approval.tool_approval import shutdown_approval_runtime
 from mindroom.coalescing.batch import CoalescingKey, RequesterCoalescingOwner, build_prepared_turn
 from mindroom.config.approval import ApprovalRuleConfig
+from mindroom.config.main import Config
 from mindroom.constants import AI_RUN_METADATA_KEY
 from mindroom.delegation.state import DelegationState, child_execution_identity
-from mindroom.dispatch_source import MESSAGE_SOURCE_KIND
+from mindroom.dispatch_source import MESSAGE_SOURCE_KIND, ScheduledHistoryBudget
 from mindroom.event_journal import ApprovalDecision
-from mindroom.history import storage as history_storage
 from mindroom.history.interrupted_replay import _render_interrupted_replay_content
 from mindroom.history.storage import read_scope_seen_event_ids
-from mindroom.hooks import EVENT_TOOL_BEFORE_CALL, EnrichmentItem, MessageEnvelope, ToolBeforeCallContext, hook
+from mindroom.hooks import (
+    EVENT_TOOL_BEFORE_CALL,
+    EnrichmentItem,
+    HookBindings,
+    HookRegistry,
+    MessageEnvelope,
+    ToolBeforeCallContext,
+    hook,
+)
 from mindroom.llm.errors import ProviderError
 from mindroom.llm.messages import Message
 from mindroom.llm.provider import ModelRequest, NativeCompactionReplay, TextDelta, TurnCompleted, UsageReported
@@ -47,12 +56,10 @@ from mindroom.llm.runs import RunRecord, RunStatus, TeamRunRecord
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.matrix.users import AgentMatrixUser
 from mindroom.message_target import MessageTarget
-from mindroom.response_runner import ResponseRequest
+from mindroom.reply_turn.request import ResponseRequest
 from mindroom.response_sources import ResponseSources
 from mindroom.response_turn import CompletedApprovalRun, PausedAttempt, ResponsePausedForApproval
 from mindroom.session_storage.agent_storage import create_session_storage
-from mindroom.session_storage.schema import quote_identifier
-from mindroom.teams import envelope
 from mindroom.teams import leader as leader_module
 from mindroom.teams.members import _as_member
 from mindroom.teams.presentation import NO_TEAM_RESPONSE
@@ -61,10 +68,18 @@ from mindroom.tool_jobs.instances import pin_background_tool_jobs
 from mindroom.tool_jobs.resources import execution_resources
 from mindroom.tool_jobs.runtime import register_background_runtime
 from mindroom.tool_system.call_record import recording_tool_calls
-from mindroom.tool_system.events import StructuredStreamChunk
+from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess, ToolManagedInitArg
+from mindroom.tool_system.events import FailedReply, StructuredStreamChunk
 from mindroom.tool_system.invocation import ToolCallContext, run_tool_call
-from mindroom.tool_system.runtime_context import get_tool_runtime_context
+from mindroom.tool_system.registration import register_tool_with_metadata
+from mindroom.tool_system.runtime_context import (
+    current_execution_identity,
+    detached_tool_scope,
+    get_tool_runtime_context,
+)
 from mindroom.tool_system.tool_function import ToolFunction
+from mindroom.tool_system.worker_routing import ToolExecutionIdentity
+from tests.agent_tool_helpers import UnansweredCallTools
 from tests.ai_user_id_helpers import _install_inert_post_response_effects
 from tests.approval_continuation_helpers import (
     carries_approval_receipt,
@@ -75,18 +90,24 @@ from tests.approval_continuation_helpers import (
 )
 from tests.bot_helpers import make_test_agent_bot, unique_room_send_responses
 from tests.conftest import (
+    GENERATION_PROBE_TOOL,
     TEST_PASSWORD,
     handle_card_response_for_test,
     initialize_approval_store_for_test,
+    install_model_providers,
     install_runtime_journal_support,
     make_matrix_client_mock,
     make_pending_event,
     make_visible_message,
     message_origin,
     patch_response_runner_module,
+    publish_test_plugins,
+    test_runtime_paths,
+    write_generation_probe_plugin,
 )
 from tests.delegation_helpers import _saved_approval_calls
 from tests.fakes.scripted_model import Await, ScriptedModel, ScriptStep, answer, calls, tool_call, usage
+from tests.fakes.summary_model import summary_model
 from tests.response_attempt_helpers import install_direct_response_admission
 from tests.scripted_agent_helpers import registered_toolkit
 from tests.team_turn_helpers import (
@@ -99,6 +120,8 @@ from tests.team_turn_helpers import (
     THREAD_ID,
     ProbeToolkit,
     TeamTurn,
+    authored_team_config,
+    build_team_turn,
     delegate,
     member_approval,
     rendered,
@@ -108,6 +131,7 @@ from tests.teams.squad import member as squad_member
 from tests.test_tool_hooks import _plugin
 from tests.tool_job_helpers import saved_jobs, tool_job_runtime
 from tests.turn_dispatch_helpers import nothing_else_queued
+from tests.usage_helpers import usage_rows
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -116,24 +140,18 @@ if TYPE_CHECKING:
 
     from mindroom.bot import AgentBot
     from mindroom.event_journal import ApprovalCall, MatrixDelivery
-    from mindroom.session_storage.store import ConversationStore
     from mindroom.teams.envelope import TeamStreamChunk
+    from mindroom.tool_jobs.runtime import BackgroundJob
     from mindroom.tool_system.events import ToolTraceEntry
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
+    from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
 
 HEADER = "🤝 **Team Response** (Writer, Checker):\n\n"
+_NO_CONSENSUS = "*No team consensus - showing individual responses only*"
+_TOUCH_NEEDS_APPROVAL = [ApprovalRuleConfig(match="touch", action="require_approval")]
 
 # Every test registers the members' probe toolkit.
 pytestmark = pytest.mark.usefixtures("squad_probe")
-
-
-def _usage_rows(storage: ConversationStore, run_id: str) -> list[dict[str, Any]]:
-    with storage.transaction(write=False) as connection:
-        rows = connection.execute(
-            f"SELECT usage_data FROM {quote_identifier(storage.names.usage)} WHERE run_id = ?",  # noqa: S608
-            (run_id,),
-        ).fetchall()
-    return [json.loads(row[0]) for row in rows]
 
 
 @pytest.mark.asyncio
@@ -182,25 +200,18 @@ async def test_a_streamed_team_reply_renders_the_members_and_the_consensus_and_s
 
 
 @pytest.mark.asyncio
-async def test_only_a_team_turn_whose_attempt_started_hands_its_session_to_queued_notice_finalization(
+async def test_a_team_reply_after_an_empty_attempt_publishes_the_usage_of_both_attempts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A turn that fails while preparing its first attempt ran nothing in the team session, so it registers none."""
-    team = squad_turn(tmp_path, monkeypatch, leader=[answer("Done.", usage(10, 1))])
+    """The reply's run metadata counts the empty attempt the turn retried as well as the attempt that answered."""
+    team = squad_turn(tmp_path, monkeypatch, leader=[answer("", usage(10, 1)), answer("Done.", usage(20, 2))])
+    published: dict[str, Any] = {}
 
-    with ai_runtime.queued_message_signal_context(None) as notices:
-        assert await team.respond() == f"{HEADER}\n**Team Consensus**:\n\nDone."
-    assert list(notices.storage_targets) == [("squad", SESSION_ID, "team")]
+    await team.respond(run_metadata_collector=published)
 
-    async def history_unavailable(*_args: object, **_kwargs: object) -> None:
-        msg = "history unavailable"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(envelope, "prepare_materialized_team_execution", history_unavailable)
-    with ai_runtime.queued_message_signal_context(None) as notices:
-        assert "history unavailable" in await team.respond()
-    assert notices.storage_targets == {}
+    reply_usage = published[AI_RUN_METADATA_KEY]["usage"]
+    assert (reply_usage["input_tokens"], reply_usage["output_tokens"]) == (30, 3)
 
 
 @pytest.mark.asyncio
@@ -227,9 +238,9 @@ async def test_a_team_turn_that_only_ran_tools_marks_its_trigger_seen(
     monkeypatch: pytest.MonkeyPatch,
     stream: bool,
 ) -> None:
-    """A turn whose runs called tools but wrote nothing keeps its run and marks the events it read seen, on either path.
+    """A turn whose runs called tools but wrote nothing keeps its run, which marks the events it read seen, on either path.
 
-    The stored session row keeps them as well as the run, as it does for every turn that produced anything.
+    The run is their only record: the session row's metadata stays unwritten.
     """
     team = squad_turn(
         tmp_path,
@@ -244,43 +255,22 @@ async def test_a_team_turn_that_only_ran_tools_marks_its_trigger_seen(
     session = team.storage.load_session(SESSION_ID)
     assert session is not None
     assert read_scope_seen_event_ids(team.storage, session) == {EVENT_ID}
-    assert history_storage._read_preserved_scope_seen_event_ids(session.metadata, TEAM_SCOPE) == {EVENT_ID}
+    assert session.metadata is None
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False], ids=["streamed", "collected"])
 @pytest.mark.parametrize("show_tool_calls", [True, False])
-async def test_the_streamed_document_keeps_the_canonical_member_and_consensus_format(
+async def test_a_team_reply_keeps_the_canonical_member_and_consensus_format(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
     show_tool_calls: bool,
 ) -> None:
-    """The final document is the member slots then the consensus; shown tool calls mark each slot, the record never."""
-    team = squad_turn(
-        tmp_path,
-        monkeypatch,
-        leader=[delegate("call-team", "writer", "Report"), answer("Consensus answer.", usage(50, 5))],
-        writer=[calls(tool_call("touch", "call-touch", label="a"), metrics=usage(10, 1)), answer("Member answer.")],
-    )
+    """The document is the member slots then the consensus, streamed or collected; shown tool calls mark each slot.
 
-    chunks = await team.stream(show_tool_calls=show_tool_calls)
-
-    canonical = f"{HEADER}**Writer**: Member answer.\n\n\n**Team Consensus**:\n\nConsensus answer."
-    shown = (
-        f"{HEADER}**Writer**:\n\n🔧 `touch` [1]\n\nMember answer.\n\n\n"
-        "**Team Consensus**:\n\n🔧 `delegate_task_to_member` [2]\n\nConsensus answer."
-    )
-    assert chunks[-1].content == (shown if show_tool_calls else canonical)
-    assert team.recorder.assistant_text == canonical
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("show_tool_calls", [True, False])
-async def test_a_collected_team_reply_is_the_streamed_document(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    show_tool_calls: bool,
-) -> None:
-    """The collected reply is the last document the stream showed, shown tool calls marked; the record never is."""
+    The collected reply is the last document the stream showed, and the record never carries the tool markers.
+    """
     team = squad_turn(
         tmp_path,
         monkeypatch,
@@ -289,8 +279,13 @@ async def test_a_collected_team_reply_is_the_streamed_document(
     )
 
     tool_trace: list[ToolTraceEntry] = []
-
-    text = await team.respond(show_tool_calls=show_tool_calls, tool_trace=tool_trace)
+    if stream:
+        *_, last = await team.stream(show_tool_calls=show_tool_calls)
+        assert isinstance(last, StructuredStreamChunk)
+        text = last.content
+        tool_trace.extend(last.tool_trace or [])
+    else:
+        text = await team.respond(show_tool_calls=show_tool_calls, tool_trace=tool_trace)
 
     assert ProbeToolkit.calls == ["a"]
     canonical = f"{HEADER}**Writer**: Member answer.\n\n\n**Team Consensus**:\n\nConsensus answer."
@@ -327,9 +322,13 @@ async def test_a_team_reply_lists_the_members_as_configured(
     assert team.recorder.assistant_text == text
 
 
-async def _checker_overloaded() -> None:
-    msg = "Checker overloaded"
-    raise ProviderError(msg, provider="Synthetic", status_code=503)
+def _provider_fails(message: str, status_code: int | None = None) -> Await:
+    """Return a scripted step that fails the request with a provider error carrying ``message``."""
+
+    async def fail() -> None:
+        raise ProviderError(message, provider="Synthetic", status_code=status_code)
+
+    return Await(fail)
 
 
 @pytest.mark.asyncio
@@ -339,7 +338,7 @@ async def _checker_overloaded() -> None:
         pytest.param(
             [delegate("call-check", "checker", "Check"), answer("The checker is unavailable.")],
             [],
-            [[Await(_checker_overloaded)]],
+            [[_provider_fails("Checker overloaded", status_code=503)]],
             "**Checker**: Checker overloaded\n\n\n**Team Consensus**:\n\nThe checker is unavailable.",
             id="member-failed-before-text",
         ),
@@ -372,7 +371,7 @@ async def _checker_overloaded() -> None:
             [delegate("call-write", "writer", "Write"), answer("")],
             [answer("Written.\n")],
             [],
-            "**Writer**: Written.\n\n\n*No team consensus - showing individual responses only*",
+            f"**Writer**: Written.\n\n\n{_NO_CONSENSUS}",
             id="no-consensus",
         ),
     ],
@@ -527,11 +526,16 @@ async def test_a_member_s_todo_work_defaults_to_the_member(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("as_job", [False, True], ids=["inline", "tool-job"])
 async def test_a_member_s_claude_sessions_are_the_member_s_own(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    as_job: bool,
 ) -> None:
-    """A member's Claude session is keyed by the member, so members of one team never share a session."""
+    """A member's Claude session is keyed by the member, so members of one team never share a session.
+
+    With background tool jobs on, the member's call runs as a managed job and still reaches the member's session.
+    """
     team = squad_turn(
         tmp_path,
         monkeypatch,
@@ -540,7 +544,11 @@ async def test_a_member_s_claude_sessions_are_the_member_s_own(
     )
     team.config.agents["writer"].tools = [PROBE_TOOL, "claude_agent"]
 
-    await team.stream()
+    if as_job:
+        job = await _stream_with_tool_jobs(team)
+        assert (job.tool_name, job.status, job.owner.agent_name) == ("claude_session_status", "completed", "writer")
+    else:
+        await team.stream()
 
     _, [member] = team.stored_runs()
     assert member.tools is not None
@@ -576,6 +584,72 @@ async def test_a_member_s_calls_run_through_the_member_s_tool_call_policy(
     assert recorded == [("touch", {"label": "a"})]
 
 
+async def _stream_with_tool_jobs(team: TeamTurn) -> BackgroundJob:
+    """Stream ``team``'s turn with background tool jobs on, and return the one job its member's call started."""
+    team.config.background_tool_jobs.enabled = True
+    pin_background_tool_jobs(team.config, team.runtime_paths)
+    runtime = await tool_job_runtime(team.runtime_paths.storage_root)
+    register_background_runtime(team.runtime_paths, runtime)
+    try:
+        async with execution_resources():
+            await team.stream()
+    finally:
+        await runtime.shutdown()
+    [job] = (await saved_jobs(team.runtime_paths.storage_root)).values()
+    return job
+
+
+@pytest.mark.asyncio
+async def test_a_member_s_background_child_result_counts_as_read_once_the_member_s_run_saves_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The member's run saves the child's result its delegation call returned, so no follow-up reports the job again.
+
+    The child's audit record names that member run as its parent run, beside the member's call.
+    """
+    team = squad_turn(
+        tmp_path,
+        monkeypatch,
+        leader=[delegate("call-team", "writer", "Ask the helper"), answer("Done.", usage(50, 5))],
+        writer=[
+            calls(tool_call("run_subagent", "call-sub", agent_name="helper", task="Dig"), metrics=usage(10, 1)),
+            answer("The helper says 42."),
+        ],
+        helper=[answer("42")],
+    )
+
+    job = await _stream_with_tool_jobs(team)
+
+    assert (job.kind, job.status, job.consumed) == ("delegation", "completed", True)
+    _record, [member] = team.stored_runs()
+    [audit] = team.runtime_paths.storage_root.glob("agents/helper/workspace/.mindroom/delegations/*/*/run.json")
+    run = json.loads(audit.read_text())
+    assert (run["parent_run_id"], run["parent_tool_call_id"]) == (member.run_id, "call-sub")
+
+
+def _assert_member_touch_job(team: TeamTurn, job: BackgroundJob, *, agent_name: str, transport_agent_name: str) -> None:
+    """Assert ``job``, the member's ``touch`` call ``call-touch``, saves this exact owner, and so this exact job ID."""
+    owner = {
+        "channel": "matrix",
+        "agent_name": agent_name,
+        "requester_id": REQUESTER_ID,
+        "room_id": ROOM_ID,
+        "thread_id": THREAD_ID,
+        "resolved_thread_id": THREAD_ID,
+        "session_id": SESSION_ID,
+        "tenant_id": None,
+        "account_id": None,
+        "transport_agent_name": transport_agent_name,
+    }
+    assert asdict(job.owner) == owner
+    # The member's run ID is random, so the ID is pinned as the hash of the pinned owner with the member's run.
+    _, [member] = team.stored_runs()
+    assert (job.adapter["run_id"], job.adapter["tool_call_id"]) == (member.run_id, "call-touch")
+    hashed = {"owner": owner, "run_id": member.run_id, "tool_call_id": "call-touch"}
+    assert job.job_id == hashlib.sha256(json.dumps(hashed, sort_keys=True).encode()).hexdigest()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("as_job", [False, True], ids=["inline", "tool-job"])
 async def test_a_member_s_tool_hooks_run_as_the_member_with_the_turn_s_live_bindings(
@@ -589,6 +663,7 @@ async def test_a_member_s_tool_hooks_run_as_the_member_with_the_turn_s_live_bind
     policy runs as the member, as the tool itself does.
     """
     seen: list[tuple[str, str | None, bool]] = []
+    room_state_querier = AsyncMock()
 
     @hook(EVENT_TOOL_BEFORE_CALL)
     async def before(context: ToolBeforeCallContext) -> None:
@@ -597,85 +672,223 @@ async def test_a_member_s_tool_hooks_run_as_the_member_with_the_turn_s_live_bind
             (
                 context.agent_name,
                 runtime.agent_name if runtime is not None else None,
-                context.room_state_querier is not None,
+                context.room_state_querier is room_state_querier,
             ),
         )
 
-    monkeypatch.setattr(agents, "_load_agent_plugins", lambda *_args, **_kwargs: [_plugin("member-policy", [before])])
     team = squad_turn(
         tmp_path,
         monkeypatch,
         leader=[delegate("call-team", "writer", "Touch it"), answer("Touched.", usage(50, 5))],
         writer=[calls(tool_call("touch", "call-touch", label="a"), metrics=usage(10, 1)), answer("Done.")],
     )
-    if not as_job:
-        await team.stream()
-    else:
-        team.config.background_tool_jobs.enabled = True
-        pin_background_tool_jobs(team.config, team.runtime_paths)
-        runtime = await tool_job_runtime(team.runtime_paths.storage_root)
-        register_background_runtime(team.runtime_paths, runtime)
-        try:
-            async with execution_resources():
-                await team.stream()
-        finally:
-            await runtime.shutdown()
-        [job] = (await saved_jobs(team.runtime_paths.storage_root)).values()
+    # The turn's bot binds its plugins' hooks and its Matrix capabilities into the turn's context.
+    team.runtime = replace(
+        team.runtime,
+        hooks=HookBindings(
+            registry=HookRegistry.from_plugins([_plugin("member-policy", [before])]),
+            room_state_querier=room_state_querier,
+        ),
+    )
+    if as_job:
+        job = await _stream_with_tool_jobs(team)
         assert (job.tool_name, job.status, job.owner.agent_name) == ("touch", "completed", "writer")
+    else:
+        await team.stream()
 
     assert ProbeToolkit.calls == ["a"]
     assert seen == [("writer", "writer", True)]
 
 
 @pytest.mark.asyncio
-async def test_the_member_step_runs_a_call_as_it_is_outside_a_matrix_turn() -> None:
-    """Without a tool runtime context, as in an OpenAI-compatible API turn, a member's call runs without one."""
-    seen: list[ToolRuntimeContext | None] = []
-
-    async def probe() -> str:
-        seen.append(get_tool_runtime_context())
-        return "ran"
-
-    function = ToolFunction(name="probe", description=None, parameters={"type": "object"}, entrypoint=probe)
-
-    result = await run_tool_call(
-        function,
-        {},
-        ToolCallContext(run_id="run-1", session_id=SESSION_ID, user_id=None),
-        middleware=(_as_member("writer", "writer-model"),),
-    )
-
-    assert (result.value, seen) == ("ran", [None])
-
-
-@pytest.mark.asyncio
-async def test_a_member_s_call_that_runs_as_a_tool_job_keeps_the_member_s_claude_session(
+async def test_publications_after_a_team_turn_captured_its_plugins_leave_its_member_calls_on_that_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """With background tool jobs on, a member's call runs as a managed job and still reaches the member's session."""
+    """Plugin publications before the turn's builds and before its first member delegation reach no member call.
+
+    The member's tool and the tool hook around its call both come from the generation the turn's context captured.
+    """
+    plugin_root = tmp_path / "plugins" / "generation-probe"
+    seen = write_generation_probe_plugin(plugin_root, 1)
+    authored = authored_team_config(
+        {
+            "writer": {
+                "display_name": "Writer",
+                "role": "Writes.",
+                "model": "writer-model",
+                "tools": [GENERATION_PROBE_TOOL],
+            },
+            "checker": {"display_name": "Checker", "role": "Checks.", "model": "checker-model"},
+        },
+        teams={"squad": {"display_name": "Squad", "role": "Answers.", "agents": ["writer", "checker"]}},
+        models=("default", "writer-model", "checker-model"),
+    )
+    authored["plugins"] = ["./plugins/generation-probe"]
+    # Startup published the plugins before the turn began.
+    publish_test_plugins(Config.model_validate(authored), test_runtime_paths(tmp_path))
+
+    def publish(generation: int) -> None:
+        write_generation_probe_plugin(plugin_root, generation)
+        publish_test_plugins(team.config, team.runtime_paths)
+
+    async def publish_before_the_delegation() -> None:
+        publish(3)
+
+    team = build_team_turn(
+        tmp_path,
+        monkeypatch,
+        authored,
+        members=("writer", "checker"),
+        team_name="squad",
+        scripts={
+            "default": [
+                [Await(publish_before_the_delegation), *delegate("call-team", "writer", "Report the generation")],
+                answer("Reported."),
+            ],
+            "writer-model": [calls(tool_call("which_generation", "call-probe")), answer("Reported.")],
+        },
+    )
+    # The turn's bot binds its captured plugins' hooks into the turn's context.
+    team.runtime = replace(team.runtime, hooks=HookBindings(registry=team.runtime.plugins.hooks))
+    publish(2)
+
+    await team.stream()
+
+    assert seen == [("hook", 1), ("tool", 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_configured_member_s_job_is_owned_by_the_member_answering_through_the_team(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured team member's call that becomes a job saves this exact owner, and so this exact job ID.
+
+    The ID hashes every owner field with the run and call IDs, so a change to any field the owner names loses saved
+    jobs across an upgrade: their next lookup computes another ID.
+    """
     team = squad_turn(
         tmp_path,
         monkeypatch,
-        leader=[delegate("call-team", "writer", "Check Claude"), answer("Checked.", usage(50, 5))],
-        writer=[calls(tool_call("claude_session_status", "call-claude"), metrics=usage(10, 1)), answer("None yet.")],
+        leader=[delegate("call-team", "writer", "Touch it"), answer("Touched.", usage(50, 5))],
+        writer=[calls(tool_call("touch", "call-touch", label="a"), metrics=usage(10, 1)), answer("Done.")],
     )
-    team.config.agents["writer"].tools = [PROBE_TOOL, "claude_agent"]
-    team.config.background_tool_jobs.enabled = True
-    pin_background_tool_jobs(team.config, team.runtime_paths)
-    runtime = await tool_job_runtime(team.runtime_paths.storage_root)
-    register_background_runtime(team.runtime_paths, runtime)
-    try:
-        async with execution_resources():
-            await team.stream()
-    finally:
-        await runtime.shutdown()
+    job = await _stream_with_tool_jobs(team)
+    _assert_member_touch_job(team, job, agent_name="writer", transport_agent_name="squad")
 
-    [job] = (await saved_jobs(team.runtime_paths.storage_root)).values()
-    assert (job.tool_name, job.status, job.owner.agent_name) == ("claude_session_status", "completed", "writer")
-    _, [member] = team.stored_runs()
-    assert member.tools is not None
-    assert member.tools[0].result == f"No active Claude session for `writer:{SESSION_ID}`."
+
+@pytest.mark.asyncio
+async def test_an_ad_hoc_member_s_job_is_owned_by_the_member_answering_through_the_posting_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ad hoc team member's call that becomes a job saves this exact owner, and so this exact job ID.
+
+    The writer's bot runs the ad hoc team, so the checker's job names the checker answering through the writer.
+    """
+    authored = authored_team_config(
+        {
+            "writer": {"display_name": "Writer", "role": "Writes.", "model": "writer-model", "tools": [PROBE_TOOL]},
+            "checker": {"display_name": "Checker", "role": "Checks.", "model": "checker-model", "tools": [PROBE_TOOL]},
+        },
+        models=("default", "writer-model", "checker-model"),
+    )
+    team = build_team_turn(
+        tmp_path,
+        monkeypatch,
+        authored,
+        members=("writer", "checker"),
+        scripts={
+            "default": [delegate("call-team", "checker", "Touch it"), answer("Touched.", usage(50, 5))],
+            "checker-model": [
+                calls(tool_call("touch", "call-touch", label="a"), metrics=usage(10, 1)),
+                answer("Done."),
+            ],
+        },
+    )
+    job = await _stream_with_tool_jobs(team)
+    _assert_member_touch_job(team, job, agent_name="checker", transport_agent_name="writer")
+
+
+class _IdentityProbe(Toolkit):
+    """Records whom a member's toolkit was built for and whom each of its calls acts for."""
+
+    built_for: ClassVar[list[str | None]] = []
+    called_for: ClassVar[list[tuple[str, str] | None]] = []
+
+    def __init__(self, worker_target: ResolvedWorkerTarget | None = None) -> None:
+        identity = worker_target.execution_identity if worker_target is not None else None
+        type(self).built_for.append(identity.agent_name if identity is not None else None)
+        super().__init__(name="identity_probe", tools=[self.who])
+
+    async def who(self) -> str:
+        """Record whom the running call acts for."""
+        identity = current_execution_identity()
+        type(self).called_for.append((identity.agent_name, identity.recipient) if identity is not None else None)
+        return "recorded"
+
+
+@pytest.mark.usefixtures("restored_builtin_tools")
+@pytest.mark.asyncio
+async def test_a_member_s_tools_are_built_for_and_called_as_the_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A member's toolkit is built for the member, and its calls act as the member answering through the team."""
+    _IdentityProbe.built_for.clear()
+    _IdentityProbe.called_for.clear()
+
+    @register_tool_with_metadata(
+        name="identity_probe",
+        file_access=ToolFileAccess.NONE,
+        display_name="identity_probe",
+        description="Records call identities.",
+        category=ToolCategory.DEVELOPMENT,
+        managed_init_args=(ToolManagedInitArg.WORKER_TARGET,),
+    )
+    def identity_probe() -> type[Toolkit]:
+        return _IdentityProbe
+
+    team = squad_turn(
+        tmp_path,
+        monkeypatch,
+        leader=[delegate("call-team", "writer", "Who?"), answer("Asked.", usage(50, 5))],
+        writer=[calls(tool_call("who", "call-who"), metrics=usage(10, 1)), answer("Done.")],
+    )
+    team.config.agents["writer"].tools = ["identity_probe"]
+    await team.stream()
+
+    assert set(_IdentityProbe.built_for) == {"writer"}
+    assert _IdentityProbe.called_for == [("writer", "squad")]
+
+
+@pytest.mark.asyncio
+async def test_the_member_step_runs_a_call_as_the_member_outside_a_matrix_turn() -> None:
+    """In an OpenAI-compatible API turn, which has no tool runtime context, a member's call acts as the member.
+
+    The member still answers through the team, as the identity the API turn bound for the team names it.
+    """
+    seen: list[tuple[ToolRuntimeContext | None, ToolExecutionIdentity | None]] = []
+
+    async def probe() -> str:
+        seen.append((get_tool_runtime_context(), current_execution_identity()))
+        return "ran"
+
+    function = ToolFunction(name="probe", description=None, parameters={"type": "object"}, entrypoint=probe)
+    team = ToolExecutionIdentity("openai_compat", "squad", REQUESTER_ID, None, None, None, SESSION_ID)
+
+    with detached_tool_scope(team):
+        result = await run_tool_call(
+            function,
+            {},
+            ToolCallContext(run_id="run-1", session_id=SESSION_ID, user_id=None),
+            middleware=(_as_member("writer", "writer-model"),),
+        )
+        assert current_execution_identity() == team
+
+    member = replace(team, agent_name="writer", transport_agent_name="squad")
+    assert (result.value, seen) == ("ran", [(None, member)])
 
 
 @pytest.mark.asyncio
@@ -716,7 +929,7 @@ async def test_the_leader_runs_with_compaction_bound_to_the_team_scope(
     assert (len(hooks.after_tool_batch), len(hooks.on_resume_entry)) == (1, 1)
     assert hooks.tool_middleware == ()
     [compaction] = [kwargs for kwargs in compactions if kwargs["scope"].kind == "team"]
-    assert (compaction["scope"], compaction["entity_name"]) == (TEAM_SCOPE, "squad")
+    assert compaction["scope"] == TEAM_SCOPE
     assert compaction["storage"].scope == TEAM_SCOPE
     assert compaction["model"] is team.models["default"]
     assert compaction["prompt_id"] is not None
@@ -733,7 +946,7 @@ async def _pause_on_the_checker(
         monkeypatch,
         leader=[delegate("call-team", "checker", "Touch it")],
         checker=[calls(tool_call("touch", "call-touch", label="dangerous"), metrics=usage(10, 1))],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
     with pytest.raises(ResponsePausedForApproval) as raised:
         await team.stream(show_tool_calls=show_tool_calls)
@@ -846,8 +1059,8 @@ async def test_an_approved_member_call_resumes_the_stored_team_run_and_renders_t
 ) -> None:
     """The reply ends with each run's text after its approval, and no paused notice.
 
-    The member and the leader paused without text of their own, so their runs held the paused notices, which no
-    longer hold once the approved call ran.
+    The member and the leader paused without text of their own, so the reply shows only what they wrote after the
+    approved call ran.
     """
     team, raised = await _pause_on_the_checker(tmp_path, monkeypatch, show_tool_calls=show_tool_calls)
     team.models["default"] = ScriptedModel([answer("The checker touched it.", usage(50, 5))])
@@ -863,7 +1076,7 @@ async def test_an_approved_member_call_resumes_the_stored_team_run_and_renders_t
     assert isinstance(result, CompletedApprovalRun)
     assert ProbeToolkit.calls == ["dangerous"]
     assert result.response_text == HEADER + body
-    assert result.metadata_content["io.mindroom.ai_run"]["status"] == "completed"
+    assert result.metadata_content[AI_RUN_METADATA_KEY]["status"] == "completed"
     record, [member] = team.stored_runs()
     assert (record.status, member.status) == (RunStatus.completed, RunStatus.completed)
     assert record.requirements == []
@@ -873,16 +1086,14 @@ async def test_an_approved_member_call_resumes_the_stored_team_run_and_renders_t
     assert team.models["default"].requests[-1].messages[-1].content == "Touched."
 
 
-class _HandOffProbe(ProbeToolkit):
-    """The squad's probe toolkit plus ``hand_off``, a call executed outside the agent loop, which nothing answers."""
+class _HandOffProbe(UnansweredCallTools):
+    """The squad's probe functions plus ``hand_off``, which pauses for an answer from outside the loop that nothing gives."""
+
+    unanswered = frozenset({"hand_off"})
 
     def __init__(self) -> None:
-        Toolkit.__init__(
-            self,
-            name="probe",
-            tools=[self.touch, self.scope, self.dig, self.model, self.hand_off],
-            external_execution_required_tools=["hand_off"],
-        )
+        probe = ProbeToolkit()
+        super().__init__(name="probe", tools=[probe.touch, probe.scope, probe.dig, probe.model, self.hand_off])
 
     async def hand_off(self) -> str:
         """Hand the work to an external executor."""
@@ -899,7 +1110,7 @@ async def test_a_team_approval_resume_that_pauses_on_a_call_nothing_answers_fail
         team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
         team.models["checker-model"] = ScriptedModel([calls(tool_call("hand_off", "call-hand"))])
 
-        # The failure names the call the team waits for, not the generic note it gave before.
+        # The failure names the call the team waits for.
         with pytest.raises(RuntimeError, match=r"team run 'run-1' paused on \['hand_off'\] without an approval"):
             await team.resume(
                 raised.paused,
@@ -1070,7 +1281,7 @@ async def test_an_approval_resume_repeats_the_request_the_leader_and_the_member_
         monkeypatch,
         leader=[delegate("call-team", "checker", "Touch it")],
         checker=[calls(tool_call("touch", "call-touch", label="dangerous"), metrics=usage(10, 1))],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
     location = EnrichmentItem(key="location", text="Alice is in Lisbon.", persist=False)
     with pytest.raises(ResponsePausedForApproval) as raised:
@@ -1119,7 +1330,7 @@ async def test_a_member_continued_after_its_own_delegation_in_an_approval_resume
         leader=[delegate("call-team", "checker", "Touch it")],
         checker=[calls(tool_call("touch", "call-touch", label="dangerous"), metrics=usage(10, 1))],
         helper=[],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
     with pytest.raises(ResponsePausedForApproval) as raised:
         await team.stream(show_tool_calls=False)
@@ -1222,19 +1433,14 @@ async def test_a_denied_member_call_never_runs_and_the_member_answers_the_denial
     assert (member.tools[0].confirmed, member.tools[0].is_error) == (False, True)
 
 
-async def _writer_unavailable() -> None:
-    msg = "Writer unavailable"
-    raise ProviderError(msg, provider="Synthetic", status_code=503)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("leader", "writer", "body"),
     [
         pytest.param(
             [delegate("call-write", "writer", "Write it up"), answer("")],
-            [[Await(_writer_unavailable)]],
-            "**Writer**: Writer unavailable\n\n\n*No team consensus - showing individual responses only*",
+            [[_provider_fails("Writer unavailable", status_code=503)]],
+            f"**Writer**: Writer unavailable\n\n\n{_NO_CONSENSUS}",
             id="member-failed-before-text",
         ),
         pytest.param([answer("\n")], [], NO_TEAM_RESPONSE, id="blank-leader-text"),
@@ -1273,7 +1479,7 @@ async def test_an_approved_resume_shows_each_run_s_content_in_a_slot_that_stream
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A resume shows each run's content in a slot that streamed no text of its own, as the Agno-backed resume did.
+    """A resume shows each run's content in a slot that streamed no text of its own.
 
     The approved checker's streamed answer stands as it streamed. The writer the resumed leader then hands a task
     streams nothing, and its error fills its slot.
@@ -1281,7 +1487,7 @@ async def test_an_approved_resume_shows_each_run_s_content_in_a_slot_that_stream
     team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
     team.models["default"] = ScriptedModel([delegate("call-write", "writer", "Write it up"), answer("Done.")])
     team.models["checker-model"] = ScriptedModel([answer("Touched.")])
-    team.models["writer-model"] = ScriptedModel([[Await(_writer_unavailable)]])
+    team.models["writer-model"] = ScriptedModel([[_provider_fails("Writer unavailable", status_code=503)]])
 
     result = await team.resume(
         raised.paused,
@@ -1302,8 +1508,7 @@ async def test_a_resume_that_pauses_on_another_member_s_call_shows_no_paused_not
 ) -> None:
     """A resume that pauses again on a call of the writer shows no paused notice, nor does the reply it completes.
 
-    The writer the resumed leader hands a task pauses on its own gated call without text, so its run and the leader's
-    hold paused notices naming that call, which no earlier pause showed.
+    The writer the resumed leader hands a task pauses on its own gated call without text.
     """
     team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
     team.models["default"] = ScriptedModel([delegate("call-write", "writer", "Touch it too"), answer("Both touched.")])
@@ -1326,16 +1531,6 @@ async def test_a_resume_that_pauses_on_another_member_s_call_shows_no_paused_not
 _KEY = "api_key=unit-test-secret"
 
 
-async def _writer_leaks_its_key() -> None:
-    msg = f"Writer unavailable: {_KEY}"
-    raise ProviderError(msg, provider="Synthetic", status_code=503)
-
-
-async def _checker_leaks_its_key() -> None:
-    msg = f"Checker unavailable: {_KEY}"
-    raise ProviderError(msg, provider="Synthetic", status_code=503)
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("leader", "checker", "writer", "body"),
@@ -1343,55 +1538,21 @@ async def _checker_leaks_its_key() -> None:
         pytest.param(
             [delegate("call-write", "writer", "Write it up"), answer("Done.")],
             [answer("Touched.")],
-            [[Await(_writer_leaks_its_key)]],
+            [[_provider_fails(f"Writer unavailable: {_KEY}", status_code=503)]],
             "**Writer**: Writer unavailable: api_key=***redacted***\n\n**Checker**: Touched.\n\n\n"
             "**Team Consensus**:\n\nDone.",
             id="started-in-the-resume",
         ),
         pytest.param(
             [answer("Done.")],
-            [[Await(_checker_leaks_its_key)]],
+            [[_provider_fails(f"Checker unavailable: {_KEY}", status_code=503)]],
             [],
             "**Checker**: Checker unavailable: api_key=***redacted***\n\n\n**Team Consensus**:\n\nDone.",
             id="resumed-after-approval",
         ),
-    ],
-)
-async def test_an_approved_resume_shows_a_failed_member_s_redacted_reason(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    leader: list[list[ScriptStep]],
-    checker: list[list[ScriptStep]],
-    writer: list[list[ScriptStep]],
-    body: str,
-) -> None:
-    """A member whose run fails in an approval resume shows why in the resumed reply, credentials redacted.
-
-    The writer the resumed leader hands a task fails before it writes anything. The approved checker fails after its
-    approved call ran, while its record still holds its paused notice, which the reply does not show for it.
-    """
-    team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
-    team.models["default"] = ScriptedModel(leader)
-    team.models["checker-model"] = ScriptedModel(checker)
-    team.models["writer-model"] = ScriptedModel(writer)
-
-    result = await team.resume(
-        raised.paused,
-        approved=True,
-        approvals=(member_approval("call-touch", "dangerous"),),
-    )
-
-    assert ProbeToolkit.calls == ["dangerous"]
-    assert result.response_text == HEADER + body
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("leader", "checker", "writer", "body"),
-    [
         pytest.param(
             [answer("Done.")],
-            [[TextDelta("Touched it, now checking"), Await(_checker_leaks_its_key)]],
+            [[TextDelta("Touched it, now checking"), _provider_fails(f"Checker unavailable: {_KEY}", status_code=503)]],
             [],
             "**Checker**: Touched it, now checking\n\nChecker unavailable: api_key=***redacted***\n\n\n"
             "**Team Consensus**:\n\nDone.",
@@ -1404,14 +1565,14 @@ async def test_an_approved_resume_shows_a_failed_member_s_redacted_reason(
                 answer("Done."),
             ],
             [answer("Touched.")],
-            [answer("Draft."), [Await(_writer_leaks_its_key)]],
+            [answer("Draft."), [_provider_fails(f"Writer unavailable: {_KEY}", status_code=503)]],
             "**Writer**: Draft.\n\nWriter unavailable: api_key=***redacted***\n\n**Checker**: Touched.\n\n\n"
             "**Team Consensus**:\n\nDone.",
             id="failed-after-an-earlier-run-wrote",
         ),
     ],
 )
-async def test_an_approved_resume_shows_a_failed_run_s_reason_after_the_text_its_member_wrote(
+async def test_an_approved_resume_shows_a_failed_member_run_s_redacted_reason(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     leader: list[list[ScriptStep]],
@@ -1419,10 +1580,11 @@ async def test_an_approved_resume_shows_a_failed_run_s_reason_after_the_text_its
     writer: list[list[ScriptStep]],
     body: str,
 ) -> None:
-    """A member run that fails in an approval resume shows why in its own paragraph, after the text its slot holds.
+    """A member run that fails in an approval resume shows why in its own paragraph, credentials redacted.
 
-    The approved checker streams part of an answer before its request fails. The writer the resumed leader hands two
-    tasks answers the first and fails the second before writing anything; the first run's answer stays.
+    The writer the resumed leader hands a task fails before it writes anything, or after an earlier run of it answered,
+    whose answer stays. The approved checker fails after its approved call ran, or after it streamed part of an
+    answer, which stays before the reason.
     """
     team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
     team.models["default"] = ScriptedModel(leader)
@@ -1444,12 +1606,12 @@ async def test_an_approved_resume_shows_a_failed_run_s_reason_after_the_text_its
     ("checker", "slot"),
     [
         pytest.param(
-            [[TextDelta("Checking it"), Await(_checker_leaks_its_key)]],
+            [[TextDelta("Checking it"), _provider_fails(f"Checker unavailable: {_KEY}", status_code=503)]],
             "Checking it\n\nChecker unavailable: api_key=***redacted***",
             id="failed-after-writing",
         ),
         pytest.param(
-            [[Await(_checker_leaks_its_key)]],
+            [[_provider_fails(f"Checker unavailable: {_KEY}", status_code=503)]],
             "Checker unavailable: api_key=***redacted***",
             id="failed-before-writing",
         ),
@@ -1493,9 +1655,9 @@ async def test_a_team_pause_shows_a_failed_member_run_s_reason_after_the_text_it
         tmp_path,
         monkeypatch,
         leader=[delegate("call-check", "checker", "Check"), delegate("call-write", "writer", "Touch it")],
-        checker=[[TextDelta("Checking it"), Await(_checker_leaks_its_key)]],
+        checker=[[TextDelta("Checking it"), _provider_fails(f"Checker unavailable: {_KEY}", status_code=503)]],
         writer=[calls(tool_call("touch", "call-touch", label="dangerous"))],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
 
     with pytest.raises(ResponsePausedForApproval) as raised:
@@ -1506,9 +1668,6 @@ async def test_a_team_pause_shows_a_failed_member_run_s_reason_after_the_text_it
     # The leader has not answered yet, so the pause shows no no-consensus note.
     assert paused.response_text == f"{HEADER}**Checker**: {slot}"
     assert [member["content"] for member in paused.response_presentation_state["members"]] == ["", slot]
-
-
-_NO_CONSENSUS = "*No team consensus - showing individual responses only*"
 
 
 @pytest.mark.asyncio
@@ -1527,7 +1686,7 @@ async def test_a_team_reply_shows_the_no_consensus_note_only_once_it_finishes(
         monkeypatch,
         leader=[delegate("call-team", "checker", "Touch it")],
         checker=[calls(tool_call("touch", "call-touch", label="dangerous"), content="Let me touch it.")],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
     live: list[TeamStreamChunk] = []
     with pytest.raises(ResponsePausedForApproval) as raised:
@@ -1595,7 +1754,7 @@ async def _pause_after_the_checker_wrote(
             ),
         ],
         checker=[calls(tool_call("touch", "call-touch", label="dangerous"), content="Let me touch it.")],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
     with pytest.raises(ResponsePausedForApproval) as raised:
         await team.stream(show_tool_calls=False)
@@ -1612,8 +1771,7 @@ async def test_an_approved_resume_shows_once_the_text_its_runs_wrote_before_the_
 ) -> None:
     """Text the leader and the checker wrote before the pause stands once when neither writes more after approval.
 
-    The Agno-backed resume added a content-less run's earlier messages to its slot again; the restored document
-    already holds them.
+    A content-less run's earlier messages are not added to its slot again; the restored document already holds them.
     """
     team, paused = await _pause_after_the_checker_wrote(tmp_path, monkeypatch)
     team.models["default"] = ScriptedModel([answer("")])
@@ -1637,7 +1795,7 @@ async def test_a_member_asked_again_after_an_approval_resume_starts_a_new_paragr
         leader=[delegate("call-draft", "writer", "Draft"), delegate("call-check", "checker", "Touch it")],
         writer=[answer("Draft one.")],
         checker=[calls(tool_call("touch", "call-touch", label="dangerous"))],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
     with pytest.raises(ResponsePausedForApproval) as raised:
         await team.stream(show_tool_calls=False)
@@ -1661,10 +1819,7 @@ async def test_an_approved_member_that_answers_without_text_shows_no_paused_noti
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A member that paused without text and answers after its approved call without text adds nothing to its slot.
-
-    Its run still holds the paused notice from before the pause, which no longer holds once the call ran.
-    """
+    """A member that paused without text and answers after its approved call without text adds nothing to its slot."""
     team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
     team.models["default"] = ScriptedModel([answer("Done.")])
     team.models["checker-model"] = ScriptedModel([answer("")])
@@ -1682,7 +1837,7 @@ async def test_a_member_that_pauses_again_after_approval_shows_its_earlier_text_
 ) -> None:
     """A member whose approved call leads only to another gated call keeps its earlier text once in the new pause.
 
-    The leader sends no request while its member waits, so its run holds a paused notice, which the pause does not show.
+    The leader sends no request while its member waits, so it adds nothing to the pause.
     """
     team, paused = await _pause_after_the_checker_wrote(tmp_path, monkeypatch)
     team.models["default"] = ScriptedModel([])
@@ -1718,9 +1873,6 @@ async def test_a_chained_approval_shows_the_text_each_run_wrote_once(
     assert isinstance(result, CompletedApprovalRun)
     assert ProbeToolkit.calls == ["dangerous", "again"]
     assert result.response_text == _WROTE_BEFORE_THE_PAUSE
-
-
-_TOUCH_NEEDS_APPROVAL = [ApprovalRuleConfig(match="touch", action="require_approval")]
 
 
 @pytest.mark.asyncio
@@ -1828,12 +1980,7 @@ async def test_a_failed_resume_stores_the_error_over_the_paused_row_and_ran_the_
 ) -> None:
     """A leader request that fails after the approved call ran reaches the caller; the rows record the outcome."""
     team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
-
-    async def lose_the_provider() -> None:
-        msg = "provider connection lost"
-        raise ProviderError(msg, provider="Synthetic")
-
-    team.models["default"] = ScriptedModel([[Await(lose_the_provider)]])
+    team.models["default"] = ScriptedModel([[_provider_fails("provider connection lost")]])
     team.models["checker-model"] = ScriptedModel([answer("Touched.")])
 
     with pytest.raises(ProviderError, match="provider connection lost"):
@@ -1856,15 +2003,10 @@ async def test_a_team_reply_that_fails_mid_turn_reports_its_stored_run_in_the_me
 
     The turn driver stores the failed turn as its interrupted record, in the failed run's place.
     """
-
-    async def lose_the_provider() -> None:
-        msg = "provider connection lost"
-        raise ProviderError(msg, provider="Synthetic")
-
     team = squad_turn(
         tmp_path,
         monkeypatch,
-        leader=[delegate("call-team", "writer", "Draft it"), [Await(lose_the_provider)]],
+        leader=[delegate("call-team", "writer", "Draft it"), [_provider_fails("provider connection lost")]],
         writer=[answer("Draft.", usage(20, 2))],
     )
     metadata: dict[str, Any] = {}
@@ -1879,28 +2021,23 @@ async def test_a_team_reply_that_fails_mid_turn_reports_its_stored_run_in_the_me
     assert payload["tools"] == {"count": 1}
 
 
-async def _lose_the_provider() -> None:
-    msg = "provider connection lost"
-    raise ProviderError(msg, provider="Synthetic")
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [True, False])
 @pytest.mark.parametrize(
     ("leader", "recorded"),
     [
         pytest.param(
-            [delegate("call-check", "checker", "Check"), [Await(_lose_the_provider)]],
+            [delegate("call-check", "checker", "Check"), [_provider_fails("provider connection lost")]],
             "**Checker**: Checker overloaded\n\n\n**Team Consensus**:\n\nprovider connection lost",
             id="after-a-member-failed",
         ),
         pytest.param(
-            [[Await(_lose_the_provider)]],
+            [[_provider_fails("provider connection lost")]],
             "\n**Team Consensus**:\n\nprovider connection lost",
             id="on-the-first-request",
         ),
         pytest.param(
-            [[TextDelta("Checked once."), Await(_lose_the_provider)]],
+            [[TextDelta("Checked once."), _provider_fails("provider connection lost")]],
             "\n**Team Consensus**:\n\nChecked once.\n\nprovider connection lost",
             id="after-streaming-text",
         ),
@@ -1918,7 +2055,12 @@ async def test_a_failed_team_turn_records_why_its_runs_failed(
     A member that failed before any text shows its error; the leader's failure stands in its consensus, after any
     text the failed request had streamed. The turn's interrupted record takes the failed team run's place.
     """
-    team = squad_turn(tmp_path, monkeypatch, leader=leader, checker=[[Await(_checker_overloaded)]])
+    team = squad_turn(
+        tmp_path,
+        monkeypatch,
+        leader=leader,
+        checker=[[_provider_fails("Checker overloaded", status_code=503)]],
+    )
 
     await team.reply(stream=stream, show_tool_calls=False)
 
@@ -1933,18 +2075,13 @@ async def test_a_failed_team_turn_records_why_its_runs_failed(
     assert record.metadata["mindroom_original_status"] == "error"
 
 
-async def _lose_the_provider_and_leak_its_key() -> None:
-    msg = f"provider connection lost: {_KEY}"
-    raise ProviderError(msg, provider="Synthetic")
-
-
 @pytest.mark.asyncio
 async def test_a_failed_team_turn_records_its_leader_s_redacted_reason(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The text a turn records when its leader fails before writing is why it failed, credentials redacted."""
-    team = squad_turn(tmp_path, monkeypatch, leader=[[Await(_lose_the_provider_and_leak_its_key)]])
+    team = squad_turn(tmp_path, monkeypatch, leader=[[_provider_fails(f"provider connection lost: {_KEY}")]])
 
     await team.respond(show_tool_calls=False)
 
@@ -1987,12 +2124,11 @@ async def test_a_saved_team_approval_that_names_no_members_is_refused_before_any
     """No member could run the approved calls, so the resume refuses at once and leaves the paused row untouched."""
     team, raised = await _pause_on_the_checker(tmp_path, monkeypatch)
     team.models["default"] = ScriptedModel([])
-    members, team.member_names = team.member_names, ()
+    team.member_names = ()
 
     with pytest.raises(RuntimeError, match="The paused team approval names no members"):
         await team.resume(raised.paused, approved=True, approvals=(member_approval("call-touch", "dangerous"),))
 
-    team.member_names = members
     assert ProbeToolkit.calls == []
     assert team.models["default"].requests == []
     record, _ = team.stored_runs()
@@ -2217,12 +2353,13 @@ async def test_two_members_approvals_under_one_call_id_are_refused_and_neither_c
         ],
         writer=[calls(tool_call("touch", "call-touch", label="a"), metrics=usage(10, 1))],
         checker=[calls(tool_call("touch", "call-touch", label="b"), metrics=usage(10, 1))],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
 
     chunks = await team.stream(show_tool_calls=False)
 
-    assert chunks[-1].endswith("Paused approval requirements contain duplicate tool-call IDs")
+    assert isinstance(chunks[-1], FailedReply)
+    assert chunks[-1].text.endswith("Paused approval requirements contain duplicate tool-call IDs")
     assert ProbeToolkit.calls == []
     record, members = team.stored_runs()
     assert record.status is RunStatus.completed
@@ -2337,7 +2474,7 @@ async def test_a_team_paused_on_its_child_s_approval_resumes_through_the_delegat
         leader=[delegate("call-team", "writer", "Research it"), answer("Consensus.", usage(50, 5))],
         writer=[_delegate_to_helper("Dig"), answer("Writer: dug.")],
         helper=[calls(tool_call("touch", "call-helper", label="deep"), metrics=usage(5, 1)), answer("Dug deep.")],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
     with pytest.raises(ResponsePausedForApproval) as raised:
         await team.stream(show_tool_calls=False)
@@ -2392,7 +2529,7 @@ async def test_a_child_that_pauses_again_after_its_approval_shows_the_leader_s_e
             calls(tool_call("touch", "call-helper-again", label="deeper"), metrics=usage(5, 1)),
             answer("Dug deeper."),
         ],
-        approval_rules=[ApprovalRuleConfig(match="touch", action="require_approval")],
+        approval_rules=_TOUCH_NEEDS_APPROVAL,
     )
     with pytest.raises(ResponsePausedForApproval) as raised:
         await team.stream(show_tool_calls=False)
@@ -2562,6 +2699,16 @@ async def test_a_member_reads_its_earlier_delegation_card_under_its_own_call_id_
     assert request_call_ids(second) == ["call-sub", "call-touch"]
 
 
+def _wait_to_be_cancelled(started: asyncio.Event) -> Await:
+    """Return a scripted step that sets ``started`` and then waits until the turn is cancelled."""
+
+    async def wait() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    return Await(wait)
+
+
 @pytest.mark.asyncio
 async def test_a_stopped_member_keeps_its_usage_and_its_row_ends_cancelled(
     tmp_path: Path,
@@ -2573,15 +2720,11 @@ async def test_a_stopped_member_keeps_its_usage_and_its_row_ends_cancelled(
     """
     streaming = asyncio.Event()
 
-    async def wait_to_be_cancelled() -> None:
-        streaming.set()
-        await asyncio.Event().wait()
-
     team = squad_turn(
         tmp_path,
         monkeypatch,
         leader=[delegate("call-team", "writer", "Write")],
-        writer=[[TextDelta("Dra"), UsageReported(usage(30, 2), final=False), Await(wait_to_be_cancelled)]],
+        writer=[[TextDelta("Dra"), UsageReported(usage(30, 2), final=False), _wait_to_be_cancelled(streaming)]],
     )
     task = asyncio.create_task(team.stream())
     await asyncio.wait_for(streaming.wait(), timeout=5)
@@ -2594,42 +2737,145 @@ async def test_a_stopped_member_keeps_its_usage_and_its_row_ends_cancelled(
     assert record.metadata is not None
     assert record.metadata["mindroom_original_status"] == "cancelled"
     assert member.parent_run_id == record.run_id
-    [member_usage] = _usage_rows(team.storage, member.run_id)
+    [member_usage] = usage_rows(team.storage, member.run_id)
     assert member_usage["metrics"]["input_tokens"] == 30
-    [leader_usage] = _usage_rows(team.storage, record.run_id)
+    [leader_usage] = usage_rows(team.storage, record.run_id)
     assert leader_usage["metrics"]["input_tokens"] == 40
     assert team.recorder.outcome == "interrupted"
     assert team.recorder.assistant_text == "**Writer**: Dra"
 
 
 @pytest.mark.asyncio
-async def test_a_stopped_team_turn_records_the_text_its_members_streamed(
+@pytest.mark.parametrize("ending", ["stopped", "failed"])
+async def test_the_next_team_turn_still_reads_the_thread_messages_an_interrupted_turn_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ending: str,
+) -> None:
+    """What others posted before the team was addressed reaches the leader's next turn once, before the prompt it preceded."""
+    working = asyncio.Event()
+    first_reply = _wait_to_be_cancelled(working) if ending == "stopped" else _provider_fails("provider connection lost")
+    team = squad_turn(tmp_path, monkeypatch, leader=[[first_reply], answer("Slot 7.")])
+    earlier = make_visible_message(
+        sender="@alice:localhost",
+        body="The deploy key is in vault slot 7.",
+        event_id="$alice:localhost",
+    )
+    current = make_visible_message(sender=REQUESTER_ID, body="Hello", event_id=EVENT_ID)
+    follow_up = make_visible_message(sender=REQUESTER_ID, body="Where is the key?", event_id="$follow-up:localhost")
+
+    task = asyncio.create_task(team.respond(thread_history=[earlier, current]))
+    if ending == "stopped":
+        await asyncio.wait_for(working.wait(), timeout=5)
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await team.respond(
+        message="Where is the key?",
+        run_id="run-2",
+        reply_to_event_id="$follow-up:localhost",
+        thread_history=[earlier, current, follow_up],
+    )
+
+    sent = [str(message.content) for message in team.models["default"].requests[-1].messages]
+    mentions = [index for index, content in enumerate(sent) if "vault slot 7" in content]
+    first_prompt = next(index for index, content in enumerate(sent) if EVENT_ID in content)
+    assert len(mentions) == 1, sent
+    assert mentions[0] < first_prompt, sent
+
+
+@pytest.mark.asyncio
+async def test_a_team_turn_stopped_before_its_run_stored_anything_keeps_the_thread_messages_it_prepared(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Stop records what the reply showed: the writer, stopped while its call ran, records what it wrote before.
+    """A Stop that lands before the team's run starts storing still keeps the thread messages its metadata marks seen."""
+    team = squad_turn(tmp_path, monkeypatch, leader=[])
 
-    The checker failed before any text; the stopped turn records its reason in its slot all the same.
+    def stopped_before_it_stores(*_args: object, **_kwargs: object) -> AsyncIterator[object]:
+        async def events() -> AsyncIterator[object]:
+            raise asyncio.CancelledError
+            yield
+
+        return events()
+
+    monkeypatch.setattr(leader_module, "run_team", stopped_before_it_stores)
+    earlier = make_visible_message(
+        sender="@alice:localhost",
+        body="The deploy key is in vault slot 7.",
+        event_id="$alice:localhost",
+    )
+    current = make_visible_message(sender=REQUESTER_ID, body="Hello", event_id=EVENT_ID)
+
+    task = asyncio.create_task(team.respond(thread_history=[earlier, current]))
+    await asyncio.gather(task, return_exceptions=True)
+
+    record, _ = team.stored_runs()
+    assert ["vault slot 7" in str(message.content) for message in record.messages] == [True, False, False]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["completed", "stopped", "failed"])
+async def test_the_next_team_turn_reads_a_leader_fold_s_summary_in_place_of_what_it_folded_however_the_turn_ended(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ending: str,
+) -> None:
+    """A scheduled team turn whose history budget its thread message used up folds that message into the team run.
+
+    The team run keeps the leader fold's summary in place of the message, and the next turn reads it so, however the
+    turn ended.
     """
+    working = asyncio.Event()
+    second_reply = {
+        "completed": answer("Done."),
+        "stopped": [_wait_to_be_cancelled(working)],
+        "failed": [_provider_fails("provider connection lost")],
+    }[ending]
     team = squad_turn(
         tmp_path,
         monkeypatch,
-        leader=[delegate("call-check", "checker", "Check"), delegate("call-write", "writer", "Write")],
-        checker=[[Await(_checker_overloaded)]],
-        writer=[calls(tool_call("touch", "call-touch", label="draft", wait=True), content="Drafting.")],
+        leader=[
+            # The first response reports a request far over the 4,000-token window, so the second request compacts.
+            calls(
+                tool_call("delegate_task_to_member", "call-team", member_id="writer", task="Write"),
+                metrics=usage(1_000_000, 1),
+            ),
+            second_reply,
+            answer("Slot 7."),
+        ],
+        writer=[answer("Draft.")],
+        context_window=4000,
     )
-    task = asyncio.create_task(team.respond(show_tool_calls=False))
-    await asyncio.wait_for(ProbeToolkit.waiting.wait(), timeout=5)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    install_model_providers(monkeypatch, {"summary": summary_model("SUMMARY")})
+    earlier = make_visible_message(
+        sender="@alice:localhost",
+        body="The deploy key is in vault slot 7.",
+        event_id="$alice:localhost",
+    )
+    current = make_visible_message(sender=REQUESTER_ID, body="Hello", event_id=EVENT_ID)
+    follow_up = make_visible_message(sender=REQUESTER_ID, body="Where is the key?", event_id="$follow-up:localhost")
+    budget = ScheduledHistoryBudget(limit=1, source_event_id=EVENT_ID)
 
-    record, members = team.stored_runs()
-    assert [run.status for run in (record, *members)] == [RunStatus.completed, RunStatus.error, RunStatus.cancelled]
-    assert record.metadata is not None
-    assert record.metadata["mindroom_original_status"] == "cancelled"
-    assert team.recorder.outcome == "interrupted"
-    assert team.recorder.assistant_text == "**Writer**: Drafting.\n\n**Checker**: Checker overloaded"
+    task = asyncio.create_task(team.respond(thread_history=[earlier, current], scheduled_history_budget=budget))
+    if ending == "stopped":
+        await asyncio.wait_for(working.wait(), timeout=5)
+        task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    first, folded = (
+        [str(message.content) for message in request.messages] for request in team.models["default"].requests[:2]
+    )
+    assert any("vault slot 7" in content for content in first)
+    assert not any("vault slot 7" in content for content in folded)
+    await team.respond(
+        message="Where is the key?",
+        run_id="run-2",
+        reply_to_event_id="$follow-up:localhost",
+        thread_history=[earlier, current, follow_up],
+    )
+
+    sent = [str(message.content) for message in team.models["default"].requests[-1].messages]
+    assert not any("vault slot 7" in content for content in sent), sent
+    assert len([content for content in sent if "SUMMARY" in content]) == 1, sent
 
 
 @pytest.mark.asyncio
@@ -2648,7 +2894,7 @@ async def test_a_stopped_team_turn_records_its_member_runs_in_configured_order(
         tmp_path,
         monkeypatch,
         leader=[delegate("call-check", "checker", "Check"), delegate("call-write", "writer", "Write")],
-        checker=[[Await(_checker_overloaded)]],
+        checker=[[_provider_fails("Checker overloaded", status_code=503)]],
         writer=[calls(tool_call("touch", "call-touch", label="draft", wait=True), content="Drafting.")],
     )
     task = asyncio.create_task(team.reply(stream=stream, show_tool_calls=False))
@@ -2677,10 +2923,6 @@ async def test_a_stopped_team_turn_records_what_its_leader_wrote_before_its_memb
     """
     working = asyncio.Event()
 
-    async def wait_to_be_cancelled() -> None:
-        working.set()
-        await asyncio.Event().wait()
-
     team = squad_turn(
         tmp_path,
         monkeypatch,
@@ -2690,7 +2932,7 @@ async def test_a_stopped_team_turn_records_what_its_leader_wrote_before_its_memb
                 content="Asking the writer.",
                 metrics=usage(40, 4),
             ),
-            [Await(wait_to_be_cancelled)],
+            [_wait_to_be_cancelled(working)],
         ],
         writer=[_delegate_to_helper("Dig"), answer("")],
         helper=[answer("Helper found it.")],
@@ -2735,7 +2977,7 @@ async def test_a_team_turn_stopped_after_its_run_ended_records_the_finished_docu
         tmp_path,
         monkeypatch,
         leader=[delegate("call-check", "checker", "Check"), answer("Done.")],
-        checker=[[Await(_checker_overloaded)]],
+        checker=[[_provider_fails("Checker overloaded", status_code=503)]],
     )
     task = asyncio.create_task(team.respond(show_tool_calls=False))
     await asyncio.wait_for(finishing.wait(), timeout=5)
@@ -2749,11 +2991,13 @@ async def test_a_team_turn_stopped_after_its_run_ended_records_the_finished_docu
     assert team.recorder.assistant_text == "**Checker**: Checker overloaded\n\n\n**Team Consensus**:\n\nDone."
 
 
-class _ExternalProbeToolkit(ProbeToolkit):
-    """The members' probe with ``touch`` executed outside the loop: a run paused on that call has nothing to resume it."""
+class _ExternalProbeToolkit(UnansweredCallTools):
+    """The members' probe with ``touch`` pausing for an answer from outside the loop: nothing resumes a run paused on it."""
+
+    unanswered = frozenset({"touch"})
 
     def __init__(self) -> None:
-        Toolkit.__init__(self, name="probe", tools=[self.touch], external_execution_required_tools=["touch"])
+        super().__init__(name="probe", tools=[ProbeToolkit().touch])
 
 
 @pytest.mark.asyncio
@@ -2771,7 +3015,7 @@ async def test_a_team_turn_that_fails_after_its_run_ended_records_the_document_i
         tmp_path,
         monkeypatch,
         leader=[delegate("call-check", "checker", "Check"), delegate("call-write", "writer", "Write")],
-        checker=[[Await(_checker_overloaded)]],
+        checker=[[_provider_fails("Checker overloaded", status_code=503)]],
         writer=[calls(tool_call("touch", "call-touch", label="outside"), content="Let me touch it.")],
     )
 
@@ -2787,7 +3031,7 @@ async def test_a_team_turn_that_fails_after_its_run_ended_records_the_document_i
     assert team.recorder.assistant_text == "**Writer**: Let me touch it.\n\n**Checker**: Checker overloaded"
 
 
-def _team_bot(team: TeamTurn, tmp_path: Path, entity: str = "squad") -> AgentBot:
+def _team_bot(team: TeamTurn, entity: str = "squad") -> AgentBot:
     """Build the squad's team bot on the team's config, with a mocked Matrix client and inert post-response effects.
 
     A completed reply would otherwise queue a thread summary on the config's real ``default`` model. An agent
@@ -2800,7 +3044,6 @@ def _team_bot(team: TeamTurn, tmp_path: Path, entity: str = "squad") -> AgentBot
             display_name=entity.title(),
             user_id=f"@mindroom_{entity}:localhost",
         ),
-        tmp_path,
         team.config,
         team.runtime_paths,
         rooms=[ROOM_ID],
@@ -2810,13 +3053,7 @@ def _team_bot(team: TeamTurn, tmp_path: Path, entity: str = "squad") -> AgentBot
     unique_room_send_responses(bot.client)
     install_runtime_journal_support(bot)
     _install_inert_post_response_effects(bot._response_runner)
-    bot.orchestrator = team.orchestrator
     return bot
-
-
-def _runner(team: TeamTurn, tmp_path: Path) -> Any:  # noqa: ANN401
-    """Return the runner of the squad's team bot."""
-    return _team_bot(team, tmp_path)._response_runner
 
 
 def _request(prompt: str = "Hello") -> ResponseRequest:
@@ -2875,7 +3112,7 @@ async def test_an_ad_hoc_team_turn_is_dated_in_the_zone_of_the_agent_whose_bot_r
     """
     team = squad_turn(tmp_path, monkeypatch, leader=[], writer=[answer("Done.")])
     team.config.agents["writer"].timezone = "America/Los_Angeles"
-    bot = _team_bot(team, tmp_path, "writer")
+    bot = _team_bot(team, "writer")
     room = nio.MatrixRoom(ROOM_ID, "@mindroom_writer:localhost")
     messages = [
         ("$first:localhost", "first", _OLDER_MESSAGE_MS + 900_000),
@@ -2937,7 +3174,7 @@ async def test_a_configured_team_turn_is_dated_in_the_global_zone(
     team = squad_turn(tmp_path, monkeypatch, leader=[answer("Done.")])
     team.config.agents["writer"].timezone = "America/Los_Angeles"
     request = replace(_request("What changed?"), current_timestamp_ms=_OLDER_MESSAGE_MS + 960_000)
-    bot = _team_bot(team, tmp_path)
+    bot = _team_bot(team)
 
     with _older_thread_history(bot), patch_response_runner_module(should_use_streaming=AsyncMock(return_value=False)):
         await bot._response_runner.generate_team_response_helper(
@@ -2966,17 +3203,13 @@ async def test_the_driver_writes_the_interrupted_record_after_the_loop_stored_th
     """
     working = asyncio.Event()
 
-    async def wait_to_be_cancelled() -> None:
-        working.set()
-        await asyncio.Event().wait()
-
     team = squad_turn(
         tmp_path,
         monkeypatch,
         leader=[delegate("call-team", "writer", "Write")],
-        writer=[[TextDelta("Dra"), UsageReported(usage(30, 2), final=False), Await(wait_to_be_cancelled)]],
+        writer=[[TextDelta("Dra"), UsageReported(usage(30, 2), final=False), _wait_to_be_cancelled(working)]],
     )
-    runner = _runner(team, tmp_path)
+    runner = _team_bot(team)._response_runner
     statuses_when_interrupted_record_written: list[RunStatus | None] = []
     original = response_turn.persist_interrupted_replay_snapshot
 
@@ -3005,18 +3238,13 @@ async def test_the_driver_writes_the_interrupted_record_after_the_loop_stored_th
     assert record.metadata["mindroom_original_status"] == "cancelled"
     [member] = [run for run in session.runs if isinstance(run, RunRecord)]
     assert member.status is RunStatus.cancelled
-    [row] = _usage_rows(team.storage, member.run_id)
+    [row] = usage_rows(team.storage, member.run_id)
     assert row["metrics"]["input_tokens"] == 30
 
 
 def _leader_writing_then_waiting(working: asyncio.Event) -> list[list[ScriptStep]]:
     """Return a leader turn that writes a little, sets ``working``, and then waits to be stopped."""
-
-    async def wait_to_be_cancelled() -> None:
-        working.set()
-        await asyncio.Event().wait()
-
-    return [[TextDelta("Dra"), Await(wait_to_be_cancelled)]]
+    return [[TextDelta("Dra"), _wait_to_be_cancelled(working)]]
 
 
 @pytest.mark.asyncio
@@ -3081,12 +3309,11 @@ async def test_a_stopped_team_turn_cancelled_again_while_its_record_is_stored_en
 @asynccontextmanager
 async def _approving_team_bot(
     team: TeamTurn,
-    tmp_path: Path,
     *,
     streaming: bool = True,
 ) -> AsyncIterator[tuple[AgentBot, list[MatrixDelivery]]]:
     """Yield the squad's team bot with its approval cards published into the yielded list, the n-th as ``$card-n``."""
-    bot = _team_bot(team, tmp_path)
+    bot = _team_bot(team)
     cards: list[MatrixDelivery] = []
 
     async def prepare_event(_room_id: str, _thread_id: str | None, content: dict[str, Any]) -> dict[str, Any]:
@@ -3162,7 +3389,7 @@ async def test_a_member_s_gated_delegation_posts_its_card_and_the_approved_reply
         helper=[answer("Dug.")],
         approval_rules=[ApprovalRuleConfig(match="run_subagent", action="require_approval")],
     )
-    async with _approving_team_bot(team, tmp_path, streaming=streaming) as (bot, cards):
+    async with _approving_team_bot(team, streaming=streaming) as (bot, cards):
         await bot._response_runner.generate_team_response_helper(
             _request(),
             member_names=team.member_names,
@@ -3207,7 +3434,7 @@ async def test_a_member_s_next_gated_delegation_during_the_resume_posts_the_next
         helper=[answer("Dug."), answer("Dug more.")],
         approval_rules=[ApprovalRuleConfig(match="run_subagent", action="require_approval")],
     )
-    async with _approving_team_bot(team, tmp_path) as (bot, cards):
+    async with _approving_team_bot(team) as (bot, cards):
         await bot._response_runner.generate_team_response_helper(
             _request(),
             member_names=team.member_names,
@@ -3255,7 +3482,7 @@ async def test_a_member_s_child_s_gated_delegation_posts_its_card_in_the_team_sl
         approval_rules=[ApprovalRuleConfig(match="run_subagent", action="require_approval")],
     )
     team.config.agents["helper"].delegate_to = ["checker"]
-    async with _approving_team_bot(team, tmp_path) as (bot, cards):
+    async with _approving_team_bot(team) as (bot, cards):
         await bot._response_runner.generate_team_response_helper(
             _request(),
             member_names=team.member_names,

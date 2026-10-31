@@ -278,7 +278,7 @@ agents:
 
 The tools that default to workers when no list is set are `browser_mcp`, `coding`, `docker`, `file`, `python`, and `shell`.
 Any other registered tool can be listed in `worker_tools`, except tools that need the primary runtime or room context, which stay in the primary runtime even when listed.
-These include the Matrix, scheduling, todo, attachment, and thread tools, `gmail` and the other Google tools, `github`, `atlassian`, `slack`, `spotify`, `homeassistant`, `reasoning`, `daytona`, `e2b`, `mem0`, `claude_agent`, `config_manager`, `oauth_connections`, and `agent_vault_access`, plus `browserbase`, `composio`, `duckdb`, `pandas`, `sql`, and `zep`, which keep a session, connection, or other state between calls.
+These include the Matrix, scheduling, todo, attachment, and thread tools, `gmail` and the other Google tools, `github`, `atlassian`, `slack`, `spotify`, `homeassistant`, `reasoning`, `daytona`, `e2b`, `mem0`, `claude_agent`, `config_manager`, and `oauth_connections`, plus `browserbase`, `composio`, `duckdb`, `pandas`, `sql`, and `zep`, which keep a session, connection, or other state between calls.
 The built-in `memory`, `delegate`, `self_config`, and `agent_manager` tools and configured MCP `mcp_<server_id>` tools also always run in the primary runtime.
 The `browser` tool chooses per call: `target: desktop` stays in the primary runtime, while `target: host` follows the worker routing.
 
@@ -343,7 +343,7 @@ Adding, removing, or re-scoping a `worker_scope: user` agent changes every user 
 ### Dashboard credentials and worker scopes
 
 The dashboard's generic credential forms work only for unscoped agents and agents with `worker_scope: shared`.
-OAuth connections are an exception: the dashboard can connect scoped `user` and `user_agent` credentials for any [OAuth framework](../oauth-framework.md) provider, including the Google Drive, Docs, Gmail, Calendar, Sheets, and Tasks providers, whose tools still execute in the primary runtime; the Spotify and Home Assistant integrations are not framework providers and stay shared-only.
+OAuth connections are an exception: the dashboard can connect scoped `user` and `user_agent` credentials for any [OAuth framework](../oauth-framework.md) provider, including the Google Drive, Docs, Gmail, Calendar, Sheets, and Tasks providers, whose tools still execute in the primary runtime, except Spotify, which, like the Home Assistant integration, stays shared-only.
 GitHub and Atlassian managed OAuth credentials always use the requester's `user` scope, independently of the agent's `worker_scope`.
 Saved tool settings are stored by the primary per agent for `shared`, per requester across agents for `user`, and per requester-agent pair for `user_agent`, and reach worker-routed calls through [credential leases](#credential-leases).
 Tools without a scoped OAuth provider have no dashboard form for `user` and `user_agent` settings, so configure them in authored config (see [Per-Agent Tool Configuration](../tools/index.md#per-agent-tool-configuration)) or through shared settings granted with `defaults.worker_grantable_credentials`.
@@ -361,7 +361,7 @@ Runtime `.env` values and provider API keys such as `OPENAI_API_KEY` and `ANTHRO
 Worker-routed `python` receives only allowed runtime names.
 
 To pass more variables to `shell`, set the shell tool's `extra_env_passthrough` to exact names or glob patterns of exported process variables; it does not match config-adjacent `.env` entries.
-Everything that matches passes through, including service tokens and provider credentials, except MindRoom's own control variables such as credential seeds, Kubernetes worker backend settings, `MINDROOM_CREDENTIALS_ENCRYPTION_KEY`, and any name starting with `MINDROOM_SANDBOX_`.
+Everything that matches passes through, including service tokens and provider credentials, except MindRoom's own control variables such as credential seeds, Docker and Kubernetes worker backend settings, `MINDROOM_CREDENTIALS_ENCRYPTION_KEY`, and any name starting with `MINDROOM_SANDBOX_`.
 Use `shell_path_prepend` to add directories, such as wrapper directories, ahead of the existing `PATH`.
 Both options are documented with the [shell tool](../tools/execution-and-coding.md#shell).
 A plugin's [`tool:environment` hook](../hooks.md#shell-command-environment-toolenvironment) can also set, remove, or pass through variables for one call's commands.
@@ -423,68 +423,17 @@ For shell authentication, use [environment passthrough](#shell-environment-and-p
 
 To let worker-routed `shell` and `python` call external APIs without ever receiving the real credential, route their egress through a proxy that injects the credential in transit.
 This works at the network layer, so it covers URLs inside scripts, package CLIs, and subprocesses.
-There are three supported shapes:
+There are two supported shapes:
 
 - **Native egress broker** runs inside the primary runtime and injects secrets from primary-only credential stores that workers never read, for agents with the [`egress_credentials` tool](egress-broker.md#agent-tool).
   See [Agent Keys](egress-broker.md) for configuration, secret management, and deployment.
-  This is the recommended option for new deployments; it works with Docker workers, the static runner, and Kubernetes workers through the runtime chart's `egressBroker` values; for hosted instances, see [Hosted instances](egress-broker.md#hosted-instances-sandbox-runner-sidecar).
-- **Per-worker Agent Vault egress** (Kubernetes backend), the legacy path, which gives each worker its own vault for per-user or per-agent isolation, described below.
+  It works with Docker workers, the static runner, and Kubernetes workers through the runtime chart's `egressBroker` values; for hosted instances, see [Hosted instances](egress-broker.md#hosted-instances-sandbox-runner-sidecar).
 - **A shared credential-injecting proxy** that you run, configured through `MINDROOM_KUBERNETES_WORKER_ENV_JSON`, the chart's `egressProxy` integration, or the worker proxy environment on other backends.
   The proxy holds the real credential and workers receive only its URL.
 
-[Approved egress](approved-egress.md) and the `mindroom-egress-proxy` image restrict which hosts workers can reach but do not inject credentials; to combine them with the egress broker, see [Egress Broker Chaining](approved-egress.md#egress-broker-chaining), or with Agent Vault, see [Agent Vault Chaining](approved-egress.md#agent-vault-chaining).
+[Approved egress](approved-egress.md) and the `mindroom-egress-proxy` image restrict which hosts workers can reach but do not inject credentials; to combine them with the egress broker, see [Egress Broker Chaining](approved-egress.md#egress-broker-chaining).
 
 Do not put upstream API tokens in `extra_env_passthrough` or `.mindroom/worker-env.sh` unless you intend the worker process to receive them.
-
-### Per-worker Agent Vault egress (Kubernetes backend)
-
-Each dedicated worker gets its own vault, created if missing, and a fresh proxy-role Agent Vault token on one shared Agent Vault server.
-Before enabling it, create the Secret named by `MINDROOM_KUBERNETES_AGENT_VAULT_BOOTSTRAP_SECRET_NAME` (chart: `workers.kubernetes.agentVault.bootstrapSecretName`, default `agent-vault-bootstrap`) with both `AGENT_VAULT_MASTER_PASSWORD` and `AGENT_VAULT_OWNER_PASSWORD`.
-Create it in the worker namespace too when that differs from the release namespace.
-`python` and `shell` egress then goes through the Agent Vault proxy with that token, so credentials stored in the worker's vault are injected in transit.
-
-```bash
-MINDROOM_KUBERNETES_AGENT_VAULT_ENABLED=true
-MINDROOM_KUBERNETES_AGENT_VAULT_CLI_IMAGE=infisical/agent-vault:<pinned>
-MINDROOM_KUBERNETES_AGENT_VAULT_OWNER_EMAIL=vault-owner@example.test
-# optional overrides and their defaults:
-MINDROOM_KUBERNETES_AGENT_VAULT_VAULT_NAME_PREFIX=agent-vault
-MINDROOM_KUBERNETES_AGENT_VAULT_API_URL=http://agent-vault:14321
-MINDROOM_KUBERNETES_AGENT_VAULT_PROXY_URL=http://agent-vault:14322
-MINDROOM_KUBERNETES_AGENT_VAULT_BOOTSTRAP_SECRET_NAME=agent-vault-bootstrap
-```
-
-The proxy token exists only inside the worker pod and changes on every worker restart.
-Tool code can read its own token, but a proxy-role token cannot read or decrypt credentials through the Agent Vault API and cannot reach another worker's vault.
-
-For HTTPS, workers must trust the Agent Vault root CA.
-Publish the CA from `agent-vault ca fetch` as a ConfigMap with key `ca.pem` and set `MINDROOM_KUBERNETES_AGENT_VAULT_WORKER_CA_CONFIGMAP_NAME` (chart: `workers.kubernetes.agentVault.workerCaConfigMapName`); `python` and `shell` then get `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `SSL_CERT_FILE` pointing at it.
-
-When you also use [approved egress](approved-egress.md), Squid must be the first hop; see [Agent Vault Chaining](approved-egress.md#agent-vault-chaining).
-Workers still need access to the Agent Vault API (`apiUrl`, usually port `14321`) to obtain their token.
-The chart adds that rule when it manages the Agent Vault server; for an external server, add an egress rule for the API endpoint only, and do not add direct worker egress to the proxy port (`proxyUrl`, usually `14322`) when approved egress owns dynamic grants.
-The chart-managed server's own NetworkPolicy is described under `workers.kubernetes.agentVault.server.networkPolicy` in `cluster/k8s/runtime/README.md`.
-
-### Self-service vault access
-
-The `agent_vault_access` tool lets a user ask their agent for a link to manage that agent's vault.
-For `user` and `user_agent` scopes it grants the requester's Agent Vault account admin access to the worker's vault and returns the UI link.
-For shared scopes it only returns the vault name and UI link (`"access": "operator_managed"`), which grants nothing by itself and tells the operator which vault backs the agent.
-
-```bash
-MINDROOM_AGENT_VAULT_ACCESS_API_URL=http://agent-vault:14321
-MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN=<owner or admin session/agent token>
-MINDROOM_AGENT_VAULT_ACCESS_UI_BASE_URL=https://example.com/agent-vault
-MINDROOM_AGENT_VAULT_ACCESS_EMAIL_DOMAIN=example.com
-MINDROOM_AGENT_VAULT_ACCESS_VAULT_NAME_PREFIX=agent-vault  # must match workers.kubernetes.agentVault.vaultNamePrefix
-```
-
-Shared scopes need only the UI base URL and the vault name prefix; `user` and `user_agent` scopes also need the API URL, admin token, and email domain.
-Instead of the inline admin token, `MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN_FILE` can point at a file holding it; the file takes precedence and is re-read on every call, so rotating the Secret needs no restart.
-When `MINDROOM_AGENT_VAULT_ACCESS_OWNER_EMAIL` names the Agent Vault owner account, self-service grants keep that account admin on the worker vault too.
-The requester's account is `<Matrix localpart>@<EMAIL_DOMAIN>`, and only requesters on the runtime's own homeserver can self-grant.
-The user must already have registered and verified that Agent Vault account.
-This mapping controls only who may manage a vault in the UI, never which worker uses which vault.
 
 ## Stopping and background commands
 

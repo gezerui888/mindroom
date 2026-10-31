@@ -8,38 +8,45 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
+from mindroom.ai_run_metadata import prior_usage_of
 from mindroom.authorization import is_sender_allowed_for_responder
 from mindroom.background_tasks import run_coroutine_until_complete
 from mindroom.delegation.audit import (
-    child_audit_context,
+    ChildAudit,
     child_response_usage,
     finish_child_record,
+    flush_child_audit,
+    open_child_audit,
+    record_child_event,
     record_child_response,
     start_child_record,
 )
-from mindroom.delegation.audit import observe_child_event as record_child_event
 from mindroom.delegation.personas import caller_toolkit_names, self_only_refusal
 from mindroom.delegation.records import DelegationRecordLimitError
 from mindroom.delegation.sessions import reserve_subagent_turn, update_subagent_turn, update_subagent_turn_sync
 from mindroom.delegation.state import TERMINAL_CHILD_STATUSES, DelegationChild, child_execution_identity
 from mindroom.delegation.storage import freeze_delegation_storage
-from mindroom.llm.events import RunFinished, TextDelta, ToolStarted
+from mindroom.llm.events import RunFinished, TextDelta, ToolCompleted, ToolStarted
 from mindroom.llm.runs import RunRecord, RunStatus
 from mindroom.requester_identity import is_access_checked_requester_id
 from mindroom.tool_system.progress import cap_progress, report_tool_progress
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import get_detached_requester_context, get_tool_runtime_context
 from mindroom.tool_system.worker_routing import serialize_tool_execution_identity
 from mindroom.turn_model import ModelScope, TurnBudget, resolve_turn_model
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Sequence
+    from typing import TypeGuard
 
     from mindroom.agent_modes import AgentMode
     from mindroom.budgets.monitor import BudgetMonitor
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
     from mindroom.delegation.state import DelegationTerminalStatus, SubagentPersona
+    from mindroom.event_journal import ApprovalCall
     from mindroom.llm.events import RunEvent
+    from mindroom.llm.runs import AnyRunRecord
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity
 
@@ -49,31 +56,34 @@ type _DelegationGrant = Literal["delegate", "dynamic_workflow"]
 
 
 @dataclass
-class _ChildRunObservation:
-    """Exact terminal evidence collected while one child response envelope runs.
+class ChildRunObservation:
+    """Exact terminal evidence collected while one child response envelope runs, and the child's live audit.
 
-    ``response`` is the terminal record of the child's latest run: the record the run ended with when it ran in this
-    context, which also carries what storage never holds, such as a failure's ``error``, else the outcome the envelope
-    read back from storage. A child that is cancelled leaves no record here: the loop stores its terminal row, which
-    the interruption reads, and the cancellation propagates to the driver.
+    ``response`` is the terminal record of the child's latest run: the record its stream ended with when it ran in
+    this context, completed, paused, or failed, else the outcome the envelope returned without running it. A child
+    that is cancelled leaves no record here: the loop stores its terminal row, which the interruption reads, and the
+    cancellation propagates to the driver.
     """
 
     child: DelegationChild
-    parent: _ChildRunObservation | None = None
+    audit: ChildAudit
+    parent: ChildRunObservation | None = None
     response: RunRecord | None = None
     # The tail of what the child said and which tools it called, reported as its caller's progress.
     activity: str = ""
 
-    def keep_outcome(self, record: RunRecord) -> None:
-        """Keep the outcome the envelope returned, unless this context already holds the record that run ended with.
+    def owns(self, record: AnyRunRecord) -> TypeGuard[RunRecord]:
+        """Return whether a terminal record is of the child's current run and session, the run this context streams."""
+        child = self.child
+        return isinstance(record, RunRecord) and record.run_id == child.run_id and record.session_id == child.session_id
 
-        The envelope reads a run it started back from storage, and the stored copy lacks what is never stored.
-        """
-        if self.response is None or self.response.run_id != record.run_id:
-            self.response = record
+    def current_record(self) -> RunRecord | None:
+        """Return the terminal record of the child's current run, None while that run has handed over none."""
+        response = self.response
+        return response if response is not None and response.run_id == self.child.run_id else None
 
 
-_CHILD_RUN: ContextVar[_ChildRunObservation | None] = ContextVar("delegation_child_run", default=None)
+_CHILD_RUN: ContextVar[ChildRunObservation | None] = ContextVar("delegation_child_run", default=None)
 
 
 def running_child_id() -> str | None:
@@ -166,14 +176,14 @@ async def settle_child_response(
     *,
     config: Config,
     runtime_paths: RuntimePaths,
-    decisions: Mapping[str, bool] | None = None,
-    denial_reasons: Mapping[str, str | None] | None = None,
+    approval_calls: Sequence[ApprovalCall] = (),
 ) -> None:
     """Derive operational state from one exact run, then publish its audit view.
 
     A finished run's result is what it hands over (``handover_content``), so a failed run's is why it failed, a run
     recovery cancelled hands over why, and a resumed run's is what it wrote before its pause and since, else the
-    completion note.
+    completion note. A finished turn's usage is the run's with that of the turn's earlier runs, which its record
+    carries (``prior_usage_of``), however many pauses and restarts lay between them.
     """
     if response.run_id != child.run_id or response.session_id != child.session_id:
         msg = "Delegation child response does not match its retained run"
@@ -193,21 +203,25 @@ async def settle_child_response(
         child.result = None
     await update_subagent_turn(child, runtime_paths)
     try:
-        usage = await record_child_response(
+        await record_child_response(
             child,
             response,
             config=config,
             runtime_paths=runtime_paths,
-            decisions=decisions,
-            denial_reasons=denial_reasons,
+            approval_calls=approval_calls,
         )
     except DelegationRecordLimitError:
+        # A full record keeps room for its terminal event, so a terminal child is settled without the remaining
+        # ordinary events.
         if child.status not in TERMINAL_CHILD_STATUSES:
             raise
-        # A full record keeps room for its terminal event, so settle it without the remaining ordinary events.
-        usage = child_response_usage(response)
     if child.status in TERMINAL_CHILD_STATUSES:
-        await finish_child_record(child, config=config, runtime_paths=runtime_paths, usage=usage)
+        await finish_child_record(
+            child,
+            config=config,
+            runtime_paths=runtime_paths,
+            usage=child_response_usage(response, prior_usage_of(response)),
+        )
 
 
 async def finish_child_turn(
@@ -237,23 +251,26 @@ async def child_run_context(
     *,
     config: Config,
     runtime_paths: RuntimePaths,
-) -> AsyncIterator[_ChildRunObservation]:
-    """Observe one child attempt and settle it independently of audit event capture."""
-    observation = _ChildRunObservation(child, parent=_CHILD_RUN.get())
+) -> AsyncIterator[ChildRunObservation]:
+    """Observe and audit one child attempt, then settle it even when its last buffered output fails to record."""
+    audit = await open_child_audit(child, config=config, runtime_paths=runtime_paths)
+    observation = ChildRunObservation(child, audit, parent=_CHILD_RUN.get())
     token = _CHILD_RUN.set(observation)
     try:
-        async with child_audit_context(child, config=config, runtime_paths=runtime_paths):
-            yield observation
+        yield observation
     finally:
         try:
-            response = observation.response
-            if response is not None and response.run_id == child.run_id:
-                await settle_child_response(child, response, config=config, runtime_paths=runtime_paths)
+            await flush_child_audit(audit)
         finally:
-            _CHILD_RUN.reset(token)
+            try:
+                response = observation.current_record()
+                if response is not None:
+                    await settle_child_response(child, response, config=config, runtime_paths=runtime_paths)
+            finally:
+                _CHILD_RUN.reset(token)
 
 
-def _report_child_activity(observation: _ChildRunObservation, event: TextDelta | ToolStarted) -> None:
+def _report_child_activity(observation: ChildRunObservation, event: TextDelta | ToolStarted) -> None:
     text = event.text if isinstance(event, TextDelta) else f"\nCalling {event.call.tool_name}\n"
     if text:
         observation.activity = cap_progress(observation.activity + text)
@@ -261,31 +278,24 @@ def _report_child_activity(observation: _ChildRunObservation, event: TextDelta |
 
 
 async def observe_child_event(event: RunEvent) -> None:
-    """Retain execution evidence and report the child's activity before forwarding the event to the audit adapter.
+    """Retain execution evidence and report the child's activity before recording the event in the child's audit.
 
     The loop's events carry no run identity; they are the events of the child turn running in this context, whose
-    terminal record names the run it ended.
-    """
-    observation = _CHILD_RUN.get()
-    if observation is not None and isinstance(event, (TextDelta, ToolStarted)):
-        _report_child_activity(observation, event)
-    if isinstance(event, RunFinished) and isinstance(event.record, RunRecord):
-        observe_child_record(event.record)
-    await record_child_event(event)
-
-
-def observe_child_record(record: RunRecord) -> None:
-    """Retain the terminal record of the child turn running in this context, as the loop stored it.
-
-    A completed or paused record arrives with ``RunFinished``; a run that failed stores its ``ERROR`` record and
-    raises instead, so the turn that caught the failure hands the record over here.
+    terminal record, which ends the stream of every run that is not cancelled, names the run it ended. A terminal
+    record the child does not own is neither its evidence nor in its audit.
     """
     observation = _CHILD_RUN.get()
     if observation is None:
         return
-    child = observation.child
-    if record.run_id == child.run_id and record.session_id == child.session_id:
+    if isinstance(event, TextDelta | ToolStarted):
+        _report_child_activity(observation, event)
+    elif isinstance(event, RunFinished):
+        if not observation.owns(record := event.record):
+            return
         observation.response = record
+    elif not isinstance(event, ToolCompleted):
+        return
+    await record_child_event(observation.audit, event)
 
 
 def delegation_grant(child: DelegationChild) -> _DelegationGrant:
@@ -300,9 +310,11 @@ def caller_grants_child(caller_name: str, agent_name: str, config: Config, grant
         return False
     if grant == "delegate":
         return agent_name in caller.delegate_to
+    # The workflow tool is built in, so the built-in tools decide whether the caller is offered it.
     return agent_name == caller_name and "dynamic_workflow" in caller_toolkit_names(
         caller_name,
         config,
+        builtin_tool_registry(),
         delegation_depth=0,
     )
 
@@ -313,19 +325,15 @@ def _target_refusal(
     task: str,
     *,
     config: Config,
-    allowed_targets: Sequence[str] | None,
     grant: _DelegationGrant,
 ) -> str | None:
     """Return why this caller cannot start this target at all, before any requester check."""
-    if not task or not task.strip():
+    if not task.strip():
         return "Cannot delegate an empty task. Please provide a task description."
     if grant == "dynamic_workflow":
-        if agent_name == caller_name:
-            return None
-        return self_only_refusal(agent_name)
-    if allowed_targets is None:
-        caller = config.agents.get(caller_name)
-        allowed_targets = caller.delegate_to if caller is not None else []
+        return None if agent_name == caller_name else self_only_refusal(agent_name)
+    caller = config.agents.get(caller_name)
+    allowed_targets = caller.delegate_to if caller is not None else []
     if agent_name in allowed_targets:
         return None
     return f"Cannot delegate to '{agent_name}'. Allowed subagents: {', '.join(allowed_targets)}."
@@ -350,7 +358,6 @@ def authorize_delegation(  # noqa: PLR0911
     runtime_paths: RuntimePaths,
     execution_identity: ToolExecutionIdentity | None,
     depth: int,
-    allowed_targets: Sequence[str] | None = None,
     model: str | None = None,
     grant: _DelegationGrant = "delegate",
 ) -> Config | str:
@@ -360,7 +367,6 @@ def authorize_delegation(  # noqa: PLR0911
         agent_name,
         task,
         config=config,
-        allowed_targets=allowed_targets,
         grant=grant,
     )
     if refusal is not None:
@@ -388,26 +394,19 @@ def authorize_delegation(  # noqa: PLR0911
         return f"Cannot delegate to '{agent_name}': requester authorization is unavailable."
     if active_config is None or agent_name not in active_config.agents:
         return f"Cannot delegate to '{agent_name}': that agent is not allowed to reply to you."
-    caller_allows_target = caller_grants_child(caller_name, agent_name, active_config, grant)
+    if not caller_grants_child(caller_name, agent_name, active_config, grant):
+        return f"Cannot delegate to '{agent_name}': it is no longer an allowed target."
     # A workflow participant is the caller's own copy inside the caller's tool call, so the requester
     # the caller already serves, possibly only through a team's access, keeps that access.
-    if not caller_allows_target or (
-        grant == "delegate"
-        and not is_sender_allowed_for_responder(
-            requester_id,
-            agent_name,
-            authorization_room_id,
-            active_config,
-            runtime_paths,
-            membership_index,
-        )
+    if grant == "delegate" and not is_sender_allowed_for_responder(
+        requester_id,
+        agent_name,
+        authorization_room_id,
+        active_config,
+        runtime_paths,
+        membership_index,
     ):
-        reason = (
-            "it is no longer an allowed target"
-            if not caller_allows_target
-            else "that agent is not allowed to reply to you"
-        )
-        return f"Cannot delegate to '{agent_name}': {reason}."
+        return f"Cannot delegate to '{agent_name}': that agent is not allowed to reply to you."
     if active_config.agents[agent_name].private is not None and not is_access_checked_requester_id(
         requester_id,
         active_config,
@@ -445,18 +444,15 @@ def prepare_child_turn(
     A follow-up keeps the mode and persona of the child it continues, and its requested model, checked again against the owner's budget.
     """
     delegation_id = uuid4().hex
-    session_id = previous.session_id if previous is not None else f"delegate:{caller_name}:{agent_name}:{delegation_id}"
-    identity = (
-        child_execution_identity(previous)
-        if previous is not None
-        else replace(
-            owner,
-            agent_name=agent_name,
-            session_id=session_id,
-        )
-    )
-    if previous is not None:
-        model = previous.requested_model_name
+    if previous is None:
+        session_id = f"delegate:{caller_name}:{agent_name}:{delegation_id}"
+        identity = replace(owner, agent_name=agent_name, session_id=session_id)
+        subagent_id, previous_delegation_id = delegation_id, None
+    else:
+        session_id = previous.session_id
+        identity = child_execution_identity(previous)
+        subagent_id, previous_delegation_id = previous.subagent_id, previous.delegation_id
+        model, agent_mode, persona = previous.requested_model_name, previous.agent_mode, previous.persona
     # Each turn checks the budget against the requested model, so a follow-up recovers once spend is under the cap.
     turn_model = resolve_turn_model(
         config,
@@ -481,10 +477,10 @@ def prepare_child_turn(
         requested_model_name=turn_model.requested_model_name,
         depth=depth + 1,
         execution_identity=serialize_tool_execution_identity(identity),
-        subagent_id=previous.subagent_id if previous is not None else delegation_id,
-        previous_delegation_id=previous.delegation_id if previous is not None else None,
+        subagent_id=subagent_id,
+        previous_delegation_id=previous_delegation_id,
         parent_requirement_id=parent_requirement_id,
         storage_bindings=freeze_delegation_storage(config, (caller_name, agent_name)),
-        agent_mode=previous.agent_mode if previous is not None else agent_mode,
-        persona=previous.persona if previous is not None else persona,
+        agent_mode=agent_mode,
+        persona=persona,
     )

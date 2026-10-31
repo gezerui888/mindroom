@@ -11,10 +11,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 from urllib.parse import quote
 
-from mindroom.tool_system.context_bound_streams import context_bound_async_stream
-
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+    from collections.abc import Iterator, Mapping
 
     from mindroom.agent_policy import ResolvedAgentPolicy
     from mindroom.constants import RuntimePaths
@@ -27,16 +25,15 @@ _WORKER_DIRNAME_MAX_PREFIX_LENGTH = 80
 _DEFAULT_WORKER_NAME_PREFIX = "mindroom-worker"
 _DNS_LABEL_MAX_LENGTH = 63
 _WORKER_ID_DIGEST_LENGTH = 24
-_DESCRIPTIVE_WORKER_ID_DIGEST_LENGTH = 10
 _AGENT_WORKSPACE_DIRNAME = "workspace"
 _PRIVATE_INSTANCE_ROOT_DIRNAME = "private_instances"
 SHARED_DIRECTORIES_DIRNAME = "shared_directories"
 WORKER_CREDENTIALS_DIRNAME = "credentials"
 WORKER_SHARED_CREDENTIALS_DIRNAME = ".shared_credentials"
-# Tools and dashboard integrations restricted to shared scope. MCP registry tools are supported on every scope:
-# OAuth-backed servers follow the configured worker scope, and non-OAuth servers always execute through the shared
-# server session without requester credentials.
-_SHARED_ONLY_INTEGRATION_NAMES = frozenset({"spotify", "homeassistant"})
+# Tools and dashboard integrations restricted to shared scope, with `spotify_oauth`, the credential service of the
+# Spotify connection. MCP registry tools are supported on every scope: OAuth-backed servers follow the configured
+# worker scope, and non-OAuth servers always execute through the shared server session without requester credentials.
+_SHARED_ONLY_INTEGRATION_NAMES = frozenset({"spotify", "spotify_oauth", "homeassistant"})
 
 
 @dataclass(frozen=True)
@@ -116,7 +113,6 @@ def parse_tool_execution_identity_payload(
 class _ResolvedWorkerExecution:
     """Resolved worker execution scope from explicit worker-scope policy."""
 
-    worker_scope: WorkerScope | None
     execution_identity: ToolExecutionIdentity | None
     worker_key: str | None
 
@@ -139,56 +135,28 @@ class ResolvedWorkerTarget:
     private_agent_names: frozenset[str] | None = None
 
 
-_TOOL_EXECUTION_IDENTITY: ContextVar[ToolExecutionIdentity | None] = ContextVar(
-    "tool_execution_identity",
+# The identity a runner without a Matrix conversation binds for the calls it runs; a conversation's context names
+# its own. Only ``runtime_context.detached_tool_scope``, ``runtime_context.member_tool_scope``, and the worker's
+# sandbox runner bind it; everything else reads ``runtime_context.current_execution_identity()``.
+_DETACHED_EXECUTION_IDENTITY: ContextVar[ToolExecutionIdentity | None] = ContextVar(
+    "detached_execution_identity",
     default=None,
 )
 
 
-def get_tool_execution_identity() -> ToolExecutionIdentity | None:
-    """Return the current tool execution identity."""
-    return _TOOL_EXECUTION_IDENTITY.get()
-
-
-def active_tool_execution_identity(
-    execution_identity: ToolExecutionIdentity | None,
-) -> ToolExecutionIdentity | None:
-    """Return the explicit execution identity or the active boundary context."""
-    if execution_identity is not None:
-        return execution_identity
-    return get_tool_execution_identity()
+def detached_execution_identity() -> ToolExecutionIdentity | None:
+    """Return the identity the running call's runner bound outside any Matrix conversation."""
+    return _DETACHED_EXECUTION_IDENTITY.get()
 
 
 @contextmanager
-def tool_execution_identity(identity: ToolExecutionIdentity | None) -> Iterator[None]:
-    """Set the current tool execution identity for the active execution scope."""
-    token = _TOOL_EXECUTION_IDENTITY.set(identity)
+def bind_detached_execution_identity(identity: ToolExecutionIdentity | None) -> Iterator[None]:
+    """Bind ``identity`` as the running call's identity where no Matrix conversation names one."""
+    token = _DETACHED_EXECUTION_IDENTITY.set(identity)
     try:
         yield
     finally:
-        _TOOL_EXECUTION_IDENTITY.reset(token)
-
-
-async def run_with_tool_execution_identity[ReturnT](
-    identity: ToolExecutionIdentity | None,
-    *,
-    operation: Callable[[], Awaitable[ReturnT]],
-) -> ReturnT:
-    """Execute one async operation inside one execution-identity boundary."""
-    with tool_execution_identity(identity):
-        return await operation()
-
-
-def stream_with_tool_execution_identity[ChunkT](
-    identity: ToolExecutionIdentity | None,
-    *,
-    stream_factory: Callable[[], AsyncIterator[ChunkT]],
-) -> AsyncIterator[ChunkT]:
-    """Wrap one async iterator without spanning execution-identity tokens across yields."""
-    return context_bound_async_stream(
-        context_factory=lambda: tool_execution_identity(identity),
-        stream_factory=stream_factory,
-    )
+        _DETACHED_EXECUTION_IDENTITY.reset(token)
 
 
 def normalize_worker_key_part(value: str) -> str:
@@ -197,61 +165,12 @@ def normalize_worker_key_part(value: str) -> str:
     return normalized or "default"
 
 
-def _digest_and_safe_prefix(worker_key: str, prefix: str, *, digest_length: int) -> tuple[str, str]:
-    """Return the worker-key digest and a prefix normalized to a DNS-label-safe slug beside it."""
-    digest = hashlib.sha256(worker_key.encode("utf-8")).hexdigest()[:digest_length]
-    normalized_prefix = re.sub(r"[^a-z0-9-]+", "-", prefix.lower()).strip("-") or _DEFAULT_WORKER_NAME_PREFIX
-    max_prefix_length = _DNS_LABEL_MAX_LENGTH - len(digest) - 1
-    safe_prefix = normalized_prefix[:max_prefix_length].rstrip("-")
-    if not safe_prefix:
-        safe_prefix = _DEFAULT_WORKER_NAME_PREFIX[:max_prefix_length].rstrip("-") or "worker"
-    return digest, safe_prefix
-
-
 def worker_id_for_key(worker_key: str, *, prefix: str) -> str:
     """Return a DNS-safe resource name for one worker key (63-char label limit)."""
-    digest, safe_prefix = _digest_and_safe_prefix(worker_key, prefix, digest_length=_WORKER_ID_DIGEST_LENGTH)
-    return f"{safe_prefix}-{digest}"
-
-
-def descriptive_worker_id_for_key(worker_key: str, *, prefix: str) -> str:
-    """Return a DNS-safe resource name that keeps the worker key's scope readable.
-
-    Embeds the key's tenant/scope/requester/agent parts as a lowercase slug
-    (dropping the `v1` version tag and the `default` tenant, and reducing
-    Matrix requesters to their localpart) so listings stay human-readable,
-    with a short digest for uniqueness after truncation.
-    """
-    digest, safe_prefix = _digest_and_safe_prefix(
-        worker_key,
-        prefix,
-        digest_length=_DESCRIPTIVE_WORKER_ID_DIGEST_LENGTH,
-    )
-    max_slug_length = max(0, _DNS_LABEL_MAX_LENGTH - len(safe_prefix) - len(digest) - 2)
-    slug = _worker_key_slug(worker_key, max_length=max_slug_length)
-    if not slug:
-        return f"{safe_prefix}-{digest}"
-    return f"{safe_prefix}-{slug}-{digest}"
-
-
-def _worker_key_slug(worker_key: str, *, max_length: int) -> str:
-    parts = worker_key.split(":")
-    if len(parts) >= 4 and parts[0] == "v1":
-        tenant, scope, rest = parts[1], parts[2], parts[3:]
-        if scope == "user":
-            rest = [_requester_localpart(":".join(rest))]
-        elif scope == "user_agent" and len(rest) >= 2:
-            rest = [_requester_localpart(":".join(rest[:-1])), rest[-1]]
-        parts = ([] if tenant == "default" else [tenant]) + [scope, *rest]
-    slug = re.sub(r"[^a-z0-9]+", "-", ":".join(parts).lower()).strip("-")
-    return slug[:max_length].rstrip("-")
-
-
-def _requester_localpart(requester: str) -> str:
-    """Return the localpart of a Matrix-style requester; other requesters pass through."""
-    if requester.startswith("@"):
-        return requester[1:].split(":", 1)[0]
-    return requester
+    digest = hashlib.sha256(worker_key.encode("utf-8")).hexdigest()[:_WORKER_ID_DIGEST_LENGTH]
+    normalized_prefix = re.sub(r"[^a-z0-9-]+", "-", prefix.lower()).strip("-") or _DEFAULT_WORKER_NAME_PREFIX
+    max_prefix_length = _DNS_LABEL_MAX_LENGTH - len(digest) - 1
+    return f"{normalized_prefix[:max_prefix_length].rstrip('-')}-{digest}"
 
 
 def _encode_worker_requester_part(value: str) -> str:
@@ -336,7 +255,6 @@ def resolve_worker_execution_scope(
             agent_name=agent_name,
         )
     return _ResolvedWorkerExecution(
-        worker_scope=worker_scope,
         execution_identity=resolved_execution_identity,
         worker_key=worker_key,
     )

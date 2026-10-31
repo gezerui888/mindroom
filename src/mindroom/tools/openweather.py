@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="api_key",
+            env=("OPENWEATHER_API_KEY",),
             label="API Key",
             type="password",
             required=False,
@@ -79,7 +80,7 @@ if TYPE_CHECKING:
             default=30,
         ),
     ],
-    dependencies=["requests"],  # From agno requirements
+    dependencies=["requests"],
     docs_url="https://docs.mindroom.chat/tools/location-commerce-and-home/#openweather",
     function_names=("geocode_location", "get_air_pollution", "get_current_weather", "get_forecast"),
 )

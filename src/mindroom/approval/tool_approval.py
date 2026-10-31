@@ -31,20 +31,16 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from mindroom.config.main import Config
-    from mindroom.tool_system.tool_function import ToolFunction
 
 __all__ = [
     "DEFAULT_ROUTER_MANAGED_ROOM_REASON",
-    "JOB_APPROVAL_TYPE",
     "NO_APPROVER_REASON",
-    "POLICY_CONFIRMATION_APPROVAL_TYPE",
     "ApprovalActionResult",
     "BackgroundScriptToolOrigin",
     "MatrixApprovalAction",
     "ToolApprovalDecision",
     "ToolApprovalScriptError",
     "ToolApprovalTransportError",
-    "approval_gated",
     "evaluate_tool_approval",
     "handle_matrix_approval_action",
     "human_gate",
@@ -55,10 +51,6 @@ __all__ = [
     "tool_may_require_approval",
 ]
 
-# The loop copies this field onto the paused ToolExecution, preserving whether MindRoom added the confirmation boundary.
-POLICY_CONFIRMATION_APPROVAL_TYPE = "mindroom_policy"
-# A policy-gated call whose approval is the first phase of the background job it runs as, instead of a paused run.
-JOB_APPROVAL_TYPE = "mindroom_job"
 NO_APPROVER_REASON = "No approval recipient is configured; the tool was denied safely."
 # The terminal card edit carries the reason twice, and nio encrypts it as ASCII-escaped JSON that base64 grows by 4/3.
 # Escaping turns one emoji into 12 bytes, so the reply is bounded by escaped size to keep the edit below the event limit.
@@ -161,11 +153,6 @@ def _matching_tool_approval_rule(config: Config, tool_name: str) -> ApprovalRule
     return rule
 
 
-def approval_gated(function: ToolFunction) -> bool:
-    """Return whether a call waits for a human decision, by pausing its run or as the first phase of its job."""
-    return bool(function.requires_confirmation or function.approval_type == JOB_APPROVAL_TYPE)
-
-
 def tool_may_require_approval(config: Config, tool_name: str) -> bool:
     """Return whether one tool must use the persisted confirmation boundary."""
     rule = _matching_tool_approval_rule(config, tool_name)
@@ -225,7 +212,7 @@ async def evaluate_tool_approval(
     require_approval = approval_config.default == "require_approval"
     timeout_seconds = approval_config.timeout_days * 24 * 60 * 60
 
-    if tool_call_is_approval_exempt(tool_name, arguments):
+    if tool_call_is_approval_exempt(tool_name, arguments, runtime_paths):
         return False, timeout_seconds
 
     rule = _matching_tool_approval_rule(config, tool_name)

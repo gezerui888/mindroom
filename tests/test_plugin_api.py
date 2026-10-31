@@ -10,6 +10,8 @@ from __future__ import annotations
 import enum
 import inspect
 
+import typing_extensions
+
 from mindroom import plugin_api
 
 _EXPORTS = [
@@ -56,10 +58,13 @@ _EXPORTS = [
     "FinalResponseTransformContext",
     "GoogleWorkspaceConfig",
     "HelperResult",
+    "HookBindings",
     "MessageEnrichContext",
     "MessageEnvelope",
     "MessageReceivedContext",
     "MessageTarget",
+    "ModelProvider",
+    "ModelScope",
     "OAuthDiscoveryConfig",
     "OAuthProvider",
     "ReactionReceivedContext",
@@ -81,7 +86,6 @@ _EXPORTS = [
     "ToolFileAccess",
     "ToolManagedInitArg",
     "ToolRuntimeContext",
-    "ToolRuntimeHookBindings",
     "ToolStatus",
     "ToolValue",
     "Toolkit",
@@ -92,11 +96,12 @@ _EXPORTS = [
     "atlassian_connection_oauth_provider",
     "automation",
     "automation_threads",
-    "build_execution_identity_from_runtime_context",
     "build_model_provider",
     "build_oauth_connect_instruction",
     "complete_prompt",
+    "config_plugins",
     "current_call",
+    "current_execution_identity",
     "emit_custom_event",
     "get_logger",
     "get_tool_by_name",
@@ -113,23 +118,20 @@ _EXPORTS = [
     "register_tool_with_metadata",
     "resolve_agent_file",
     "resolve_config_relative_path",
-    "resolve_tool_runtime_hook_bindings",
+    "resolve_turn_model",
     "tool",
     "toolkit_functions",
     "write_file_within_root",
 ]
 
-# Every hook context but the three tool contexts puts the base parameters first and ends with the keyword-only ones,
-# which start with the three `emit` fills for each hook.
+# Every hook context puts the base parameters first and ends with the keyword-only ones, which start with the three
+# `emit` fills for each hook. A tool hook context makes its event name and every field of its own keyword-only.
 _HOOK = "event_name, config, runtime_paths, correlation_id"
 _HOOK_HELPERS = (
     "plugin_name, settings, logger, runtime_started_at, message_sender, agent_message_snapshot_reader, matrix_admin, "
     "room_state_querier, room_state_putter"
 )
-_TOOL_HOOK = (
-    "event_name, plugin_name, settings, config, runtime_paths, logger, correlation_id, message_received_depth, *, "
-    "message_sender, matrix_admin, room_state_querier, room_state_putter"
-)
+_TOOL_HOOK = f"config, runtime_paths, correlation_id, *, event_name, {_HOOK_HELPERS}"
 
 # Each callable's parameter names and kinds, written as a signature without annotations or defaults.
 # A class lists its constructor parameters; underscore-prefixed ones are MindRoom's own wiring and are left out.
@@ -151,7 +153,7 @@ _SIGNATURES = {
         f"token_count_after, compaction_summary, *, {_HOOK_HELPERS})"
     ),
     "ConfigField": (
-        "(name, label, type, required, default, placeholder, description, options, validation, authored_override)"
+        "(name, label, type, required, default, placeholder, description, options, validation, authored_override, env)"
     ),
     "ConfigReloadedContext": (
         f"({_HOOK}, changed_entities, added_entities, removed_entities, plugin_changes, *, {_HOOK_HELPERS})"
@@ -166,6 +168,10 @@ _SIGNATURES = {
     "FinalResponseTransformContext": f"({_HOOK}, draft, *, {_HOOK_HELPERS})",
     "GoogleWorkspaceConfig": "(*, name, display_name, client_config_service, allowed_hosted_domains, services)",
     "HelperResult": "(*, content, usage)",
+    "HookBindings": (
+        "(registry, registry_state, message_sender, matrix_admin, room_state_querier, room_state_putter, "
+        "agent_message_snapshot_reader, runtime_started_at)"
+    ),
     "MessageEnrichContext": f"({_HOOK}, envelope, target_entity_name, target_member_names, *, {_HOOK_HELPERS})",
     "MessageEnvelope": (
         "(source_event_id, target, body, attachment_ids, mentioned_agents, agent_name, hook_source, "
@@ -173,6 +179,7 @@ _SIGNATURES = {
     ),
     "MessageReceivedContext": f"({_HOOK}, envelope, skip_plugin_names, suppress, *, {_HOOK_HELPERS})",
     "MessageTarget": "(room_id, source_thread_id, resolved_thread_id, reply_to_event_id, session_id)",
+    "ModelScope": "(entity, room_id, thread_id, explicit, explicit_context_window)",
     "OAuthDiscoveryConfig": (
         "(resource, discovery, authorization_server, authorization_url, token_url, registration_url, "
         "dynamic_client_registration, token_endpoint_auth_method, pkce_code_challenge_method, allow_insecure_env, "
@@ -182,10 +189,10 @@ _SIGNATURES = {
         "(id, display_name, authorization_url, token_url, scopes, credential_service, tool_config_service, "
         "client_config_services, shared_client_config_services, default_redirect_path, extra_auth_params, "
         "extra_token_params, token_endpoint_auth_method, pkce_code_challenge_method, allow_empty_scopes, "
-        "requester_scoped_credentials, tool_config_oauth_fallback_fields, tool_config_oauth_fallback_env_vars, "
-        "allowed_email_domains, allowed_hosted_domains, allowed_email_domains_env, allowed_hosted_domains_env, "
-        "status_capabilities, token_parser, token_exchanger, claim_validator, runtime_bootstrapper, "
-        "account_claims_reader)"
+        "requester_scoped_credentials, tool_config_oauth_fallback_fields, allowed_email_domains, "
+        "allowed_hosted_domains, allowed_email_domains_env, allowed_hosted_domains_env, status_capabilities, "
+        "token_parser, token_exchanger, claim_validator, runtime_bootstrapper, account_claims_reader, "
+        "legacy_credentials)"
     ),
     "ReactionReceivedContext": (
         f"({_HOOK}, room_id, event_id, sender_id, reaction_key, target_event_id, thread_id, *, {_HOOK_HELPERS})"
@@ -209,27 +216,23 @@ _SIGNATURES = {
     "SessionHookContext": f"({_HOOK}, agent_name, scope, session_id, room_id, thread_id, *, {_HOOK_HELPERS})",
     "SystemEnrichContext": f"({_HOOK}, envelope, target_entity_name, target_member_names, *, {_HOOK_HELPERS})",
     "ToolAfterCallContext": (
-        "(tool_name, arguments, agent_name, room_id, thread_id, requester_id, session_id, result, error, blocked, "
-        f"duration_ms, {_TOOL_HOOK})"
+        f"({_TOOL_HOOK}, tool_name, arguments, agent_name, room_id, thread_id, requester_id, session_id, result, "
+        "error, blocked, duration_ms, message_received_depth)"
     ),
     "ToolBeforeCallContext": (
-        "(tool_name, arguments, agent_name, room_id, thread_id, requester_id, session_id, declined, decline_reason, "
-        f"{_TOOL_HOOK})"
+        f"({_TOOL_HOOK}, tool_name, arguments, agent_name, room_id, thread_id, requester_id, session_id, "
+        "message_received_depth, declined, decline_reason)"
     ),
     "ToolEnvironmentContext": (
-        "(function_name, registered_toolkit, arguments, agent_name, room_id, requester_id, declined, decline_reason, "
-        "event_name, plugin_name, settings, config, runtime_paths, logger, correlation_id)"
+        f"({_TOOL_HOOK}, function_name, registered_toolkit, arguments, agent_name, room_id, requester_id, "
+        "message_received_depth, declined, decline_reason)"
     ),
     "ToolRuntimeContext": (
-        "(agent_name, target, requester_id, client, config, runtime_paths, conversation_reader, relations, "
+        "(agent_name, target, requester_id, client, config, runtime_paths, plugins, conversation_reader, relations, "
         "agent_reply_memberships, transport_agent_name, active_model_name, room, storage_path, attachment_ids, "
-        "runtime_attachment_ids, runtime_media_attachments, hook_registry, hook_registry_state, correlation_id, "
-        "hook_message_sender, matrix_admin, room_state_querier, room_state_putter, message_received_depth, "
+        "runtime_attachment_ids, runtime_media_attachments, hooks, correlation_id, message_received_depth, "
         "orchestrator, tool_function_filter, persona, membership, membership_turn_id, source_kind, config_provider, "
         "cli_approval_handler, hook_source)"
-    ),
-    "ToolRuntimeHookBindings": (
-        "(message_sender, matrix_admin, room_state_querier, room_state_putter, message_received_depth)"
     ),
     "ToolValue": "(*, content, images, audios, videos, files)",
     "Toolkit": "(*, name, tools, instructions)",
@@ -241,15 +244,16 @@ _SIGNATURES = {
     "atlassian_connection_oauth_provider": "(connection)",
     "automation": "(name, *, requires_file_memory)",
     "automation_threads": "(runtime_paths)",
-    "build_execution_identity_from_runtime_context": "(context)",
     "build_model_provider": "(config, runtime_paths, model_name, *, execution_identity)",
     "build_oauth_connect_instruction": "(provider, connect_url)",
     "complete_prompt": "(provider, prompt, *, instructions, schema, overrides, run_id)",
+    "config_plugins": "(config, runtime_paths)",
     "current_call": "()",
+    "current_execution_identity": "()",
     "emit_custom_event": "(plugin_name, event_name, payload)",
     "get_logger": "(name)",
     "get_tool_by_name": (
-        "(tool_name, runtime_paths, *, runs_in_worker, credential_overrides, credentials_manager, "
+        "(tool_name, runtime_paths, *, tools, runs_in_worker, credential_overrides, credentials_manager, "
         "runtime_config, tool_config_overrides, tool_init_overrides, runtime_overrides, "
         "allowed_shared_services, tool_output_workspace_root, agent_state_root, "
         "tool_output_auto_save_threshold_bytes, workspace_in_worker, worker_target)"
@@ -273,7 +277,7 @@ _SIGNATURES = {
     ),
     "resolve_agent_file": "(raw_path, *, workspace_root, file_access, field_name)",
     "resolve_config_relative_path": "(raw_path, runtime_paths)",
-    "resolve_tool_runtime_hook_bindings": "(context)",
+    "resolve_turn_model": "(config, runtime_paths, scope, budget)",
     "tool": "(function, /, *, name, description)",
     "toolkit_functions": "(toolkit)",
     "write_file_within_root": "(root, relative_path, payload, *, file_mode, dir_mode, exclusive)",
@@ -348,9 +352,16 @@ def test_plugin_api_exports_exactly_the_supported_names() -> None:
 
 
 def test_each_exported_callable_keeps_its_parameter_names_and_kinds() -> None:
-    """A plugin calls these by position or keyword as documented, so each parameter's name and kind stay put."""
+    """A plugin calls these by position or keyword as documented, so each parameter's name and kind stay put.
+
+    A protocol, such as `ModelProvider`, is a type plugins annotate with and never call.
+    """
     exported = {name: getattr(plugin_api, name) for name in plugin_api.__all__}
-    shapes = {name: _parameter_shape(obj) for name, obj in exported.items() if callable(obj) and not _is_enum(obj)}
+    shapes = {
+        name: _parameter_shape(obj)
+        for name, obj in exported.items()
+        if callable(obj) and not _is_enum(obj) and not typing_extensions.is_protocol(obj)
+    }
     assert shapes == _SIGNATURES
 
 

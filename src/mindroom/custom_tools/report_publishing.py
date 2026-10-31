@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
-
-from agno.tools import Toolkit
 
 from mindroom.background_tasks import run_blocking_or_compensate, run_blocking_until_complete
 from mindroom.custom_tools.dynamic_workflow_context import (
     authorize_dynamic_workflow_run,
     dynamic_workflow_store_and_owner,
 )
-from mindroom.custom_tools.tool_payloads import custom_tool_payload
-from mindroom.custom_tools.toolkit_functions import JSON_OBJECT_SCHEMA, register_toolkit_functions
-from mindroom.dynamic_workflows.validation import DynamicWorkflowError
+from mindroom.custom_tools.tool_payloads import custom_tool_payload, tool_context_or_error
+from mindroom.dynamic_workflows.spec import DynamicWorkflowError
+from mindroom.dynamic_workflows.store import AGENT_SCOPE
 from mindroom.report_publishing.store import (
     ARTIFACT_KIND_STATIC_SITE,
     PublishableReport,
@@ -23,82 +21,36 @@ from mindroom.report_publishing.store import (
     ReportPublishingError,
     ReportPublishingStore,
 )
-from mindroom.tool_system.runtime_context import (
-    ToolRuntimeContext,
-    get_tool_runtime_context,
-)
+from mindroom.tool_system.authoring import Toolkit, tool
 from mindroom.workspaces import resolve_workspace_relative_path
 
-_DYNAMIC_WORKFLOW_RUN_SOURCE_KEYS = frozenset({"workflow_id", "run_id", "scope"})
+if TYPE_CHECKING:
+    from mindroom.tool_system.runtime_context import ToolRuntimeContext
+
+_DYNAMIC_WORKFLOW_RUN_SOURCE_KEYS = frozenset({"workflow_id", "run_id"})
 _STATIC_SITE_SOURCE_KEYS = frozenset({"path", "title"})
-
-
-_TOOL_DESCRIPTIONS = {
-    "publish_report": (
-        "Publish an authorized report source through a revocable public link. "
-        "Supports source_type dynamic_workflow_run and static_site."
-    ),
-    "revoke_public_report": "Revoke a previously published public report link.",
-}
-
-
-_TOOL_PARAMETERS: dict[str, dict[str, object]] = {
-    "publish_report": {
-        "type": "object",
-        "properties": {
-            "source_type": {"type": "string"},
-            "source": JSON_OBJECT_SCHEMA,
-            "confirm_public": {"type": "boolean"},
-        },
-        "required": ["source_type", "source", "confirm_public"],
-    },
-    "revoke_public_report": {
-        "type": "object",
-        "properties": {"slug": {"type": "string"}},
-        "required": ["slug"],
-    },
-}
 
 
 class ReportPublishingTools(Toolkit):
     """Tools that publish authorized report artifacts through revocable public links."""
 
     def __init__(self) -> None:
-        super().__init__(name="report_publishing", tools=[])
-        self._register_functions()
-
-    def _register_functions(self) -> None:
-        register_toolkit_functions(
-            self,
-            entrypoints={
-                "publish_report": self.publish_report,
-                "revoke_public_report": self.revoke_public_report,
-            },
-            descriptions=_TOOL_DESCRIPTIONS,
-            parameters=_TOOL_PARAMETERS,
-        )
+        super().__init__(name="report_publishing")
 
     @staticmethod
     def _payload(status: str, **fields: object) -> str:
         return custom_tool_payload("report_publishing", status, **fields)
 
-    @classmethod
-    def _context_error(cls) -> str:
-        return cls._payload(
-            "error",
-            message="Report Publishing tool context is unavailable in this runtime path.",
-        )
-
+    @tool
     async def publish_report(
         self,
         source_type: str,
         source: dict[str, Any],
         confirm_public: bool,
     ) -> str:
-        """Publish an authorized report artifact through a revocable public link."""
-        context = get_tool_runtime_context()
-        if context is None:
-            return self._context_error()
+        """Publish an authorized report source through a revocable public link. Supports source_type dynamic_workflow_run and static_site."""
+        if isinstance(context := tool_context_or_error(self._payload, "Report Publishing"), str):
+            return context
         if not confirm_public:
             return self._payload(
                 "error",
@@ -130,11 +82,11 @@ class ReportPublishingTools(Toolkit):
             published_at=report.published_at,
         )
 
+    @tool
     async def revoke_public_report(self, slug: str) -> str:
         """Revoke a previously published public report link."""
-        context = get_tool_runtime_context()
-        if context is None:
-            return self._context_error()
+        if isinstance(context := tool_context_or_error(self._payload, "Report Publishing"), str):
+            return context
         try:
             store = ReportPublishingStore(context.runtime_paths.storage_root)
             report = await run_blocking_until_complete(partial(store.get_public_report, slug, include_revoked=True))
@@ -204,11 +156,10 @@ def _resolve_dynamic_workflow_run_source(
     _reject_unsupported_source_fields(source, _DYNAMIC_WORKFLOW_RUN_SOURCE_KEYS, "dynamic_workflow_run source")
     workflow_id = _required_source_text(source, "workflow_id", context="dynamic_workflow_run source")
     run_id = _required_source_text(source, "run_id", context="dynamic_workflow_run source")
-    scope = _optional_source_text(source, "scope", default="agent", context="dynamic_workflow_run source")
-    store, owner_id = dynamic_workflow_store_and_owner(context, scope)
+    store, owner_id = dynamic_workflow_store_and_owner(context)
     run = store.get_workflow_run(
         workflow_id=workflow_id,
-        scope=scope,
+        scope=AGENT_SCOPE,
         owner_id=owner_id,
         run_id=run_id,
     )
@@ -221,7 +172,6 @@ def _resolve_dynamic_workflow_run_source(
         source={
             "workflow_id": workflow_id,
             "run_id": run_id,
-            "scope": scope,
         },
         artifact_path=store.run_report_html_artifact_path(run),
         title=store.run_report_title(run),
@@ -261,20 +211,6 @@ def _required_source_text(source: dict[str, object], key: str, *, context: str) 
         msg = f"{context} field '{key}' is missing."
         raise ReportPublishingError(msg)
     value = source[key]
-    if not isinstance(value, str) or not value.strip():
-        msg = f"{context} field '{key}' must be a non-empty string."
-        raise ReportPublishingError(msg)
-    return value.strip()
-
-
-def _optional_source_text(
-    source: dict[str, object],
-    key: str,
-    *,
-    default: str,
-    context: str,
-) -> str:
-    value = source.get(key, default)
     if not isinstance(value, str) or not value.strip():
         msg = f"{context} field '{key}' must be a non-empty string."
         raise ReportPublishingError(msg)

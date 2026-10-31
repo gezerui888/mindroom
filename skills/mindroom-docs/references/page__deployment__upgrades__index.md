@@ -4,6 +4,39 @@ Use this page when upgrading an existing deployment across a release that needs 
 Each section names the change, what to do before or after the upgrade, and what does not carry over.
 Always back up configuration and persistent storage before replacing the running version, and never run two backend versions against the same storage at once.
 
+## Upgrading from Agent Vault
+
+MindRoom no longer supports Agent Vault; [Agent Keys](https://docs.mindroom.chat/deployment/egress-broker/) injects credentials into worker egress instead, and secrets stored in Agent Vault do not carry over.
+Before upgrading, remove `agent_vault_access` from agents' `tools:` lists and `defaults.tools`, because a config that still lists it fails to load, and give agents that need brokered credentials the [`egress_credentials` tool](https://docs.mindroom.chat/deployment/egress-broker/#agent-tool).
+In runtime chart values, enable the [egress broker](https://github.com/mindroom-ai/mindroom/blob/main/cluster/k8s/runtime/README.md#egress-broker) and delete `workers.kubernetes.agentVault`, `approvedEgress.parentProxy.enabled`, `approvedEgress.parentProxy.host`, and `approvedEgress.parentProxy.port`, which the chart now ignores; `approvedEgress.parentProxy.bypassDomains` still applies to the broker chain.
+A `helm upgrade` of a release that ran the chart-managed Agent Vault server deletes that server, its Jobs, and its data claim, so first back up the volume and its bootstrap Secret if you still need the stored secrets.
+Helm leaves behind the CA ConfigMap (`workers.kubernetes.agentVault.workerCaConfigMapName`) and the admin token Secret (default `agent-vault-access-admin`) that the bootstrap Job created, so delete them yourself, and remove the archived `agent-vault-bridge` plugin from `plugins:` if you use it.
+
+## Upgrading to shared team memory
+
+Earlier releases kept a copy of each team's memory in every member's storage directory; the first start after this upgrade merges those copies into team memory under `team_memory/` before any agent comes online, and removes each copy it merged from its member; the exceptions below stay where they are.
+Each member had extracted every team turn on its own, so each turn keeps the member's extraction that holds the most facts, as a team turn now writes one; a turn only one member stored stays, and file team memory keeps every `MEMORY.md` entry once.
+Mem0 copies merge from the agents the config lists with Mem0 memory, the only stores they were read from; to keep the team memories of an agent you switched to `file` or `none` for now, switch it back to `mem0` before upgrading.
+A member's team file copy holding anything MindRoom did not write, such as a hand-written line or another file, stays where it is, no longer read, and startup logs a warning starting with `Left` with its path; to keep a note from it, add it to the team's `MEMORY.md` as a `- [id=<unique id>] <note>` line, since team memory finds only such entries.
+A member's Mem0 store holding a link or special file, or one Chroma cannot read, is not merged either, and its warning also starts with `Left`; its team memories stay there, no longer read.
+Only Mem0 team memories of the configured embedder merge; those an earlier embedder wrote, which the runtime no longer read, stay with a `Left` warning, as does a memory whose embedding size the configured embedder never gives.
+A storage error while writing team memory stops startup before any member's Mem0 copy is removed, and the next start merges the rest.
+The first start installs Chroma for this when any agent the config lists has a Mem0 store; with `MINDROOM_NO_AUTO_INSTALL_TOOLS=1` and no `chromadb` extra, the Mem0 copies stay until the first start with Chroma.
+With any embedder other than OpenAI's own API, such as a local or Ollama embedder or an OpenAI-compatible server set as `host` or through `OPENAI_BASE_URL`, the first start asks the embedder once for the size of its embeddings, and the Mem0 copies wait for a start whose embedder answers; after fixing the embedder, restart MindRoom to merge them.
+An older release does not read `team_memory/`; after going back and upgrading again, delete `tracking/team_memory_merged.json` before the start so the copies that release wrote merge too.
+That start also checks again every copy a `Left` warning named, so first remove any of them whose memories you do not want back.
+
+## Upgrading to progress kept in conversation order
+
+This upgrade needs no action: conversation databases convert at the first start without a backup, and memory auto-flush, knowledge-graph ingestion, and the `exploration` automation convert their progress when they next read each conversation.
+
+### Going back from progress kept in conversation order
+
+The release before this one reads the converted databases, but its memory auto-flush and knowledge-graph ingestion then fail on every pass for each agent or graph whose progress converted, logging `Memory auto-flush failed for an agent` or `Knowledge graph ingestion failed for an agent`.
+To go back, stop MindRoom, then restore `tracking/memory_auto_flush.json` and each `knowledge_graph/ingestion/<graph>.json` under the storage root from a backup taken before the upgrade, or delete them.
+Without those files, auto-flush starts again with the turns after the next start, and ingestion reads the conversations active within `knowledge_graph.ingest.backfill_days` again, which pays for that extraction again.
+That release's usage reports also leave out the usage recorded while this release ran.
+
 ## Upgrading to one owner per conversation database
 
 The first start after this upgrade converts every conversation database once more before any agent comes online, as the [conversation storage v2](#upgrading-to-conversation-storage-v2) upgrade did, so that each records the agent, team, or internal usage store it belongs to.
@@ -126,7 +159,7 @@ Preserve the failed deployment's state while recovering it, because pending inpu
 ## Private storage migration
 
 Private storage created by v2026.9.32 or earlier uses older requester directory names.
-The first primary startup of a release with this migration moves every verified private scope to its current path before accepting traffic, in both the orchestrator and the standalone primary API.
+The first primary startup of a release with this migration moves every verified private scope to its current path before accepting traffic.
 Current and empty storage need no migration and trigger no worker checks.
 
 ### Before upgrading
@@ -208,20 +241,27 @@ Smaller changes that need operator action:
 - **Mem0 history file**: Mem0 memory keeps its history in `mem0/` in each agent's state root, and stored memories carry over; MindRoom does not read the `history.db` in Mem0's own directory (`~/.mem0/`, or `MEM0_DIR` when set), which can hold the text of deleted memories, so delete that file unless an agent uses the [`mem0` tool](https://docs.mindroom.chat/tools/memory-and-storage/#mem0) without an API key, which keeps its history there.
   `mem0` is now a reserved name, so an agent whose `private.root` starts with `mem0` fails config load until you rename it.
 - **Boolean tool settings**: stored tool config values for boolean fields, including credential seeds read from environment variables or files, must be JSON booleans, JSON `null`, or exactly `true` or `false`; any other value makes the tool fail to load with an error naming the field.
-- **Retired Agno settings and unsupported model keys**: when you upgrade, delete `learning` and `learning_mode` (see [Agno Learning](https://docs.mindroom.chat/memory/#agno-learning)), `compress_tool_results` (see [History Settings](https://docs.mindroom.chat/configuration/history/#history-settings)), and the `website` tool's `knowledge` option (see [`website`](https://docs.mindroom.chat/tools/web-scraping-and-browser/#website)) from `config.yaml`.
+- **Retired Agno settings and unsupported model keys**: when you upgrade, delete `learning` and `learning_mode`, `compress_tool_results`, and the `website` tool's `knowledge` option from `config.yaml`, since each fails config load.
   Configs created by older `mindroom config init` runs set `learning: false` on the `mind` agent.
+  The `learning/<agent>.db` databases that Agno Learning left under agent state roots are unused, and you can delete them.
   Also delete every `extra_kwargs` key a model's provider does not accept, such as the retired Agno setting `retries` or a misspelled key, on every model, including models no agent uses; [Extra Kwargs](https://docs.mindroom.chat/configuration/models/#extra-kwargs) lists the accepted keys.
+- **Tool settings that took Python objects**: delete these settings, which no config value could supply, from every tool entry in `config.yaml`, since each fails config load: `db_engine` and `tables` of `sql`, `connection` of `postgres`, `connection` and `config` of `duckdb`, `duckdb_connection` and `duckdb_kwargs` of `csv`, `obb` of `openbb`, `safe_globals` and `safe_locals` of `python`, `reddit_instance` of `reddit`, `knowledge` of `wikipedia`, `sandbox_options` of `e2b`, and `workspace_config`, `connected_account_ids`, `metadata`, `processors`, and `logging_level` of `composio`.
+  Values saved for them in the dashboard are ignored.
 - **Unknown config keys**: every section of `config.yaml` except free-form maps, such as a plugin's `settings` and `memory.llm.config`, rejects keys MindRoom does not define, so a misspelled or leftover key, such as one under `memory`, `models`, `knowledge_bases`, `voice`, `router`, `plugins`, `authorization`, or an agent's `private` or `compaction`, fails config load with `Unknown key` even when nothing uses it; before upgrading, run the new release's `mindroom config validate` and delete or correct each key it names.
 - **Sandbox runner release**: a `static_runner` sandbox runner from a release with another worker protocol, such as a Compose `sandbox-runner` service that was not pulled again, is refused and the calls routed to it fail, so upgrade it together with the primary (see [Keeping worker versions matched](https://docs.mindroom.chat/deployment/sandbox-proxy/#keeping-worker-versions-matched)).
 - **Model providers**: a model whose `provider` is not one of the [supported providers](https://docs.mindroom.chat/configuration/models/#supported-providers) fails config load, even when no agent uses it, so `mindroom run` and the dashboard do not start until you fix or delete that model in `config.yaml`; this includes models saved earlier with Together, Mistral, Perplexity, Cohere, or xAI.
 - **Model names**: a model key under `models` may contain only letters, digits, `:`, `_`, and `-`, so a key such as `gpt-6.1` fails config load even when no agent uses it, and `mindroom run` and the dashboard do not start until you rename it, as [Model Config Fields](https://docs.mindroom.chat/configuration/models/#model-config-fields) describes, and update every reference to it.
 - **Restart resume setting**: `defaults.auto_resume_after_restart` is removed and fails validation, so delete it from `config.yaml`; a reply interrupted by a restart always continues in the same message.
 - **Delegation records**: a delegation still running during the upgrade finishes normally, but its workspace `run.json`, `events.jsonl`, and `transcript.md` stop updating.
+- **Pending tool approvals after going back**: once this release has opened a conversation, an earlier release cannot resume a reply in it that waits for a tool approval, and approving it there fails; answer pending approvals before going back, or ask again afterwards.
+- **Knowledge index state**: the first start converts each semantic knowledge base's index in place, and older releases cannot read the converted index, so going back to one rebuilds every semantic base from scratch, embedding every file again, and its search is unavailable until that rebuild finishes.
 - **MCP gateway and shared agents**: the [MCP gateway](https://docs.mindroom.chat/deployment/mcp-gateway/#agent-eligibility) no longer offers agents whose worker scope is `shared` or unset, so their users lose gateway access to them and saved selections of them stop working.
   To restore an agent, set `mcp_gateway_shared_credentials: true` on it or give it `worker_scope: user` or `user_agent`.
 - **Retired prompt overrides**: a [`prompts`](https://docs.mindroom.chat/configuration/#built-in-prompt-overrides) entry for `DEFAULT_UNSEEN_MESSAGES_HEADER`, `INTERRUPTED_PARTIAL_REPLY_HEADER`, `MIXED_PARTIAL_REPLY_HEADER`, or `PREVIOUS_CONVERSATION_THREAD_HEADER` fails validation as an unknown prompt, so delete it from `config.yaml`; no prompt rendered these headers, so removing them changes no text a model reads.
 - **Dedicated workers**: the upgrade replaces every Docker and Kubernetes worker once on its next use, which ends background shell commands running in it.
   Kubernetes background scripts still running during the upgrade are interrupted when MindRoom starts again instead of resuming; start them again.
+- **Credentials from the environment**: the first start, or `mindroom doctor`, deletes the credential files earlier releases copied from provider-key variables, `OLLAMA_HOST`, `GITHUB_TOKEN`, `EMBEDDER_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, and credential seeds; MindRoom now reads those values from the environment at each start (see [Credentials from the Environment](https://docs.mindroom.chat/oauth-framework/#credentials-from-the-environment)).
+  Before upgrading, set again any such variable you removed after MindRoom imported it, or save that credential in the dashboard, or the key stops working; startup logs each removed service whose variable is no longer set.
 - **Docker worker config**: Docker workers get the config MindRoom has applied, and `MINDROOM_DOCKER_WORKER_HOST_CONFIG_PATH` only says where that config's directory is on the Docker host; a separate file at that path is no longer read, so move any worker-only settings into `config.yaml`.
 
 ### Compaction History

@@ -7,13 +7,15 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from mindroom import helper_usage, routing, thread_summary, topic_generator
+from mindroom import helper_usage, routing, topic_generator
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
 from mindroom.config.models import ModelConfig
 from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 from mindroom.matrix.identity import MatrixID
 from mindroom.scheduling import tasks as scheduling
+from mindroom.scheduling.errors import SchedulingError
+from mindroom.thread_summary.generation import GeneratedSummary, generate_summary
 from mindroom.usage.stats import collect_admin_usage
 from tests.conftest import bind_runtime_paths, install_model_providers, test_runtime_paths
 from tests.fakes.scripted_model import ScriptedModel, answer, usage
@@ -34,7 +36,7 @@ if TYPE_CHECKING:
         ("summary", "thread_summary"),
     ],
 )
-async def test_internal_calls_retain_each_paid_run_even_when_output_is_rejected(  # noqa: C901, PLR0912 - four caller paths
+async def test_internal_calls_retain_each_paid_run_even_when_output_is_rejected(  # noqa: C901, PLR0912, PLR0915 - four caller paths
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caller: str,
@@ -95,13 +97,12 @@ async def test_internal_calls_retain_each_paid_run_even_when_output_is_rejected(
     else:
 
         async def invoke() -> object:
-            return await thread_summary._generate_summary(
+            return await generate_summary(
                 [ResolvedVisibleMessage.synthetic(sender="@person:localhost", body="Help", event_id="$message")],
                 config,
                 paths,
                 model_name="default",
                 tag_vocabulary=None,
-                trusted_sender_ids=frozenset(),
             )
 
     valid = await invoke()
@@ -114,12 +115,16 @@ async def test_internal_calls_retain_each_paid_run_even_when_output_is_rejected(
     elif caller == "topic":
         assert valid == "A room topic"
     else:
-        assert valid == "A summary"
+        assert valid == GeneratedSummary(summary="A summary")
     if storage_failure:
         return
-    rejected = await invoke()
-    if caller in {"routing", "summary"}:
-        assert rejected is None
+    if caller == "schedule":
+        with pytest.raises(SchedulingError, match="Failed to parse the schedule request"):
+            await invoke()
+    elif caller == "topic":
+        await invoke()
+    else:
+        assert await invoke() is None
 
     report = collect_admin_usage(config=config, runtime_paths=paths, include_requests=True)
     assert report.totals.total_tokens == 55

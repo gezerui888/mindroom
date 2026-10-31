@@ -113,9 +113,8 @@ def test_apply_runner_ca_bundle_sets_ca_vars_and_pops_pem(tmp_path: Path, test_c
         "EXISTING_VAR": "kept",
     }
 
-    result = apply_runner_ca_bundle(test_env, tmp_path)
+    apply_runner_ca_bundle(test_env, tmp_path)
 
-    assert result is True
     assert BROKER_CA_PEM_ENV not in test_env
     assert test_env["EXISTING_VAR"] == "kept"
 
@@ -142,11 +141,10 @@ def test_apply_runner_ca_bundle_sets_ca_vars_and_pops_pem(tmp_path: Path, test_c
 
 
 def test_apply_runner_ca_bundle_noop_without_pem(tmp_path: Path) -> None:
-    """apply_runner_ca_bundle returns False when BROKER_CA_PEM_ENV is absent."""
+    """apply_runner_ca_bundle leaves the env unchanged when BROKER_CA_PEM_ENV is absent."""
     test_env = {"OTHER_VAR": "value"}
-    result = apply_runner_ca_bundle(test_env, tmp_path)
+    apply_runner_ca_bundle(test_env, tmp_path)
 
-    assert result is False
     assert test_env == {"OTHER_VAR": "value"}
 
 
@@ -268,7 +266,8 @@ def _agent(*tools: str, **extra: object) -> dict[str, object]:
 
 
 # A sandbox runner, so shell and python calls run in a worker unless an agent's `worker_tools` keeps them local.
-_RUNNER = {"MINDROOM_SANDBOX_PROXY_URL": "http://sandbox-runner.test"}
+_RUNNER_WITHOUT_BROKER = {"MINDROOM_SANDBOX_PROXY_URL": "http://sandbox-runner.test"}
+_RUNNER = {**_RUNNER_WITHOUT_BROKER, "MINDROOM_EGRESS_BROKER_PORT": "8768"}
 
 
 @pytest.mark.parametrize(
@@ -365,3 +364,32 @@ def test_an_egress_tool_no_worker_command_uses_is_reported(
 
     assert egress_tool_without_worker_commands(config, "agent", runtime_paths) is unused
     assert egress_tool_without_worker_commands(config, "removed", runtime_paths) is False
+
+
+@pytest.mark.parametrize(
+    ("process_env", "scope"),
+    [
+        pytest.param(_RUNNER, "unscoped", id="broker-on"),
+        pytest.param(_RUNNER_WITHOUT_BROKER, None, id="broker-off"),
+    ],
+)
+def test_an_agent_does_not_use_a_broker_that_is_off(
+    tmp_path: Path,
+    process_env: dict[str, str],
+    scope: EgressAgentScope | None,
+) -> None:
+    """While the broker is off, the egress credentials tool is unavailable, so no agent that lists it uses the broker."""
+    runtime_paths = resolve_runtime_paths(
+        config_path=tmp_path / "config.yaml",
+        storage_path=tmp_path,
+        process_env=process_env,
+    )
+    config = Config.validate_with_runtime(
+        {
+            "models": {"default": {"provider": "openai", "id": "gpt-6-astra"}},
+            "agents": {"agent": _agent("shell", "egress_credentials")},
+        },
+        runtime_paths,
+    )
+
+    assert egress_agent_scope(config, "agent", runtime_paths) == scope

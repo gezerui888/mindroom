@@ -32,11 +32,13 @@ from mindroom.agent_cli.shell_contract import AgentCliShellEnv, current_agent_cl
 from mindroom.agent_loop.model_loop import EMPTY_REQUEST, LoopState
 from mindroom.agent_loop.spec import RunContext
 from mindroom.agent_loop.tools import PlannedCall, PreparedTools
+from mindroom.ai_run_metadata import with_prior_usage
 from mindroom.approval import execution as approval_execution
 from mindroom.approval import tool_owners as approval_tools
 from mindroom.approval.receipt_readers import approval_receipt_context
 from mindroom.config.agent import AgentConfig
 from mindroom.config.approval import ApprovalRuleConfig, ToolApprovalConfig
+from mindroom.constants import AI_RUN_METADATA_KEY
 from mindroom.event_journal import ApprovalCall, ApprovalDecision, approval_arguments_digest
 from mindroom.history.types import HistoryScope
 from mindroom.knowledge.read_protocol import SearchHit
@@ -45,6 +47,7 @@ from mindroom.llm.events import ToolCallOrigin
 from mindroom.llm.media import Audio, Image
 from mindroom.llm.messages import Message
 from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, ToolExecution
+from mindroom.llm.usage import RunMetrics, TokenCounts
 from mindroom.media_inputs import MediaInputs
 from mindroom.response_sources import ResponseSources
 from mindroom.response_turn import (
@@ -59,14 +62,14 @@ from mindroom.session_storage.agent_storage import create_agent_state_storage, c
 from mindroom.session_storage.store import persist_to
 from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_system.agent_tool_calls import PreparedAgentToolCatalog
-from mindroom.tool_system.agno_toolkits import adapt_function, adapt_toolkit
+from mindroom.tool_system.agno_toolkits import adapt_toolkit
 from mindroom.tool_system.events import CollectedStreamPresentation
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import (
-    LiveToolDispatchContext,
-    build_execution_identity_from_runtime_context,
     tool_runtime_context,
 )
 from mindroom.tool_system.tool_function import AdaptedToolkit, ToolOutcome
+from tests.agent_tool_helpers import offered_agno_function
 from tests.approval_continuation_helpers import (
     RECEIPT_CALLS,
     RECEIPT_TEXT,
@@ -75,7 +78,7 @@ from tests.approval_continuation_helpers import (
     receipts,
 )
 from tests.conftest import install_model_providers, stored_session_state, unwrap_extracted_collaborator
-from tests.fakes.scripted_model import ScriptedModel, answer
+from tests.fakes.scripted_model import ScriptedModel, answer, usage
 from tests.history_helpers import store_fold
 from tests.identity_helpers import persist_entity_accounts
 from tests.minimal_agent_fixtures import (  # noqa: F401 - agent_cli_api is a pytest fixture
@@ -105,10 +108,17 @@ def _minimal_build(runtime: ToolRuntimeContext, **options) -> AgentBuild:
         "helper",
         runtime.config,
         runtime.runtime_paths,
-        build_execution_identity_from_runtime_context(runtime),
+        runtime.execution_identity,
         agent_mode="minimal",
         supports_native_tool_approval=True,
-        **({"knowledge": None, "model": turn_model(runtime.config, runtime.runtime_paths, "helper")} | options),
+        **(
+            {
+                "knowledge": None,
+                "model": turn_model(runtime.config, runtime.runtime_paths, "helper"),
+                "plugins": config_plugins(runtime.config, runtime.runtime_paths),
+            }
+            | options
+        ),
     )
 
 
@@ -153,12 +163,13 @@ async def test_approval_tool_restore_requires_current_tool_search_assignment(tmp
         tools=["shell", {"sleep": {"defer": True}}],
     )
     call = ApprovalCall("search", "tool_search", "helper", 100, toolkit_name="dynamic_tools")
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     required = await approval_tools.required_approval_tool_names(
         "helper",
         (call,),
         config=runtime.config,
         runtime_paths=runtime.runtime_paths,
+        tools=config_plugins(runtime.config, runtime.runtime_paths).tools,
         execution_identity=identity,
         delegation_depth=0,
     )
@@ -170,6 +181,7 @@ async def test_approval_tool_restore_requires_current_tool_search_assignment(tmp
             (call,),
             config=runtime.config,
             runtime_paths=runtime.runtime_paths,
+            tools=config_plugins(runtime.config, runtime.runtime_paths).tools,
             execution_identity=identity,
             delegation_depth=0,
         )
@@ -194,7 +206,7 @@ def _knowledge(searches: list[str]) -> AgentKnowledge:
 def _approval_execution(tmp_path: Path, runtime: ToolRuntimeContext, monkeypatch, knowledge: AgentKnowledge | None):
     runner = unwrap_extracted_collaborator(_bot(tmp_path / "runner")._response_runner)
     execution = replace(
-        runner._approvals._approval_execution,
+        runner.approvals._approval_execution,
         config=lambda: runtime.config,
         runtime_paths=runtime.runtime_paths,
     )
@@ -219,9 +231,10 @@ async def test_recovered_model_switch_call_retains_response_lifecycle(
     The follow-up turn, built afresh after the switch, sends the approval receipt the runner binds.
     """
     runtime = _helper_runtime(tmp_path, tools=["shell", "thread_model"])
-    runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=TurnToolRegistry()))
+    # The switch reads the runtime's budgets, which this runtime has none of.
+    runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=TurnToolRegistry(), budgets=None))
     persist_entity_accounts(runtime.config, runtime.runtime_paths)
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     knowledge = _knowledge([])
     builds = []
     real_create = agents.create_agent
@@ -258,7 +271,7 @@ async def test_recovered_model_switch_call_retains_response_lifecycle(
             messages=[Message(role="user", content="Keep this model and answer using knowledge")],
         ),
     )
-    switch_arguments = {"model_name": "default", "when": "next-turn"}
+    switch_arguments = {"model_name": "default", "when": "after-toolcall"}
     requirement = RunRequirement(
         ToolExecution(
             tool_call_id="switch",
@@ -285,6 +298,7 @@ async def test_recovered_model_switch_call_retains_response_lifecycle(
                 "switch_thread_model",
                 "helper",
                 100,
+                decision=ApprovalDecision.APPROVED,
                 toolkit_name="thread_model",
                 arguments_digest=approval_arguments_digest(switch_arguments),
             ),
@@ -296,7 +310,7 @@ async def test_recovered_model_switch_call_retains_response_lifecycle(
             "call_id": "switch",
             "parent_bash_call_id": "interrupted-bash",
             "arguments": switch_arguments,
-            "requirements": [requirement.to_dict()],
+            "pending_calls": [requirement.tool_execution.to_dict()],
             "delegation_depth": 2,
         },
     )
@@ -322,9 +336,7 @@ async def test_recovered_model_switch_call_retains_response_lifecycle(
         result = await execution.continue_run(
             continuation,
             paused_answer=PausedAnswer(),
-            tool_dispatch=LiveToolDispatchContext.from_runtime_context(runtime),
-            decisions={"switch": True},
-            denial_reasons={"switch": None},
+            tool_context=runtime,
             tool_trace_collector=[],
             typing_log_context={},
             progress=None,
@@ -347,11 +359,106 @@ async def test_recovered_model_switch_call_retains_response_lifecycle(
     assert typing_events == [True, False]
 
 
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("agent_cli_api")
+async def test_a_recovered_call_s_follow_up_publishes_the_usage_its_turn_spent_before_the_pause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The follow-up turn of a call recovered after a restart publishes the attempts its turn spent before the pause.
+
+    The checkpointed run's record carries that usage, as the turn stored it on the run, such as a model switch the
+    turn continued.
+    """
+    runtime = _helper_runtime(tmp_path, tools=["shell", "thread_model"])
+    runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=TurnToolRegistry()))
+    persist_entity_accounts(runtime.config, runtime.runtime_paths)
+    identity = runtime.execution_identity
+    install_model_providers(monkeypatch, {"default": ScriptedModel([answer("Recovered.", usage(30, 3))])})
+    monkeypatch.setattr(
+        response_owner,
+        "agent_cli_shell_env",
+        lambda _config, _runtime_paths, _agent_name, token: AgentCliShellEnv("http://127.0.0.1:8765", token),
+    )
+    store = create_session_storage("helper", runtime.config, runtime.runtime_paths, identity)
+    spent = RunMetrics(tokens=TokenCounts(input_tokens=100, output_tokens=5))
+    _saved(
+        store,
+        runtime.session_id,
+        RunRecord(
+            run_id="saved-run",
+            session_id=runtime.session_id,
+            agent_id="helper",
+            status=RunStatus.cancelled,
+            metadata=with_prior_usage({"agent_mode": "minimal"}, [spent]),
+            messages=[Message(role="user", content="Switch, then answer")],
+        ),
+    )
+    switch_arguments = {"model_name": "default", "when": "after-toolcall"}
+    requirement = RunRequirement(
+        ToolExecution(
+            tool_call_id="switch",
+            tool_name="switch_thread_model",
+            tool_args=switch_arguments,
+            requires_confirmation=True,
+        ),
+    )
+    continuation = approval_continuation(
+        correlation_id=runtime.correlation_id,
+        run_id="saved-run",
+        session_id=runtime.session_id,
+        entity_name="helper",
+        room_id=runtime.room_id,
+        thread_id=runtime.thread_id,
+        requester_id=runtime.requester_id,
+        sources=ResponseSources((runtime.reply_to_event_id,), (runtime.reply_to_event_id,)),
+        state="claimed",
+        request_body="Switch, then answer",
+        calls=(
+            ApprovalCall(
+                "switch",
+                "switch_thread_model",
+                "helper",
+                100,
+                decision=ApprovalDecision.APPROVED,
+                toolkit_name="thread_model",
+                arguments_digest=approval_arguments_digest(switch_arguments),
+            ),
+        ),
+        cli_call={
+            "kind": "agent_cli",
+            "toolkit": "thread_model",
+            "function": "switch_thread_model",
+            "call_id": "switch",
+            "parent_bash_call_id": "interrupted-bash",
+            "arguments": switch_arguments,
+            "pending_calls": [requirement.tool_execution.to_dict()],
+            "delegation_depth": 0,
+        },
+    )
+    execution = _approval_execution(tmp_path, runtime, monkeypatch, _knowledge([]))
+
+    with approval_receipt_context(RECEIPT_CALLS, run_id=continuation.run_id):
+        result = await execution.continue_run(
+            continuation,
+            paused_answer=PausedAnswer(),
+            tool_context=runtime,
+            tool_trace_collector=[],
+            typing_log_context={},
+            progress=None,
+        )
+
+    assert isinstance(result, CompletedApprovalRun)
+    assert "Recovered." in result.response_text
+    published = result.metadata_content[AI_RUN_METADATA_KEY]["usage"]
+    assert (published["input_tokens"], published["output_tokens"]) == (130, 8)
+
+
 def _actions(name: str, entrypoint, **flags) -> AdaptedToolkit:
     function = Function.from_callable(entrypoint, name=name)
     for flag, value in flags.items():
         setattr(function, flag, value)
-    return AdaptedToolkit(name="actions", functions=(adapt_function(function),), instructions=None)
+    return AdaptedToolkit(name="actions", functions=(offered_agno_function(function),), instructions=None)
 
 
 # A decision the requester took on a call, as (approved, the reason given, the note the call is denied with).
@@ -447,6 +554,7 @@ async def test_restart_resolves_hidden_call_and_never_replays_parent(
                 "helper",
                 100,
                 decision=ApprovalDecision.APPROVED if approved else ApprovalDecision.DENIED,
+                reason=reason,
                 toolkit_name="actions",
                 arguments_digest=approval_arguments_digest({"value": "exact\nargument"}),
             ),
@@ -459,7 +567,7 @@ async def test_restart_resolves_hidden_call_and_never_replays_parent(
             "arguments": {"value": "exact\nargument"},
             "call_id": "hidden",
             "parent_bash_call_id": "bash-parent",
-            "requirements": [requirement.to_dict()],
+            "pending_calls": [requirement.tool_execution.to_dict()],
         },
     )
 
@@ -485,20 +593,20 @@ async def test_restart_resolves_hidden_call_and_never_replays_parent(
             RunStorage(store, session, None),
             paused_answer=PausedAnswer(text=presentation.final_text(), tool_trace=tuple(presentation.tool_trace)),
             runtime_context=runtime,
-            decisions={"hidden": approved},
-            denial_reasons={"hidden": reason},
             tool_trace_collector=[],
             refresh_scheduler=None,
             authorize=authorize,
             progress=publish,
         )
     assert isinstance(follow_up, cli_approval_recovery.CliFollowUpTurn)
-    if control and approved:
+    if control == "after-toolcall" and approved:
         assert follow_up.reusable_build is None
-        assert follow_up.ctx.active_model_name == ("new-model" if control == "after-toolcall" else None)
+        assert follow_up.ctx.active_model_name == "new-model"
         assert "SYSTEM NOTICE" in follow_up.prompt
     else:
+        # Any other call's result reaches the follow-up turn on its build through the recovery notice below.
         assert follow_up.reusable_build is build
+        assert follow_up.prompt == continuation.request_body
     trace = follow_up.presentation.tool_trace
     assert len(trace) == 1
     assert trace[0].type == "tool_call_completed"
@@ -594,7 +702,7 @@ async def test_a_later_save_of_the_recovered_session_keeps_the_state_the_recover
             "arguments": {"value": "v"},
             "call_id": "hidden",
             "parent_bash_call_id": "bash-parent",
-            "requirements": [requirement.to_dict()],
+            "pending_calls": [requirement.tool_execution.to_dict()],
         },
     )
 
@@ -610,8 +718,6 @@ async def test_a_later_save_of_the_recovered_session_keeps_the_state_the_recover
             RunStorage(store, session, None),
             paused_answer=PausedAnswer(text="", tool_trace=()),
             runtime_context=runtime,
-            decisions={"hidden": True},
-            denial_reasons={"hidden": None},
             tool_trace_collector=[],
             refresh_scheduler=None,
             authorize=authorize,
@@ -674,6 +780,7 @@ async def test_restart_settles_outer_bash_approval_without_running_it(
                 "helper",
                 100,
                 decision=ApprovalDecision.APPROVED if approved else ApprovalDecision.DENIED,
+                reason=reason,
                 toolkit_name="shell",
                 arguments_digest=approval_arguments_digest(arguments),
             ),
@@ -697,8 +804,6 @@ async def test_restart_settles_outer_bash_approval_without_running_it(
             RunStorage(store, session, None),
             paused_answer=PausedAnswer(text=presentation.final_text(), tool_trace=tuple(presentation.tool_trace)),
             runtime_context=runtime,
-            decisions={"bash": approved},
-            denial_reasons={"bash": reason},
             tool_trace_collector=[],
             refresh_scheduler=None,
             authorize=AsyncMock(),
@@ -709,6 +814,101 @@ async def test_restart_settles_outer_bash_approval_without_running_it(
     assert [(entry.tool_call_id, entry.type) for entry in trace] == [("bash", "tool_call_completed")]
     assert not marker.exists()
     assert ("saved command was not resumed" if approved else denial) in follow_up.ctx.transient_enrichment_items[0].text
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_approval_keeps_the_thread_messages_its_paused_turn_read(tmp_path: Path) -> None:
+    """The saved record keeps what others posted before the agent was addressed, which the paused run marked seen.
+
+    It keeps them before the prompt, as the paused run sent them, and no other message the paused request held.
+    """
+    runtime = _helper_runtime(tmp_path, tools=["shell"])
+    persist_entity_accounts(runtime.config, runtime.runtime_paths)
+    build = _minimal_build(runtime)
+    store = create_agent_state_storage("helper", tmp_path)
+    arguments = {"command": "touch never"}
+    requirement = _outer_bash_approval(arguments)
+    earlier = Message(
+        role="user",
+        content='<msg event_id="$alice" from="@alice:localhost"><![CDATA[The deploy key is in vault slot 7.]]></msg>',
+    )
+    bash_call = {"id": "bash", "type": "function", "function": {"name": "bash", "arguments": json.dumps(arguments)}}
+    persisted, session = _saved(
+        store,
+        "session",
+        RunRecord(
+            run_id="run",
+            session_id="session",
+            agent_id="helper",
+            status=RunStatus.cancelled,
+            metadata={
+                "requester_id": runtime.requester_id,
+                "matrix_event_id": "$source",
+                "matrix_seen_event_ids": ["$source", "$alice"],
+            },
+            messages=[
+                earlier,
+                Message(role="user", content="Current message:\nHello"),
+                Message(role="user", content="Jobs: none.", add_to_agent_memory=False),
+                Message(role="assistant", tool_calls=[bash_call]),
+            ],
+        ),
+    )
+    presentation = CollectedStreamPresentation(show_tool_calls=True, track_hidden_tools=True)
+    presentation.start_tool(requirement.tool_execution.call, origin=ToolCallOrigin("bash", "shell"))
+    continuation = approval_continuation(
+        run_id="run",
+        session_id="session",
+        entity_name="helper",
+        room_id=runtime.room_id,
+        requester_id=runtime.requester_id,
+        response_event_id="$response",
+        state="claimed",
+        request_body="Hello",
+        calls=(
+            ApprovalCall(
+                "bash",
+                "run_shell_command",
+                "helper",
+                100,
+                decision=ApprovalDecision.DENIED,
+                reason="Denied",
+                toolkit_name="shell",
+                arguments_digest=approval_arguments_digest(arguments),
+            ),
+        ),
+        cli_call=CliApprovalCall(
+            toolkit="shell",
+            function="run_shell_command",
+            arguments=arguments,
+            call_id="bash",
+            parent_bash_call_id="bash",
+            requirements=(requirement,),
+            delegation_depth=0,
+        ).to_dict(),
+    )
+
+    with tool_runtime_context(runtime):
+        await cli_approval_recovery.continue_cli_approval(
+            build,
+            continuation,
+            CliApprovalCall.from_dict(continuation.cli_call),
+            persisted,
+            RunStorage(store, session, None),
+            paused_answer=PausedAnswer(text=presentation.final_text(), tool_trace=tuple(presentation.tool_trace)),
+            runtime_context=runtime,
+            tool_trace_collector=[],
+            refresh_scheduler=None,
+            authorize=AsyncMock(),
+            progress=None,
+        )
+
+    saved = store.get_run("run")
+    assert saved is not None
+    context, prompt, answer = [(message.id, message.get_content_string()) for message in saved.messages]
+    assert context == (earlier.id, earlier.content)
+    assert prompt[1] == f'<msg event_id="$source" from="{runtime.requester_id}"><![CDATA[Hello]]></msg>'
+    assert "turn stopped before completion" in answer[1]
 
 
 @pytest.mark.asyncio
@@ -762,6 +962,7 @@ async def test_a_recovered_approval_saves_no_tool_call_its_fold_already_summariz
                 "helper",
                 100,
                 decision=ApprovalDecision.DENIED,
+                reason="Denied",
                 toolkit_name="shell",
                 arguments_digest=approval_arguments_digest(arguments),
             ),
@@ -786,8 +987,6 @@ async def test_a_recovered_approval_saves_no_tool_call_its_fold_already_summariz
             RunStorage(store, session, None),
             paused_answer=PausedAnswer(text=presentation.final_text(), tool_trace=tuple(presentation.tool_trace)),
             runtime_context=runtime,
-            decisions={"bash": False},
-            denial_reasons={"bash": "Denied"},
             tool_trace_collector=[],
             refresh_scheduler=None,
             authorize=AsyncMock(),
@@ -961,7 +1160,7 @@ async def test_minimal_recovery_keeps_mode_media_and_uses_fresh_shell_grant(  # 
         "helper",
         runtime.config,
         runtime.runtime_paths,
-        build_execution_identity_from_runtime_context(runtime),
+        runtime.execution_identity,
     )
     persisted, session = await _checkpointed_batch(runtime, store, sibling_image)
     continuation = approval_continuation(
@@ -997,7 +1196,7 @@ async def test_minimal_recovery_keeps_mode_media_and_uses_fresh_shell_grant(  # 
             "arguments": arguments,
             "call_id": "hidden",
             "parent_bash_call_id": "old-bash",
-            "requirements": [requirement.to_dict()],
+            "pending_calls": [requirement.tool_execution.to_dict()],
             "delegation_depth": 2,
         },
     )
@@ -1023,8 +1222,15 @@ async def test_minimal_recovery_keeps_mode_media_and_uses_fresh_shell_grant(  # 
         return tuple(
             apply_exact_approval_decisions(
                 list(paused.requirements),
-                decisions={paused.cli_call["call_id"]: True},
-                denial_reasons={paused.cli_call["call_id"]: None},
+                (
+                    ApprovalCall(
+                        paused.cli_call["call_id"],
+                        paused.cli_call["function"],
+                        "helper",
+                        100,
+                        decision=ApprovalDecision.APPROVED,
+                    ),
+                ),
             ),
         )
 
@@ -1035,7 +1241,7 @@ async def test_minimal_recovery_keeps_mode_media_and_uses_fresh_shell_grant(  # 
         steps=[[("bash", {"command": "later model shell"})], "finished"] if nested == "approval" else ["finished"],
     )
     provider.install(monkeypatch)
-    build = _with_toolkit(_minimal_build(runtime, history_storage=store), media_toolkit)
+    build = _with_toolkit(_minimal_build(runtime), media_toolkit)
 
     def check_follow_up(follow_up: cli_approval_recovery.CliFollowUpTurn) -> None:
         assert follow_up.ctx.agent_mode == "minimal"
@@ -1075,8 +1281,6 @@ async def test_minimal_recovery_keeps_mode_media_and_uses_fresh_shell_grant(  # 
             RunStorage(store, session, None),
             paused_answer=PausedAnswer(text=presentation.response_text, tool_trace=tuple(presentation.tool_trace)),
             runtime_context=runtime,
-            decisions={"hidden": True},
-            denial_reasons={"hidden": None},
             tool_trace_collector=[],
             refresh_scheduler=None,
             authorize=authorize,
@@ -1099,7 +1303,7 @@ async def test_minimal_recovery_keeps_mode_media_and_uses_fresh_shell_grant(  # 
             knowledge=None,
             refresh_scheduler=None,
             tool_trace_collector=[],
-            tool_dispatch=LiveToolDispatchContext.from_runtime_context(runtime),
+            tool_context=runtime,
             progress=publish,
         )
 
@@ -1185,7 +1389,7 @@ async def test_generated_cli_approval_rebuilds_and_authorizes_exact_function(
         tool_function_filter=lambda function: permitted or function.name != "search_knowledge_base",
     )
     persist_entity_accounts(runtime.config, runtime.runtime_paths)
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     searches: list[str] = []
     store = create_session_storage("helper", runtime.config, runtime.runtime_paths, identity)
     _saved(
@@ -1218,7 +1422,16 @@ async def test_generated_cli_approval_rebuilds_and_authorizes_exact_function(
         thread_id=runtime.thread_id,
         requester_id=runtime.requester_id,
         state="claimed",
-        calls=(ApprovalCall("search-id", "search_knowledge_base", "helper", 100, toolkit_name="agent"),),
+        calls=(
+            ApprovalCall(
+                "search-id",
+                "search_knowledge_base",
+                "helper",
+                100,
+                decision=ApprovalDecision.APPROVED,
+                toolkit_name="agent",
+            ),
+        ),
         cli_call={
             "kind": "agent_cli",
             "delegation_depth": 0,
@@ -1227,7 +1440,7 @@ async def test_generated_cli_approval_rebuilds_and_authorizes_exact_function(
             "call_id": "search-id",
             "parent_bash_call_id": "interrupted-bash",
             "arguments": arguments,
-            "requirements": [requirement.to_dict()],
+            "pending_calls": [requirement.tool_execution.to_dict()],
         },
     )
     execution = _approval_execution(tmp_path, runtime, monkeypatch, _knowledge(searches) if available else None)
@@ -1240,9 +1453,7 @@ async def test_generated_cli_approval_rebuilds_and_authorizes_exact_function(
         return await execution.continue_run(
             continuation,
             paused_answer=PausedAnswer(),
-            tool_dispatch=LiveToolDispatchContext.from_runtime_context(runtime),
-            decisions={"search-id": True},
-            denial_reasons={"search-id": None},
+            tool_context=runtime,
             tool_trace_collector=[],
             typing_log_context={},
             progress=None,
@@ -1288,7 +1499,7 @@ async def test_an_approved_call_of_an_implied_toolkit_runs_after_its_bash_stoppe
     registry = TurnToolRegistry()
     runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=registry))
     persist_entity_accounts(runtime.config, runtime.runtime_paths)
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
 
     async def run_shell_command(args: str, timeout: int = 120, tail: int = 100) -> str:  # noqa: ARG001, ASYNC109
         owner = shell_cli_owner(registry)
@@ -1329,11 +1540,11 @@ async def test_an_approved_call_of_an_implied_toolkit_runs_after_its_bash_stoppe
         )
     paused = raised.value.paused
     assert paused.cli_call is not None
-    call_id = paused.cli_call["call_id"]
     # The call is shown under the toolkit the model called; its approval names the tool that brings it in.
     assert [entry.toolkit_name for entry in paused.tool_trace] == ["attachments"]
     assert paused.toolkit_owners == {("helper", "list_attachments"): "matrix_message"}
     assert (paused.cli_call["toolkit"], paused.cli_call["function"]) == ("matrix_message", "list_attachments")
+    [waiting] = paused.requirements
     continuation = approval_continuation(
         approval_id="implied-approval",
         run_id=paused.run_id,
@@ -1343,8 +1554,10 @@ async def test_an_approved_call_of_an_implied_toolkit_runs_after_its_bash_stoppe
         thread_id=runtime.resolved_thread_id,
         requester_id=runtime.requester_id,
         state="claimed",
-        calls=tuple(
-            replace(call, decision=ApprovalDecision.APPROVED) for call in approval_calls_for_cli_pause(paused, "helper")
+        calls=approval_calls_for_cli_pause(
+            paused,
+            "helper",
+            (RunRequirement(replace(waiting.tool_execution, confirmed=True)),),
         ),
         cli_call=paused.cli_call,
     )
@@ -1356,9 +1569,7 @@ async def test_an_approved_call_of_an_implied_toolkit_runs_after_its_bash_stoppe
         result = await execution.continue_run(
             continuation,
             paused_answer=PausedAnswer(text=paused.response_text, tool_trace=paused.tool_trace if saved_trace else ()),
-            tool_dispatch=LiveToolDispatchContext.from_runtime_context(runtime),
-            decisions={call_id: True},
-            denial_reasons={call_id: None},
+            tool_context=runtime,
             tool_trace_collector=[],
             typing_log_context={},
             progress=None,

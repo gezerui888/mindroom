@@ -7,13 +7,15 @@ decode, are ``tests/llm/test_codecs.py``'s.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from mindroom.llm import usage as llm_usage
 from mindroom.llm.media import Audio, File, Image, Video
 from mindroom.llm.messages import Message
 from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
-from mindroom.llm.usage import MessageMetrics, ModelMetrics, RunMetrics, SessionMetrics, TokenCounts
+from mindroom.llm.usage import MessageMetrics, ModelMetrics, RunMetrics, TokenCounts
 
 # --- media -----------------------------------------------------------------------------------------------------
 
@@ -66,27 +68,46 @@ def test_a_binary_file_is_stored_as_base64_and_reads_back_as_its_bytes() -> None
 
 
 def test_message_metrics_store_only_what_they_hold() -> None:
-    """Zero counters and unset values are left out; a zero cost or duration is a value and is kept."""
-    owned = MessageMetrics(tokens=TokenCounts(input_tokens=1), cost=0.0, duration=0.0, provider_metrics={})
+    """Zero counters and unset values are left out; a zero duration is a value and is kept."""
+    owned = MessageMetrics(tokens=TokenCounts(input_tokens=1), duration=0.0)
 
-    assert owned.to_dict() == {"input_tokens": 1, "cost": 0.0, "duration": 0.0}
+    assert owned.to_dict() == {"input_tokens": 1, "duration": 0.0}
     assert MessageMetrics().to_dict() == {}
 
 
-def test_message_metrics_add_counters_cost_and_duration_and_keep_the_first_time_to_first_token() -> None:
+def test_a_request_s_context_stores_the_counters_it_holds_after_the_rest() -> None:
+    """A context reports each of its counters, so a zero one is left out and reads back as zero."""
+    owned = MessageMetrics(
+        tokens=TokenCounts(input_tokens=30, output_tokens=5, total_tokens=35, cache_read_tokens=900),
+        duration=1.5,
+        context=TokenCounts(input_tokens=8, cache_read_tokens=400),
+    )
+
+    stored = owned.to_dict()
+
+    assert list(stored.items()) == [
+        ("input_tokens", 30),
+        ("output_tokens", 5),
+        ("total_tokens", 35),
+        ("cache_read_tokens", 900),
+        ("duration", 1.5),
+        ("context", {"input_tokens": 8, "cache_read_tokens": 400}),
+    ]
+    assert MessageMetrics.from_dict(stored) == owned
+
+
+def test_message_metrics_add_counters_and_duration_and_keep_the_first_time_to_first_token() -> None:
     first = MessageMetrics(
         tokens=TokenCounts(input_tokens=120, output_tokens=30, total_tokens=150, cache_read_tokens=100),
-        cost=0.0123,
         duration=1.25,
         time_to_first_token=0.4,
-        provider_metrics={"context_usage": {"input_tokens": 40}, "service_tier": "default", "timings": 3},
+        context=TokenCounts(input_tokens=40),
     )
     second = MessageMetrics(
         tokens=TokenCounts(input_tokens=5, output_tokens=7),
-        cost=0.001,
         duration=0.5,
         time_to_first_token=9.0,
-        provider_metrics={"timings": 2, "service_tier": "flex", "new": 1},
+        context=TokenCounts(input_tokens=5, cache_write_tokens=2),
     )
 
     assert (first + second).to_dict() == {
@@ -94,11 +115,10 @@ def test_message_metrics_add_counters_cost_and_duration_and_keep_the_first_time_
         "output_tokens": 37,
         "total_tokens": 150,
         "cache_read_tokens": 100,
-        "cost": 0.0133,
         "duration": 1.75,
         "time_to_first_token": 0.4,
-        # Numbers add; any other value is the later report's.
-        "provider_metrics": {"context_usage": {"input_tokens": 40}, "service_tier": "flex", "timings": 5, "new": 1},
+        # The context is the later report's, as a retried request's is the answering attempt's.
+        "context": {"input_tokens": 5, "cache_write_tokens": 2},
     }
     assert (MessageMetrics(tokens=TokenCounts(input_tokens=1)) + MessageMetrics()).to_dict() == {"input_tokens": 1}
 
@@ -110,17 +130,13 @@ def test_run_metrics_count_each_request_in_the_totals_and_under_its_model() -> N
             "Anthropic",
             MessageMetrics(
                 tokens=TokenCounts(input_tokens=10, output_tokens=2, total_tokens=12),
-                cost=0.1,
-                provider_metrics={"n": 1},
+                context=TokenCounts(input_tokens=10),
             ),
         ),
         (
             "claude-opus-5-5",
             "Anthropic",
-            MessageMetrics(
-                tokens=TokenCounts(input_tokens=5, output_tokens=1, total_tokens=6, cache_read_tokens=4),
-                provider_metrics={"n": 2, "tier": "a"},
-            ),
+            MessageMetrics(tokens=TokenCounts(input_tokens=5, output_tokens=1, total_tokens=6, cache_read_tokens=4)),
         ),
         (
             "gpt-6-luna",
@@ -132,12 +148,12 @@ def test_run_metrics_count_each_request_in_the_totals_and_under_its_model() -> N
     for model_id, provider, usage in reports:
         owned.add(usage, model_id=model_id, provider=provider)
 
+    # A request's context describes that request alone, so neither the totals nor a model's entry keep one.
     assert owned.to_dict() == {
         "input_tokens": 16,
         "output_tokens": 4,
         "total_tokens": 20,
         "cache_read_tokens": 4,
-        "cost": 0.1,
         "details": {
             "model": [
                 {
@@ -145,10 +161,8 @@ def test_run_metrics_count_each_request_in_the_totals_and_under_its_model() -> N
                     "output_tokens": 3,
                     "total_tokens": 18,
                     "cache_read_tokens": 4,
-                    "cost": 0.1,
                     "id": "claude-opus-5-5",
                     "provider": "Anthropic",
-                    "provider_metrics": {"n": 3, "tier": "a"},
                 },
                 {
                     "input_tokens": 1,
@@ -160,38 +174,35 @@ def test_run_metrics_count_each_request_in_the_totals_and_under_its_model() -> N
             ],
         },
     }
-    # Each model's entry copies its request's provider metrics, so counting the next request leaves the first intact.
-    assert reports[0][2].provider_metrics == {"n": 1}
 
 
 def test_run_metrics_add_their_totals_and_each_model_s_entry_and_keep_the_earliest_first_token() -> None:
-    def opus(input_tokens: int, cost: float, **counters: int) -> ModelMetrics:
+    def opus(input_tokens: int, **counters: int) -> ModelMetrics:
         tokens = TokenCounts(input_tokens=input_tokens, **counters)
-        return ModelMetrics(tokens=tokens, cost=cost, id="claude-opus-5-5", provider="Anthropic")
+        return ModelMetrics(tokens=tokens, id="claude-opus-5-5", provider="Anthropic")
 
-    luna = ModelMetrics(tokens=TokenCounts(input_tokens=100), cost=0.01, id="gpt-6-luna", provider="OpenAI Chat")
+    luna = ModelMetrics(tokens=TokenCounts(input_tokens=100), id="gpt-6-luna", provider="OpenAI Chat")
     first = RunMetrics(
         tokens=TokenCounts(input_tokens=300, output_tokens=60),
-        cost=0.05,
         time_to_first_token=0.3,
         duration=4.5,
-        details={"model": [opus(200, 0.04, output_tokens=40), luna]},
+        details={"model": [opus(200, output_tokens=40), luna]},
     )
     second = RunMetrics(
         tokens=TokenCounts(input_tokens=10, output_tokens=1),
-        cost=0.5,
         time_to_first_token=0.1,
         duration=1.0,
-        details={"model": [opus(10, 0.5)]},
+        details={"model": [opus(10)]},
     )
 
     assert first + second == RunMetrics(
         tokens=TokenCounts(input_tokens=310, output_tokens=61),
-        cost=0.55,
         time_to_first_token=0.1,
         duration=5.5,
-        details={"model": [opus(210, 0.54, output_tokens=40), luna]},
+        details={"model": [opus(210, output_tokens=40), luna]},
     )
+    # Summing leaves both runs' entries as they were.
+    assert first.details == {"model": [opus(200, output_tokens=40), luna]}
     assert (RunMetrics(tokens=TokenCounts(input_tokens=1)) + RunMetrics()).to_dict() == {"input_tokens": 1}
 
 
@@ -323,7 +334,7 @@ def test_only_context_no_history_keeps_stores_its_flag_and_reads_back_as_it() ->
     assert [Message.from_dict(message.to_dict()) for message in (context, prompt)] == [context, prompt]
 
 
-# --- tool executions and requirements --------------------------------------------------------------------------
+# --- tool executions and the requirements read from them ------------------------------------------------------
 
 
 def test_a_tool_execution_stores_its_id_name_and_the_fields_it_sets() -> None:
@@ -347,7 +358,6 @@ def test_a_tool_execution_stores_every_set_field_under_its_stored_key_false_incl
         confirmed=False,
         confirmation_note="No.",
         external_execution_required=False,
-        external_execution_silent=False,
         approval_type="mindroom_policy",
     )
 
@@ -363,7 +373,6 @@ def test_a_tool_execution_stores_every_set_field_under_its_stored_key_false_incl
         "confirmed": False,
         "confirmation_note": "No.",
         "external_execution_required": False,
-        "external_execution_silent": False,
         "approval_type": "mindroom_policy",
     }
     assert ToolExecution.from_dict(owned.to_dict()) == owned
@@ -461,29 +470,18 @@ def test_a_run_v2026_10_664_stored_with_every_default_reads_as_the_run_stored_no
                 "stop_after_tool_call": True,
             },
         ],
-        "requirements": [
-            {
-                "id": "q",
-                "tool_execution": {
-                    "tool_call_id": "c2",
-                    "tool_name": "add",
-                    "tool_args": {"a": 1},
-                    "requires_confirmation": True,
-                    "approval_type": "mindroom_policy",
-                },
-            },
-        ],
     }
+    # Requirements are no longer stored with the run; layout version 8 folded a paused row's into its tool rows.
+    del now["requirements"]
 
     assert RunRecord.from_dict(earlier).to_dict() == now
     assert RunRecord.from_dict(now) == RunRecord.from_dict(earlier)
 
 
-def test_new_tool_executions_and_requirements_store_no_timing() -> None:
-    stored = RunRequirement(ToolExecution(tool_call_id="c", tool_name="t", tool_args={})).to_dict()
+def test_new_tool_executions_store_no_timing() -> None:
+    stored = ToolExecution(tool_call_id="c", tool_name="t", tool_args={}).to_dict()
 
-    assert "created_at" not in stored
-    assert {"metrics", "created_at"}.isdisjoint(stored["tool_execution"])
+    assert {"metrics", "created_at"}.isdisjoint(stored)
 
 
 def _member_confirmation() -> RunRequirement:
@@ -496,35 +494,62 @@ def _member_confirmation() -> RunRequirement:
     )
     return RunRequirement(
         waiting,
-        id="req-1",
         member_agent_id="writer",
         member_display_name="Writer",
         member_run_id="member-run-1",
     )
 
 
-def test_a_requirement_stores_its_decision_and_member_and_reads_back_as_itself() -> None:
-    owned = _member_confirmation()
-    owned.confirm()
+def test_a_run_stores_a_paused_call_once_and_reads_its_requirement_and_decision_from_it() -> None:
+    """The paused tool execution is the only stored copy of the call: its requirement and decision read from it."""
+    done = ToolExecution(tool_call_id="call_1", tool_name="t", tool_args={}, result="ok")
+    waiting = ToolExecution(
+        tool_call_id="call_2",
+        tool_name="delegate",
+        tool_args={"task": "x"},
+        requires_confirmation=True,
+    )
+    record = RunRecord(run_id="r", agent_id="writer", status=RunStatus.paused, tools=[done, waiting], created_at=1)
+    [requirement] = record.requirements
+    assert requirement.tool_execution is waiting
 
-    stored = owned.to_dict()
+    requirement.confirm()
+    stored = record.to_dict()
 
-    assert {key: value for key, value in stored.items() if key != "tool_execution"} == {
-        "id": "req-1",
-        "confirmation": True,
-        "member_agent_id": "writer",
-        "member_agent_name": "Writer",
-        "member_run_id": "member-run-1",
+    assert "requirements" not in stored
+    assert stored["tools"][1] == {
+        "tool_call_id": "call_2",
+        "tool_name": "delegate",
+        "tool_args": {"task": "x"},
+        "requires_confirmation": True,
+        "confirmed": True,
     }
-    assert stored["tool_execution"] == owned.tool_execution.to_dict()
-    assert RunRequirement.from_dict(stored) == owned
+    assert RunRecord.from_dict(stored).requirements == [requirement]
+
+
+def test_a_paused_team_run_waits_on_its_own_calls_then_its_paused_members_naming_each_member() -> None:
+    own = ToolExecution(tool_call_id="call_1", tool_name="t", requires_confirmation=True)
+    member_call = ToolExecution(tool_call_id="call_1", tool_name="delegate", requires_confirmation=True)
+    member = RunRecord(
+        run_id="member-run-1",
+        agent_id="writer",
+        agent_display_name="Writer",
+        status=RunStatus.paused,
+        tools=[member_call],
+    )
+    team = TeamRunRecord(run_id="t", team_id="x", status=RunStatus.paused, tools=[own], member_responses=[member])
+
+    assert team.requirements == [RunRequirement(own), replace(_member_confirmation(), tool_execution=member_call)]
+    # The team row stores neither the requirements nor its members, whose rows hold their own calls.
+    assert {"requirements", "member_responses"} & set(team.to_dict()) == {"member_responses"}
+    assert team.to_dict()["member_responses"] == [member.to_dict()]
 
 
 @pytest.mark.parametrize(
     ("decision", "note"),
     [("confirm", None), ("reject", "Alice declined it."), ("reject", None), ("reject", "")],
 )
-def test_a_decision_is_recorded_on_the_requirement_and_its_call(decision: str, note: str | None) -> None:
+def test_a_decision_is_recorded_on_the_call(decision: str, note: str | None) -> None:
     """A denial always records the note the model is told: the requester's reason, or that the call was not approved."""
     owned = _member_confirmation()
     if decision == "confirm":
@@ -535,7 +560,7 @@ def test_a_decision_is_recorded_on_the_requirement_and_its_call(decision: str, n
     approved = decision == "confirm"
     recorded_note = None if approved else note or "Not approved by requester"
     execution = owned.tool_execution
-    assert (owned.confirmation, owned.confirmation_note) == (approved, recorded_note)
+    assert owned.confirmation == approved
     assert (execution.confirmed, execution.confirmation_note) == (approved, recorded_note)
     # The call still records that it needed confirmation; a resume clears that once it acts on the decision.
     assert execution.requires_confirmation is True
@@ -566,16 +591,15 @@ def test_a_requirement_that_was_not_denied_has_no_denial_note(decision: str) -> 
         _ = owned.denial_note
 
 
-def test_an_external_result_is_recorded_on_the_requirement_and_its_call() -> None:
+def test_an_external_result_is_recorded_on_the_call() -> None:
     delegation = ToolExecution(tool_call_id="call_3", tool_name="run_subagent", external_execution_required=True)
-    owned = RunRequirement(delegation, id="req-2")
+    owned = RunRequirement(delegation)
     assert owned.needs_external_execution is True
 
     owned.set_external_execution_result("subagent said hi")
 
-    assert (owned.external_execution_result, owned.tool_execution.result) == ("subagent said hi", "subagent said hi")
+    assert delegation.result == "subagent said hi"
     assert owned.is_resolved() is True
-    assert RunRequirement.from_dict(owned.to_dict()) == owned
 
 
 # --- run records -----------------------------------------------------------------------------------------------
@@ -603,13 +627,14 @@ def test_a_minimal_run_stores_its_ids_status_metrics_and_creation_time() -> None
     assert RunRecord.from_dict(owned.to_dict()) == owned
 
 
-def test_a_run_stores_tools_requirements_and_metrics_exactly_when_set() -> None:
-    """``[]`` stays apart from none, so a run with no tool calls and a resolved pause reads back as it was stored."""
-    empty = RunRecord(run_id="r", agent_id="a", tools=[], requirements=[], created_at=1)
+def test_a_run_stores_tools_and_metrics_exactly_when_set() -> None:
+    """``[]`` stays apart from none, so a run with no tool calls reads back as it was stored."""
+    empty = RunRecord(run_id="r", agent_id="a", tools=[], created_at=1)
     absent = RunRecord(run_id="r", agent_id="a", created_at=1)
 
-    assert (empty.to_dict()["tools"], empty.to_dict()["requirements"]) == ([], [])
+    assert empty.to_dict()["tools"] == []
     assert {"tools", "requirements", "metrics"}.isdisjoint(absent.to_dict())
+    assert "requirements" not in empty.to_dict()
     # A new run stores its starting status.
     assert absent.to_dict()["status"] == "RUNNING"
     assert [RunRecord.from_dict(run.to_dict()) for run in (empty, absent)] == [empty, absent]
@@ -630,54 +655,3 @@ def test_run_statuses_are_stored_by_value_and_named_in_lower_case() -> None:
         # ``.name`` is persisted as ``mindroom_original_status``, so the member names are stored values too.
         assert status.name == status.value.lower()
         assert status == str(status)
-
-
-# --- session totals --------------------------------------------------------------------------------------------
-
-
-def test_session_metrics_count_token_counters_only() -> None:
-    """A run's cost, timing, and provider metrics never reach the session totals, in total or per model."""
-    counters = TokenCounts(input_tokens=2, total_tokens=2)
-    run = RunMetrics(
-        tokens=counters,
-        cost=1.5,
-        duration=3.0,
-        details={"model": [ModelMetrics(tokens=counters, cost=1.5, id="m", provider="P", provider_metrics={"x": 1})]},
-    )
-    totals = SessionMetrics()
-
-    totals.count_run(run, replacing=None)
-
-    assert totals.to_dict() == {
-        "input_tokens": 2,
-        "total_tokens": 2,
-        "details": {"model": [{"input_tokens": 2, "total_tokens": 2, "id": "m", "provider": "P"}]},
-    }
-
-
-def test_session_metrics_count_a_saved_again_run_once() -> None:
-    """A run saved when it paused and again when it finished adds only its final usage."""
-    paused = RunMetrics()
-    paused.add(MessageMetrics(tokens=TokenCounts(input_tokens=300, output_tokens=60)), model_id="m", provider="P")
-    finished = RunMetrics.from_dict(paused.to_dict())
-    finished.add(
-        MessageMetrics(tokens=TokenCounts(input_tokens=7, output_tokens=3, total_tokens=10)),
-        model_id="m",
-        provider="P",
-    )
-    once = SessionMetrics()
-    once.count_run(finished, replacing=None)
-
-    twice = SessionMetrics()
-    twice.count_run(paused, replacing=None)
-    twice.count_run(finished, replacing=paused)
-
-    assert twice.tokens.input_tokens == finished.tokens.input_tokens
-    assert twice.to_dict() == once.to_dict()
-
-
-def test_session_metrics_from_dict_ignores_unreadable_details() -> None:
-    assert SessionMetrics.from_dict({"input_tokens": 3, "details": "garbage", "timer": 1}).to_dict() == {
-        "input_tokens": 3,
-    }
-    assert SessionMetrics.from_dict({"details": {"model": "garbage"}}).to_dict() == {}

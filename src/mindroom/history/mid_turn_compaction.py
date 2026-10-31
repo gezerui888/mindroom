@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from mindroom.agent_loop.model_loop import SendRequest
+from mindroom.constants import PRIOR_USAGE_RUN_METADATA_KEY
 from mindroom.helper_usage import get_helper_usage_owner
 from mindroom.history.policy import context_budget_after_reserve
 from mindroom.history.prompt_tokens import tool_definition_tokens
@@ -46,7 +47,7 @@ from mindroom.session_storage.lanes import run_session_storage_operation
 from mindroom.session_storage.summary_rows import Fold, summarized_tool_call_ids
 from mindroom.token_budget import estimate_text_tokens
 from mindroom.tool_system.runtime_context import current_requester_id
-from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY, project_requests
+from mindroom.usage.storage import COMPACTED_REQUESTS_METADATA_KEY, message_request_snapshot
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -73,6 +74,9 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+# Run metadata keys holding usage that belongs to the run whose record holds them, which a run seeded from it drops.
+_RUN_USAGE_METADATA_KEYS = frozenset({COMPACTED_REQUESTS_METADATA_KEY, PRIOR_USAGE_RUN_METADATA_KEY})
+
 
 @dataclass
 class _MidTurnCompaction:
@@ -88,7 +92,6 @@ class _MidTurnCompaction:
 
     config: Config
     runtime_paths: RuntimePaths
-    entity_name: str | None
     scope: HistoryScope
     model_name: str
     model: ModelProvider
@@ -133,7 +136,6 @@ def mid_turn_compaction_hook(
     *,
     config: Config,
     runtime_paths: RuntimePaths,
-    entity_name: str | None,
     scope: HistoryScope,
     model_name: str,
     model: ModelProvider,
@@ -153,7 +155,6 @@ def mid_turn_compaction_hook(
     compaction = _MidTurnCompaction(
         config=config,
         runtime_paths=runtime_paths,
-        entity_name=entity_name,
         scope=scope,
         model_name=model_name,
         model=model,
@@ -172,11 +173,15 @@ def mid_turn_compaction_hook(
     return hook
 
 
-def without_fold_records(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Return a run's metadata for seeding a new run, without the folded usage that belongs to that run."""
+def without_run_usage(metadata: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a run's metadata for seeding a new run, without the usage that belongs to that run.
+
+    That is the usage of the requests its mid-turn folds carried out of its messages, and the usage its turn spent
+    before it (``with_prior_usage``).
+    """
     if metadata is None:
         return None
-    return {key: value for key, value in metadata.items() if key != COMPACTED_REQUESTS_METADATA_KEY}
+    return {key: value for key, value in metadata.items() if key not in _RUN_USAGE_METADATA_KEYS}
 
 
 @dataclass(frozen=True)
@@ -382,7 +387,6 @@ def _policy(compaction: _MidTurnCompaction, state: LoopState) -> _Policy | None:
     inputs = resolve_entity_preparation_inputs(
         config=compaction.config,
         runtime_paths=compaction.runtime_paths,
-        entity_name=compaction.entity_name,
         static_prompt_tokens=0,
         active_model_name=compaction.model_name,
         active_context_window=None,
@@ -706,8 +710,7 @@ def _carry_request_usage(record: AnyRunRecord, folded: Sequence[Message]) -> Non
     requests = [
         {**request, "message_id": message.id}
         for message in folded
-        if message.role == "assistant"
-        for request in project_requests([message.to_dict()]) or []
+        if (request := message_request_snapshot(message)) is not None
     ]
     if not requests:
         return
@@ -717,4 +720,4 @@ def _carry_request_usage(record: AnyRunRecord, folded: Sequence[Message]) -> Non
     record.metadata = metadata
 
 
-__all__ = ["mid_turn_compaction_hook", "without_fold_records"]
+__all__ = ["mid_turn_compaction_hook", "without_run_usage"]

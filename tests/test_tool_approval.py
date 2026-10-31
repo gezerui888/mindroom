@@ -91,7 +91,7 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture(autouse=True)
-def reset_approval_store() -> Generator[None, None, None]:
+def reset_approval_store() -> Generator[None]:
     asyncio.run(shutdown_approval_runtime())
     yield
     asyncio.run(shutdown_approval_runtime())
@@ -1998,13 +1998,12 @@ async def test_evaluate_tool_approval_rule_action_requires_approval(tmp_path: Pa
 )
 @pytest.mark.asyncio
 async def test_evaluate_tool_approval_honors_tool_approval_exemption(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     hostnames: object,
     expected: bool,
 ) -> None:
     """request_network_access calls where every hostname is statically allowlisted need no approval."""
-    monkeypatch.setenv("MINDROOM_APPROVED_EGRESS_ALLOWLIST", ".example.com")
+    (tmp_path / ".env").write_text("MINDROOM_APPROVED_EGRESS_ALLOWLIST=.example.com\n")
     runtime_paths = test_runtime_paths(tmp_path)
     config = bind_runtime_paths(
         Config(

@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import nio
 import pytest
 import yaml
+from pydantic import ValidationError
 
 import mindroom.tools  # noqa: F401
 from mindroom import agents
@@ -33,15 +34,22 @@ from mindroom.dynamic_workflows.runner import (
     execute_workflow_spec,
 )
 from mindroom.dynamic_workflows.service import DynamicWorkflowService
+from mindroom.dynamic_workflows.spec import (
+    DynamicWorkflowError,
+    Permissions,
+    RoomAgentParticipant,
+    WorkflowSpec,
+    parse_workflow_spec,
+)
 from mindroom.dynamic_workflows.store import DynamicWorkflowRun, DynamicWorkflowStore
-from mindroom.dynamic_workflows.validation import DynamicWorkflowError
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.llm.errors import ProviderError
 from mindroom.llm.messages import system_text
 from mindroom.matrix.state import MatrixState
 from mindroom.message_target import MessageTarget
+from mindroom.tool_system.authoring import toolkit_functions
 from mindroom.tool_system.automation_approval import NEVER_PREAPPROVE_TOOLKITS, build_automation_approval_config
-from mindroom.tool_system.metadata import TOOL_METADATA
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import ToolRuntimeContext, tool_runtime_context
 from tests.access_schema_support import with_responder_access
 from tests.authorization_helpers import (
@@ -56,12 +64,14 @@ from tests.conftest import (
 )
 from tests.fakes.scripted_model import Await, ScriptedModel, answer
 from tests.identity_helpers import persist_entity_accounts
+from tests.matrix_state_helpers import save_matrix_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from mindroom.dynamic_workflows.runner import ParticipantExecutor
+    from mindroom.dynamic_workflows.spec import Participant
     from tests.fakes.scripted_model import ScriptStep
 
 
@@ -179,18 +189,23 @@ def _workflow_spec(**overrides: object) -> dict[str, object]:
     return spec
 
 
+def _parsed_spec(**overrides: object) -> WorkflowSpec:
+    return parse_workflow_spec(_workflow_spec(**overrides))
+
+
+_RESEARCH_BRIEF_STEPS: dict[str, object] = {
+    "workflow": [{"id": "research", "type": "transform_step", "template": "Research brief for {input.topic}."}],
+    "outputs": [{"id": "brief", "type": "text", "from_step": "research"}],
+}
+
+
 def _make_context(tmp_path: Path) -> ToolRuntimeContext:
     runtime_paths = test_runtime_paths(tmp_path)
-    runtime_paths = runtime_paths.__class__(
-        config_path=runtime_paths.config_path,
-        config_dir=runtime_paths.config_dir,
-        env_path=runtime_paths.env_path,
-        storage_root=runtime_paths.storage_root,
-        process_env={
-            **dict(runtime_paths.process_env),
-            "MINDROOM_PUBLIC_URL": "https://acme.mindroom.chat",
-        },
-        env_file_values=runtime_paths.env_file_values,
+    runtime_paths = replace(
+        runtime_paths,
+        # The test's paths keep no control state root.
+        control_state_root=None,
+        process_env={**runtime_paths.process_env, "MINDROOM_PUBLIC_URL": "https://acme.mindroom.chat"},
     )
     config = bind_runtime_paths(
         Config(
@@ -281,6 +296,38 @@ def _tool_payload(result: str) -> dict[str, Any]:
     return json.loads(result)
 
 
+def _context_with_allowed_tools(tmp_path: Path, allowed_tools: object, **config_fields: object) -> ToolRuntimeContext:
+    """Return a context whose agent authors ``allowed_tools`` on its dynamic_workflow tool."""
+    context = _make_context(tmp_path)
+    config = bind_runtime_paths(
+        Config(
+            agents={
+                "general": AgentConfig(
+                    display_name="General Agent",
+                    tools=[{"dynamic_workflow": {"allowed_tools": allowed_tools}}],
+                ),
+            },
+            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5-5")},
+            **config_fields,
+        ),
+        context.runtime_paths,
+    )
+    return replace(context, config=config, runtime_paths=runtime_paths_for(config))
+
+
+def _save_dashboard_allowed_tools(context: ToolRuntimeContext, value: object, *, agent_name: str | None = None) -> None:
+    """Save dynamic_workflow's ``allowed_tools`` from the dashboard, globally or with a shared-scope agent selected."""
+    target = RequestCredentialsTarget(
+        runtime_paths=context.runtime_paths,
+        base_manager=get_runtime_credentials_manager(context.runtime_paths),
+        worker_scope="shared" if agent_name else None,
+        agent_name=agent_name,
+        execution_identity=None,
+        tools=builtin_tool_registry(),
+    )
+    save_credentials_for_target("dynamic_workflow", {"allowed_tools": value}, target)
+
+
 def _run_config(context: ToolRuntimeContext, function_owners: dict[str, frozenset[str]]) -> Config:
     """Build the participant overlay with the allowed tools the caller's config and dashboard grant."""
     allowed = dynamic_workflow_module._workflow_allowed_tools(context)
@@ -294,7 +341,7 @@ def _run_config(context: ToolRuntimeContext, function_owners: dict[str, frozense
 
 def test_dynamic_workflow_tool_registered() -> None:
     """Dynamic Workflow tool metadata should be visible to config and dashboard surfaces."""
-    metadata = TOOL_METADATA["dynamic_workflow"]
+    metadata = builtin_tool_registry().entries["dynamic_workflow"]
 
     assert metadata.display_name == "Dynamic Workflows"
     assert metadata.function_names == (
@@ -313,7 +360,7 @@ def test_create_workflow_persists_immutable_revision(tmp_path: Path) -> None:
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
 
     created = store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -334,7 +381,7 @@ def test_update_workflow_creates_new_revision_without_mutating_old_one(tmp_path:
     """Updating a workflow should create a new active revision and keep old specs unchanged."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     store.create_workflow(
-        spec=_workflow_spec(description="Original description."),
+        spec=_parsed_spec(description="Original description."),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -365,7 +412,7 @@ def test_concurrent_update_workflow_creates_distinct_revisions(tmp_path: Path) -
     """Concurrent updates should serialize revision numbering for one workflow."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     store.create_workflow(
-        spec=_workflow_spec(description="Original description."),
+        spec=_parsed_spec(description="Original description."),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -404,7 +451,7 @@ def test_update_workflow_rejects_workflow_id_changes(tmp_path: Path) -> None:
     """Workflow revisions should not mutate the persisted workflow identity."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -431,7 +478,7 @@ async def test_run_workflow_writes_run_record_and_private_html_report(tmp_path: 
         participant_executor=_answering("Report about Agno factories."),
     )
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -474,7 +521,7 @@ async def test_run_workflow_persists_failed_run_when_completion_persistence_fail
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     service = DynamicWorkflowService(store, participant_executor=_answering(object()))
     store.create_workflow(
-        spec=_workflow_spec(
+        spec=_parsed_spec(
             workflow=[
                 {"id": "collect", "type": "agent_step", "participant": "writer", "prompt": "Collect raw data."},
                 {"id": "report", "type": "report_step", "body_template": "Report completed."},
@@ -519,7 +566,7 @@ async def test_service_records_validation_failure_before_execution(
         executions.append("executed")
         return "unexpected execution"
 
-    def validate_policy(_spec: dict[str, object]) -> None:
+    def validate_policy(_spec: WorkflowSpec) -> None:
         if reject_policy:
             msg = "Participant is no longer allowed."
             raise DynamicWorkflowError(msg)
@@ -530,7 +577,7 @@ async def test_service_records_validation_failure_before_execution(
         spec_validator=validate_policy,
     )
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -584,11 +631,11 @@ async def test_service_records_a_failure_without_text_by_its_type(
         monkeypatch.setattr(store, "complete_workflow_run", fail)
     service = DynamicWorkflowService(
         store,
-        participant_executor=lambda **_: _written(),
+        participant_executor=_answering("written"),
         spec_validator=fail if stage == "validation" else None,
     )
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -606,16 +653,12 @@ async def test_service_records_a_failure_without_text_by_its_type(
     assert (run.status, run.error) == ("failed", "TimeoutError")
 
 
-async def _written() -> ParticipantOutput:
-    return ParticipantOutput("written")
-
-
 @pytest.mark.asyncio
 async def test_service_uses_revision_pinned_when_run_started(tmp_path: Path) -> None:
     """An update after admission must not replace the run's spec or input schema."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     store.create_workflow(
-        spec=_workflow_spec(
+        spec=_parsed_spec(
             workflow=[{"id": "write", "type": "transform_step", "template": "Original {input.topic}."}],
         ),
         scope="agent",
@@ -642,7 +685,7 @@ async def test_service_uses_revision_pinned_when_run_started(tmp_path: Path) -> 
         reason="Update report inputs",
     )
     validated_names: list[str] = []
-    service = DynamicWorkflowService(store, spec_validator=lambda spec: validated_names.append(str(spec["name"])))
+    service = DynamicWorkflowService(store, spec_validator=lambda spec: validated_names.append(spec.name))
 
     with patch.object(store, "start_workflow_run", return_value=started):
         run = await service.run_workflow(
@@ -685,79 +728,13 @@ async def test_service_propagates_run_start_failure(tmp_path: Path) -> None:
     assert not (tmp_path / "mindroom_data").exists()
 
 
-def test_validate_workflow_spec_rejects_invalid_input_schema_type(tmp_path: Path) -> None:
-    """Workflow input schemas should be validated before specs are persisted."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="Unsupported workflow input schema type"):
-        store.create_workflow(
-            spec=_workflow_spec(
-                inputs={
-                    "type": "object",
-                    "properties": {"topic": {"type": "secret_string"}},
-                },
-            ),
-            scope="agent",
-            owner_id="general",
-            created_by="general",
-            reason="bad schema",
-        )
-
-
-def test_validate_workflow_spec_rejects_empty_input_schema_type_list(tmp_path: Path) -> None:
-    """Empty input type lists should not silently disable type validation."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="type list must be non-empty"):
-        store.validate_workflow(
-            _workflow_spec(
-                inputs={
-                    "type": "object",
-                    "properties": {"topic": {"type": []}},
-                },
-            ),
-        )
-
-
-def test_validate_workflow_spec_requires_supported_schema_version(tmp_path: Path) -> None:
-    """Workflow specs should not silently run missing or future schema versions."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="schema_version"):
-        store.validate_workflow(_workflow_spec(schema_version=2))
-    with pytest.raises(DynamicWorkflowError, match="schema_version"):
-        store.validate_workflow(_workflow_spec(schema_version=True))
-    with pytest.raises(DynamicWorkflowError, match="schema_version"):
-        store.validate_workflow(_workflow_spec(schema_version=1.0))
-
-    spec_without_version = _workflow_spec()
-    del spec_without_version["schema_version"]
-    with pytest.raises(DynamicWorkflowError, match="schema_version"):
-        store.validate_workflow(spec_without_version)
-
-
-def test_validate_workflow_spec_rejects_unsupported_input_schema_keywords(tmp_path: Path) -> None:
-    """Workflow input schemas should not accept constraints the validator ignores."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="default"):
-        store.validate_workflow(
-            _workflow_spec(
-                inputs={
-                    "type": "object",
-                    "properties": {"topic": {"type": "string", "default": "Agno"}},
-                },
-            ),
-        )
-
-
 @pytest.mark.asyncio
 async def test_run_workflow_enforces_input_schema_enum(tmp_path: Path) -> None:
     """Declared enum constraints should be enforced before workflow execution."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     service = DynamicWorkflowService(store)
     store.create_workflow(
-        spec=_workflow_spec(
+        spec=_parsed_spec(
             inputs={
                 "type": "object",
                 "required": ["topic", "visibility"],
@@ -766,14 +743,7 @@ async def test_run_workflow_enforces_input_schema_enum(tmp_path: Path) -> None:
                     "visibility": {"type": "string", "enum": ["private"]},
                 },
             },
-            workflow=[
-                {
-                    "id": "research",
-                    "type": "transform_step",
-                    "template": "Research brief for {input.topic}.",
-                },
-            ],
-            outputs=[{"id": "brief", "type": "text", "from_step": "research"}],
+            **_RESEARCH_BRIEF_STEPS,
         ),
         scope="agent",
         owner_id="general",
@@ -792,63 +762,6 @@ async def test_run_workflow_enforces_input_schema_enum(tmp_path: Path) -> None:
 
     assert run.status == "failed"
     assert "declared enum values" in str(run.error)
-
-
-def test_validate_workflow_spec_rejects_excessive_agent_steps(tmp_path: Path) -> None:
-    """Workflow permissions should cap the amount of LLM work one run can trigger."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="max_total_agents"):
-        store.validate_workflow(
-            _workflow_spec(
-                workflow=[
-                    {"id": "write_a", "type": "agent_step", "participant": "writer", "prompt": "Write A."},
-                    {"id": "write_b", "type": "agent_step", "participant": "writer", "prompt": "Write B."},
-                ],
-                outputs=[{"id": "report", "type": "text", "from_step": "write_b"}],
-                permissions={"max_total_agents": 1, "tools": []},
-            ),
-        )
-
-
-def test_validate_workflow_spec_normalizes_tool_grants(tmp_path: Path) -> None:
-    """Tool grants of any registered name should validate, strip, and dedupe at the store layer."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    validated = store.validate_workflow(
-        _workflow_spec(
-            participants=[
-                {
-                    "id": "writer",
-                    "kind": "subagent",
-                    "system_prompt": "P",
-                    "model": "claude-sonnet-5",
-                    "tools": [" shell ", "website", "shell"],
-                },
-            ],
-            permissions={"tools": ["shell", "website"]},
-        ),
-    )
-
-    participants = validated["participants"]
-    assert isinstance(participants, list)
-    assert participants[0]["tools"] == ["shell", "website"]
-    permissions = validated["permissions"]
-    assert isinstance(permissions, dict)
-    assert permissions["tools"] == ["shell", "website"]
-
-
-def test_validate_workflow_spec_rejects_participant_tool_not_granted_by_permissions(tmp_path: Path) -> None:
-    """Participant tools must be a subset of the workflow-level permissions.tools grant."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match=r"not granted by permissions\.tools"):
-        store.validate_workflow(
-            _workflow_spec(
-                participants=[{"id": "writer", "kind": "subagent", "system_prompt": "P", "tools": ["duckduckgo"]}],
-                permissions={"tools": ["website"]},
-            ),
-        )
 
 
 @pytest.mark.asyncio
@@ -923,212 +836,13 @@ async def test_validate_workflow_tool_policy_rejects_each_restricted_tool(tmp_pa
     assert "agent-infrastructure" in participant_payload["message"]
 
 
-def test_validate_workflow_spec_rejects_room_agent_participant_tools(tmp_path: Path) -> None:
-    """Room-agent participants must stay tool-less even for allowlisted tools."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="only available to subagent participants"):
-        store.validate_workflow(
-            _workflow_spec(
-                participants=[{"id": "writer", "kind": "room_agent", "agent": "general", "tools": ["duckduckgo"]}],
-                permissions={"tools": ["duckduckgo"]},
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_unimplemented_thread_data_permissions(tmp_path: Path) -> None:
-    """Workflow specs should not declare data access the runner does not provide."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="matrix_history"):
-        store.validate_workflow(
-            _workflow_spec(
-                permissions={
-                    "tools": [],
-                    "data": {
-                        "matrix_history": "current_thread",
-                        "attachments": "none",
-                        "knowledge_bases": [],
-                    },
-                },
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_unimplemented_knowledge_data_permissions(tmp_path: Path) -> None:
-    """Workflow specs should not declare knowledge access the runner does not provide."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="knowledge_bases"):
-        store.validate_workflow(
-            _workflow_spec(
-                permissions={
-                    "tools": [],
-                    "data": {
-                        "matrix_history": "none",
-                        "attachments": "none",
-                        "knowledge_bases": ["reference"],
-                    },
-                },
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_unknown_data_permissions(tmp_path: Path) -> None:
-    """Workflow specs should not accept unimplemented data permission namespaces."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="external_db"):
-        store.validate_workflow(
-            _workflow_spec(
-                permissions={
-                    "tools": [],
-                    "data": {
-                        "matrix_history": "none",
-                        "attachments": "none",
-                        "knowledge_bases": [],
-                        "external_db": "customers",
-                    },
-                },
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_unsupported_participant_fields(tmp_path: Path) -> None:
-    """Workflow specs should not accept participant fields the runner ignores."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="memory_mode"):
-        store.validate_workflow(
-            _workflow_spec(
-                participants=[
-                    {
-                        "id": "researcher",
-                        "kind": "room_agent",
-                        "agent": "general",
-                        "memory_mode": "read_only",
-                    },
-                ],
-                workflow=[
-                    {
-                        "id": "write",
-                        "type": "agent_step",
-                        "participant": "researcher",
-                        "prompt": "Write a cited report.",
-                    },
-                ],
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_unsupported_agent_step_fields(tmp_path: Path) -> None:
-    """Workflow specs should not accept control-flow fields the runner ignores."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="input_from"):
-        store.validate_workflow(
-            _workflow_spec(
-                workflow=[
-                    {
-                        "id": "plan",
-                        "type": "transform_step",
-                        "template": "Plan for {input.topic}.",
-                    },
-                    {
-                        "id": "write",
-                        "type": "agent_step",
-                        "participant": "writer",
-                        "input_from": "plan",
-                        "prompt": "Write from {steps.plan}.",
-                    },
-                ],
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_ambiguous_report_step_source(tmp_path: Path) -> None:
-    """Report steps should not accept a source field the runner would ignore."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="report source"):
-        store.validate_workflow(
-            _workflow_spec(
-                workflow=[
-                    {
-                        "id": "research",
-                        "type": "transform_step",
-                        "template": "Research brief for {input.topic}.",
-                    },
-                    {
-                        "id": "write",
-                        "type": "report_step",
-                        "from_step": "research",
-                        "body_template": "{steps.research}",
-                    },
-                ],
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_output_without_source_step(tmp_path: Path) -> None:
-    """Declared outputs should not disappear at runtime because from_step is missing."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="from_step"):
-        store.validate_workflow(
-            _workflow_spec(
-                outputs=[
-                    {
-                        "id": "report",
-                        "type": "text",
-                    },
-                ],
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_output_without_type(tmp_path: Path) -> None:
-    """Declared outputs should include the documented output type."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="field 'type' is missing"):
-        store.validate_workflow(
-            _workflow_spec(
-                outputs=[
-                    {
-                        "id": "report",
-                        "from_step": "write",
-                    },
-                ],
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_unsupported_output_type(tmp_path: Path) -> None:
-    """Output type docs and validation should stay aligned."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="unsupported type"):
-        store.validate_workflow(
-            _workflow_spec(
-                outputs=[
-                    {
-                        "id": "report",
-                        "type": "pdf_report",
-                        "from_step": "write",
-                    },
-                ],
-            ),
-        )
-
-
 @pytest.mark.asyncio
 async def test_run_workflow_executes_steps_and_persists_outputs(tmp_path: Path) -> None:
     """Running a workflow should execute declared steps and persist their outputs."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     service = DynamicWorkflowService(store)
     store.create_workflow(
-        spec=_workflow_spec(
+        spec=_parsed_spec(
             workflow=[
                 {
                     "id": "research",
@@ -1184,21 +898,13 @@ async def test_run_workflow_executes_steps_and_persists_outputs(tmp_path: Path) 
 async def test_agent_step_uses_participant_executor_instead_of_prompt_template() -> None:
     """Agent steps should invoke the resolved participant instead of echoing the prompt."""
 
-    async def participant_executor(
-        *,
-        participant: dict[str, object],
-        prompt: str,
-        input_data: dict[str, object],
-        step_outputs: dict[str, object],
-    ) -> ParticipantOutput:
-        assert participant["id"] == "writer"
+    async def participant_executor(*, participant: Participant, prompt: str) -> ParticipantOutput:
+        assert participant.id == "writer"
         assert prompt == "Write about Agno factories."
-        assert input_data == {"topic": "Agno factories"}
-        assert step_outputs == {}
         return ParticipantOutput("Executed by Report Writer.")
 
     execution = await execute_workflow_spec(
-        _workflow_spec(
+        _parsed_spec(
             workflow=[
                 {
                     "id": "write",
@@ -1225,7 +931,7 @@ async def test_agent_step_uses_participant_executor_instead_of_prompt_template()
 )
 async def test_a_participant_that_raises_fails_its_step_with_why(error: Exception, text: str) -> None:
     """A participant's exception fails its step with the exception's text, or its type name when it has none."""
-    spec = _workflow_spec(
+    spec = _parsed_spec(
         workflow=[
             {"id": "write", "type": "agent_step", "participant": "writer", "prompt": "Write about {input.topic}."},
         ],
@@ -1243,7 +949,7 @@ async def test_a_participant_that_raises_fails_its_step_with_why(error: Exceptio
 async def test_agent_step_fails_without_participant_executor() -> None:
     """Agent steps should not silently degrade into template-only execution."""
     execution = await execute_workflow_spec(
-        _workflow_spec(
+        _parsed_spec(
             workflow=[
                 {
                     "id": "write",
@@ -1266,16 +972,7 @@ async def test_service_completes_tool_runs_without_raw_background_thread(tmp_pat
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     service = DynamicWorkflowService(store)
     store.create_workflow(
-        spec=_workflow_spec(
-            workflow=[
-                {
-                    "id": "research",
-                    "type": "transform_step",
-                    "template": "Research brief for {input.topic}.",
-                },
-            ],
-            outputs=[{"id": "brief", "type": "text", "from_step": "research"}],
-        ),
+        spec=_parsed_spec(**_RESEARCH_BRIEF_STEPS),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -1308,6 +1005,48 @@ async def test_service_completes_tool_runs_without_raw_background_thread(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_service_persists_why_an_execution_failed(tmp_path: Path) -> None:
+    """A run whose execution fails is stored failed, with the failed step's reason."""
+    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
+
+    async def fail(**_arguments: object) -> ParticipantOutput:
+        msg = "model unavailable"
+        raise RuntimeError(msg)
+
+    service = DynamicWorkflowService(store, participant_executor=fail)
+    store.create_workflow(
+        spec=_parsed_spec(
+            workflow=[
+                {"id": "write", "type": "agent_step", "participant": "writer", "prompt": "Write about {input.topic}."},
+            ],
+        ),
+        scope="agent",
+        owner_id="general",
+        created_by="general",
+        reason="initial design",
+    )
+
+    run = await service.run_workflow(
+        workflow_id="competitor-research-report",
+        scope="agent",
+        owner_id="general",
+        input_data={"topic": "pricing"},
+        requested_by="general",
+    )
+    loaded = store.get_workflow_run(
+        workflow_id="competitor-research-report",
+        scope="agent",
+        owner_id="general",
+        run_id=run.run_id,
+    )
+
+    assert (loaded.status, loaded.error) == (
+        "failed",
+        "Agent step 'write' participant 'writer' failed: model unavailable",
+    )
+
+
+@pytest.mark.asyncio
 async def test_service_run_enforces_runtime_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Async service runs should cancel participant work when the runtime cap is exceeded."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
@@ -1322,9 +1061,9 @@ async def test_service_run_enforces_runtime_cap(tmp_path: Path, monkeypatch: pyt
         return ParticipantOutput("late")
 
     service = DynamicWorkflowService(store, participant_executor=slow_executor)
-    monkeypatch.setattr("mindroom.dynamic_workflows.service.workflow_runtime_seconds", lambda _spec: 0.01)
+    monkeypatch.setattr(Permissions, "runtime_seconds", property(lambda _permissions: 0.01))
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -1364,9 +1103,9 @@ async def test_service_run_fails_at_deadline_when_cancellation_is_suppressed(
         return ParticipantOutput("late")
 
     service = DynamicWorkflowService(store, participant_executor=stubborn_executor)
-    monkeypatch.setattr("mindroom.dynamic_workflows.service.workflow_runtime_seconds", lambda _spec: 0.01)
+    monkeypatch.setattr(Permissions, "runtime_seconds", property(lambda _permissions: 0.01))
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -1403,7 +1142,7 @@ async def test_service_records_how_a_run_ended_while_the_loop_stays_free(
 ) -> None:
     """However a run ends, its records are written while other coroutines keep running on the event loop."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-    store.create_workflow(spec=_workflow_spec(), scope="agent", owner_id="general", created_by="general")
+    store.create_workflow(spec=_parsed_spec(), scope="agent", owner_id="general", created_by="general")
 
     async def executor(**_kwargs: object) -> ParticipantOutput:
         if ending == "cancelled":
@@ -1416,7 +1155,7 @@ async def test_service_records_how_a_run_ended_while_the_loop_stays_free(
         raise RuntimeError(msg)
 
     if ending == "timeout":
-        monkeypatch.setattr(service_module, "workflow_runtime_seconds", lambda _spec: 0.01)
+        monkeypatch.setattr(Permissions, "runtime_seconds", property(lambda _permissions: 0.01))
     if ending == "failure":
         monkeypatch.setattr(service_module, "execute_workflow_spec", fail)
     service = DynamicWorkflowService(store, participant_executor=executor)
@@ -1460,7 +1199,7 @@ async def test_service_keeps_the_final_record_a_cancellation_interrupts(
 ) -> None:
     """A run cancelled while its final record is written keeps that record, and the call waits for the write."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-    store.create_workflow(spec=_workflow_spec(), scope="agent", owner_id="general", created_by="general")
+    store.create_workflow(spec=_parsed_spec(), scope="agent", owner_id="general", created_by="general")
     loop = asyncio.get_running_loop()
     final_write_started = asyncio.Event()
     release_final_write = threading.Event()
@@ -1489,7 +1228,7 @@ async def test_service_keeps_the_final_record_a_cancellation_interrupts(
         raise RuntimeError(msg)
 
     if ending == "timeout":
-        monkeypatch.setattr(service_module, "workflow_runtime_seconds", lambda _spec: 0.01)
+        monkeypatch.setattr(Permissions, "runtime_seconds", property(lambda _permissions: 0.01))
     if ending == "failure":
         monkeypatch.setattr(service_module, "execute_workflow_spec", fail)
     service = DynamicWorkflowService(store, participant_executor=executor)
@@ -1534,7 +1273,7 @@ async def test_service_records_a_run_cancelled_while_it_is_prepared_as_cancelled
 ) -> None:
     """A run cancelled while it is being prepared ends cancelled, unless its preparation already rejected it."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-    store.create_workflow(spec=_workflow_spec(), scope="agent", owner_id="general", created_by="general")
+    store.create_workflow(spec=_parsed_spec(), scope="agent", owner_id="general", created_by="general")
     loop = asyncio.get_running_loop()
     preparation_waiting = asyncio.Event()
     release_preparation = threading.Event()
@@ -1550,7 +1289,7 @@ async def test_service_records_a_run_cancelled_while_it_is_prepared_as_cancelled
         executions.append(kwargs)
         return ParticipantOutput("written")
 
-    def reject(_spec: dict[str, object]) -> None:
+    def reject(_spec: WorkflowSpec) -> None:
         if rejection is not None:
             raise DynamicWorkflowError(rejection)
 
@@ -1611,65 +1350,11 @@ async def test_service_ends_cancelled_when_a_cancelled_preparation_raises(tmp_pa
     assert not (tmp_path / "mindroom_data/dynamic_workflows").exists()
 
 
-def test_validate_workflow_spec_rejects_missing_step_id(tmp_path: Path) -> None:
-    """Workflow specs should reject malformed step entries before they are persisted."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="Workflow step at index 0 field 'id' is missing"):
-        store.validate_workflow(
-            _workflow_spec(
-                workflow=[
-                    {
-                        "type": "transform_step",
-                        "template": "Research brief for {input.topic}.",
-                    },
-                ],
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_ambiguous_agent_step_template(tmp_path: Path) -> None:
-    """Validation and execution should not disagree about which agent-step template wins."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="only one template field"):
-        store.validate_workflow(
-            _workflow_spec(
-                workflow=[
-                    {
-                        "id": "write",
-                        "type": "agent_step",
-                        "participant": "writer",
-                        "response_template": "Safe template.",
-                        "prompt": "{steps.future}",
-                    },
-                ],
-            ),
-        )
-
-
-def test_validate_workflow_spec_rejects_unsupported_participant_kind(tmp_path: Path) -> None:
-    """Participant kind errors should fail at create/update time."""
-    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
-
-    with pytest.raises(DynamicWorkflowError, match="unsupported kind"):
-        store.validate_workflow(
-            _workflow_spec(
-                participants=[
-                    {
-                        "id": "writer",
-                        "kind": "team_agent",
-                    },
-                ],
-            ),
-        )
-
-
 def test_get_workflow_run_rejects_traversal_run_id(tmp_path: Path) -> None:
     """Run lookup should reject path traversal before building the run filename."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -1689,7 +1374,7 @@ def test_load_workflow_revision_rejects_traversal_revision(tmp_path: Path) -> No
     """Revision lookup should reject path traversal before building the revision filename."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -1709,7 +1394,7 @@ def test_get_workflow_run_wraps_json_decoder_errors(tmp_path: Path) -> None:
     """Corrupt run JSON should return a Dynamic Workflow storage error."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -1731,13 +1416,53 @@ def test_get_workflow_run_wraps_json_decoder_errors(tmp_path: Path) -> None:
     assert str(tmp_path) not in str(exc_info.value)
 
 
+def test_revision_with_non_text_descriptions_reads_them_as_text(tmp_path: Path) -> None:
+    """A saved non-text workflow or input-property description reads as its text, a null stays null, and updates save text."""
+    store = DynamicWorkflowStore(tmp_path / "mindroom_data")
+    store.create_workflow(
+        spec=_parsed_spec(),
+        scope="agent",
+        owner_id="general",
+        created_by="general",
+        reason="initial design",
+    )
+    revisions = tmp_path / "mindroom_data/dynamic_workflows/agent/general/competitor-research-report/revisions"
+    revision = yaml.safe_load((revisions / "000001.yaml").read_text(encoding="utf-8"))
+    revision["description"] = {"summary": 3}
+    revision["inputs"]["properties"] = {"topic": {"type": "string", "description": 7}, "depth": {"description": None}}
+    (revisions / "000001.yaml").write_text(yaml.safe_dump(revision, sort_keys=False), encoding="utf-8")
+
+    spec = store.load_workflow_revision(
+        workflow_id="competitor-research-report",
+        scope="agent",
+        owner_id="general",
+        revision="000001",
+    )
+    store.update_workflow(
+        workflow_id="competitor-research-report",
+        scope="agent",
+        owner_id="general",
+        patch={"name": "Renamed"},
+        updated_by="general",
+        reason="rename",
+    )
+
+    assert spec.description == "{'summary': 3}"
+    assert spec.inputs is not None
+    assert spec.inputs.properties["topic"].description == "7"
+    assert spec.inputs.properties["depth"].description is None
+    updated = yaml.safe_load((revisions / "000002.yaml").read_text(encoding="utf-8"))
+    assert updated["description"] == "{'summary': 3}"
+    assert updated["inputs"]["properties"] == {"topic": {"type": "string", "description": "7"}, "depth": {}}
+
+
 @pytest.mark.asyncio
 async def test_run_workflow_records_failed_run_when_stored_step_reference_is_missing(tmp_path: Path) -> None:
     """Failed workflow execution should still persist a run record and error report."""
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     service = DynamicWorkflowService(store)
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -1784,7 +1509,7 @@ async def test_run_workflow_records_failed_run_when_active_revision_is_missing(t
     store = DynamicWorkflowStore(tmp_path / "mindroom_data")
     service = DynamicWorkflowService(store)
     store.create_workflow(
-        spec=_workflow_spec(),
+        spec=_parsed_spec(),
         scope="agent",
         owner_id="general",
         created_by="general",
@@ -1820,16 +1545,7 @@ async def test_dynamic_workflow_tool_uses_runtime_context(tmp_path: Path) -> Non
     """Runtime-aware tool should scope workflows to current agent and storage root."""
     tool = DynamicWorkflowTools()
     context = _make_context(tmp_path)
-    transform_spec = _workflow_spec(
-        workflow=[
-            {
-                "id": "research",
-                "type": "transform_step",
-                "template": "Research brief for {input.topic}.",
-            },
-        ],
-        outputs=[{"id": "brief", "type": "text", "from_step": "research"}],
-    )
+    transform_spec = _workflow_spec(**_RESEARCH_BRIEF_STEPS)
 
     with tool_runtime_context(context):
         created = _tool_payload(await tool.create_workflow(transform_spec, reason="initial design"))
@@ -1843,6 +1559,9 @@ async def test_dynamic_workflow_tool_uses_runtime_context(tmp_path: Path) -> Non
 
     assert created["status"] == "ok"
     assert created["workflow_id"] == "competitor-research-report"
+    # Every workflow is the calling agent's, so results name no scope the tools would not take.
+    assert "scope" not in created
+    assert "scope" not in listed
     assert listed["workflows"][0]["workflow_id"] == "competitor-research-report"
     assert run["status"] == "completed"
     assert run["outputs"]["brief"] == "Research brief for Agno factories."
@@ -1857,16 +1576,7 @@ async def test_dynamic_workflow_tool_denies_run_read_for_different_requester(tmp
     tool = DynamicWorkflowTools()
     alice_context = _make_context(tmp_path)
     bob_context = replace(alice_context, requester_id="@bob:localhost")
-    transform_spec = _workflow_spec(
-        workflow=[
-            {
-                "id": "research",
-                "type": "transform_step",
-                "template": "Research brief for {input.topic}.",
-            },
-        ],
-        outputs=[{"id": "brief", "type": "text", "from_step": "research"}],
-    )
+    transform_spec = _workflow_spec(**_RESEARCH_BRIEF_STEPS)
 
     with tool_runtime_context(alice_context):
         _tool_payload(await tool.create_workflow(transform_spec, reason="initial design"))
@@ -1878,20 +1588,34 @@ async def test_dynamic_workflow_tool_denies_run_read_for_different_requester(tmp
     assert "not available to the current requester" in read_result["message"]
 
 
-def test_dynamic_workflow_tool_json_schemas_allow_arbitrary_json_values() -> None:
-    """Tool-call schemas should accept scalar, array, and object values inside JSON payload fields."""
-    tool = DynamicWorkflowTools()
-    async_functions = tool.get_async_functions()
+@pytest.mark.asyncio
+async def test_dynamic_workflow_json_arguments_take_objects_of_any_json_values() -> None:
+    """spec, patch, and input take an object of any JSON values; a non-object or an unknown argument fails validation."""
+    functions = toolkit_functions(DynamicWorkflowTools())
+    value = {
+        "text": "a",
+        "number": 1.5,
+        "integer": 2,
+        "flag": True,
+        "none": None,
+        "list": [1, "b"],
+        "object": {"c": []},
+    }
+    calls = {
+        "create_workflow": ("spec", {}),
+        "validate_workflow": ("spec", {}),
+        "update_workflow": ("patch", {"workflow_id": "flow", "reason": "edit"}),
+        "run_workflow": ("input", {"workflow_id": "flow"}),
+    }
 
-    spec_schema = async_functions["create_workflow"].parameters["properties"]["spec"]
-    patch_schema = async_functions["update_workflow"].parameters["properties"]["patch"]
-    input_schema = async_functions["run_workflow"].parameters["properties"]["input"]
-
-    for schema in (spec_schema, patch_schema, input_schema):
-        value_schema = schema["additionalProperties"]
-        allowed_types = {entry["type"] for entry in value_schema["anyOf"]}
-        assert {"object", "array", "string", "boolean", "null"} <= allowed_types
-        assert allowed_types & {"number", "integer"}
+    for name, (argument, others) in calls.items():
+        # Outside a tool call the body answers that it has no runtime context, so the arguments validated.
+        accepted = json.loads(await functions[name](**others, **{argument: value}))
+        assert "tool context is unavailable" in accepted["message"]
+        with pytest.raises(ValidationError):
+            await functions[name](**others, **{argument: ["not", "an", "object"]})
+    with pytest.raises(ValidationError):
+        await functions["list_workflows"](scope="agent")
 
 
 @pytest.mark.asyncio
@@ -2159,19 +1883,6 @@ async def test_dynamic_workflow_tool_revalidates_saved_revision_policy_before_ru
 
 
 @pytest.mark.asyncio
-async def test_dynamic_workflow_tool_returns_payload_for_invalid_scope(tmp_path: Path) -> None:
-    """Tool calls should return JSON payload errors instead of raising runtime exceptions."""
-    tool = DynamicWorkflowTools()
-    context = _make_context(tmp_path)
-
-    with tool_runtime_context(context):
-        result = _tool_payload(await tool.list_workflows(scope="global"))
-
-    assert result["status"] == "error"
-    assert "Unsupported Dynamic Workflow scope" in result["message"]
-
-
-@pytest.mark.asyncio
 async def test_dynamic_workflow_tool_returns_payload_when_agent_name_is_missing(tmp_path: Path) -> None:
     """Runtime-aware tool should fail cleanly when required context owner data is missing."""
     tool = DynamicWorkflowTools()
@@ -2184,22 +1895,6 @@ async def test_dynamic_workflow_tool_returns_payload_when_agent_name_is_missing(
     assert "Agent name is missing" in result["message"]
 
 
-@pytest.mark.asyncio
-async def test_dynamic_workflow_tool_denies_shared_scopes_without_policy(tmp_path: Path) -> None:
-    """Agent tools should not mutate room or tenant workflow scopes without an approval policy."""
-    tool = DynamicWorkflowTools()
-    context = _make_context(tmp_path)
-
-    with tool_runtime_context(context):
-        room_result = _tool_payload(await tool.create_workflow(_workflow_spec(), scope="room"))
-        tenant_result = _tool_payload(await tool.create_workflow(_workflow_spec(), scope="tenant"))
-
-    assert room_result["status"] == "error"
-    assert "scope requires Dynamic Workflow approval policy" in room_result["message"]
-    assert tenant_result["status"] == "error"
-    assert "scope requires Dynamic Workflow approval policy" in tenant_result["message"]
-
-
 def test_room_agent_participant_must_be_available_to_requester_in_room(tmp_path: Path) -> None:
     """Room-agent participants should not bypass normal room responder eligibility."""
     context = _make_multi_agent_context(tmp_path, room_agents=["general"])
@@ -2208,8 +1903,9 @@ def test_room_agent_participant_must_be_available_to_requester_in_room(tmp_path:
         asyncio.run(
             dynamic_workflow_module._execute_room_agent_participant(
                 context,
-                {"id": "specialist", "kind": "room_agent", "agent": "specialist"},
+                RoomAgentParticipant.model_validate({"id": "specialist", "kind": "room_agent", "agent": "specialist"}),
                 "Write a report.",
+                run_key="report:run_1",
             ),
         )
 
@@ -2243,7 +1939,7 @@ def test_room_agent_participant_runs_as_that_agent_without_durable_state(
     runtime_paths = runtime_paths_for(config)
     state = MatrixState.load(runtime_paths=runtime_paths)
     state.add_room("lobby", room_id="!room:localhost", alias="#lobby:localhost", name="Lobby")
-    state.save(runtime_paths=runtime_paths)
+    save_matrix_state(state, runtime_paths)
     persist_entity_accounts(config, runtime_paths)
     context = replace(context, config=config, runtime_paths=runtime_paths)
     parent_loop = asyncio.new_event_loop()
@@ -2258,9 +1954,11 @@ def test_room_agent_participant_runs_as_that_agent_without_durable_state(
             result = parent_loop.run_until_complete(
                 dynamic_workflow_module._execute_room_agent_participant(
                     context,
-                    {"id": "writer_a", "kind": "room_agent", "agent": "specialist"},
+                    RoomAgentParticipant.model_validate(
+                        {"id": "writer_a", "kind": "room_agent", "agent": "specialist"},
+                    ),
                     "Write a report.",
-                    run_scope="competitor-research-report:run_1",
+                    run_key="competitor-research-report:run_1",
                 ),
             )
         finally:
@@ -2280,7 +1978,6 @@ def test_room_agent_participant_runs_as_that_agent_without_durable_state(
     )
     assert create_kwargs["model"].model_name == "large"
     assert create_kwargs["knowledge"] is None
-    assert create_kwargs["persist_runtime_state"] is False
     assert create_kwargs["disable_runtime_capabilities"] is True
     assert create_kwargs["execution_identity"].agent_name == "specialist"
 
@@ -2299,8 +1996,9 @@ async def test_room_agent_participant_is_resolved_and_built_while_the_loop_stays
     ) as freedom:
         result = await dynamic_workflow_module._execute_room_agent_participant(
             context,
-            {"id": "writer_a", "kind": "room_agent", "agent": "specialist"},
+            RoomAgentParticipant.model_validate({"id": "writer_a", "kind": "room_agent", "agent": "specialist"}),
             "Write a report.",
+            run_key="report:run_1",
         )
 
     assert result == "done"
@@ -2330,7 +2028,7 @@ def test_participant_run_config_requires_approval_for_granted_tools(tmp_path: Pa
 
 
 def test_dynamic_workflow_uses_shared_automation_approval_policy(tmp_path: Path) -> None:
-    """The extracted helper preserves the participant approval overlay exactly."""
+    """Automation approval requires approval by default and auto-approves functions of pre-approved toolkits."""
     context = _make_context(tmp_path)
     shared = build_automation_approval_config(
         context.config,
@@ -2373,20 +2071,7 @@ def test_participant_tools_must_be_pre_approved_or_auto_approved(tmp_path: Path)
 
 def test_participant_run_config_pre_approves_allowed_tools(tmp_path: Path) -> None:
     """Tools listed in the dynamic_workflow allowed_tools config skip per-call approval."""
-    context = _make_context(tmp_path)
-    config = bind_runtime_paths(
-        Config(
-            agents={
-                "general": AgentConfig(
-                    display_name="General Agent",
-                    tools=[{"dynamic_workflow": {"allowed_tools": ["website"]}}],
-                ),
-            },
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5")},
-        ),
-        context.runtime_paths,
-    )
-    context = replace(context, config=config, runtime_paths=runtime_paths_for(config))
+    context = _context_with_allowed_tools(tmp_path, ["website"])
 
     run_config = _run_config(context, {"read_url": frozenset({"website"}), "run_shell_command": frozenset({"shell"})})
 
@@ -2412,38 +2097,66 @@ def test_participant_run_config_pre_approves_dashboard_allowed_tools_for_shared_
         context.runtime_paths,
     )
     context = replace(context, config=config, runtime_paths=runtime_paths_for(config))
-    manager = get_runtime_credentials_manager(context.runtime_paths)
-    target = RequestCredentialsTarget(
-        runtime_paths=context.runtime_paths,
-        base_manager=manager,
-        target_manager=manager,
-        worker_scope="shared" if agent_selected else None,
-        agent_name="general" if agent_selected else None,
-        execution_identity=None,
-    )
-    save_credentials_for_target("dynamic_workflow", {"allowed_tools": ["website"]}, target)
+    _save_dashboard_allowed_tools(context, ["website"], agent_name="general" if agent_selected else None)
 
     run_config = _run_config(context, {"read_url": frozenset({"website"})})
 
     assert [(rule.match, rule.action) for rule in run_config.tool_approval.rules] == [("read_url", "auto_approve")]
 
 
+def test_workflow_allowed_tools_splits_a_comma_separated_authored_value(tmp_path: Path) -> None:
+    """An authored allowed_tools string lists toolkits as the registry's other string-array settings do."""
+    context = _context_with_allowed_tools(tmp_path, "calculator, website")
+
+    assert dynamic_workflow_module._workflow_allowed_tools(context) == frozenset({"calculator", "website"})
+
+
+def test_workflow_allowed_tools_layers_dashboard_values_under_authored_ones(tmp_path: Path) -> None:
+    """The agent's dashboard value overrides the global one, and authored config overrides both."""
+    context = _make_context(tmp_path)
+
+    def allowed(tools: list[str | dict[str, object]], *, defaults: list[str | dict[str, object]] | None = None) -> set:
+        config = bind_runtime_paths(
+            Config(
+                agents={"general": AgentConfig(display_name="General Agent", tools=tools, worker_scope="shared")},
+                defaults={"tools": defaults or []},
+                models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5-5")},
+            ),
+            context.runtime_paths,
+        )
+        return set(dynamic_workflow_module._workflow_allowed_tools(replace(context, config=config)))
+
+    _save_dashboard_allowed_tools(context, ["website"])
+    assert allowed(["dynamic_workflow"]) == {"website"}
+    _save_dashboard_allowed_tools(context, ["calculator"], agent_name="general")
+    assert allowed(["dynamic_workflow"]) == {"calculator"}
+    assert allowed([{"dynamic_workflow": {"allowed_tools": ["*"]}}]) == {"*"}
+    assert allowed([], defaults=[{"dynamic_workflow": {"allowed_tools": ["shell"]}}]) == {"shell"}
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        (" calculator ", {"calculator"}),
+        (["website", 3, " ", " shell "], {"website", "shell"}),
+        (5, set()),
+    ],
+)
+def test_workflow_allowed_tools_reads_only_string_names_of_a_stored_value(
+    tmp_path: Path,
+    stored: object,
+    expected: set[str],
+) -> None:
+    """A dashboard-saved allowed_tools is unvalidated JSON, so only its non-blank string names count."""
+    context = _make_context(tmp_path)
+    _save_dashboard_allowed_tools(context, stored)
+
+    assert dynamic_workflow_module._workflow_allowed_tools(context) == expected
+
+
 def test_participant_run_config_wildcard_pre_approves_all_granted_tools(tmp_path: Path) -> None:
     """allowed_tools ["*"] pre-approves every granted tool's functions."""
-    context = _make_context(tmp_path)
-    config = bind_runtime_paths(
-        Config(
-            agents={
-                "general": AgentConfig(
-                    display_name="General Agent",
-                    tools=[{"dynamic_workflow": {"allowed_tools": ["*"]}}],
-                ),
-            },
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5")},
-        ),
-        context.runtime_paths,
-    )
-    context = replace(context, config=config, runtime_paths=runtime_paths_for(config))
+    context = _context_with_allowed_tools(tmp_path, ["*"])
 
     run_config = _run_config(context, {"run_shell_command": frozenset({"shell"})})
 
@@ -2455,20 +2168,7 @@ def test_participant_run_config_wildcard_pre_approves_all_granted_tools(tmp_path
 
 def test_participant_run_config_does_not_pre_approve_colliding_function_names(tmp_path: Path) -> None:
     """A function name shared with a non-pre-approved toolkit must not be auto-approved."""
-    context = _make_context(tmp_path)
-    config = bind_runtime_paths(
-        Config(
-            agents={
-                "general": AgentConfig(
-                    display_name="General Agent",
-                    tools=[{"dynamic_workflow": {"allowed_tools": ["python"]}}],
-                ),
-            },
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5")},
-        ),
-        context.runtime_paths,
-    )
-    context = replace(context, config=config, runtime_paths=runtime_paths_for(config))
+    context = _context_with_allowed_tools(tmp_path, ["python"])
 
     run_config = _run_config(
         context,
@@ -2484,20 +2184,7 @@ def test_participant_run_config_does_not_pre_approve_colliding_function_names(tm
 
 def test_participant_run_config_never_pre_approves_system_mutating_tools(tmp_path: Path) -> None:
     """allowed_tools (wildcard or explicit) must not pre-approve system-mutating tools."""
-    context = _make_context(tmp_path)
-    config = bind_runtime_paths(
-        Config(
-            agents={
-                "general": AgentConfig(
-                    display_name="General Agent",
-                    tools=[{"dynamic_workflow": {"allowed_tools": ["*", "scheduler"]}}],
-                ),
-            },
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5")},
-        ),
-        context.runtime_paths,
-    )
-    context = replace(context, config=config, runtime_paths=runtime_paths_for(config))
+    context = _context_with_allowed_tools(tmp_path, ["*", "scheduler"])
 
     run_config = _run_config(context, {"schedule_task": frozenset({"scheduler"}), "read_url": frozenset({"website"})})
 
@@ -2507,21 +2194,11 @@ def test_participant_run_config_never_pre_approves_system_mutating_tools(tmp_pat
 
 def test_participant_run_config_preserves_operator_rule_precedence(tmp_path: Path) -> None:
     """An operator require_approval rule must win over workflow pre-approval (first-match)."""
-    context = _make_context(tmp_path)
-    config = bind_runtime_paths(
-        Config(
-            agents={
-                "general": AgentConfig(
-                    display_name="General Agent",
-                    tools=[{"dynamic_workflow": {"allowed_tools": ["*"]}}],
-                ),
-            },
-            models={"default": ModelConfig(provider="anthropic", id="claude-sonnet-5")},
-            tool_approval={"rules": [{"match": "run_shell_command", "action": "require_approval"}]},
-        ),
-        context.runtime_paths,
+    context = _context_with_allowed_tools(
+        tmp_path,
+        ["*"],
+        tool_approval={"rules": [{"match": "run_shell_command", "action": "require_approval"}]},
     )
-    context = replace(context, config=config, runtime_paths=runtime_paths_for(config))
 
     run_config = _run_config(context, {"run_shell_command": frozenset({"shell"})})
 
@@ -2543,7 +2220,7 @@ async def test_a_room_agent_whose_model_fails_fails_its_step(tmp_path: Path, mon
         raise ProviderError(msg, provider="Synthetic")
 
     _room_agent_model(monkeypatch, [Await(fail)])
-    spec = _workflow_spec(participants=[{"id": "writer", "kind": "room_agent", "agent": "specialist"}])
+    spec = _parsed_spec(participants=[{"id": "writer", "kind": "room_agent", "agent": "specialist"}])
 
     run = await execute_workflow_spec(
         spec,
@@ -2578,9 +2255,9 @@ async def test_validate_workflow_reports_all_spec_errors_in_one_call(tmp_path: P
     assert payload["errors"] == [
         "Workflow spec contains unsupported field 'steps'.",
         "Workflow spec field 'schema_version' must be 1.",
-        "Workflow spec field 'kind' is missing.",
-        "Workflow spec field 'participants' is missing.",
-        "Workflow spec field 'workflow' is missing.",
+        "Workflow spec field 'kind': Field required.",
+        "Workflow spec field 'participants': Field required.",
+        "Workflow spec field 'workflow': Field required.",
     ]
     assert payload["message"] == "\n".join(payload["errors"])
     assert payload["minimal_valid_spec_example"] == _MINIMAL_SPEC_EXAMPLE
@@ -2597,11 +2274,39 @@ async def test_create_workflow_reports_all_spec_errors_in_one_call(tmp_path: Pat
 
     assert payload["status"] == "error"
     assert payload["errors"] == [
-        "Workflow spec field 'id' is missing.",
-        "Workflow spec field 'name' is missing.",
-        "Workflow spec field 'participants' is missing.",
-        "Workflow spec field 'workflow' is missing.",
+        "Workflow spec field 'id': Field required.",
+        "Workflow spec field 'name': Field required.",
+        "Workflow spec field 'participants': Field required.",
+        "Workflow spec field 'workflow': Field required.",
     ]
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_reports_all_spec_errors_in_one_call(tmp_path: Path) -> None:
+    """update_workflow rejects a patch that breaks the spec with the same full error list, and saves nothing."""
+    context = _make_context(tmp_path)
+    tool = DynamicWorkflowTools()
+
+    with tool_runtime_context(context):
+        created = _tool_payload(await tool.create_workflow(_workflow_spec(), reason="initial design"))
+        payload = _tool_payload(
+            await tool.update_workflow(
+                created["workflow_id"],
+                {"name": "", "permissions": {"max_runtime_seconds": 0, "budget": 1}},
+                "break it",
+            ),
+        )
+        revisions = _tool_payload(await tool.list_workflow_revisions(created["workflow_id"]))
+
+    assert payload["status"] == "error"
+    assert payload["workflow_id"] == "competitor-research-report"
+    assert payload["errors"] == [
+        "Workflow permission contains unsupported field 'budget'.",
+        "Workflow spec field 'name': String should have at least 1 character.",
+        "Workflow permission field 'max_runtime_seconds': Input should be greater than or equal to 1.",
+    ]
+    assert payload["message"] == "\n".join(payload["errors"])
+    assert revisions["revisions"] == ["000001"]
 
 
 @pytest.mark.asyncio
@@ -2629,3 +2334,10 @@ def test_participant_function_owners_count_only_selected_functions() -> None:
         {"file": ("read_file",), "python": ("read_file",)},
     )
     assert whole == {"read_file": frozenset({"file", "python"})}
+
+
+@pytest.mark.parametrize("scope", ["room", "tenant"])
+def test_the_store_has_only_the_agent_scope(tmp_path: Path, scope: str) -> None:
+    """No tool creates another scope, so the store refuses one, as a report URL naming it does."""
+    with pytest.raises(DynamicWorkflowError, match="Unsupported Dynamic Workflow scope"):
+        DynamicWorkflowStore(tmp_path).list_workflows(scope=scope, owner_id="general")

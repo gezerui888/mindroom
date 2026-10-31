@@ -68,6 +68,7 @@ The oracle exists because each review round of the earlier storage designs found
   A call stored without an id reads with one derived from what it stores, which two such calls share, and the conversion keeps only text ids, so ids need not be unique within a run, while places are.
 - **Converting the background readers' cursors.**
   Memory auto-flush and the knowledge graph keep `(created_at, run_id)` cursors outside the databases, which the backups do not cover, so their approval wait stays and a follow-up can convert those cursors on their own.
+  [Persistence owners](2026-10-29-persistence-owners.md) later converted them, each entry when its reader next reads the conversation.
 
 ## Assumptions
 
@@ -103,9 +104,3 @@ The oracle exists because each review round of the earlier storage designs found
 - A converted file keeps the pages its Agno tables used until later writes reuse them when the compaction after the conversion is skipped, because those pages are under a quarter of the file or the directory lacks twice the live data free, or when its `VACUUM` fails; [Upgrade Notes](../deployment/upgrades.md#upgrading-to-conversation-storage-v2) says how to reclaim them offline.
 - Python's `sqlite3` cannot open a database without following links, so a store's open checks for a linked sessions directory or database before and after connecting, and the link gaps that remain are listed in the security posture's [Known gaps](../architecture/security-posture.md#known-gaps).
 - Not verified: how often released databases hold the odd shapes the conversion handles, such as members of members, a repeated message id in one run, `RUNNING` rows, workflow rows, and runs that do not decode; whether any deployment runs in write-ahead-log mode; and how long the largest real databases take to convert.
-
-## Follow-ups
-
-- The session totals in `session_data` repeat what the usage ledger records, but retiring them needs a per-session baseline in the ledger for usage from before it existed and changes the usage reports, so it is a later change.
-- Team seen ids in session metadata stay, because removing them changes what a discarded empty team turn marks as seen.
-- The background readers' approval wait stays until their cursors get a conversion of their own.

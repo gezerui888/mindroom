@@ -16,14 +16,17 @@ from agno.utils.schema import AGNO_INJECTED_PARAMS, FRAMEWORK_INJECTED_PARAMS
 from mindroom.llm.provider import ToolSpec
 from mindroom.tool_system import agno_toolkits
 from mindroom.tool_system.agno_toolkits import (
-    adapt_function,
     adapt_toolkit,
     injected_parameters,
+    toolkit_function,
     with_offered_instructions,
 )
 from mindroom.tool_system.authoring import Toolkit as OwnedToolkit
 from mindroom.tool_system.authoring import tool
-from mindroom.tool_system.registry_state import BUILTIN_TOOL_METADATA
+from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
+from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.tool_function import ToolGate
+from tests.agent_tool_helpers import offered_agno_function
 from tests.agno_parity import tool_argument_probes as probes
 from tests.agno_parity.golden_files import render
 from tests.tool_system import agno_parity_support as support
@@ -31,8 +34,11 @@ from tests.tool_system import agno_parity_support as support
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from agno.run import RunContext as CheckedRunContext
+
     from mindroom.config.main import Config
     from mindroom.constants import RuntimePaths
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
 
 # Importing these SDKs to build their tools warns about their own deprecated usage.
 pytestmark = [
@@ -49,9 +55,13 @@ def assert_same_json(actual: object, golden: object) -> None:
     assert json.dumps(actual, indent=2) == json.dumps(golden, indent=2)
 
 
-def assert_no_function_instructions(toolkit: Toolkit) -> None:
-    """No function sets instructions of its own, so the toolkit's are all the prompt and the guidance carry."""
-    assert all(function.instructions is None for function in toolkit.get_async_functions().values())
+def assert_no_function_instructions(toolkit: AnyToolkit) -> None:
+    """No function sets instructions of its own, so the toolkit's are all the prompt and the guidance carry.
+
+    An owned toolkit's functions have no instructions of their own.
+    """
+    if isinstance(toolkit, Toolkit):
+        assert all(function.instructions is None for function in toolkit.get_async_functions().values())
 
 
 @pytest.mark.parametrize(
@@ -81,7 +91,7 @@ def test_the_tool_goldens_cover_every_registered_tool(golden_runtime: tuple[Path
     """
     root, _config, _runtime_paths = golden_runtime
     with support.isolated_process(root):
-        registered = set(BUILTIN_TOOL_METADATA)
+        registered = set(builtin_tool_registry())
         switched = {tool_name for tool_name in SCHEMAS if support.all_enabled_overrides(tool_name)}
 
     assert set(SCHEMAS) == registered - support.UNBUILDABLE
@@ -90,7 +100,7 @@ def test_the_tool_goldens_cover_every_registered_tool(golden_runtime: tuple[Path
 
 @pytest.mark.parametrize("tool_name", sorted(SCHEMAS))
 def test_adapted_tool_matches_golden(tool_name: str, golden_runtime: tuple[Path, Config, RuntimePaths]) -> None:
-    """Each registered tool adapts to the golden functions, in Agno's async-run order, with the golden instructions."""
+    """Each registered tool adapts to the golden functions, in the order it offers them, with golden instructions."""
     root, config, runtime_paths = golden_runtime
     with support.isolated_process(root):
         if (missing := support.missing_dependencies(tool_name)) is not None:
@@ -126,7 +136,7 @@ def test_adapting_leaves_the_shared_function_untouched() -> None:
     function = toolkit.functions["probe_scalars"]
     parameters_before = json.dumps(function.parameters)
 
-    adapted = adapt_function(function)
+    adapted = offered_agno_function(function)
 
     assert function.entrypoint is probes.probe_scalars
     assert json.dumps(function.parameters) == parameters_before
@@ -153,7 +163,17 @@ def test_functions_with_agno_hooks_are_rejected_instead_of_running_without_them(
     function = Function(name="lookup", entrypoint=_lookup, **hooks)
 
     with pytest.raises(ValueError, match=r"'lookup' sets an Agno pre_hook, post_hook, or tool_hooks"):
-        adapt_function(function)
+        offered_agno_function(function)
+
+
+def test_looking_up_one_function_refuses_a_field_mindroom_cannot_honor() -> None:
+    """A function looked up alone by name raises the refusal its toolkit's adapter would name in ``refused``."""
+    toolkit = Toolkit(name="hooked")
+    toolkit.functions["lookup"] = Function(name="lookup", entrypoint=_lookup, pre_hook=_noop_hook)
+
+    assert set(adapt_toolkit(toolkit).refused) == {"lookup"}
+    with pytest.raises(ValueError, match="pre_hook"):
+        toolkit_function(toolkit, "lookup")
 
 
 def test_every_field_of_agnos_function_is_named_by_one_row_of_the_adapter_table() -> None:
@@ -181,8 +201,7 @@ _SET_FIELDS: dict[str, object] = {
     "entrypoint": _lookup_country,
     "skip_entrypoint_processing": True,
     "requires_confirmation": True,
-    "approval_type": "mindroom_policy",
-    "external_execution": True,
+    "approval_type": "required",
     "external_execution_silent": True,
     "stop_after_tool_call": True,
     "user_input_fields": ["city"],
@@ -199,13 +218,11 @@ _SET_FIELDS: dict[str, object] = {
 
 
 def _what_the_loop_reads(function: Function) -> tuple[object, ...]:
-    adapted = adapt_function(function)
+    adapted = offered_agno_function(function)
     return (
         adapted.definition(),
-        (adapted.requires_confirmation, adapted.external_execution, adapted.approval_type),
+        adapted.gate,
         adapted.stop_after_call,
-        adapted.external_execution_silent,
-        adapted.entrypoint_processed,
         adapted.injected_params,
     )
 
@@ -238,20 +255,24 @@ def test_every_mapped_or_ignored_field_has_a_value_to_set() -> None:
     ("options", "error"),
     [
         ({"requires_user_input": True}, r"'lookup' sets Agno's requires_user_input"),
+        ({"external_execution": True}, r"'lookup' sets Agno's external_execution"),
         ({"instructions": "Call it twice."}, r"'lookup' sets instructions for Agno to add to the system prompt"),
     ],
-    ids=["requires_user_input", "instructions"],
+    ids=["requires_user_input", "external_execution", "instructions"],
 )
 def test_functions_asking_for_what_the_owned_loop_never_does_are_rejected(options: dict[str, Any], error: str) -> None:
-    """A function that needs user input or adds its own prompt instructions fails loudly instead of running without."""
+    """A function that needs user input, runs outside MindRoom, or adds its own prompt instructions fails loudly.
+
+    Running it without what it asks for would answer the model as if it had.
+    """
     with pytest.raises(ValueError, match=error):
-        adapt_function(Function(name="lookup", entrypoint=_lookup, **options))
+        offered_agno_function(Function(name="lookup", entrypoint=_lookup, **options))
 
 
 def test_fields_agno_would_not_act_on_adapt_unchanged() -> None:
     """Instructions Agno keeps out of the prompt, and user-input fields without the pause, are left unread."""
-    plain = adapt_function(Function(name="lookup", entrypoint=_lookup))
-    quiet = adapt_function(
+    plain = offered_agno_function(Function(name="lookup", entrypoint=_lookup))
+    quiet = offered_agno_function(
         Function(
             name="lookup",
             entrypoint=_lookup,
@@ -315,7 +336,9 @@ def test_agno_default_instructions_show_only_while_every_function_they_name_is_o
 ) -> None:
     """Agno's default instructions show while the agent offers every function they name; authored ones always show."""
     root, config, runtime_paths = golden_runtime
-    authorable = any(field.name == "instructions" for field in BUILTIN_TOOL_METADATA[tool_name].config_fields or ())
+    authorable = any(
+        field.name == "instructions" for field in builtin_tool_registry().entries[tool_name].config_fields or ()
+    )
     with support.isolated_process(root):
         if (missing := support.missing_dependencies(tool_name)) is not None:
             pytest.skip(f"{tool_name} needs {missing}")
@@ -353,19 +376,18 @@ def test_definition_is_the_provider_facing_tool_spec() -> None:
             name="gated",
             tools=[probes.probe_choice],
             requires_confirmation_tools=["probe_choice"],
-            external_execution_required_tools=["probe_choice"],
         ),
     ).functions
-    bare = adapt_function(Function(name="bare", entrypoint=lambda: "x", skip_entrypoint_processing=True))
+    bare = offered_agno_function(Function(name="bare", entrypoint=lambda: "x", skip_entrypoint_processing=True))
 
-    # A plain Toolkit leaves ``strict`` unset and the approval flags False; MindRoom's wrappers set ``strict`` False.
+    # A plain Toolkit leaves ``strict`` unset and no gate; MindRoom's wrappers set ``strict`` False.
     assert function.definition() == ToolSpec(
         name="probe_choice",
         description="Record a constrained choice.",
         parameters=function.parameters,
         strict=None,
     )
-    assert (gated.requires_confirmation, gated.external_execution) == (True, True)
+    assert (function.gate, gated.gate) == (None, ToolGate.CONFIRM)
     assert gated.definition() == replace(function.definition(), name=gated.name)
     # The definition keeps None for a field the tool never set, so a provider adapter can omit it.
     assert bare.definition() == ToolSpec(
@@ -374,6 +396,73 @@ def test_definition_is_the_provider_facing_tool_spec() -> None:
         parameters=bare.parameters,
         strict=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_keyword_arguments_a_vendor_function_collects_reach_it_without_a_kwargs_property() -> None:
+    """A function collecting ``**fields``, as ClickUp's ``update_task`` does, offers only its named parameters.
+
+    The model sends the fields beside them, and the function receives each one as its own keyword argument.
+    """
+
+    def update_task(task_id: str, **fields: object) -> str:
+        return json.dumps({"task_id": task_id, "fields": fields})
+
+    [function] = adapt_toolkit(Toolkit(name="tasks", tools=[update_task])).functions
+    outcome = await execute_tool_call(
+        function,
+        {"task_id": "7", "status": "done"},
+        ToolCallContext(run_id="run", session_id="session", user_id=None),
+        middleware=(),
+    )
+
+    assert function.parameters == {
+        "type": "object",
+        "properties": {"task_id": {"type": "string"}},
+        "required": ["task_id"],
+    }
+    assert json.loads(outcome.content) == {"task_id": "7", "fields": {"status": "done"}}
+
+
+def _remember(label: str, run_context: CheckedRunContext) -> str:
+    """Remember a label for the run."""
+    return f"{label}@{run_context.run_id}"
+
+
+@pytest.mark.asyncio
+async def test_a_parameter_the_framework_fills_may_name_a_type_only_a_type_checker_resolves() -> None:
+    """A tool annotating ``run_context`` with a type imported for type checking is offered and runs.
+
+    Its schema reads only the annotations of the parameters the model sends, and its call runs unvalidated.
+    """
+    [function] = adapt_toolkit(Toolkit(name="notes", tools=[_remember])).functions
+    outcome = await execute_tool_call(
+        function,
+        {"label": "blue"},
+        ToolCallContext(run_id="run", session_id="session", user_id=None),
+        middleware=(),
+    )
+
+    assert function.description == "Remember a label for the run."
+    assert function.parameters == {"type": "object", "properties": {"label": {"type": "string"}}, "required": ["label"]}
+    assert outcome.content == "blue@run"
+
+
+def test_a_function_asking_for_a_strict_schema_is_offered_one() -> None:
+    """A strict schema closes every object and requires each property, which strict function calling demands."""
+
+    def lookup(city: str, limit: int = 5) -> str:
+        return f"{city}:{limit}"
+
+    function = offered_agno_function(Function(name="lookup", entrypoint=lookup, strict=True))
+
+    assert function.strict is True
+    assert function.parameters == {
+        "type": "object",
+        "properties": {"city": {"type": "string"}, "limit": {"type": "integer"}},
+        "additionalProperties": False,
+        "required": ["city", "limit"],
+    }
 
 
 def test_injected_parameters_are_the_names_the_framework_supplies() -> None:

@@ -20,8 +20,9 @@ from mindroom.tool_system.worker_routing import ToolExecutionIdentity, WorkerSco
 # 5: a shell call's PATH directories go first on the command's PATH.
 # 6: requests and responses are these typed models, which refuse unknown fields, and each request names its
 #    protocol, so mixed releases fail instead of dropping fields; a request names its workspace in `base_dir`.
+# 7: a call's arguments arrive as the model sent them, and the worker validates and coerces them.
 # A wire model change bumps this; `tests/test_worker_protocol_schema.py` pins each version's schema.
-WORKER_PROTOCOL_VERSION = 6
+WORKER_PROTOCOL_VERSION = 7
 
 FailureKind = Literal["tool", "worker"]
 
@@ -67,7 +68,7 @@ class CallEnvironment(_WireModel):
     ``set_names`` are the ``execution_env`` variables the call set itself, from plugin hooks or a CLI grant, and
     ``unset_names`` the variables its hooks removed; both apply over the worker's own environment and the
     workspace's ``.mindroom/worker-env.sh``, except where the worker's own composition changed the name (its
-    protected names, HOME, its CA bundle and its Agent Vault settings). ``path_prepend`` holds the directories the
+    protected names, HOME and its CA bundle). ``path_prepend`` holds the directories the
     call puts first on the command's ``PATH``.
     """
 

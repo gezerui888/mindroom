@@ -2,28 +2,29 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Literal
 
 import yaml
-from agno.tools import Toolkit
 from pydantic import ValidationError
 
-from mindroom.api.config_lifecycle import validate_and_persist_config_payload
 from mindroom.config.agent import AgentConfig
 from mindroom.config.main import ConfigRuntimeValidationError, format_invalid_config_message, load_config_or_user_error
 from mindroom.custom_tools.config_manager import (
+    commit_authored_config,
     platform_administrator_error,
     preserve_tool_overrides,
     redaction_marker_error,
     validate_knowledge_bases,
 )
-from mindroom.logging_config import get_logger
-from mindroom.tool_system.catalog import resolved_tool_metadata_for_runtime
+from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.tool_function import ToolGate
 
 if TYPE_CHECKING:
     from mindroom.constants import RuntimePaths
+    from mindroom.tool_system.tool_function import ToolFunction
 
-logger = get_logger(__name__)
 
 _SELF_CONFIG_BLOCKED_TOOLS = {"config_manager"}
 _CONFIG_CHANGE_REJECTED_MESSAGE = "Changes were NOT applied."
@@ -38,14 +39,18 @@ class SelfConfigTools(Toolkit):
     def __init__(self, agent_name: str, runtime_paths: RuntimePaths) -> None:
         self.agent_name = agent_name
         self.runtime_paths = runtime_paths
-        self.config_path = runtime_paths.config_path
         super().__init__(
             name="self_config",
             tools=[self.get_own_config, self.update_own_config],
         )
+
+    def offered_function(self, function: ToolFunction) -> ToolFunction:
+        """Require confirmation of every write."""
         # A human confirms every write, even under tool_approval.default: auto_approve,
         # because the model issuing the call also reads untrusted content.
-        self.functions["update_own_config"].requires_confirmation = True
+        if function.name == "update_own_config":
+            return replace(function, gate=ToolGate.CONFIRM)
+        return function
 
     def get_own_config(self) -> str:
         """Get this agent's current redacted configuration as YAML.
@@ -140,11 +145,7 @@ class SelfConfigTools(Toolkit):
 
         # Validate tools against known tool metadata
         if tools is not None:
-            tool_metadata = resolved_tool_metadata_for_runtime(
-                self.runtime_paths,
-                config,
-                tolerate_plugin_load_errors=True,
-            )
+            tool_metadata = config_plugins(config, self.runtime_paths).tools
             invalid_tools = [t for t in tools if t not in tool_metadata]
             if invalid_tools:
                 return f"Error: Unknown tools: {', '.join(invalid_tools)}"
@@ -188,7 +189,8 @@ class SelfConfigTools(Toolkit):
         ]
         non_null_updates = {field_name: value for field_name, value in requested_updates if value is not None}
 
-        candidate_agent_data = agent.model_dump()
+        # Only the fields the entry already set, plus the requested ones, so saving does not spell out every default.
+        candidate_agent_data = agent.model_dump(exclude_unset=True)
         candidate_agent_data.update(non_null_updates)
 
         try:
@@ -199,9 +201,7 @@ class SelfConfigTools(Toolkit):
         current_values = agent.model_dump()
         validated_values = validated_agent.model_dump()
         updates: dict[str, str] = {}
-        for field_name, new_value in requested_updates:
-            if new_value is None:
-                continue
+        for field_name in non_null_updates:
             current_value = current_values[field_name]
             validated_value = validated_values[field_name]
             if validated_value == current_value:
@@ -220,7 +220,7 @@ class SelfConfigTools(Toolkit):
 
         config.agents[self.agent_name] = validated_agent
         try:
-            validate_and_persist_config_payload(config.authored_model_dump(), self.runtime_paths)
+            commit_authored_config(config, self.runtime_paths)
         except (ValidationError, ConfigRuntimeValidationError) as exc:
             return format_invalid_config_message(exc, footer=_CONFIG_CHANGE_REJECTED_MESSAGE)
         except Exception as e:

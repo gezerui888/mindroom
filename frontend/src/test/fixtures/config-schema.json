@@ -1961,6 +1961,28 @@
           "description": "Only limit paths, for a service a user adds; a config service is refused with it and uses restrict_to_rules. The rules take part in the path check like restrict_to_rules (which this implies), but never choose a credential, so an allowed path still uses the credential of the most specific other service on the host. Such a service has no key, OAuth login, or placeholders, its rules need no auth, and a preset contributes only its display_name, description, and rules. Presets never set this",
           "title": "Restrict Only",
           "type": "boolean"
+        },
+        "admin_key": {
+          "default": false,
+          "description": "Use one key for every agent the service serves, which only an administrator sets, on the dashboard; users and credential managers see that it is set but cannot set, replace, or remove it. Such a service uses no connected account, so a preset's oauth_provider and read_only are left out. Only config.yaml may set it, and presets never do",
+          "title": "Admin Key",
+          "type": "boolean"
+        },
+        "agents": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Agents whose requests get the service's credential; requests it matches from any other agent are refused (403 agent_not_allowed), and it is not offered to them. Omit to serve every agent that uses Agent Keys. Only config.yaml may set it, and presets never do",
+          "title": "Agents"
         }
       },
       "title": "EgressService",
@@ -2379,7 +2401,10 @@
           ],
           "default": null,
           "description": "Model that writes a short context for each chunk of a multi-chunk file before it is indexed (contextual retrieval); costs one model call per chunk of each changed file",
-          "title": "Chunk Context Model"
+          "title": "Chunk Context Model",
+          "x-mindroom": {
+            "reference": "model"
+          }
         },
         "include_extensions": {
           "anyOf": [
@@ -2552,7 +2577,10 @@
           ],
           "default": null,
           "description": "Model alias that extracts entities and facts; required when any agent enables the graph",
-          "title": "Model"
+          "title": "Model",
+          "x-mindroom": {
+            "reference": "model"
+          }
         },
         "extraction_instructions": {
           "default": "",
@@ -3380,12 +3408,6 @@
           "title": "Backend",
           "type": "string"
         },
-        "team_reads_member_memory": {
-          "default": false,
-          "description": "When true, team-context memory reads can access member agent memories in addition to the shared team scope",
-          "title": "Team Reads Member Memory",
-          "type": "boolean"
-        },
         "embedder": {
           "$ref": "#/$defs/_MemoryEmbedderConfig",
           "default": {
@@ -3417,7 +3439,6 @@
         "file": {
           "$ref": "#/$defs/_MemoryFileConfig",
           "default": {
-            "path": null,
             "max_entrypoint_lines": 200,
             "max_entrypoint_tokens": 50000
           },
@@ -4566,7 +4587,10 @@
           ],
           "default": null,
           "description": "Review model alias; defaults to the model of the reviewed response",
-          "title": "Model"
+          "title": "Model",
+          "x-mindroom": {
+            "reference": "model"
+          }
         },
         "review_interval": {
           "default": 10,
@@ -5197,7 +5221,10 @@
           ],
           "default": null,
           "description": "Model config that runs extraction instead of the agent's own model",
-          "title": "Model"
+          "title": "Model",
+          "x-mindroom": {
+            "reference": "model"
+          }
         },
         "no_reply_token": {
           "default": "NO_REPLY",
@@ -5269,19 +5296,6 @@
       "additionalProperties": false,
       "description": "File-backed memory configuration.",
       "properties": {
-        "path": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "default": null,
-          "description": "Optional fallback root for direct file-memory paths. Relative paths resolve from the config directory. Canonical agent and team file memory live under their canonical workspace or scope roots.",
-          "title": "Path"
-        },
         "max_entrypoint_lines": {
           "default": 200,
           "description": "Maximum number of lines to preload from MEMORY.md",
@@ -5513,7 +5527,6 @@
       "$ref": "#/$defs/MemoryConfig",
       "default": {
         "backend": "mem0",
-        "team_reads_member_memory": false,
         "embedder": {
           "config": {
             "api_key": null,
@@ -5529,8 +5542,7 @@
         "llm": null,
         "file": {
           "max_entrypoint_lines": 200,
-          "max_entrypoint_tokens": 50000,
-          "path": null
+          "max_entrypoint_tokens": 50000
         },
         "search": {
           "include": [

@@ -6,7 +6,6 @@ import asyncio
 import inspect
 import json
 from dataclasses import replace
-from functools import partial
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,12 +19,13 @@ import mindroom.custom_tools.chat_ui as chat_ui_module
 import mindroom.tools  # noqa: F401
 from mindroom.custom_tools.chat_ui import ChatUITools, show_computer_once
 from mindroom.event_journal import EventClass, EventKind
-from mindroom.matrix.client_visible_messages import extract_visible_message, is_visible_room_message
 from mindroom.matrix.journal_ingress import ingestion_timeline_views
-from mindroom.matrix.room_history_reads import parse_room_message_event
 from mindroom.message_target import MessageTarget
-from mindroom.tool_system.metadata import TOOL_METADATA, get_tool_by_name
+from mindroom.tool_system.agno_toolkits import toolkit_function_names
+from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.runtime_context import tool_runtime_context
+from tests.agent_tool_helpers import toolkit_offers
 from tests.chat_ui_contract_fixture import (
     REQUESTER_ID,
     ROOM_ID,
@@ -39,7 +39,7 @@ from tests.chat_ui_contract_fixture import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
     from mindroom.tool_system.runtime_context import ToolRuntimeContext
@@ -51,23 +51,13 @@ def _no_computer_shown_yet(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(chat_ui_module, "_SHOWN_COMPUTERS", {})
 
 
-@pytest.fixture(params=["show_computer", "open_panel"])
-def computer_request(request: pytest.FixtureRequest) -> Callable[[], Awaitable[str]]:
-    """Exercise both Computer entry points against the same transport and safety contract."""
-    tool = ChatUITools()
-    if request.param == "show_computer":
-        return tool.show_computer
-    return partial(tool.open_panel, panel="computer")
-
-
 def test_chat_ui_tool_registered_and_exposes_only_bounded_arguments(tmp_path: Path) -> None:
     """The opt-in toolkit must not let the caller choose URLs, credentials, or identities."""
     context = _context(tmp_path)
-    metadata = TOOL_METADATA["chat_ui"]
+    metadata = builtin_tool_registry().entries["chat_ui"]
 
     assert metadata.requires_room_context
     assert metadata.function_names == (
-        "show_computer",
         "open_settings",
         "open_panel",
         "show_canvas",
@@ -77,10 +67,12 @@ def test_chat_ui_tool_registered_and_exposes_only_bounded_arguments(tmp_path: Pa
         ("enable_show_canvas", False),
         ("enable_canvas_libraries", False),
     ]
-    assert sorted(ChatUITools().async_functions) == ["open_panel", "open_settings", "show_computer"]
-    assert {"show_canvas", "read_canvas_state"} <= set(ChatUITools(enable_show_canvas=True).async_functions)
-    assert isinstance(get_tool_by_name("chat_ui", context.runtime_paths, worker_target=None), ChatUITools)
-    assert tuple(inspect.signature(ChatUITools.show_computer).parameters) == ("self",)
+    assert sorted(ChatUITools().functions) == ["open_panel", "open_settings"]
+    assert {"show_canvas", "read_canvas_state"} <= set(ChatUITools(enable_show_canvas=True).functions)
+    assert isinstance(
+        get_tool_by_name("chat_ui", context.runtime_paths, worker_target=None, tools=builtin_tool_registry()),
+        ChatUITools,
+    )
     assert tuple(inspect.signature(ChatUITools.open_settings).parameters) == ("self", "section")
     assert tuple(inspect.signature(ChatUITools.open_panel).parameters) == ("self", "panel")
     assert tuple(inspect.signature(ChatUITools.show_canvas).parameters) == (
@@ -93,22 +85,32 @@ def test_chat_ui_tool_registered_and_exposes_only_bounded_arguments(tmp_path: Pa
     )
     assert tuple(inspect.signature(ChatUITools.read_canvas_state).parameters) == ("self", "canvas_event_id")
     assert inspect.signature(ChatUITools.open_panel).parameters["panel"].default == "members"
-    function = ChatUITools().get_async_functions()["open_panel"]
-    function.process_entrypoint(strict=True)
+    function = toolkit_offers(ChatUITools(), "open_panel")
     assert function.parameters["properties"]["panel"]["enum"] == ["members", "computer"]
-    assert function.parameters["additionalProperties"] is False
+
+
+def test_excluding_a_function_an_option_left_off_is_a_no_op(tmp_path: Path) -> None:
+    """``show_canvas`` is declared but off by default, so excluding it keeps the toolkit and its other functions."""
+    context = _context(tmp_path)
+
+    toolkit = get_tool_by_name(
+        "chat_ui",
+        context.runtime_paths,
+        tool_config_overrides={"exclude_tools": ["show_canvas", "open_settings"]},
+        worker_target=None,
+        tools=builtin_tool_registry(),
+    )
+
+    assert toolkit_function_names(toolkit) == ("open_panel",)
 
 
 @pytest.mark.asyncio
-async def test_computer_request_sends_exact_wire_metadata_from_canonical_context(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_computer_request_sends_exact_wire_metadata_from_canonical_context(tmp_path: Path) -> None:
     """Changing any runtime-derived identity or canonical thread field must break this contract."""
     context = _context(tmp_path)
 
     with tool_runtime_context(context):
-        result = json.loads(await computer_request())
+        result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result["status"] == "ok"
     content = _sent_content(context)
@@ -142,15 +144,12 @@ async def test_computer_request_sends_exact_wire_metadata_from_canonical_context
 
 
 @pytest.mark.asyncio
-async def test_ui_notice_survives_live_ingress_and_history_projection(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_ui_notice_survives_live_ingress_and_history_projection(tmp_path: Path) -> None:
     """The normal notice path must retain action metadata without creating agent work."""
     context = _context(tmp_path)
 
     with tool_runtime_context(context):
-        await computer_request()
+        await ChatUITools().open_panel(panel="computer")
 
     content = _sent_content(context)
     source = {
@@ -174,17 +173,6 @@ async def test_ui_notice_survives_live_ingress_and_history_projection(
     assert inbound.event_class is EventClass.CONTEXT_ONLY
     assert projected is not None
     assert projected.content["io.mindroom.ui_action"] == content["io.mindroom.ui_action"]
-
-    parsed = parse_room_message_event(source)
-    assert is_visible_room_message(parsed)
-    history_message = await extract_visible_message(
-        parsed,
-        config=context.config,
-        runtime_paths=context.runtime_paths,
-        trusted_sender_ids={context.client.user_id},
-    )
-    assert history_message["content"]["io.mindroom.ui_action"] == content["io.mindroom.ui_action"]
-    assert history_message["content"]["m.relates_to"] == content["m.relates_to"]
 
 
 @pytest.mark.asyncio
@@ -262,16 +250,13 @@ async def test_room_version_12_room_without_a_server_name_gets_the_request(tmp_p
 
 
 @pytest.mark.asyncio
-async def test_thread_continuation_uses_latest_projected_event_for_fallback(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_thread_continuation_uses_latest_projected_event_for_fallback(tmp_path: Path) -> None:
     """A non-reply thread action must fall back to the latest event, not blindly to the root."""
     context = _context(tmp_path, reply_to_event_id=None)
     context.conversation_reader.latest_thread_event_id.return_value = "$latest"
 
     with tool_runtime_context(context):
-        result = json.loads(await computer_request())
+        result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result["status"] == "ok"
     assert _sent_content(context)["m.relates_to"] == {
@@ -287,15 +272,12 @@ async def test_thread_continuation_uses_latest_projected_event_for_fallback(
 
 
 @pytest.mark.asyncio
-async def test_missing_thread_fallback_is_rejected_without_sending(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_missing_thread_fallback_is_rejected_without_sending(tmp_path: Path) -> None:
     """A threaded action must not invent a fallback target when projection cannot resolve one."""
     context = _context(tmp_path, reply_to_event_id=None)
 
     with tool_runtime_context(context):
-        result = json.loads(await computer_request())
+        result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result == {
         "action": "show_computer",
@@ -336,51 +318,45 @@ async def test_open_settings_emits_each_supported_section(tmp_path: Path, sectio
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("method_name", "argument", "message_fragment"),
+    ("function_name", "arguments"),
     [
-        ("open_settings", "security", "settings section"),
-        ("open_panel", "files", "side panel"),
-        ("open_panel", "browser", "side panel"),
-        ("open_panel", "settings", "side panel"),
+        ("open_settings", {"section": "security"}),
+        ("open_panel", {"panel": "files"}),
+        ("open_panel", {"panel": "browser"}),
+        ("open_panel", {"panel": "settings"}),
     ],
 )
 async def test_invalid_action_argument_is_rejected_without_sending(
     tmp_path: Path,
-    method_name: str,
-    argument: str,
-    message_fragment: str,
+    function_name: str,
+    arguments: dict[str, str],
 ) -> None:
     """Unsupported UI targets must fail before they can become client instructions."""
     context = _context(tmp_path)
-    method = getattr(ChatUITools(), method_name)
+    function = toolkit_offers(ChatUITools(), function_name)
 
-    with tool_runtime_context(context):
-        result = json.loads(await method(argument))
+    with tool_runtime_context(context), pytest.raises(ValidationError, match=next(iter(arguments))):
+        await function.entrypoint(**arguments)
 
-    assert result["status"] == "error"
-    assert message_fragment in result["message"]
     context.client.room_send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_missing_runtime_context_is_rejected(computer_request: Callable[[], Awaitable[str]]) -> None:
+async def test_missing_runtime_context_is_rejected() -> None:
     """Detached calls must not accept caller-supplied routing as a substitute for runtime authority."""
-    result = json.loads(await computer_request())
+    result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result["status"] == "error"
     assert "runtime context" in result["message"]
 
 
 @pytest.mark.asyncio
-async def test_malformed_runtime_requester_is_rejected_without_sending(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_malformed_runtime_requester_is_rejected_without_sending(tmp_path: Path) -> None:
     """An invalid addressed-user identity must never be copied into trusted wire metadata."""
     context = replace(_context(tmp_path), requester_id="not-a-matrix-user")
 
     with tool_runtime_context(context):
-        result = json.loads(await computer_request())
+        result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result["status"] == "error"
     assert "requester" in result["message"]
@@ -427,13 +403,12 @@ async def test_malformed_matrix_target_is_rejected_without_sending(
     tmp_path: Path,
     target: MessageTarget,
     message_fragment: str,
-    computer_request: Callable[[], Awaitable[str]],
 ) -> None:
     """Malformed runtime routing must fail before the Matrix delivery boundary."""
     context = replace(_context(tmp_path), target=target)
 
     with tool_runtime_context(context):
-        result = json.loads(await computer_request())
+        result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result["status"] == "error"
     assert message_fragment in result["message"]
@@ -441,15 +416,12 @@ async def test_malformed_matrix_target_is_rejected_without_sending(
 
 
 @pytest.mark.asyncio
-async def test_transport_agent_mismatch_is_rejected_without_sending(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_transport_agent_mismatch_is_rejected_without_sending(tmp_path: Path) -> None:
     """A delegated agent must not point a UI request at its transport agent's worker."""
     context = _context(tmp_path, transport_agent_name="router")
 
     with tool_runtime_context(context):
-        result = json.loads(await computer_request())
+        result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result["status"] == "error"
     assert "transport identity" in result["message"]
@@ -457,16 +429,13 @@ async def test_transport_agent_mismatch_is_rejected_without_sending(
 
 
 @pytest.mark.asyncio
-async def test_matrix_sender_mismatch_is_rejected_without_sending(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_matrix_sender_mismatch_is_rejected_without_sending(tmp_path: Path) -> None:
     """Metadata agent identity must equal both the configured agent and actual Matrix sender."""
     context = _context(tmp_path)
     context.client.user_id = "@mindroom_other:example.org"
 
     with tool_runtime_context(context):
-        result = json.loads(await computer_request())
+        result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result["status"] == "error"
     assert "Matrix sender" in result["message"]
@@ -474,15 +443,12 @@ async def test_matrix_sender_mismatch_is_rejected_without_sending(
 
 
 @pytest.mark.asyncio
-async def test_team_context_is_rejected_without_sending(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_team_context_is_rejected_without_sending(tmp_path: Path) -> None:
     """A team has no single agent worker identity for the client to select."""
     context = _context(tmp_path, agent_name="research", include_team=True)
 
     with tool_runtime_context(context):
-        result = json.loads(await computer_request())
+        result = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     assert result["status"] == "error"
     assert "configured agent" in result["message"]
@@ -514,10 +480,8 @@ async def test_delivery_failure_returns_error_without_claiming_the_ui_opened(tmp
 async def test_panel_rejects_unexpected_url_without_sending(tmp_path: Path, panel: str) -> None:
     """Panel requests cannot smuggle navigation or endpoints through extra arguments."""
     context = _context(tmp_path)
-    function = ChatUITools().get_async_functions()["open_panel"]
-    function.process_entrypoint(strict=False)
-    assert function.entrypoint is not None
-    with tool_runtime_context(context), pytest.raises((TypeError, ValidationError), match="url"):
+    function = toolkit_offers(ChatUITools(), "open_panel")
+    with tool_runtime_context(context), pytest.raises(ValidationError, match="url"):
         await function.entrypoint(panel=panel, url="https://example.org")
     context.client.room_send.assert_not_awaited()
 
@@ -554,16 +518,17 @@ def _show_computer_metadata(context: ToolRuntimeContext, thread_id: str | None) 
 
 @pytest.mark.asyncio
 async def test_show_computer_once_sends_the_show_computer_notice_once_per_thread(tmp_path: Path) -> None:
-    """The first browser use announces the computer with the notice show_computer() sends, and only once."""
+    """The first browser use announces the computer with the notice open_panel(panel='computer') sends, once."""
     announced = _context(tmp_path)
     explicit = _context(tmp_path)
 
-    with tool_runtime_context(announced):
+    with tool_runtime_context(announced), capture_logs() as logs:
         await show_computer_once()
         await show_computer_once()
     with tool_runtime_context(explicit):
-        await ChatUITools().show_computer()
+        await ChatUITools().open_panel(panel="computer")
 
+    assert [log for log in logs if log["log_level"] == "warning"] == []
     announced.client.room_send.assert_awaited_once()
     content = _sent_content(announced)
     assert content == _sent_content(explicit)
@@ -589,7 +554,6 @@ async def test_explicit_computer_request_without_a_reply_identity_still_sends(tm
 @pytest.mark.parametrize("first", ["browser", "explicit"])
 async def test_one_turn_sends_one_computer_notice(
     tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
     first: str,
 ) -> None:
     """An agent that browses and shows its computer in the same reply posts one notice, in either order."""
@@ -603,11 +567,11 @@ async def test_one_turn_sends_one_computer_notice(
     context.client.room_send.side_effect = slow_send
 
     with tool_runtime_context(context):
-        calls = [show_computer_once(), computer_request()]
+        calls = [show_computer_once(), ChatUITools().open_panel(panel="computer")]
         if first == "explicit":
             calls.reverse()
         results = await asyncio.gather(*calls)
-        repeated = json.loads(await computer_request())
+        repeated = json.loads(await ChatUITools().open_panel(panel="computer"))
 
     context.client.room_send.assert_awaited_once()
     assert repeated["status"] == "ok"
@@ -615,10 +579,7 @@ async def test_one_turn_sends_one_computer_notice(
 
 
 @pytest.mark.asyncio
-async def test_a_racing_request_sends_when_the_announcement_fails(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_a_racing_request_sends_when_the_announcement_fails(tmp_path: Path) -> None:
     """A notice that is not delivered does not count as shown, even for a request that waited on it."""
     context = replace(_context(tmp_path), correlation_id="$turn")
     delivered = context.client.room_send.return_value
@@ -631,17 +592,14 @@ async def test_a_racing_request_sends_when_the_announcement_fails(
     context.client.room_send.side_effect = send
 
     with tool_runtime_context(context):
-        _announced, explicit = await asyncio.gather(show_computer_once(), computer_request())
+        _announced, explicit = await asyncio.gather(show_computer_once(), ChatUITools().open_panel(panel="computer"))
 
     assert context.client.room_send.await_count == 2
     assert json.loads(explicit)["message"] == "UI action request sent."
 
 
 @pytest.mark.asyncio
-async def test_a_cancelled_request_does_not_count_as_shown(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_a_cancelled_request_does_not_count_as_shown(tmp_path: Path) -> None:
     """Stopping a reply while its notice is sending lets the next browser call announce the computer."""
     context = replace(_context(tmp_path), correlation_id="$turn")
     delivered = context.client.room_send.return_value
@@ -655,7 +613,7 @@ async def test_a_cancelled_request_does_not_count_as_shown(
     context.client.room_send.side_effect = stalled_send
 
     with tool_runtime_context(context):
-        request = asyncio.create_task(computer_request())
+        request = asyncio.create_task(ChatUITools().open_panel(panel="computer"))
         await sending.wait()
         request.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -667,17 +625,14 @@ async def test_a_cancelled_request_does_not_count_as_shown(
 
 
 @pytest.mark.asyncio
-async def test_a_later_turn_can_show_the_computer_again(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_a_later_turn_can_show_the_computer_again(tmp_path: Path) -> None:
     """A reply after the one that announced the computer can show it again, for example for a login."""
     context = _context(tmp_path)
 
     with tool_runtime_context(replace(context, correlation_id="$first-turn")):
         await show_computer_once()
     with tool_runtime_context(replace(context, correlation_id="$second-turn")):
-        assert json.loads(await computer_request())["status"] == "ok"
+        assert json.loads(await ChatUITools().open_panel(panel="computer"))["status"] == "ok"
 
     assert context.client.room_send.await_count == 2
 
@@ -714,7 +669,7 @@ async def test_each_requester_in_a_thread_gets_one_announcement(tmp_path: Path, 
 
     with tool_runtime_context(alice):
         if alice_shows == "explicitly":
-            await ChatUITools().show_computer()
+            await ChatUITools().open_panel(panel="computer")
         await show_computer_once()
         await show_computer_once()
     with tool_runtime_context(bob):
@@ -728,15 +683,12 @@ async def test_each_requester_in_a_thread_gets_one_announcement(tmp_path: Path, 
 
 
 @pytest.mark.asyncio
-async def test_explicit_show_computer_suppresses_the_announcement(
-    tmp_path: Path,
-    computer_request: Callable[[], Awaitable[str]],
-) -> None:
+async def test_explicit_computer_request_suppresses_the_announcement(tmp_path: Path) -> None:
     """A conversation the agent already showed its computer to gets no second notice from browsing."""
     context = _context(tmp_path)
 
     with tool_runtime_context(context):
-        assert json.loads(await computer_request())["status"] == "ok"
+        assert json.loads(await ChatUITools().open_panel(panel="computer"))["status"] == "ok"
         await show_computer_once()
 
     context.client.room_send.assert_awaited_once()
@@ -1061,7 +1013,8 @@ async def test_canvas_just_under_the_edit_ceiling_stays_inline(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
-async def test_canvas_from_a_workspace_file(tmp_path: Path) -> None:
+@pytest.mark.parametrize("html", [None, ""])
+async def test_canvas_from_a_workspace_file(tmp_path: Path, html: str | None) -> None:
     """Agents can show a page they keep in their workspace, such as slides they are building."""
     workspace = tmp_path / "workspace"
     (workspace / "slides").mkdir(parents=True)
@@ -1070,7 +1023,11 @@ async def test_canvas_from_a_workspace_file(tmp_path: Path) -> None:
 
     with tool_runtime_context(context):
         result = json.loads(
-            await ChatUITools(tool_output_workspace_root=workspace).show_canvas(title="Deck", path="slides/deck.html"),
+            await ChatUITools(tool_output_workspace_root=workspace).show_canvas(
+                title="Deck",
+                html=html,
+                path="slides/deck.html",
+            ),
         )
 
     assert result["status"] == "ok"
@@ -1615,6 +1572,10 @@ async def test_reading_a_canvas_state_reports_nothing_shared_and_unshared_canvas
     result = await _read(foreign)
     assert result["action"] == "read_canvas_state"
     assert "Only your own canvases can be read." in result["message"]
+
+    not_an_event = await _read(context, "canvas")
+    assert not_an_event["status"] == "error"
+    assert "earlier show_canvas call" in not_an_event["message"]
 
 
 @pytest.mark.asyncio

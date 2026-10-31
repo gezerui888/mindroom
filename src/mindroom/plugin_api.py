@@ -46,6 +46,7 @@ from mindroom.hooks import (
     EnrichmentItem,
     FinalResponseDraft,
     FinalResponseTransformContext,
+    HookBindings,
     MessageEnrichContext,
     MessageEnvelope,
     MessageReceivedContext,
@@ -67,10 +68,11 @@ from mindroom.hooks import (
     TurnTrust,
     hook,
 )
+from mindroom.llm.provider import ModelProvider
 from mindroom.logging_config import get_logger
 from mindroom.message_target import MessageTarget
 from mindroom.oauth import OAuthDiscoveryConfig, OAuthProvider, oauth_runtime_bootstrapper
-from mindroom.oauth.google_cloud import google_cloud_oauth_provider
+from mindroom.oauth.google import google_cloud_oauth_provider
 from mindroom.oauth.service import build_oauth_connect_instruction, oauth_connect_url
 from mindroom.path_confinement import open_directory_within_root, read_regular_file_within_root, write_file_within_root
 from mindroom.providers.registry import build_model_provider
@@ -95,17 +97,17 @@ from mindroom.tool_system.google_workspaces import (
     register_google_workspace_tools,
 )
 from mindroom.tool_system.metadata import get_tool_by_name
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.registration import register_tool_with_metadata
 from mindroom.tool_system.runtime_context import (
     ToolRuntimeContext,
-    ToolRuntimeHookBindings,
-    build_execution_identity_from_runtime_context,
+    current_execution_identity,
     emit_custom_event,
     get_tool_runtime_context,
-    resolve_tool_runtime_hook_bindings,
 )
 from mindroom.tool_system.tool_function import ToolValue
 from mindroom.tool_system.worker_routing import ResolvedWorkerTarget
+from mindroom.turn_model import ModelScope, resolve_turn_model
 
 __all__ = [
     "ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND",
@@ -151,10 +153,13 @@ __all__ = [
     "FinalResponseTransformContext",
     "GoogleWorkspaceConfig",
     "HelperResult",
+    "HookBindings",
     "MessageEnrichContext",
     "MessageEnvelope",
     "MessageReceivedContext",
     "MessageTarget",
+    "ModelProvider",
+    "ModelScope",
     "OAuthDiscoveryConfig",
     "OAuthProvider",
     "ReactionReceivedContext",
@@ -176,7 +181,6 @@ __all__ = [
     "ToolFileAccess",
     "ToolManagedInitArg",
     "ToolRuntimeContext",
-    "ToolRuntimeHookBindings",
     "ToolStatus",
     "ToolValue",
     "Toolkit",
@@ -187,11 +191,12 @@ __all__ = [
     "atlassian_connection_oauth_provider",
     "automation",
     "automation_threads",
-    "build_execution_identity_from_runtime_context",
     "build_model_provider",
     "build_oauth_connect_instruction",
     "complete_prompt",
+    "config_plugins",
     "current_call",
+    "current_execution_identity",
     "emit_custom_event",
     "get_logger",
     "get_tool_by_name",
@@ -208,7 +213,7 @@ __all__ = [
     "register_tool_with_metadata",
     "resolve_agent_file",
     "resolve_config_relative_path",
-    "resolve_tool_runtime_hook_bindings",
+    "resolve_turn_model",
     "tool",
     "toolkit_functions",
     "write_file_within_root",

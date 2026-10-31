@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from mindroom.tool_system.agno_toolkits import Function, adapt_function
+from mindroom.agent_cli.shell_contract import SHELL_FUNCTION
+from mindroom.tool_system.agno_toolkits import adapt_callable
 from mindroom.tool_system.invocation import current_tool_call
 from mindroom.tool_system.tool_access import ToolKey
-from mindroom.tool_system.tool_function import AdaptedToolkit, ToolValue  # Agno reads ToolValue from module globals.
+from mindroom.tool_system.tool_function import AdaptedToolkit, ToolValue  # The schema reads it from module globals.
+from mindroom.tool_system.tool_schema import closed_parameters
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -19,7 +22,7 @@ __all__ = ["minimal_bash_toolkit"]
 def minimal_bash_toolkit(
     execute: Callable[[ToolKey, dict[str, object], str], Awaitable[str | ToolValue]] | None = None,
 ) -> AdaptedToolkit:
-    """Project only effective shell functions into one provider-visible function.
+    """Project the agent's shell function into one provider-visible Bash function.
 
     The required execution owner retains the canonical prepared call, approval
     state, hooks, operation mutex and dispatch-window lifetimes. There is
@@ -54,8 +57,8 @@ def minimal_bash_toolkit(
         if execute is None or not call_id:
             msg = "Bash requires an active response owner"
             raise RuntimeError(msg)
-        return await execute(ToolKey("shell", "run_shell_command"), arguments, call_id)
+        return await execute(ToolKey("shell", SHELL_FUNCTION), arguments, call_id)
 
-    # The provider sees the schema Agno derives from the signature and docstring.
-    function = adapt_function(Function.from_callable(bash))
+    function = adapt_callable(bash)
+    function = replace(function, parameters=closed_parameters(bash, function.parameters))
     return AdaptedToolkit(name="minimal_bash", functions=(function,), instructions=None)

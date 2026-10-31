@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from contextlib import ExitStack, closing
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -24,7 +25,7 @@ from mindroom.constants import resolve_runtime_paths
 from mindroom.history.storage import has_queued_force_compaction
 from mindroom.history.types import HistoryScope
 from mindroom.llm.messages import Message
-from mindroom.llm.runs import RunRecord, RunRequirement, RunStatus, TeamRunRecord, ToolExecution
+from mindroom.llm.runs import RunRecord, RunStatus, TeamRunRecord, ToolExecution
 from mindroom.session_storage import legacy_agno3_conversion
 from mindroom.session_storage import store as store_module
 from mindroom.session_storage.agent_storage import prepare_conversation_database
@@ -35,12 +36,19 @@ from mindroom.session_storage.legacy_agno3_conversion import (
 )
 from mindroom.session_storage.legacy_agno3_schema import AgnoTableNames, agno_schema_sql
 from mindroom.session_storage.legacy_conversion_backup import ConversionSpaceError
+from mindroom.session_storage.legacy_scope_metadata import LEGACY_COMPACTION_METADATA_KEY
 from mindroom.session_storage.schema import LOG_VERSION, SESSION_COLUMNS, TableNames, table_names
 from mindroom.session_storage.store import ConversationStore, connect_by_name
 from mindroom.session_storage.summary_rows import folded_tool_call_ids, history_event_ids, legacy_event_ids, retire
 from mindroom.session_storage.types import ConversationSession
 from mindroom.usage.storage import SYSTEM_USAGE_STORAGE_NAME
-from tests.llm.agno_dict_helpers import DROPPED_RUN_KEYS, DROPPED_TOOL_EXECUTION_KEYS, expected_run_dict
+from tests.llm.agno_dict_helpers import (
+    DROPPED_RUN_KEYS,
+    DROPPED_TOOL_EXECUTION_KEYS,
+    expected_run_dict,
+    stored_requirement,
+    with_requirements,
+)
 from tests.session_storage.agno_layout import named_owner, recorded_owner, write_agno_database
 from tests.session_storage.goldens import LEGACY_AGNO3
 from tests.storage_oracle.determinism import deterministic
@@ -384,16 +392,72 @@ def test_a_paused_team_runs_embedded_members_become_its_member_rows(tmp_path: Pa
         session_id=_SESSION,
         status=RunStatus.paused,
         created_at=100,
-        requirements=[RunRequirement(tool_execution=tool, id="req", member_agent_id="code", member_run_id="member")],
         member_responses=[embedded],
     )
-    _insert_run(database, team_run, run_index=0)
+    requirement = stored_requirement(tool, "req", member_agent_id="code", member_run_id="member")
+    _insert_run(database, with_requirements(team_run, requirement), run_index=0)
     _insert_run(database, _run("after"), run_index=1)
     store = _converted(database)
     assert sorted(_seqs(database), key=_seqs(database).get) == ["team", "member", "after"]
     resumed = store.get_run("team")
     assert isinstance(resumed, TeamRunRecord)
     assert [run.to_dict() for run in resumed.member_responses] == [embedded.to_dict()]
+
+
+def test_an_embedded_member_s_own_requirement_folds_into_its_call(tmp_path: Path) -> None:
+    """A paused team row's embedded member's delegation call keeps the id its own requirement stored, with no team copy."""
+    database = _agno_database(tmp_path, (_SESSION, "team", "squad"))
+    tool = ToolExecution(tool_call_id="call", tool_name="run_subagent", external_execution_required=True)
+    embedded = _run("member", status=RunStatus.paused, parent_run_id="team", tools=[tool])
+    team_run = TeamRunRecord(
+        run_id="team",
+        team_id="squad",
+        session_id=_SESSION,
+        status=RunStatus.paused,
+        created_at=100,
+    )
+    stored = {
+        **team_run.to_dict(),
+        "member_responses": [with_requirements(embedded, stored_requirement(tool, "own"))],
+        "requirements": [],
+    }
+    _insert_run(database, stored, run_index=0)
+
+    store = _converted(database)
+
+    member = store.get_run("member")
+    assert member is not None
+    assert member.tools == [replace(tool, pause_id="own")]
+
+
+def test_a_team_row_s_copy_takes_the_embedded_member_call_its_member_s_entry_took(tmp_path: Path) -> None:
+    """A member paused on two calls under one id; the team row's copy of the second one folds into the second call."""
+    database = _agno_database(tmp_path, (_SESSION, "team", "squad"))
+    first = ToolExecution(tool_call_id="call", tool_name="dangerous", tool_args={"n": 1}, requires_confirmation=True)
+    second = replace(first, tool_args={"n": 2})
+    embedded = _run("member", status=RunStatus.paused, parent_run_id="team", tools=[first, second])
+    team_run = TeamRunRecord(
+        run_id="team",
+        team_id="squad",
+        session_id=_SESSION,
+        status=RunStatus.paused,
+        created_at=100,
+    )
+    copy = replace(second, confirmation_note="only on the team's copy")
+    stored = {
+        **team_run.to_dict(),
+        "member_responses": [
+            with_requirements(embedded, stored_requirement(first, "q1"), stored_requirement(second, "q2")),
+        ],
+        "requirements": [stored_requirement(copy, "q2", member_agent_id="code", member_run_id="member")],
+    }
+    _insert_run(database, stored, run_index=0)
+
+    store = _converted(database)
+
+    member = store.get_run("member")
+    assert member is not None
+    assert member.tools == [first, copy]
 
 
 def test_a_fold_whose_run_has_no_row_gets_a_cancelled_row_after_its_summary(tmp_path: Path) -> None:
@@ -891,10 +955,10 @@ def test_converted_runs_drop_their_stored_tool_schemas(tmp_path: Path) -> None:
         status=RunStatus.paused,
         created_at=100,
         metadata={"tools_schema": [{"name": "x"}], "room_id": "!r"},
-        requirements=[RunRequirement(tool_execution=tool, id="req", member_agent_id="code", member_run_id="m1")],
         member_responses=[member],
     )
-    _insert_run(database, team, run_index=0)
+    requirement = stored_requirement(tool, "req", member_agent_id="code", member_run_id="m1")
+    _insert_run(database, with_requirements(team, requirement), run_index=0)
 
     store = _converted(database)
 
@@ -921,8 +985,9 @@ def test_converted_runs_keep_only_the_keys_records_model(tmp_path: Path) -> None
         json.loads(data) for (data,) in _query(database, 'SELECT data FROM "code_sessions_log_tools" ORDER BY ord')
     ]
     assert DROPPED_RUN_KEYS.isdisjoint(json.loads(record))
-    executions = [*tools, *(item["tool_execution"] for item in json.loads(requirements))]
-    assert all(DROPPED_TOOL_EXECUTION_KEYS.isdisjoint(execution) for execution in executions)
+    # The paused call's requirement folded into its tool row.
+    assert requirements is None
+    assert all(DROPPED_TOOL_EXECUTION_KEYS.isdisjoint(execution) for execution in tools)
     converted = store.get_run(stored["run_id"])
     assert converted is not None
     # The database's agent owns its top-level runs.
@@ -1237,7 +1302,10 @@ def _session_columns(database: Path, session_id: str) -> tuple[object, object, o
 
 
 def test_a_queued_compaction_request_becomes_the_metadata_flag(tmp_path: Path) -> None:
-    """Each scope a session state queued gets the metadata force flag, and the state and the rest of the row stay."""
+    """The database owner's queued request becomes its metadata force flag; the state and the rest of the row stay.
+
+    No run of the database reads another scope's flag, so another scope's request, or state, asks for nothing.
+    """
     database = _agno_database(
         tmp_path,
         (_SESSION, "agent", "code"),
@@ -1262,7 +1330,7 @@ def test_a_queued_compaction_request_becomes_the_metadata_flag(tmp_path: Path) -
         "code_sessions",
         "metadata",
         json.dumps(
-            {"other": "kept", constants.MINDROOM_COMPACTION_METADATA_KEY: {"version": 2, "states": other_scope}},
+            {"other": "kept", LEGACY_COMPACTION_METADATA_KEY: {"version": 2, "states": other_scope}},
         ),
         session_id=_SESSION,
     )
@@ -1284,30 +1352,25 @@ def test_a_queued_compaction_request_becomes_the_metadata_flag(tmp_path: Path) -
 
     state, session_data, metadata, updated_at = _session_columns(database, _SESSION)
     assert (json.loads(state), json.loads(session_data)) == ({"tool": "kept"}, {"session_metrics": {"total_tokens": 3}})
-    flagged = {"force_compact_before_next_run": True}
     assert json.loads(metadata) == {
         "other": "kept",
-        constants.MINDROOM_COMPACTION_METADATA_KEY: {
-            "version": 2,
-            "states": {**other_scope, "agent:code": flagged, "team:squad": flagged},
-        },
+        constants.MINDROOM_HISTORY_METADATA_KEY: {"force_compact_before_next_run": True},
     }
     assert updated_at == 1
-    assert has_queued_force_compaction(store, _SESSION, HistoryScope(kind="agent", scope_id="code"))
-    assert has_queued_force_compaction(store, _SESSION, HistoryScope(kind="team", scope_id="squad"))
-    # The database's agent owns the session the team row named too.
+    assert has_queued_force_compaction(store, _SESSION)
+    # The database's agent owns the session the team row named too, and the team's request asks nothing of it.
     team = store.load_session("team")
     assert team is not None
     assert team.session_state == {}
-    assert has_queued_force_compaction(store, "team", HistoryScope(kind="team", scope_id="squad"))
+    assert not has_queued_force_compaction(store, "team")
     assert _session_columns(database, "idle") == ('{"tool": 1}', None, idle_metadata, idle_updated_at)
 
 
 def test_a_request_queued_before_the_summary_rows_existed_leaves_the_scopes_tombstones_to_their_step(
     tmp_path: Path,
 ) -> None:
-    """The destructive compactor's tombstones in the scope's state drop their runs before the flag joins that state."""
-    compaction = constants.MINDROOM_COMPACTION_METADATA_KEY
+    """The destructive compactor's tombstones in the scope's state still drop their runs, and the request sets the flag."""
+    compaction = LEGACY_COMPACTION_METADATA_KEY
     database = write_agno_database(
         _NAMES.database_path(tmp_path),
         ConversationSession(
@@ -1327,9 +1390,7 @@ def test_a_request_queued_before_the_summary_rows_existed_leaves_the_scopes_tomb
     session = store.load_session(_SESSION)
     assert session is not None
     assert session.session_state == {}
-    assert session.metadata == {
-        compaction: {"version": 2, "states": {"agent:code": {"force_compact_before_next_run": True}}},
-    }
+    assert session.metadata == {constants.MINDROOM_HISTORY_METADATA_KEY: {"force_compact_before_next_run": True}}
 
 
 @pytest.mark.parametrize(
@@ -1358,7 +1419,7 @@ def test_a_queued_request_that_names_no_scope_requests_nothing(tmp_path: Path, q
     state, session_data, metadata, _updated_at = _session_columns(database, _SESSION)
     assert (json.loads(state), session_data) == ({"tool": "kept"}, None)
     assert metadata == '{"other":  "kept"}'
-    assert not has_queued_force_compaction(store, _SESSION, HistoryScope(kind="agent", scope_id="code"))
+    assert not has_queued_force_compaction(store, _SESSION)
 
 
 @pytest.mark.parametrize(

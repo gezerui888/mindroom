@@ -24,12 +24,14 @@ if TYPE_CHECKING:
     config_fields=[
         ConfigField(
             name="chat_id",
+            env=("TELEGRAM_CHAT_ID",),
             label="Chat ID",
             type="text",
             required=True,
         ),
         ConfigField(
             name="token",
+            env=("TELEGRAM_TOKEN",),
             label="Token",
             type="password",
             required=False,
@@ -149,7 +151,7 @@ if TYPE_CHECKING:
             default=False,
         ),
     ],
-    dependencies=["httpx"],
+    dependencies=["pytelegrambotapi"],
     docs_url="https://docs.mindroom.chat/tools/messaging-and-social/#telegram",
     function_names=(
         "delete_message",

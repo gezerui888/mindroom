@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
-from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Literal
-
-from agno.tools import Toolkit
 
 from mindroom.tool_jobs.consumption import consume_tool_job, job_failure, job_failure_text
 from mindroom.tool_jobs.conversation import current_approval_wait_timeout, current_conversation
@@ -19,9 +16,9 @@ from mindroom.tool_jobs.runtime import (
     get_background_runtime,
     job_summary,
 )
-from mindroom.tool_system.declarations import tool_schema_source
-from mindroom.tool_system.output_files import wrap_toolkit_for_output_files
-from mindroom.tool_system.runtime_context import get_tool_runtime_context
+from mindroom.tool_system.agno_toolkits import configure_toolkit_functions
+from mindroom.tool_system.authoring import Toolkit
+from mindroom.tool_system.runtime_context import current_execution_identity
 from mindroom.tool_system.tool_function import ToolValue
 
 if TYPE_CHECKING:
@@ -42,8 +39,8 @@ _UNAVAILABLE = (
 
 
 def is_job_function(function: ToolFunction) -> bool:
-    """Recognize the reserved implementation through SDK and MindRoom output wrappers, never a same-named plugin."""
-    entrypoint = tool_schema_source(inspect.unwrap(function.entrypoint))
+    """Recognize the reserved implementation through its validation and output wrappers, never a same-named plugin."""
+    entrypoint = inspect.unwrap(function.entrypoint)
     return (
         inspect.ismethod(entrypoint)
         and isinstance(entrypoint.__self__, JobTools)
@@ -103,9 +100,8 @@ async def _collect(runtime: ToolJobRuntime, owner: ToolExecutionIdentity) -> str
 class JobTools(Toolkit):
     """Discover and manage jobs belonging to the exact caller and conversation."""
 
-    def __init__(self, runtime_paths: RuntimePaths, owner: ToolExecutionIdentity) -> None:
+    def __init__(self, runtime_paths: RuntimePaths) -> None:
         self._runtime_paths = runtime_paths
-        self._owner = owner
         super().__init__(
             name="job",
             tools=[self.job],
@@ -145,30 +141,7 @@ class JobTools(Toolkit):
         if "job" in offered:
             msg = "Tool function name job is reserved for managed job controls"
             raise ValueError(msg)
-        return wrap_toolkit_for_output_files(JobTools(runtime_paths, owner), output_file_policy)
-
-    def caller_identity(self) -> ToolExecutionIdentity:
-        """Keep the original execution owner with the current conversation session."""
-        context = get_tool_runtime_context()
-        if context is None:
-            return self._owner
-        transport = context.recipient
-        if transport == self._owner.recipient:
-            transport = self._owner.transport_agent_name
-        return replace(
-            self._owner,
-            agent_name=(
-                self._owner.agent_name
-                if context.agent_name in {self._owner.agent_name, self._owner.transport_agent_name}
-                else context.agent_name
-            ),
-            requester_id=context.requester_id,
-            room_id=context.room_id,
-            thread_id=context.thread_id,
-            resolved_thread_id=context.resolved_thread_id,
-            session_id=context.session_id,
-            transport_agent_name=transport,
-        )
+        return configure_toolkit_functions(JobTools(runtime_paths), output_files=output_file_policy)
 
     async def job(  # noqa: PLR0911 - Each public action returns its own result.
         self,
@@ -194,9 +167,10 @@ class JobTools(Toolkit):
 
         """
         runtime = get_background_runtime(self._runtime_paths)
-        if runtime is None:
+        # The jobs the running call's caller started in its conversation, as its identity names them.
+        owner = current_execution_identity()
+        if runtime is None or owner is None:
             return "Job controls require a managed conversation."
-        owner = self.caller_identity()
         # Job controls exist only for the top-level caller, so every job they reach has depth 0.
         try:
             if action == "list":
@@ -222,8 +196,6 @@ class JobTools(Toolkit):
                 if waited.claim is not None:
                     return await _claimed_result(runtime, waited.job, waited.claim)
                 return format_job_handle(waited.job)
-            if action != "cancel":
-                return "Unknown job action."
             # The job stops on its own time; the next notice reports how it ended.
             return format_job_handle(await runtime.cancel(job_id, owner=owner, depth=0))
         except JobUnavailableError:

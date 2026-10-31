@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from functools import cached_property, partial
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import mindroom.tools  # noqa: F401
 from mindroom import constants
@@ -16,11 +16,7 @@ from mindroom.agent_loop.build import AgentBuild, AgentSurface
 from mindroom.agent_loop.prompt import PromptSpec, join_sections
 from mindroom.agent_loop.spec import AgentSpec
 from mindroom.agent_loop.tools import offered_toolkits, toolkit_instructions
-from mindroom.approval.tool_approval import (
-    JOB_APPROVAL_TYPE,
-    POLICY_CONFIRMATION_APPROVAL_TYPE,
-    tool_may_require_approval,
-)
+from mindroom.approval.tool_approval import tool_may_require_approval
 from mindroom.config.resolution import memory_backend
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.custom_tools.computer_announcement import computer_announcement_middleware
@@ -35,12 +31,11 @@ from mindroom.delegation.state import DELEGATION_FUNCTIONS
 from mindroom.entity_resolution import entity_identity_registry
 from mindroom.error_handling import MinimalModeUnavailableError, minimal_mode_failure_message
 from mindroom.failure_text import failure_text
-from mindroom.hooks import HookRegistry
+from mindroom.hooks import HookBindings
 from mindroom.knowledge.search import KNOWLEDGE_SEARCH_TOOL_NAME
 from mindroom.llm.provider import DeferredTools, ModelRequest
 from mindroom.logging_config import get_logger
-from mindroom.mcp.registry import mcp_tool_name
-from mindroom.mcp.toolkit import MindRoomMCPToolkit, mcp_function_collisions
+from mindroom.mcp.toolkit import MindRoomMCPToolkit
 from mindroom.path_confinement import read_regular_file_within_root
 from mindroom.prompt_templates import build_agent_identity_context, openai_compat_identity, render_prompt_template
 from mindroom.providers import registry as provider_registry
@@ -49,7 +44,6 @@ from mindroom.runtime_resolution import (
     resolve_agent_runtime,
 )
 from mindroom.scheduling.scheduled_tool_calls import bind_live_tools
-from mindroom.session_storage import agent_storage
 from mindroom.shared_directories.paths import describe_agent_shared_directories
 from mindroom.system_prompt import render_session_context
 from mindroom.timing import timed, timed_block
@@ -59,16 +53,13 @@ from mindroom.tool_jobs.settings import background_tool_jobs_enabled, toolkit_is
 from mindroom.tool_system.agent_tool_calls import DeferredAgentToolkit
 from mindroom.tool_system.agent_tools import AgentTools, turn_room_flags
 from mindroom.tool_system.agno_toolkits import (
-    adapt_function,
     adapt_toolkit,
+    configure_toolkit_functions,
     offered_refusal,
+    toolkit_function_names,
     with_offered_instructions,
 )
-from mindroom.tool_system.catalog import (
-    TOOL_METADATA,
-    ensure_tool_registry_loaded,
-    get_tool_by_name,
-)
+from mindroom.tool_system.catalog import get_tool_by_name
 from mindroom.tool_system.construction import (
     ToolConstruction,
     bind_toolkit_construction,
@@ -76,28 +67,26 @@ from mindroom.tool_system.construction import (
     tool_config_signature,
 )
 from mindroom.tool_system.declarations import (
-    MATRIX_ROOM_RUNTIME_APPROVAL_TYPE,
     MATRIX_ROOM_RUNTIME_TOOL_NAMES,
     ToolFileAccess,
+    is_matrix_room_runtime_function,
 )
 from mindroom.tool_system.dynamic_toolkits import DeferredToolkit, ToolDeferral, defer_toolkit
-from mindroom.tool_system.output_files import ToolOutputFilePolicy, wrap_toolkit_for_output_files
-from mindroom.tool_system.plugins import load_plugins
-from mindroom.tool_system.runtime_context import ToolDispatchContext
+from mindroom.tool_system.output_files import ToolOutputFilePolicy
 from mindroom.tool_system.sandbox_proxy import ToolPlacement, tool_placement
 from mindroom.tool_system.skills import SKILL_FUNCTION_NAMES, agent_workspace_skills_root, build_skills_toolkit
-from mindroom.tool_system.tool_function import AdaptedToolkit
+from mindroom.tool_system.tool_function import AdaptedToolkit, ToolGate
 from mindroom.tool_system.tool_hooks import build_tool_hook_middleware
 from mindroom.tool_system.toolkit_connections import run_connection
 from mindroom.tool_system.worker_routing import (
     agent_workspace_root_path,
     resolve_agent_owned_path,
 )
-from mindroom.workers.runtime import primary_worker_backend_name
+from mindroom.workers.backend_kinds import WorkerBackendKind, worker_backend_kind
 from mindroom.workspaces import ensure_workspace_template
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
     from contextlib import AbstractContextManager
 
     from mindroom.agent_modes import AgentMode
@@ -106,13 +95,13 @@ if TYPE_CHECKING:
     from mindroom.config.models import EffectiveToolConfig, FileAccess
     from mindroom.config.resolution import ResolvedAgent
     from mindroom.delegation.state import SubagentPersona
-    from mindroom.hooks import HookRegistryPlugin
     from mindroom.knowledge.refresh_scheduler import KnowledgeRefreshScheduler
     from mindroom.knowledge.search import AgentKnowledge
     from mindroom.llm.provider import ModelProvider
-    from mindroom.session_storage.store import ConversationStore
-    from mindroom.tool_system.agno_toolkits import Toolkit
+    from mindroom.tool_system.agno_toolkits import AnyToolkit
     from mindroom.tool_system.invocation import ToolCall, ToolMiddleware, ToolNext
+    from mindroom.tool_system.plugins import ConfigPlugins
+    from mindroom.tool_system.registry import ToolRegistry
     from mindroom.tool_system.skills import RefusedWorkspaceSkill, SkillsToolkit
     from mindroom.tool_system.tool_function import ToolFunction
     from mindroom.tool_system.worker_routing import ToolExecutionIdentity, WorkerScope
@@ -161,7 +150,7 @@ class _ToolkitEntry:
     """
 
     adapted: AdaptedToolkit
-    toolkit: Toolkit | None = None
+    toolkit: AnyToolkit | None = None
     deferral: ToolDeferral | None = None
 
 
@@ -186,7 +175,7 @@ class _AgentToolAssembly:
         """Return the toolkits a run offers, in offer order."""
         return tuple(entry.adapted for entry in self.entries)
 
-    def job_sources(self) -> tuple[tuple[Toolkit, ToolFunction], ...]:
+    def job_sources(self) -> tuple[tuple[AnyToolkit, ToolFunction], ...]:
         """Return each function a run offers of a configured toolkit with the toolkit built for it, as tool jobs see it."""
         return tuple(
             (entry.toolkit, function)
@@ -568,22 +557,33 @@ def _file_mode_knowledge_instruction_block(
     return "\n".join([*lines, *source_lines])
 
 
-def _tool_base_dir_override(tool_name: str, *, workspace_path: Path) -> dict[str, object] | None:
+def _tool_base_dir_override(tool_name: str, *, tools: ToolRegistry, workspace_path: Path) -> dict[str, object] | None:
     """Point a registered tool that exposes a ``base_dir`` config field at the agent's workspace."""
-    metadata = TOOL_METADATA.get(tool_name)
+    metadata = tools.get(tool_name)
     config_fields = (metadata.config_fields if metadata is not None else None) or ()
     if not any(field.name == "base_dir" for field in config_fields):
         return None
     return {"base_dir": str(workspace_path)}
 
 
-def _offered_entries(entries: Sequence[_ToolkitEntry], *, agent_name: str) -> tuple[_ToolkitEntry, ...]:
-    """Return ``entries``, each holding only the functions a run offers of it, as ``offered_toolkits`` resolves them.
+def _offered_entries(
+    entries: Sequence[_ToolkitEntry],
+    *,
+    agent_name: str,
+) -> tuple[tuple[_ToolkitEntry, ...], dict[str, set[str]]]:
+    """Return ``entries``, each holding only the functions a run offers of it, and by tool the functions left out.
 
-    A configured toolkit whose every function name an earlier toolkit took is reported.
+    A run offers one function per name. An MCP function leaves whenever another toolkit offers its name, or the name
+    is reserved for Matrix room recovery, because its server's catalog chooses that name and can change it without
+    anyone editing the config, so a new remote tool never shadows a local function or another server's; every other
+    name keeps its first function (``offered_toolkits``). A configured toolkit whose every function another took is
+    reported.
     """
-    offered = offered_toolkits([entry.adapted for entry in entries], agent=agent_name)
+    offered = offered_toolkits(_without_colliding_mcp_functions(entries, agent_name=agent_name), agent=agent_name)
+    offered_entries: list[_ToolkitEntry] = []
+    left_out: dict[str, set[str]] = {}
     for entry, toolkit in zip(entries, offered, strict=True):
+        offered_entries.append(replace(entry, adapted=toolkit))
         if entry.toolkit is not None and entry.adapted.functions and not toolkit.functions:
             logger.warning(
                 "Configured toolkit exposes no unique model functions because function names collide",
@@ -591,57 +591,58 @@ def _offered_entries(entries: Sequence[_ToolkitEntry], *, agent_name: str) -> tu
                 toolkit=toolkit.name,
                 function_names=sorted(function.name for function in entry.adapted.functions),
             )
-    return tuple(replace(entry, adapted=toolkit) for entry, toolkit in zip(entries, offered, strict=True))
+        offered_names = {function.name for function in toolkit.functions}
+        for function in entry.adapted.functions:
+            if function.name not in offered_names and function.registered_toolkit is not None:
+                left_out.setdefault(function.registered_toolkit, set()).add(function.name)
+    return tuple(offered_entries), left_out
 
 
-def _without_session_mcp_function_collisions(
-    entries: Sequence[_ToolkitEntry],
-    *,
-    agent_name: str,
-) -> tuple[list[_ToolkitEntry], dict[str, tuple[str, ...]]]:
-    """Leave the MCP functions that collide in the session's tool surface out of what a run offers.
-
-    Return the entries and, per tool, the functions left out.
-    """
-    hidden = mcp_function_collisions(
-        [
-            (entry.toolkit, [function.name for function in entry.adapted.functions])
-            for entry in entries
-            if entry.toolkit is not None
-        ],
-    )
-    for server_id, function_names in hidden.items():
-        logger.warning(
-            "Hiding colliding MCP functions from session tool surface",
-            agent=agent_name,
-            server_id=server_id,
-            function_names=list(function_names),
-        )
-    kept = [
-        _without_functions(entry, hidden.get(entry.toolkit.server_id, ()))
-        if isinstance(entry.toolkit, MindRoomMCPToolkit)
-        else entry
-        for entry in entries
-    ]
-    return kept, {mcp_tool_name(server_id): function_names for server_id, function_names in hidden.items()}
-
-
-def _without_functions(entry: _ToolkitEntry, names: Collection[str]) -> _ToolkitEntry:
-    """Return ``entry`` offering none of the functions ``names`` names."""
-    if not names:
-        return entry
-    functions = tuple(function for function in entry.adapted.functions if function.name not in names)
-    return replace(entry, adapted=replace(entry.adapted, functions=functions))
+def _without_colliding_mcp_functions(entries: Sequence[_ToolkitEntry], *, agent_name: str) -> list[AdaptedToolkit]:
+    """Return the toolkits of ``entries``, each MCP one without the functions whose name another toolkit offers."""
+    # Each owner is an entry, named by its toolkit; a reserved room-recovery function is its registered tool's,
+    # offered or not.
+    owners: dict[str, list[tuple[_ToolkitEntry | None, str]]] = {
+        name: [(None, name)] for name in MATRIX_ROOM_RUNTIME_TOOL_NAMES
+    }
+    for entry in entries:
+        for function in entry.adapted.functions:
+            owners.setdefault(function.name, []).append((entry, entry.adapted.name))
+    toolkits: list[AdaptedToolkit] = []
+    for entry in entries:
+        toolkit = entry.adapted
+        if isinstance(entry.toolkit, MindRoomMCPToolkit):
+            kept: list[ToolFunction] = []
+            for function in toolkit.functions:
+                others = [*dict.fromkeys(name for owner, name in owners[function.name] if owner is not entry)]
+                if not others:
+                    kept.append(function)
+                    continue
+                logger.warning(
+                    "Hiding an MCP function whose name another toolkit offers",
+                    agent=agent_name,
+                    toolkit=toolkit.name,
+                    function_name=function.name,
+                    colliding_toolkits=others,
+                )
+            toolkit = replace(toolkit, functions=tuple(kept))
+        toolkits.append(toolkit)
+    return toolkits
 
 
 class _MatrixRoomRuntimeToolCollisionError(ValueError):
     """Raised when another registered tool claims a reserved runtime function."""
 
 
-def _reject_matrix_room_runtime_tool_function_collisions(registered_tool_name: str, toolkit: Toolkit) -> None:
-    """Keep reserved room-runtime functions owned by their registered built-in tool, whatever else the toolkit holds."""
+def _reject_matrix_room_runtime_tool_function_collisions(registered_tool_name: str, toolkit: AnyToolkit) -> None:
+    """Keep reserved room-runtime functions owned by their registered built-in tool, whatever else the toolkit holds.
+
+    An MCP server's catalog chooses its names, so its function of a reserved name leaves at offer time instead.
+    """
+    if isinstance(toolkit, MindRoomMCPToolkit):
+        return
     reserved_names = set(MATRIX_ROOM_RUNTIME_TOOL_NAMES)
-    function_names = set(toolkit.get_async_functions())
+    function_names = set(toolkit_function_names(toolkit))
     collisions = sorted(name for name in function_names & reserved_names if registered_tool_name != name)
     if collisions:
         msg = f"Tool function name(s) {', '.join(collisions)} are reserved for Matrix room recovery tools."
@@ -692,7 +693,7 @@ def build_agent_toolkit(  # noqa: C901, PLR0911
     refresh_scheduler: KnowledgeRefreshScheduler | None = None,
     persona: SubagentPersona | None = None,
     deferred_toolkits: Callable[[], Sequence[DeferredToolkit]] | None = None,
-) -> Toolkit | None:
+) -> AnyToolkit | None:
     """Build one of the toolkits ``agent_tools`` offers the agent, where ``placement`` runs it.
 
     ``persona`` is an authored subagent's persona; its ``delegate`` toolkit keeps
@@ -713,29 +714,25 @@ def build_agent_toolkit(  # noqa: C901, PLR0911
             execution_identity=execution_identity,
             create=True,
         )
-    storage_path = runtime_paths.storage_root
     credentials_manager = get_runtime_credentials_manager(runtime_paths)
 
-    def constructed(toolkit: Toolkit) -> Toolkit:
+    def constructed[T: AnyToolkit](toolkit: T) -> T:
         return bind_toolkit_construction(
             toolkit,
             ToolConstruction(tool_name, None, tool_config_signature(tool_config_overrides)),
         )
 
-    def wrap_direct(toolkit: Toolkit) -> Toolkit:
+    def wrap_direct[T: AnyToolkit](toolkit: T) -> T:
         threshold = config.defaults.tool_output_auto_save_threshold_bytes
         policy = _agent_tool_output_file_policy(agent_runtime, runtime_paths, threshold)
-        return constructed(wrap_toolkit_for_output_files(toolkit, policy))
+        return constructed(configure_toolkit_functions(toolkit, output_files=policy))
 
     if tool_name == "memory":
         from mindroom.custom_tools.memory import MemoryTools  # noqa: PLC0415
 
-        # MemoryTools resolves the canonical per-agent storage roots internally via the
-        # shared memory facade, so it should receive the caller-visible runtime root here.
         return wrap_direct(
             MemoryTools(
                 agent_name=agent_name,
-                storage_path=storage_path,
                 config=config,
                 runtime_paths=runtime_paths,
                 execution_identity=execution_identity,
@@ -754,7 +751,6 @@ def build_agent_toolkit(  # noqa: C901, PLR0911
         return wrap_direct(
             delegate.DelegateTools(
                 agent_name=agent_name,
-                delegate_to=agent_config.delegate_to,
                 runtime_paths=runtime_paths,
                 config=config,
                 execution_identity=execution_identity,
@@ -831,10 +827,15 @@ def build_agent_toolkit(  # noqa: C901, PLR0911
     return get_tool_by_name(
         tool_name,
         runtime_paths,
+        tools=agent_tools.tools,
         credentials_manager=credentials_manager,
         runtime_config=config,
         tool_config_overrides=tool_config_overrides,
-        tool_init_overrides=_tool_base_dir_override(tool_name, workspace_path=agent_runtime.workspace.root),
+        tool_init_overrides=_tool_base_dir_override(
+            tool_name,
+            tools=agent_tools.tools,
+            workspace_path=agent_runtime.workspace.root,
+        ),
         runs_in_worker=agent_tools.runs_in_worker(tool_name, placement),
         allowed_shared_services=config.get_worker_grantable_credentials() if worker_scope is not None else None,
         tool_output_workspace_root=agent_runtime.workspace.root,
@@ -891,14 +892,14 @@ def _render_tool_execution_environment(
             ],
         )
 
-    backend = primary_worker_backend_name(runtime_paths)
+    backend = worker_backend_kind(runtime_paths)
     lines = [
         "## Tool Execution Environment",
         f"- Local tools (primary MindRoom runtime): {tool_list(local_tool_names)}.",
         f"- Worker-routed tools: {tool_list(worker_routed_tool_names)}.",
-        f"- Worker backend: `{backend}`.",
+        f"- Worker backend: `{backend.value}`.",
     ]
-    if backend == "static_runner":
+    if backend is WorkerBackendKind.STATIC_RUNNER:
         lines.append(
             "- Worker reuse: requests use the configured static runner; no per-user or per-agent "
             "worker state boundary is selected.",
@@ -911,8 +912,8 @@ def _render_tool_execution_environment(
             "user_agent": "one runtime used only by this user-agent pair",
         }[worker_scope]
         idle_behavior = {
-            "docker": "the container stops",
-            "kubernetes": "the deployment scales to zero",
+            WorkerBackendKind.DOCKER: "the container stops",
+            WorkerBackendKind.KUBERNETES: "the deployment scales to zero",
         }[backend]
         lines.extend(
             (
@@ -926,15 +927,20 @@ def _render_tool_execution_environment(
     return "\n".join(lines)
 
 
-def _unconfined_tool_names(tool_names: tuple[str, ...], *, requires_primary_runtime: bool) -> tuple[str, ...]:
+def _unconfined_tool_names(
+    tool_names: tuple[str, ...],
+    *,
+    tools: ToolRegistry,
+    requires_primary_runtime: bool,
+) -> tuple[str, ...]:
     """Return sorted tools not confined by file_access, split by whether a worker can isolate them."""
     return tuple(
         sorted(
             name
             for name in tool_names
-            if name in TOOL_METADATA
-            and TOOL_METADATA[name].file_access is ToolFileAccess.UNCONFINED
-            and TOOL_METADATA[name].requires_primary_runtime is requires_primary_runtime
+            if (metadata := tools.get(name)) is not None
+            and metadata.file_access is ToolFileAccess.UNCONFINED
+            and metadata.requires_primary_runtime is requires_primary_runtime
         ),
     )
 
@@ -959,60 +965,17 @@ def _build_dynamic_tooling_instruction_block(
     )
 
 
-@timed("system_prompt_assembly.agent_create.load_plugins")
-def _load_agent_plugins(config: Config, runtime_paths: constants.RuntimePaths) -> list[HookRegistryPlugin]:
-    return cast("list[HookRegistryPlugin]", load_plugins(config, runtime_paths))
-
-
-@timed("system_prompt_assembly.agent_create.tool_registry_sync")
-def _resolve_agent_tools(config: Config, runtime_paths: constants.RuntimePaths, agent: ResolvedAgent) -> AgentTools:
-    """Sync the registry with the config's MCP servers, then return the toolkits the resolved agent may use."""
-    ensure_tool_registry_loaded(runtime_paths, config, load_plugin_tools=False)
-    return AgentTools(config=config, facts=agent.tools)
-
-
-@timed("system_prompt_assembly.agent_create.hook_bridge")
-def _build_agent_tool_middleware(
-    *,
-    hook_registry: HookRegistry | None,
-    plugins: list[HookRegistryPlugin],
-    agent_name: str,
-    dispatch_context: ToolDispatchContext | None,
-    config: Config,
-    runtime_paths: constants.RuntimePaths,
-) -> ToolMiddleware:
-    """Return the tool-call policy as the middleware the agent loop runs around every call of this agent."""
-    active_hook_registry = hook_registry if hook_registry is not None else HookRegistry.from_plugins(plugins)
-    return build_tool_hook_middleware(
-        active_hook_registry,
-        agent_name=agent_name,
-        dispatch_context=dispatch_context,
-        config=config,
-        runtime_paths=runtime_paths,
-    )
-
-
 def _keep_functions(toolkit: AdaptedToolkit, keep: Callable[[ToolFunction], bool]) -> AdaptedToolkit:
     """Return ``toolkit`` offering only the functions ``keep`` accepts."""
     return replace(toolkit, functions=tuple(function for function in toolkit.functions if keep(function)))
 
 
-def _approval_may_gate(
-    config: Config,
-    function_name: str,
-    approval_type: str | None,
-    registered_tool_name: str,
-) -> bool:
+def _approval_may_gate(config: Config, function_name: str, registered_tool_name: str) -> bool:
     """Return whether a config approval rule may gate one function of the toolkit registered as this name."""
-    is_matrix_room_runtime_function = (
-        registered_tool_name == function_name
-        and function_name in MATRIX_ROOM_RUNTIME_TOOL_NAMES
-        and approval_type == MATRIX_ROOM_RUNTIME_APPROVAL_TYPE
-    )
     # A scheduled call runs only with the approval its requester gave when it was scheduled.
     is_scheduled_call_runner = registered_tool_name == "scheduler" and function_name == "run_scheduled_call"
     return (
-        not is_matrix_room_runtime_function
+        not is_matrix_room_runtime_function(registered_tool_name, function_name)
         and not is_scheduled_call_runner
         and tool_may_require_approval(config, function_name)
     )
@@ -1020,7 +983,7 @@ def _approval_may_gate(
 
 def apply_tool_approval_capability(
     adapted: AdaptedToolkit,
-    toolkit: Toolkit,
+    toolkit: AnyToolkit,
     config: Config,
     *,
     registered_tool_name: str,
@@ -1036,23 +999,17 @@ def apply_tool_approval_capability(
     """
 
     def offered(function: ToolFunction) -> ToolFunction | None:
-        # A function that asks for its own confirmation keeps its flags; a rule may gate any other.
-        confirms = function.requires_confirmation is True
-        may_gate = _approval_may_gate(config, function.name, function.approval_type, registered_tool_name)
+        may_gate = _approval_may_gate(config, function.name, registered_tool_name)
         if not resumable:
-            return None if confirms or may_gate else function
+            return None if function.gate is ToolGate.CONFIRM or may_gate else function
         if registered_tool_name == "delegate" and function.name in DELEGATION_FUNCTIONS:
-            return replace(
-                function,
-                external_execution=True,
-                external_execution_silent=True,
-                requires_confirmation=False,
-            )
-        if confirms or not may_gate:
+            return replace(function, gate=ToolGate.DELEGATION)
+        # A function that asks for its own confirmation keeps it; a rule may gate any other.
+        if function.gate is ToolGate.CONFIRM or not may_gate:
             return function
         if approvals_as_jobs and approval_can_run_as_job(function, toolkit):
-            return replace(function, approval_type=JOB_APPROVAL_TYPE)
-        return replace(function, requires_confirmation=True, approval_type=POLICY_CONFIRMATION_APPROVAL_TYPE)
+            return replace(function, gate=ToolGate.JOB)
+        return replace(function, gate=ToolGate.POLICY)
 
     functions = (offered(function) for function in adapted.functions)
     return replace(adapted, functions=tuple(function for function in functions if function is not None))
@@ -1124,12 +1081,10 @@ def _agent_create_timing(label: str, **event_data: object) -> AbstractContextMan
 
 def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools share one construction path
     agent_tools: AgentTools,
-    config: Config,
     runtime_paths: constants.RuntimePaths,
     agent_runtime: ResolvedAgentRuntime,
     *,
     execution_identity: ToolExecutionIdentity | None,
-    hook_registry: HookRegistry | None,
     disable_runtime_capabilities: bool,
     disabled_tool_names: frozenset[str],
     tool_function_filter: Callable[[ToolFunction], bool] | None,
@@ -1142,7 +1097,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
     required_tool_names: tuple[str, ...],
     minimal_mode: bool,
     persona: SubagentPersona | None,
-    plugins: list[HookRegistryPlugin],
+    plugins: ConfigPlugins,
     knowledge: AgentKnowledge | None,
     skills: SkillsToolkit | None,
 ) -> _AgentToolAssembly:
@@ -1151,21 +1106,13 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
     The configured toolkits come first and the knowledge search and skills generated beside them after, so a
     generated function never displaces a configured one; the names across all of them are resolved once, here.
     """
+    config = agent_tools.config
     agent_name = agent_tools.agent_name
     approvals_as_jobs = (
         background_tool_jobs_enabled(config, runtime_paths) and delegation_depth == 0 and not minimal_mode
     )
     persona_tools = persona.tools if persona is not None else None
-    # A team member is built under its team turn's identity; its tool hooks and job controls act as the member.
-    agent_identity = replace(execution_identity, agent_name=agent_name) if execution_identity is not None else None
-    hook_middleware = _build_agent_tool_middleware(
-        hook_registry=hook_registry,
-        plugins=plugins,
-        agent_name=agent_name,
-        dispatch_context=ToolDispatchContext(execution_identity=agent_identity) if agent_identity is not None else None,
-        config=config,
-        runtime_paths=runtime_paths,
-    )
+    hook_middleware = build_tool_hook_middleware(HookBindings(registry=plugins.hooks), config, runtime_paths)
     room_tools, matrix_room_tools = turn_room_flags(execution_identity)
     # Minimal mode calls deferred toolkits through mindroom-agent, so it attaches only initial ones and the toolkits a
     # saved approval needs; every other runtime attaches them all. Native tool search sends deferred ones marked as
@@ -1195,7 +1142,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
             for entry in complete
             if entry.name not in resolved_tool_configs and entry.name not in disabled_tool_names
         }
-    placement = tool_placement(runtime_paths)
+    placement = tool_placement(runtime_paths, agent_tools.tools)
     workspace_in_worker = agent_tools.workspace_in_worker([*resolved_tool_configs, *deferred_configs], placement)
     entries: list[_ToolkitEntry] = []
     assembly: _AgentToolAssembly | None = None
@@ -1266,7 +1213,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
         return entry
 
     def offered_entry(
-        toolkit: Toolkit,
+        toolkit: AnyToolkit,
         adapted: AdaptedToolkit,
         tool_entry: EffectiveToolConfig,
         authored_name: str,
@@ -1276,7 +1223,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
         deferral = None
         # initial deferred tools stay in the rendered prompt prefix as plain non-deferred tools.
         if wire_deferred_tools and tool_entry.defer and not tool_entry.initial:
-            metadata = TOOL_METADATA.get(authored_name)
+            metadata = agent_tools.tools.get(authored_name)
             deferral, adapted = defer_toolkit(
                 authored_name,
                 metadata.description if metadata else "",
@@ -1299,9 +1246,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
                 replace(function, middleware=(*function.middleware, announcement)) for function in adapted.functions
             )
             adapted = replace(adapted, functions=functions)
-        if not agent_tools.runs_in_worker(tool_name, placement):
-            # A worker builds and connects its own copy of a toolkit routed through it.
-            adapted = replace(adapted, connect=run_connection(toolkit))
+        adapted = replace(adapted, connect=run_connection(toolkit))
         return _ToolkitEntry(adapted=adapted, toolkit=toolkit, deferral=deferral)
 
     cli_deferred = []
@@ -1314,7 +1259,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
                 raise ValueError(msg)
             return entry.adapted
 
-        metadata = TOOL_METADATA.get(deferred_entry.name)
+        metadata = agent_tools.tools.get(deferred_entry.name)
         cli_deferred.append(
             DeferredAgentToolkit(deferred_entry.name, metadata.description if metadata else "", materialize),
         )
@@ -1360,7 +1305,7 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
     controls = JobTools.build(
         {function.name for entry in entries for function in entry.adapted.functions},
         runtime_paths,
-        agent_identity,
+        execution_identity,
         depth=delegation_depth,
         enabled=not disable_runtime_capabilities and background_tool_jobs_enabled(config, runtime_paths),
         output_file_policy=_agent_tool_output_file_policy(
@@ -1371,19 +1316,18 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
     )
     if controls is not None:
         entries.append(_job_controls_entry(controls))
-    kept_entries, hidden_mcp_functions = _without_session_mcp_function_collisions(entries, agent_name=agent_name)
-    if persona_tools is not None:
-        require_built_persona_tools(persona_tools, persona_built, hidden_mcp_functions)
     built = [
-        *kept_entries,
+        *entries,
         *_generated_entries(
-            kept_entries,
+            entries,
             knowledge,
             skills,
             partial(_generated_function_visible, config, tool_function_filter),
         ),
     ]
-    offered = _offered_entries(built, agent_name=agent_name)
+    offered, left_out = _offered_entries(built, agent_name=agent_name)
+    if persona_tools is not None:
+        require_built_persona_tools(persona_tools, persona_built, left_out)
     assembly = _AgentToolAssembly(
         entries=offered,
         instructions=toolkit_instructions(entry.adapted for entry in offered),
@@ -1393,22 +1337,6 @@ def _assemble_agent_toolkits(  # noqa: C901, PLR0915 - eager and deferred tools 
         tool_middleware=(hook_middleware,),
     )
     return assembly
-
-
-def _open_agent_session_storage(
-    agent_name: str,
-    agent_runtime: ResolvedAgentRuntime,
-    *,
-    history_storage: ConversationStore | None,
-    persist_runtime_state: bool,
-) -> ConversationStore | None:
-    """Open (or reuse) the durable conversation store for one agent instance."""
-    with _agent_create_timing("storage_open"):
-        if not persist_runtime_state:
-            return None
-        if history_storage is not None:
-            return history_storage
-        return agent_storage.create_agent_state_storage(agent_name, agent_runtime.session_state_root)
 
 
 def _build_agent_role_context(
@@ -1423,6 +1351,7 @@ def _build_agent_role_context(
     disable_runtime_capabilities: bool,
     local_tool_names: tuple[str, ...],
     worker_routed_tool_names: tuple[str, ...],
+    tools: ToolRegistry,
     file_access: FileAccess,
     include_identity: bool,
 ) -> _AgentRoleContext:
@@ -1444,10 +1373,12 @@ def _build_agent_role_context(
                 file_access=file_access,
                 unconfined_tool_names=_unconfined_tool_names(
                     (*local_tool_names, *worker_routed_tool_names),
+                    tools=tools,
                     requires_primary_runtime=False,
                 ),
                 primary_only_unconfined_tool_names=_unconfined_tool_names(
                     (*local_tool_names, *worker_routed_tool_names),
+                    tools=tools,
                     requires_primary_runtime=True,
                 ),
                 shared_directories=describe_agent_shared_directories(config, runtime_paths, agent_name),
@@ -1571,7 +1502,7 @@ def _build_agent_instructions(
     return instructions
 
 
-def _job_controls_entry(controls: Toolkit) -> _ToolkitEntry:
+def _job_controls_entry(controls: AnyToolkit) -> _ToolkitEntry:
     """Assemble the job controls as their own authored toolkit, which no approval rule gates.
 
     The loop runs the caller's tool hooks around their calls as around any other, but they never ask for approval:
@@ -1597,25 +1528,19 @@ def team_background_jobs(
     config: Config,
     runtime_paths: constants.RuntimePaths,
     owner: ToolExecutionIdentity | None,
+    plugins: ConfigPlugins,
 ) -> LeaderJobs | None:
     """Return a team leader's job controls while the instance runs managed jobs for a Matrix owner.
 
-    The team owns the jobs its members start for it: its leader collects them through these controls.
+    The team owns the jobs its members start for it: its leader collects them through these controls; their tool
+    hooks come from ``plugins``, the view the team turn captured.
     """
     if not background_tool_jobs_enabled(config, runtime_paths) or owner is None:
         return None
     controls = JobTools.build((), runtime_paths, owner, depth=0, enabled=True)
     if controls is None:
         return None
-    plugins = _load_agent_plugins(config, runtime_paths)
-    hooks = _build_agent_tool_middleware(
-        hook_registry=None,
-        plugins=plugins,
-        agent_name=owner.recipient,
-        dispatch_context=ToolDispatchContext(execution_identity=owner),
-        config=config,
-        runtime_paths=runtime_paths,
-    )
+    hooks = build_tool_hook_middleware(HookBindings(registry=plugins.hooks), config, runtime_paths)
     entry = _job_controls_entry(controls)
     control_names = frozenset(function.name for function in entry.adapted.functions)
 
@@ -1655,9 +1580,7 @@ def _generated_entries(
     """
     generated: list[AdaptedToolkit] = []
     if knowledge is not None:
-        search = adapt_function(
-            knowledge.search_function(memory_search_available=_offers_function(entries, _MEMORY_SEARCH_TOOL_NAME)),
-        )
+        search = knowledge.search_function(memory_search_available=_offers_function(entries, _MEMORY_SEARCH_TOOL_NAME))
         if generated_visible(search):
             generated.append(AdaptedToolkit(name=KNOWLEDGE_SEARCH_TOOL_NAME, functions=(search,), instructions=None))
     if skills is not None and (visible_skills := _keep_functions(adapt_toolkit(skills), generated_visible)).functions:
@@ -1674,11 +1597,9 @@ def create_agent(
     *,
     knowledge: AgentKnowledge | None,
     model: TurnModel,
-    hook_registry: HookRegistry | None = None,
-    history_storage: ConversationStore | None = None,
+    plugins: ConfigPlugins,
     include_interactive_questions: bool = True,
     include_openai_compat_guidance: bool = False,
-    persist_runtime_state: bool = True,
     disable_runtime_capabilities: bool = False,
     tool_function_filter: Callable[[ToolFunction], bool] | None = None,
     delegation_depth: int = 0,
@@ -1690,7 +1611,7 @@ def create_agent(
     agent_cli_in_shell: bool = False,
     persona: SubagentPersona | None = None,
 ) -> AgentBuild:
-    """Build an agent from configuration: its model, tools, prompt, request settings, store, and surface.
+    """Build an agent from configuration: its model, tools, prompt, request settings, and surface.
 
     Args:
         agent_name: Name of the agent to create
@@ -1702,15 +1623,13 @@ def create_agent(
             it narrowed to the persona's kept knowledge bases. A graph-enabled agent's graph is added to it,
             unless a persona names the bases it keeps.
         model: The model this agent's turn runs, which the caller resolved for the turn.
-        hook_registry: Optional hook registry for plugin-based tool call
-            interception and event hooks.
-        history_storage: Optional already-open conversation store to reuse for this agent.
+        plugins: The plugin view the caller captured for this operation: the build's tools, placement, skills, and
+            tool hooks all come from it, deferred toolkits included.
         include_interactive_questions: Whether to include the interactive
             question authoring prompt. Set to False for channels that do not
             support Matrix reaction-based question flows.
         include_openai_compat_guidance: Whether to include OpenAI-compatible
             history-format guidance in the shared identity prompt.
-        persist_runtime_state: Whether this agent's runs should write durable history.
         disable_runtime_capabilities: Whether to omit tools, skills, knowledge,
             and preloaded context files for a restricted in-process agent run.
         tool_function_filter: Optional policy applied to each fully resolved
@@ -1757,7 +1676,7 @@ def create_agent(
         config,
         runtime_paths,
         model_name,
-        replace(execution_identity, agent_name=agent_name) if execution_identity is not None else None,
+        execution_identity,
     )
     # An authored persona's prompt replaces the agent's identity; it gets only the caller skills and knowledge bases
     # its persona keeps.
@@ -1771,14 +1690,11 @@ def create_agent(
     )
     portable_deferred_tools = agent_mode == "standard" and not eager_deferred_tools and not native_deferred_tools
 
-    # Loaded before the toolkits are resolved and placed, which read plugin tool metadata, and before the skills,
-    # which include the skills of the plugins this config loads.
-    plugins = _load_agent_plugins(config, runtime_paths)
     agent = config.resolve_agent(agent_name)
-    agent_tools = _resolve_agent_tools(config, runtime_paths, agent)
+    agent_tools = AgentTools(config=config, facts=agent.tools, tools=plugins.tools)
     tool_function_filter, disabled_tool_names = persona_tool_policy(
         persona_tools,
-        lambda: caller_toolkit_names(agent_name, config, delegation_depth=delegation_depth),
+        lambda: caller_toolkit_names(agent_name, config, plugins.tools, delegation_depth=delegation_depth),
         tool_function_filter,
     )
     workspace = agent_runtime.workspace
@@ -1799,6 +1715,7 @@ def create_agent(
             config,
             runtime_paths,
             workspace_root=workspace.root,
+            plugin_skill_roots=plugins.skill_roots,
             output_file_policy=output_file_policy,
             only=persona.kept_skills if persona is not None else None,
             refused=refused_skills,
@@ -1822,11 +1739,9 @@ def create_agent(
     offered_skills = skills if agent_mode == "minimal" else prompt_skills
     tool_assembly = _assemble_agent_toolkits(
         agent_tools,
-        config,
         runtime_paths,
         agent_runtime,
         execution_identity=execution_identity,
-        hook_registry=hook_registry,
         disable_runtime_capabilities=disable_runtime_capabilities,
         disabled_tool_names=disabled_tool_names,
         tool_function_filter=tool_function_filter,
@@ -1843,12 +1758,6 @@ def create_agent(
         knowledge=enabled_knowledge,
         skills=offered_skills,
     )
-    store = _open_agent_session_storage(
-        agent_name,
-        agent_runtime,
-        history_storage=history_storage,
-        persist_runtime_state=persist_runtime_state,
-    )
 
     role_context = _build_agent_role_context(
         agent_name,
@@ -1860,6 +1769,7 @@ def create_agent(
         include_openai_compat_guidance=include_openai_compat_guidance,
         disable_runtime_capabilities=disable_runtime_capabilities,
         local_tool_names=tool_assembly.local_tool_names,
+        tools=plugins.tools,
         worker_routed_tool_names=tool_assembly.worker_routed_tool_names,
         file_access=agent.file_access,
         include_identity=persona is None,
@@ -1988,7 +1898,6 @@ def create_agent(
         prompt=prompt,
         request_template=ModelRequest(messages=(), deferred_tools=deferred_tools),
         history_settings=agent.history_settings,
-        store=store,
         tool_policy=bind_live_tools(spec.functions, tool_assembly.tool_middleware),
         tool_jobs=tool_jobs,
         surface=surface,

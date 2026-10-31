@@ -41,10 +41,12 @@ from mindroom.llm.messages import Message, system_text
 from mindroom.memory.functions import MemoryPromptParts
 from mindroom.run_storage import RunStorage
 from mindroom.runtime_resolution import resolve_agent_storage
-from mindroom.session_storage.store import persist_to
+from mindroom.session_storage.agent_storage import create_session_storage
+from mindroom.session_storage.store import ConversationStore, persist_to
 from mindroom.session_storage.types import ConversationSession
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, tool_runtime_context
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.tool_access import ToolKey
 from tests.conftest import install_model_providers, prepare_agent_and_prompt_for_test
 from tests.identity_helpers import persist_entity_accounts
@@ -73,7 +75,14 @@ def _session(runtime) -> ConversationSession:
     return ConversationSession(session_id=runtime.session_id, kind="agent", owner_id="helper")
 
 
-async def _attempt(build, runtime, session: ConversationSession, *, run_id: str = "generation-1"):
+async def _attempt(
+    build,
+    runtime,
+    session: ConversationSession,
+    *,
+    store: ConversationStore | None = None,
+    run_id: str = "generation-1",
+):
     """Bind one managed minimal attempt of ``build`` as a reply does, returning the run's spec, hooks, and context."""
     run = RunContext(
         run_id=run_id,
@@ -85,7 +94,7 @@ async def _attempt(build, runtime, session: ConversationSession, *, run_id: str 
         replace(build.spec, system_messages=_turn(build).system_messages),
         NO_HOOKS,
         run=run,
-        storage=RunStorage(build.store, session, None),
+        storage=RunStorage(store, session, None),
         response_context=_turn_context(),
         context_documents=minimal_context_documents(build),
         delegation_depth=0,
@@ -94,15 +103,23 @@ async def _attempt(build, runtime, session: ConversationSession, *, run_id: str 
     return spec, hooks, run
 
 
-async def _run_attempt(build, runtime, session: ConversationSession, prompt: str, *, run_id: str = "generation-1"):
-    """Run one minimal attempt on the owned loop and return its terminal record."""
-    spec, hooks, run = await _attempt(build, runtime, session, run_id=run_id)
+async def _run_attempt(
+    build,
+    runtime,
+    session: ConversationSession,
+    prompt: str,
+    *,
+    store: ConversationStore | None = None,
+    run_id: str = "generation-1",
+):
+    """Run one minimal attempt on the owned loop, saving into ``store`` when given, and return its terminal record."""
+    spec, hooks, run = await _attempt(build, runtime, session, store=store, run_id=run_id)
     events = run_agent(
         spec,
         [Message(role="user", content=prompt)],
         ctx=run,
         hooks=hooks,
-        persist=persist_to(build.store, session) if build.store is not None else None,
+        persist=persist_to(store, session) if store is not None else None,
         request_template=build.request_template,
     )
     record = None
@@ -133,19 +150,19 @@ def test_explicit_mode_keeps_standard_factory_default(tmp_path: Path) -> None:
         config,
         runtime,
         None,
-        persist_runtime_state=False,
         knowledge=None,
         model=turn_model(config, runtime, "helper"),
+        plugins=config_plugins(config, runtime),
     )
     minimal = agents.create_agent(
         "helper",
         config,
         runtime,
         None,
-        persist_runtime_state=False,
         agent_mode="minimal",
         knowledge=None,
         model=turn_model(config, runtime, "helper"),
+        plugins=config_plugins(config, runtime),
     )
     assert standard.surface.mode == "standard"
     assert standard.surface.minimal_instructions == ()
@@ -173,10 +190,10 @@ def test_minimal_mode_with_background_jobs_keeps_its_shell_command(tmp_path: Pat
         config,
         runtime,
         None,
-        persist_runtime_state=False,
         agent_mode="minimal",
         knowledge=None,
         model=turn_model(config, runtime, "helper"),
+        plugins=config_plugins(config, runtime),
     )
 
     functions = {function.name: function for toolkit in minimal.spec.toolkits for function in toolkit.functions}
@@ -214,7 +231,7 @@ def test_toolkit_construction_failure_keeps_minimal_recovery_hint(
         return original(tool_name, *args, **kwargs)
 
     monkeypatch.setattr(agents, "get_tool_by_name", load)
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     with pytest.raises(MinimalModeUnavailableError) as raised:
         agents.create_agent(
             "helper",
@@ -222,10 +239,10 @@ def test_toolkit_construction_failure_keeps_minimal_recovery_hint(
             runtime.runtime_paths,
             identity,
             agent_mode="minimal",
-            persist_runtime_state=False,
             delegation_depth=delegation_depth,
             knowledge=None,
             model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+            plugins=config_plugins(runtime.config, runtime.runtime_paths),
         )
 
     message = get_user_friendly_error_message(raised.value, "helper")
@@ -239,9 +256,9 @@ def test_toolkit_construction_failure_keeps_minimal_recovery_hint(
         runtime.config,
         runtime.runtime_paths,
         identity,
-        persist_runtime_state=False,
         knowledge=None,
         model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+        plugins=config_plugins(runtime.config, runtime.runtime_paths),
     )
     functions = _function_names(standard)
     assert "run_shell_command" in functions
@@ -280,10 +297,10 @@ def test_context_files_remain_complete_and_notes_untouched(
         config,
         runtime,
         None,
-        persist_runtime_state=False,
         agent_mode="minimal",
         knowledge=None,
         model=turn_model(config, runtime, "helper"),
+        plugins=config_plugins(config, runtime),
     )
     turn = _turn(minimal)
     system = system_text(turn.system_messages)
@@ -357,11 +374,11 @@ async def test_minimal_attempt_requires_managed_owner(tmp_path: Path) -> None:
         "helper",
         runtime.config,
         runtime.runtime_paths,
-        build_execution_identity_from_runtime_context(runtime),
+        runtime.execution_identity,
         agent_mode="minimal",
-        persist_runtime_state=False,
         knowledge=None,
         model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+        plugins=config_plugins(runtime.config, runtime.runtime_paths),
     )
     with tool_runtime_context(runtime), pytest.raises(MinimalModeUnavailableError, match="response owner"):
         await _attempt(build, runtime, _session(runtime))
@@ -409,10 +426,11 @@ async def test_live_preparation_keeps_hidden_catalog_and_budget_pure(tmp_path: P
         "helper",
         context.config,
         context.runtime_paths,
-        build_execution_identity_from_runtime_context(context),
+        context.execution_identity,
         agent_mode="minimal",
         knowledge=None,
         model=turn_model(context.config, context.runtime_paths, "helper"),
+        plugins=config_plugins(context.config, context.runtime_paths),
     )
     with tool_runtime_context(context):
         async with response_cli_lifetime() as lifetime:
@@ -466,7 +484,7 @@ async def test_saved_minimal_mode_checks_shell_before_initial_or_rebuilt_request
     )
     registry = TurnToolRegistry()
     runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=registry))
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     root = resolve_agent_storage("helper", runtime.config, runtime.runtime_paths, identity).state_root
     set_agent_mode(runtime.runtime_paths, root, "helper", runtime.session_id, "minimal")
     saved_choice = (primary_records_dir(root, runtime.runtime_paths) / "agent_modes.json").read_bytes()
@@ -488,10 +506,13 @@ async def test_saved_minimal_mode_checks_shell_before_initial_or_rebuilt_request
             agent_mode=resolve_agent_mode(runtime.runtime_paths, root, "helper", runtime.session_id),
             knowledge=None,
             model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+            plugins=config_plugins(runtime.config, runtime.runtime_paths),
         )
 
-    def stored_runs(build):
-        stored = build.store.load_session(runtime.session_id)
+    store = create_session_storage("helper", runtime.config, runtime.runtime_paths, identity)
+
+    def stored_runs():
+        stored = store.load_session(runtime.session_id)
         return [run.to_dict() for run in stored.runs] if stored is not None else []
 
     with tool_runtime_context(runtime):
@@ -499,9 +520,9 @@ async def test_saved_minimal_mode_checks_shell_before_initial_or_rebuilt_request
             history = []
             if rebuild:
                 initial = create()
-                record = await _run_attempt(initial, runtime, session, "First request", run_id="first")
+                record = await _run_attempt(initial, runtime, session, "First request", store=store, run_id="first")
                 assert record.content == "done"
-                history = stored_runs(initial)
+                history = stored_runs()
                 await lifetime.retire_attempt()
             previous_owner = lifetime.owner
             previous_shell_env = previous_owner.shell_env if previous_owner is not None else None
@@ -510,14 +531,14 @@ async def test_saved_minimal_mode_checks_shell_before_initial_or_rebuilt_request
             build = create()
             if "exclude_tools" in shell_settings:
                 with pytest.raises(MinimalModeUnavailableError) as raised:
-                    await _run_attempt(build, runtime, session, "Restricted request")
+                    await _run_attempt(build, runtime, session, "Restricted request", store=store)
                 assert "`run_shell_command` shell permission" in str(raised.value)
                 assert "!mode helper standard" in str(raised.value)
                 assert provider.requests == prior_requests
                 assert lifetime.owner is previous_owner
-                assert stored_runs(build)[: len(history)] == history
+                assert stored_runs()[: len(history)] == history
             else:
-                record = await _run_attempt(build, runtime, session, "Supported request")
+                record = await _run_attempt(build, runtime, session, "Supported request", store=store)
                 assert record.content == "done"
                 assert offered_tools(provider.requests[-1]) == ["bash"]
                 assert len(provider.requests) == len(prior_requests) + 1
@@ -548,7 +569,7 @@ async def test_unreachable_cli_offers_standard_mode_without_downgrading(
     runtime = _runtime_context(tmp_path)
     runtime.config.agents["helper"] = AgentConfig(display_name="Helper", tools=["shell"], memory_backend="file")
     runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=TurnToolRegistry()))
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     root = resolve_agent_storage("helper", runtime.config, runtime.runtime_paths, identity).state_root
     set_agent_mode(runtime.runtime_paths, root, "helper", runtime.session_id, "minimal")
     provider = ScriptedProvider()
@@ -561,6 +582,7 @@ async def test_unreachable_cli_offers_standard_mode_without_downgrading(
         agent_mode=resolve_agent_mode(runtime.runtime_paths, root, "helper", runtime.session_id),
         knowledge=None,
         model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+        plugins=config_plugins(runtime.config, runtime.runtime_paths),
     )
     with tool_runtime_context(runtime):
         async with response_cli_lifetime() as lifetime:
@@ -604,7 +626,7 @@ async def test_prepared_minimal_prompt_moves_optional_enrichment_to_context(
         prompt="actual current user request",
         runtime_paths=runtime.runtime_paths,
         config=runtime.config,
-        execution_identity=build_execution_identity_from_runtime_context(runtime),
+        execution_identity=runtime.execution_identity,
     )
     assert "actual current user request" in prepared.prompt_text
     turn_context = next(
@@ -647,10 +669,11 @@ async def test_deferred_catalog_uses_normal_builder_without_opening_unrelated_to
         "helper",
         runtime.config,
         runtime.runtime_paths,
-        build_execution_identity_from_runtime_context(runtime),
+        runtime.execution_identity,
         agent_mode="minimal",
         knowledge=None,
         model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+        plugins=config_plugins(runtime.config, runtime.runtime_paths),
     )
     session = _session(runtime)
     with tool_runtime_context(runtime):
@@ -692,7 +715,8 @@ async def test_real_response_requests_only_bash_after_deferred_call_and_history(
         memory_backend="file",
     )
     registry = TurnToolRegistry()
-    runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=registry))
+    # The switch reads the runtime's budgets, which this runtime has none of.
+    runtime = replace(runtime, orchestrator=SimpleNamespace(agent_cli_registry=registry, budgets=None))
     persist_entity_accounts(runtime.config, runtime.runtime_paths)
     runtime.config.models["other"] = runtime.config.models["default"].model_copy(update={"id": "other-model"})
     owners = []
@@ -739,7 +763,7 @@ async def test_real_response_requests_only_bash_after_deferred_call_and_history(
     install_model_providers(monkeypatch, models)
     install_scripted_shell(monkeypatch, run_shell_command)
     ctx = replace(_turn_context(), agent_mode="minimal", run_id=None)
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
 
     async def respond():
         return await ai.ai_response(
@@ -756,7 +780,7 @@ async def test_real_response_requests_only_bash_after_deferred_call_and_history(
 
     with tool_runtime_context(runtime):
         result = await respond()
-    assert "done" in str(result)
+    assert "done" in result.text
     minimal_requests = models["default"].requests + models["other"].requests
     assert len(minimal_requests) == 2
     assert len(models["other"].requests) == (1 if switch_model else 0)
@@ -779,10 +803,10 @@ async def test_real_response_requests_only_bash_after_deferred_call_and_history(
     )
     ctx = replace(ctx, reply_to_event_id="$next", correlation_id="next")
     runtime = replace(runtime, target=replace(runtime.target, reply_to_event_id="$next"), correlation_id="next")
-    identity = build_execution_identity_from_runtime_context(runtime)
+    identity = runtime.execution_identity
     with tool_runtime_context(runtime):
         result = await respond()
-    assert "done" in str(result)
+    assert "done" in result.text
     replying = models["other" if switch_model else "default"]
     assert len(replying.requests) == (2 if switch_model else 3)
     assert len(owners) == 1
@@ -847,12 +871,12 @@ async def test_every_cli_toolkit_answers_to_its_own_tool_name(
                 agent_mode="minimal",
                 run_id=None,
                 prompt="list my attachments",
-                execution_identity=build_execution_identity_from_runtime_context(runtime),
+                execution_identity=runtime.execution_identity,
             ),
             runtime.runtime_paths,
             runtime.config,
         )
-    assert "done" in str(result)
+    assert "done" in result.text
     assert offered_tools(provider.requests[0]) == ["bash"]
     assert (
         f"Toolkits callable through mindroom-agent: {roster}"
@@ -890,10 +914,11 @@ async def test_routed_shell_calls_back_through_worker_origin_and_sizing_stays_pu
         "helper",
         runtime.config,
         runtime.runtime_paths,
-        build_execution_identity_from_runtime_context(runtime),
+        runtime.execution_identity,
         agent_mode="minimal",
         knowledge=None,
         model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+        plugins=config_plugins(runtime.config, runtime.runtime_paths),
     )
     assert _function_names(presented_build(build)) == ["bash"]
     with tool_runtime_context(runtime):

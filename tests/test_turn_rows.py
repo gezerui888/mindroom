@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from mindroom.event_journal import EventJournalStore, journal, turn_rows
 from mindroom.event_journal.identity import journal_principal_id
-from mindroom.event_journal.turn_rows import Accepted, Answered, Refused
+from mindroom.event_journal.turn_rows import Answered, PendingTurn, Refused
 from mindroom.history.types import HistoryScope
 from mindroom.message_target import MessageTarget
 from mindroom.turn_record import (
@@ -20,6 +21,7 @@ from mindroom.turn_record import (
     TurnRecord,
 )
 from tests.test_event_journal_store import admit
+from tests.turn_state_oracle.adapter import checked_pending_write
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -82,14 +84,14 @@ async def read(store: EventJournalStore, operation: Callable[..., Any], *args: o
 
 
 async def pending(store: EventJournalStore, record: TurnRecord, room_id: str = ROOM) -> turn_rows.ReshapeResult:
-    """Record one pending turn in ``room_id``."""
-    return await write(store, turn_rows.record_pending_turn, record, room_id=room_id)
+    """Record one pending turn in ``room_id``, requiring what it returns to be what a read of its rows finds."""
+    return await write(store, checked_pending_write, record, room_id=room_id)
 
 
 async def accepted(store: EventJournalStore, record: TurnRecord, room_id: str = ROOM) -> TurnRecord:
     """Record one pending turn and return it, requiring the write to land."""
     result = await pending(store, record, room_id)
-    assert isinstance(result, Accepted), result
+    assert isinstance(result, PendingTurn), result
     return result.record
 
 
@@ -133,6 +135,29 @@ class TestReshape:
         assert reordered.anchor_event_id == "$a"
         assert await read(store, turn_rows.load_turn, first.turn_key) is None
 
+    async def test_a_rewrite_returns_each_revisions_response_proof_as_stored(self, store: EventJournalStore) -> None:
+        """A pending write repeating revisions returns the proof each stored row ends with: one it kept or one it gained."""
+        await accepted(
+            store,
+            turn(
+                ["$a"],
+                replay={"$e1": RevisionReplay("$a", 10, response_event_id="$answer"), "$e2": RevisionReplay("$a", 20)},
+            ),
+        )
+
+        again = await accepted(
+            store,
+            turn(
+                ["$a"],
+                replay={"$e1": RevisionReplay("$a", 10), "$e2": RevisionReplay("$a", 20, response_event_id="$later")},
+            ),
+        )
+
+        assert again.revision_replay == {
+            "$e1": RevisionReplay("$a", 10, response_event_id="$answer"),
+            "$e2": RevisionReplay("$a", 20, response_event_id="$later"),
+        }
+
     async def test_watermarks_and_consumed_revision_proof_survive_reshape(self, store: EventJournalStore) -> None:
         """Watermarks and consumed revision proof survive reshape."""
         first = await accepted(
@@ -160,6 +185,26 @@ class TestReshape:
 
         assert merged.revision_replay == {"$ec": RevisionReplay("$c", 30)}
         assert merged.source_event_prompts == {"$c": "c", "$d": "d"}
+
+    async def test_absorbed_turns_resolve_one_revisions_conflicting_proofs_by_turn_key_on_either_backend(
+        self,
+        store: EventJournalStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two unfinished turns holding one edit with different response proofs merge to the lower key's proof.
+
+        The keys are pinned so the turn with the lower key is the one stored second, which the database is free
+        to return last when it reads both.
+        """
+        keys = iter(("b" * 32, "a" * 32, "c" * 32))
+        monkeypatch.setattr(turn_rows, "uuid", SimpleNamespace(uuid4=lambda: SimpleNamespace(hex=next(keys))))
+        await accepted(store, turn(["$a"], replay={"$e": RevisionReplay("$x", 10, response_event_id="$from-a")}))
+        await accepted(store, turn(["$b"], replay={"$e": RevisionReplay("$x", 10, response_event_id="$from-b")}))
+
+        merged = await accepted(store, turn(["$a", "$b"]))
+
+        assert merged.turn_key == "c" * 32
+        assert merged.revision_replay == {"$e": RevisionReplay("$x", 10, response_event_id="$from-b")}
 
     async def test_reshape_keeps_a_selected_edit_and_its_watermark_against_an_older_late_write(
         self,
@@ -237,6 +282,24 @@ class TestReshape:
         assert batch.visible_echoes == {"$m1": SourceVisibleEcho("$echo")}
         assert batch.prepared_voice_sources == {"$m2": VOICE}
         assert await read(store, turn_rows.visible_echo, "$m1") == SourceVisibleEcho("$echo", is_fallback=False)
+
+    async def test_a_pending_write_stores_the_checkpoint_and_echo_it_carries_and_keeps_stored_ones(
+        self,
+        store: EventJournalStore,
+    ) -> None:
+        """A pending write stores a candidate's voice checkpoint and echo, and a later one keeps those it finds."""
+        first = await accepted(store, turn(["$v"], voice={"$v": VOICE}, echoes={"$v": SourceVisibleEcho("$echo")}))
+        other = PreparedVoiceSource.from_content("other", {"msgtype": "m.text", "body": "other"})
+
+        again = await accepted(
+            store,
+            turn(["$v"], voice={"$v": other}, echoes={"$v": SourceVisibleEcho("$other-echo", is_fallback=True)}),
+        )
+
+        assert first.prepared_voice_sources == {"$v": VOICE}
+        assert first.visible_echoes == {"$v": SourceVisibleEcho("$echo")}
+        assert again.prepared_voice_sources == {"$v": VOICE}
+        assert again.visible_echoes == {"$v": SourceVisibleEcho("$echo")}
 
     async def test_completed_or_bound_owners_refuse_and_the_same_completed_tuple_is_answered(
         self,
@@ -337,7 +400,7 @@ class TestAliases:
         assert await pending(store, turn(["$o"])) == Refused()
         # Waiting in a batch beside a fresh source, the original refuses the batch so each source retries alone.
         assert await pending(store, turn(["$o", "$fresh"])) == Refused()
-        assert isinstance(await pending(store, turn(["$fresh"])), Accepted)
+        assert isinstance(await pending(store, turn(["$fresh"])), PendingTurn)
 
     async def test_a_relay_handed_to_its_final_delivery_also_refuses_a_batch_naming_its_original(
         self,
@@ -373,6 +436,25 @@ class TestAliases:
         relay = await accepted(store, turn(["$r"], aliases=["$o"]))
 
         assert relay.discovery_event_ids == ()
+
+    async def test_coalesced_relays_return_their_originals_in_the_order_a_read_finds_them(
+        self,
+        store: EventJournalStore,
+    ) -> None:
+        """Two relays coalesced into one turn return their originals in byte order, whichever arrived first."""
+        relays = await accepted(
+            store,
+            turn(
+                ["$r1", "$r2"],
+                aliases=["$z-original", "$a-original"],
+                metadata={
+                    "$r1": SourceEventMetadata(ALICE, discovery_event_id="$z-original"),
+                    "$r2": SourceEventMetadata(ALICE, discovery_event_id="$a-original"),
+                },
+            ),
+        )
+
+        assert relays.discovery_event_ids == ("$a-original", "$z-original")
 
 
 class TestRedactionGuard:
@@ -457,6 +539,47 @@ class TestRedactionGuard:
         assert await read(store, turn_rows.deleted_sources, selection.source_event_ids) == {"$answer", "$more"}
         assert await read(store, turn_rows.deleted_sources, relay.source_event_ids) == {"$r"}
 
+    async def test_a_pending_write_keeps_no_checkpoint_for_a_deleted_source_but_keeps_its_echo(
+        self,
+        store: EventJournalStore,
+    ) -> None:
+        """A deleted voice source's pending write stores no checkpoint, while its echo stays for publication readers."""
+        await redact(store, "$v")
+
+        result = await pending(store, turn(["$v"], voice={"$v": VOICE}, echoes={"$v": SourceVisibleEcho("$echo")}))
+
+        assert isinstance(result, PendingTurn)
+        assert result.deleted_sources == {"$v"}
+        assert result.record.prepared_voice_sources is None
+        assert result.record.visible_echoes == {"$v": SourceVisibleEcho("$echo")}
+
+    async def test_a_pending_write_clears_the_stored_checkpoint_of_a_source_it_finds_deleted(
+        self,
+        store: EventJournalStore,
+    ) -> None:
+        """A write that first maps a source to its redacted original drops the checkpoint stored for that source."""
+        await accepted(store, turn(["$r"], voice={"$r": VOICE}))
+        await redact(store, "$o")
+        relay = turn(["$r"], aliases=["$o"], metadata={"$r": SourceEventMetadata(ALICE, discovery_event_id="$o")})
+
+        result = await pending(store, relay)
+
+        assert isinstance(result, PendingTurn)
+        assert result.deleted_sources == {"$r"}
+        assert result.record.prepared_voice_sources is None
+
+    async def test_a_selection_written_after_its_question_was_deleted_returns_every_source_deleted(
+        self,
+        store: EventJournalStore,
+    ) -> None:
+        """The redacted question a selection's pending write indexes deletes every source the write returns."""
+        await redact(store, "$question")
+
+        result = await pending(store, turn(["$answer", "$more"], aliases=["$question"]))
+
+        assert isinstance(result, PendingTurn)
+        assert result.deleted_sources == {"$answer", "$more"}
+
     async def test_a_physical_source_is_never_read_as_another_sources_alias(self, store: EventJournalStore) -> None:
         """A physical source is never read as another sources alias."""
         stored = await accepted(
@@ -492,7 +615,7 @@ class TestRedactionGuard:
         await redact(store, "$e1")
         # Nothing newer is selected now, so only the redaction refuses a late write carrying E1.
         late = turn(["$s"], prompts={"$s": "E1 text"}, revisions={"$s": (10, "$e1")})
-        assert isinstance(await pending(store, late), Accepted)
+        assert isinstance(await pending(store, late), PendingTurn)
         await write(
             store,
             turn_rows.record_edit,
@@ -512,7 +635,7 @@ class TestRedactionGuard:
             prompt="E2 text",
             revision=(20, "$e2"),
         )
-        assert isinstance(await pending(store, late), Accepted)
+        assert isinstance(await pending(store, late), PendingTurn)
         await write(
             store,
             turn_rows.record_edit,

@@ -22,6 +22,7 @@ from mindroom.history.session_context import create_scope_session_storage
 from mindroom.history.storage import new_scope_session
 from mindroom.history.types import HistoryScope
 from mindroom.llm.runs import RunRecord, RunStatus
+from mindroom.session_storage.lanes import run_session_storage_operation
 from mindroom.tool_jobs.control import job_stopped_by_shutdown
 from mindroom.tool_jobs.runtime import get_background_runtime
 
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 _RESTART_INTERRUPTION_REASON = "Subagent turn was interrupted by a restart. Send a follow-up to continue its history."
 
 
-async def resolve_subagent(
+async def load_settled_subagent(
     subagent_id: str,
     *,
     owner: ToolExecutionIdentity,
@@ -44,7 +45,7 @@ async def resolve_subagent(
     runtime_paths: RuntimePaths,
     depth: int,
 ) -> DelegationChild:
-    """Resolve a scoped handle and reconcile an abandoned attempt under its recovery lock."""
+    """Load a scoped handle, first settling an abandoned attempt under its recovery lock, so this writes state."""
     load = partial(load_subagent, subagent_id, owner=owner, config=config, runtime_paths=runtime_paths, depth=depth)
     child = await load()
     if child.status == "running":
@@ -74,12 +75,12 @@ async def read_child_run(
     """Read one exact run from the frozen child storage and validate its requester."""
     config = delegation_storage_config(config, child.storage_bindings)
 
-    def read() -> RunRecord | None:
+    def read(storage: ConversationStore) -> RunRecord | None:
         # Each turn owns its exact run even after later follow-ups reuse the session.
-        response = _child_storage(child, config, paths).get_run(child.run_id)
+        response = storage.get_run(child.run_id)
         return response if isinstance(response, RunRecord) else None
 
-    response = await asyncio.to_thread(read)
+    response = await run_session_storage_operation(partial(_child_storage, child, config, paths), read)
     if response is not None and (
         not response.run_id
         or response.session_id != child.session_id
@@ -151,7 +152,6 @@ async def interrupt_child(
         # The run keeps what the child wrote; why it stopped is its error, which is what it hands over.
         response.status = RunStatus.cancelled if status == "cancelled" else RunStatus.error
         response.error = reason
-        response.requirements = []
         for tool in response.tools or ():
             if tool.is_paused:
                 tool.result = reason
@@ -159,12 +159,12 @@ async def interrupt_child(
             tool.requires_confirmation = False
             tool.external_execution_required = False
 
-        def persist() -> None:
+        def persist(storage: ConversationStore) -> None:
             # The run exists; this rewrites its row without touching the usage ledger, through a stand-in session.
             stand_in = new_scope_session(session_id=child.session_id, scope=child_scope(child))
-            _child_storage(child, config, runtime_paths).save_run(stand_in, response, record_usage=False)
+            storage.save_run(stand_in, response, record_usage=False)
 
-        await asyncio.to_thread(persist)
+        await run_session_storage_operation(partial(_child_storage, child, config, runtime_paths), persist)
     await finish_child_turn(child, config=config, runtime_paths=runtime_paths, status=status, reason=reason)
 
 
@@ -184,8 +184,8 @@ async def _cancel_delegations(
                 # The job runtime owns this child and its approvals; its own cancellation settles it.
                 continue
             await interrupt_child(child, config=config, runtime_paths=runtime_paths, reason=reason)
-    for requirement_id, hook_state in state.hooks.items():
-        child = next((item for item in state.children if item.parent_requirement_id == requirement_id), None)
+    for pause_id, hook_state in state.hooks.items():
+        child = next((item for item in state.children if item.parent_requirement_id == pause_id), None)
         await after_delegation(
             hook_state,
             config=config,
@@ -214,15 +214,21 @@ async def cancel_approval_delegations(
         scope = HistoryScope(kind="agent", scope_id=continuation.entity_name)
     if scope.kind == "agent" and continuation.entity_name not in config.agents:
         return
-    storage = await asyncio.to_thread(
-        create_scope_session_storage,
-        scope=scope,
-        config=config,
-        runtime_paths=runtime_paths,
-        execution_identity=continuation.execution_identity,
+    storage, response = await run_session_storage_operation(
+        partial(
+            create_scope_session_storage,
+            scope=scope,
+            config=config,
+            runtime_paths=runtime_paths,
+            execution_identity=continuation.execution_identity,
+        ),
+        lambda opened: (opened, opened.get_run(continuation.run_id)),
     )
-    response = await asyncio.to_thread(storage.get_run, continuation.run_id)
     if response is not None and bool((response.metadata or {}).get(DELEGATION_STATE_KEY)):
         await _cancel_delegations(response, config=config, runtime_paths=runtime_paths, reason=reason)
         changes = {DELEGATION_STATE_KEY: (response.metadata or {})[DELEGATION_STATE_KEY]}
-        await asyncio.to_thread(storage.patch_run_metadata, continuation.session_id, response.run_id, changes)
+        run_id = response.run_id
+        await run_session_storage_operation(
+            lambda: storage,
+            lambda opened: opened.patch_run_metadata(continuation.session_id, run_id, changes),
+        )

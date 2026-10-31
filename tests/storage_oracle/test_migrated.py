@@ -18,12 +18,19 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from mindroom.constants import MINDROOM_HISTORY_METADATA_KEY
+from mindroom.delegation.state import DELEGATION_FUNCTIONS, DELEGATION_STATE_KEY
+from mindroom.history.run_visibility import is_queued_notice_message
 from mindroom.history.summary_message import is_scope_summary
 from mindroom.history.types import HistoryScope
 from mindroom.llm.messages import Message
 from mindroom.llm.runs import RunRecord, RunStatus
 from mindroom.session_storage.agent_storage import create_state_storage
 from mindroom.session_storage.legacy_agno3_schema import AgnoTableNames, agno_schema_sql, run_from_row
+from mindroom.session_storage.legacy_scope_metadata import (
+    LEGACY_COMPACTION_METADATA_KEY,
+    LEGACY_MATRIX_HISTORY_METADATA_KEY,
+)
 from mindroom.session_storage.schema import TableNames, quote_identifier, table_names
 from mindroom.session_storage.summary_rows import cut_at_event
 from mindroom.session_storage.types import ConversationSession
@@ -31,6 +38,7 @@ from tests.llm.agno_dict_helpers import PAUSED_NOTICE_OPENINGS
 from tests.storage_oracle.actions import Scenario
 from tests.storage_oracle.backend import SESSION_ID
 from tests.storage_oracle.determinism import deterministic
+from tests.storage_oracle.masks import readers_in_creation_order
 from tests.storage_oracle.observe import observe
 from tests.storage_oracle.record import (
     FIXTURES,
@@ -74,13 +82,30 @@ MASKS: dict[str, str] = {
     "(``mindroom.session_storage.legacy_paused_runs``)",
     "waiting_call_names_its_member_run": "#3116: a paused team run's waiting delegation call stored without its "
     "member run names it (``mindroom.session_storage.legacy_paused_runs``)",
+    "readers_follow_the_log": "background readers list a conversation's turns in log order, not in creation order",
+    "history_state_is_the_owners_one_value": "layout version 7: the owner's force flag and preserved seen ids, kept per "
+    "scope, become one metadata value, and other scopes' entries go (``mindroom.session_storage.legacy_scope_metadata``)",
+    "paused_calls_stored_once": "#3106 item 2: a paused run's requirements fold into the calls they copy, a delegation "
+    "call keeping its requirement's id as its pause id, and delegation state lists its pending calls once "
+    "(``mindroom.session_storage.legacy_run_requirements``)",
+    "silence_flag_not_stored": "#3106: a paused delegation's ``external_execution_silent`` is read as absent "
+    "(``ToolExecution.from_dict``)",
+    "resumes_leave_out_the_paused_reply_s_notice": "#3108: a paused run's resume request leaves out the queued-message "
+    "notice the paused run holds, which the reply that paused was given",
+    "preserved_seen_ids_not_read": "#3463: seen ids an older release preserved in session metadata no longer count as "
+    "seen (``mindroom.history.storage.read_scope_seen_event_ids``)",
 }
 # The masks each golden and legacy input uses; every other input compares unmasked.
 _PINS: dict[str, set[str]] = {
-    "goldens/agent_code": {"stored_copy_hides_folded_messages"},
+    "goldens/agent_code": {"stored_copy_hides_folded_messages", "silence_flag_not_stored"},
+    "goldens/agent_code__before_run-delegation-approved": {"silence_flag_not_stored"},
     "goldens/agent_helper": {"paused_notice_reads_as_no_content"},
     "goldens/agent_helper__before_run-delegation-approved": {"paused_notice_reads_as_no_content"},
-    "goldens/team_squad": {"paused_notice_reads_as_no_content", "waiting_call_names_its_member_run"},
+    "goldens/team_squad": {
+        "history_state_is_the_owners_one_value",
+        "paused_notice_reads_as_no_content",
+        "waiting_call_names_its_member_run",
+    },
     "goldens/team_squad__before_team-approved": {
         "paused_notice_reads_as_no_content",
         "waiting_call_names_its_member_run",
@@ -106,9 +131,12 @@ _PINS: dict[str, set[str]] = {
         "row_ids_fill_the_record",
     },
     "legacy/captured__legacy_compaction_state__opening_storage_adopts_legacy_summary_tombstones_and_seen_ids_once": {
+        "history_state_is_the_owners_one_value",
         "row_ids_fill_the_record",
     },
     "legacy/captured__legacy_compaction_state__opening_storage_leaves_uncompacted_scopes_and_their_seen_ids_alone": {
+        "history_state_is_the_owners_one_value",
+        "preserved_seen_ids_not_read",
         "row_ids_fill_the_record",
     },
     "legacy/captured__legacy_compaction_state__opening_storage_numbers_rows_an_old_writer_stored_without_an_index": {
@@ -122,21 +150,89 @@ _PINS: dict[str, set[str]] = {
     "legacy/synthetic__members_of_members": {"members_of_members_join_their_team"},
     "legacy/synthetic__orphan_segment": {"fold_stores_cancelled_row"},
     "legacy/synthetic__undecodable_run_data": {"undecodable_run_left_out"},
+    "goldens/team_panel": {"history_state_is_the_owners_one_value"},
+    "legacy/captured__legacy_compaction_state__opening_storage_keeps_seen_ids_of_a_scope_without_a_summary": {
+        "history_state_is_the_owners_one_value",
+        "preserved_seen_ids_not_read",
+    },
 }
 # The masks each recorded end state uses; every other end state compares unmasked.
 _END_STATE_PINS: dict[str, frozenset[str]] = {
     **dict.fromkeys(
-        (f"generated/{seed}" for seed in (10, 11, 12, 15, 17, 23, 25, 28, 29, 34, 38)),
+        (f"generated/{seed}" for seed in (10, 11, 12, 17, 25, 29, 34, 38)),
         frozenset({"fold_stores_cancelled_row"}),
     ),
-    "generated/2": frozenset({"fold_stores_cancelled_row", "force_request_moves_into_metadata"}),
+    "generated/2": frozenset(
+        {"history_state_is_the_owners_one_value", "fold_stores_cancelled_row", "force_request_moves_into_metadata"},
+    ),
     "generated/3": frozenset({"history_copies_not_stored"}),
-    "generated/13": frozenset({"fold_stores_cancelled_row", "history_copies_not_stored"}),
-    "generated/20": frozenset({"embedded_members_become_member_rows"}),
-    "generated/39": frozenset({"history_copies_not_stored"}),
-    "generated/8": frozenset({"force_request_moves_into_metadata"}),
-    "generated/19": frozenset({"force_request_moves_into_metadata"}),
+    "generated/13": frozenset(
+        {"history_state_is_the_owners_one_value", "fold_stores_cancelled_row", "history_copies_not_stored"},
+    ),
+    "generated/20": frozenset({"embedded_members_become_member_rows", "resumes_leave_out_the_paused_reply_s_notice"}),
+    "generated/37": frozenset({"resumes_leave_out_the_paused_reply_s_notice"}),
+    "generated/39": frozenset(
+        {"history_copies_not_stored", "readers_follow_the_log", "resumes_leave_out_the_paused_reply_s_notice"},
+    ),
+    "generated/8": frozenset({"history_state_is_the_owners_one_value", "force_request_moves_into_metadata"}),
+    "generated/19": frozenset({"history_state_is_the_owners_one_value", "force_request_moves_into_metadata"}),
+    "generated/0": frozenset({"history_state_is_the_owners_one_value"}),
+    "generated/15": frozenset({"fold_stores_cancelled_row", "history_state_is_the_owners_one_value"}),
+    "generated/16": frozenset({"history_state_is_the_owners_one_value", "readers_follow_the_log"}),
+    "generated/18": frozenset({"history_state_is_the_owners_one_value"}),
+    "generated/21": frozenset({"history_state_is_the_owners_one_value"}),
+    "generated/23": frozenset({"fold_stores_cancelled_row", "history_state_is_the_owners_one_value"}),
+    "generated/27": frozenset({"history_state_is_the_owners_one_value", "readers_follow_the_log"}),
+    "generated/28": frozenset({"fold_stores_cancelled_row", "history_state_is_the_owners_one_value"}),
+    "generated/32": frozenset({"history_state_is_the_owners_one_value"}),
+    "generated/9": frozenset({"history_state_is_the_owners_one_value"}),
+    "named/interrupted_voice_playout": frozenset({"readers_follow_the_log"}),
 }
+# The inputs and the recorded end states whose stored runs hold requirements, which the ``paused_calls_stored_once``
+# mask shows folded; it adds to the pins above.
+_STORED_REQUIREMENTS = (
+    "goldens/agent_code",
+    "goldens/agent_code__before_run-approved",
+    "goldens/agent_code__before_run-delegation-approved",
+    "goldens/agent_code__before_run-rejected",
+    "goldens/agent_helper",
+    "goldens/agent_helper__before_run-delegation-approved",
+    "goldens/team_squad",
+    "goldens/team_squad__before_team-approved",
+    "legacy/synthetic__embedded_paused_member_advanced",
+)
+_END_STATES_STORED_REQUIREMENTS = (
+    "generated/0",
+    "generated/11",
+    "generated/12",
+    "generated/13",
+    "generated/14",
+    "generated/16",
+    "generated/17",
+    "generated/2",
+    "generated/20",
+    "generated/22",
+    "generated/24",
+    "generated/26",
+    "generated/27",
+    "generated/29",
+    "generated/3",
+    "generated/30",
+    "generated/32",
+    "generated/34",
+    "generated/35",
+    "generated/37",
+    "generated/38",
+    "generated/39",
+    "generated/4",
+    "generated/5",
+    "generated/6",
+    "generated/7",
+    "named/cli_delegate_then_complete",
+    "named/delegation_state_after_continuation",
+    "named/stale_paused_copy",
+    "named/team_pause_advanced",
+)
 # Where an older release also queued a manual compaction request: the scope keys listed in the session state.
 _PENDING_KEY = "mindroom_pending_compaction_scope_keys"
 
@@ -272,6 +368,26 @@ def _unminted(observed: dict[str, Any]) -> None:
             message["id"] = "minted"
 
 
+def _resumes_leave_out_paused_notices(recorded: dict[str, Any], observed: dict[str, Any], used: set[str]) -> None:
+    """Show each recorded resume request without the queued-message notices of the paused run it resumes.
+
+    Those are the notices the request holds that are not history copies; the notices of earlier runs still replay.
+    """
+
+    def paused_notice(message: dict[str, Any]) -> bool:
+        return not message.get("from_history") and is_queued_notice_message(Message.from_dict(message))
+
+    for side in (recorded, observed):
+        resumes = side["resume_requests"] if isinstance(side["resume_requests"], dict) else {}
+        for resume in resumes.values():
+            kept = [message for message in resume["request"] if not paused_notice(message)]
+            if side is observed:
+                assert kept == resume["request"]
+            elif kept != resume["request"]:
+                resume["request"] = kept
+                used.add("resumes_leave_out_the_paused_reply_s_notice")
+
+
 def _rows_fill_records(recorded: dict[str, Any], observed: dict[str, Any], session_id: str, used: set[str]) -> None:
     for run in _runs(observed):
         assert run["session_id"] == session_id
@@ -311,6 +427,15 @@ def _waiting_calls_name_their_member_runs(recorded: dict[str, Any], observed: di
             if call.get("child_run_id") is None:
                 call["child_run_id"] = member_runs[(call.get("tool_args") or {}).get("member_id")]
                 used.add("waiting_call_names_its_member_run")
+
+
+def _silence_flag_not_stored(recorded: dict[str, Any], used: set[str]) -> None:
+    for run in _runs(recorded):
+        requirements = run.get("requirements") or []
+        for execution in (*(run.get("tools") or []), *(item["tool_execution"] for item in requirements)):
+            if execution.get("external_execution_silent") is not None:
+                execution["external_execution_silent"] = None
+                used.add("silence_flag_not_stored")
 
 
 def _drop_history_copies(recorded: dict[str, Any], observed: dict[str, Any], used: set[str]) -> None:
@@ -397,6 +522,53 @@ def _members_join_team(recorded: dict[str, Any], used: set[str]) -> None:
             used.add("members_of_members_join_their_team")
 
 
+def _waits(call: dict[str, Any]) -> bool:
+    return bool(call.get("requires_confirmation") or call.get("external_execution_required"))
+
+
+def _paused_call_ids(runs: list[dict[str, Any]]) -> dict[tuple[str, str], list[str]]:
+    """Return the ids each paused run's waiting requirements give its calls, by ``(run id, call id)`` in call order.
+
+    A paused run's own requirements name its calls, and a paused team run's copies name its paused members' calls,
+    which fold after the members' own; a resolved requirement leaves its call as stored.
+    """
+    paused = {run["run_id"] for run in runs if run.get("status") == RunStatus.paused.value}
+    entries = [
+        (run["run_id"], entry) for run in runs if run["run_id"] in paused for entry in run.get("requirements") or []
+    ]
+    ids: dict[tuple[str, str], list[str]] = {}
+    for copies in (False, True):
+        for run_id, entry in entries:
+            owner = entry.get("member_run_id") or run_id
+            if (owner != run_id) is copies and owner in paused and _waits(entry["tool_execution"]):
+                named = ids.setdefault((owner, entry["tool_execution"]["tool_call_id"]), [])
+                if entry["id"] not in named:
+                    named.append(entry["id"])
+    return ids
+
+
+def _paused_calls_stored_once(recorded: dict[str, Any], observed: dict[str, Any], used: set[str]) -> None:
+    """Show each recorded run's paused calls stored once: a delegation call takes its requirement's id, no copy stays."""
+    for run in _runs(observed):
+        assert "requirements" not in run, run["run_id"]
+        assert "pending_requirements" not in ((run.get("metadata") or {}).get(DELEGATION_STATE_KEY) or {})
+    runs = _runs(recorded)
+    ids = _paused_call_ids(runs)
+    for run in runs:
+        if run.pop("requirements", None) is not None:
+            used.add("paused_calls_stored_once")
+        state = (run.get("metadata") or {}).get(DELEGATION_STATE_KEY)
+        if isinstance(state, dict) and state.pop("pending_requirements", None) is not None:
+            used.add("paused_calls_stored_once")
+        unclaimed = {key: list(named) for key, named in ids.items() if key[0] == run["run_id"]}
+        for tool in run.get("tools") or []:
+            named = unclaimed.get((run["run_id"], tool["tool_call_id"]))
+            if named and _waits(tool):
+                pause_id = named.pop(0)
+                if tool["tool_name"] in DELEGATION_FUNCTIONS and tool.get("external_execution_required"):
+                    tool["pause_id"] = pause_id
+
+
 def _states(observed: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the session states ``observed`` shows, the loaded session's and the row's, where each is an object."""
     session, row = observed["session"], observed["row"]
@@ -416,11 +588,43 @@ def _force_requests_in_metadata(recorded: dict[str, Any], observed: dict[str, An
     if not requested:
         return
     metadata = recorded["session"]["metadata"] or {}
-    compaction = metadata.get("mindroom_compaction", {"version": 2, "states": {}})
+    compaction = metadata.get(LEGACY_COMPACTION_METADATA_KEY, {"version": 2, "states": {}})
     flags = {scope_key: {"force_compact_before_next_run": True} for scope_key in requested[0]}
     states = {**compaction["states"], **flags}
-    recorded["session"]["metadata"] = {**metadata, "mindroom_compaction": {**compaction, "states": states}}
+    recorded["session"]["metadata"] = {**metadata, LEGACY_COMPACTION_METADATA_KEY: {**compaction, "states": states}}
     used.add("force_request_moves_into_metadata")
+
+
+def _history_state_in_one_value(recorded: dict[str, Any], owner_key: str, used: set[str]) -> None:
+    """Show the per-scope history state an older release kept in session metadata as the owner's one value."""
+    metadata = recorded["session"]["metadata"] if isinstance(recorded["session"], dict) else None
+    legacy_keys = {LEGACY_COMPACTION_METADATA_KEY, LEGACY_MATRIX_HISTORY_METADATA_KEY}
+    if not isinstance(metadata, dict) or not legacy_keys & metadata.keys():
+        return
+    compaction = metadata.get(LEGACY_COMPACTION_METADATA_KEY, {}).get("states", {}).get(owner_key, {})
+    history = metadata.get(LEGACY_MATRIX_HISTORY_METADATA_KEY, {})
+    seen = history.get("states", {}).get(owner_key, {}).get("seen_event_ids", [])
+    state = {
+        **({"force_compact_before_next_run": True} if compaction.get("force_compact_before_next_run") is True else {}),
+        **({"seen_event_ids": sorted(set(seen))} if seen else {}),
+    }
+    kept = {key: value for key, value in metadata.items() if key not in legacy_keys}
+    recorded["session"]["metadata"] = {**kept, **({MINDROOM_HISTORY_METADATA_KEY: state} if state else {})}
+    used.add("history_state_is_the_owners_one_value")
+
+
+def _preserved_seen_ids_not_read(recorded: dict[str, Any], observed: dict[str, Any], used: set[str]) -> None:
+    """Show the recorded seen ids without the preserved ones the owner's history state holds and no history does."""
+    metadata = recorded["session"]["metadata"] if isinstance(recorded["session"], dict) else None
+    state = metadata.get(MINDROOM_HISTORY_METADATA_KEY, {}) if isinstance(metadata, dict) else {}
+    seen = recorded["seen_event_ids"]
+    if not isinstance(seen, list):
+        return
+    dropped = set(state.get("seen_event_ids", [])) - set(observed["seen_event_ids"])
+    if dropped:
+        assert dropped <= set(seen)
+        recorded["seen_event_ids"] = sorted(set(seen) - dropped)
+        used.add("preserved_seen_ids_not_read")
 
 
 def _session_columns_encoded_once(recorded: dict[str, Any], observed: dict[str, Any], used: set[str]) -> None:
@@ -439,20 +643,27 @@ def _mask_session(
     observed: dict[str, Any],
     facts: _Input,
     session_id: str,
+    owner_key: str,
     used: set[str],
 ) -> set[str]:
     """Show one session's recorded and observed observables as one store would; return the runs the fold mask hid."""
     _rows_fill_records(recorded, observed, session_id, used)
+    _resumes_leave_out_paused_notices(recorded, observed, used)
     _paused_notices_read_as_no_content(recorded, observed, used)
     _waiting_calls_name_their_member_runs(recorded, observed, used)
+    _silence_flag_not_stored(recorded, used)
     _session_columns_encoded_once(recorded, observed, used)
     _force_requests_in_metadata(recorded, observed, used)
+    _history_state_in_one_value(recorded, owner_key, used)
+    _preserved_seen_ids_not_read(recorded, observed, used)
+    readers_in_creation_order(observed, used)
     _drop_history_copies(recorded, observed, used)
     _hide_folded(recorded, facts, used)
     created = _hide_fold_rows(observed, facts, used)
     _restore_repeated_ids(observed, facts, used)
     _embedded_members(recorded, used)
     _members_join_team(recorded, used)
+    _paused_calls_stored_once(recorded, observed, used)
     return created
 
 
@@ -484,7 +695,7 @@ def _masked(
         if "observed" not in entry:
             continue
         old = recorded["sessions"][session_id]["observed"]
-        created = _mask_session(old, entry["observed"], facts, session_id, used)
+        created = _mask_session(old, entry["observed"], facts, session_id, entry["scope"], used)
         entry["run_ids"] = sorted((set(entry["run_ids"]) - created) | set(extra.get(session_id, [])))
     return used
 
@@ -499,7 +710,7 @@ def test_a_converted_input_shows_its_recording_but_for_named_masks(name: str, tm
     observed = with_defaults(observe_database(text, tmp_path / "converted", facts.extra_run_ids()))
     used = _masked(text, recorded, observed, facts, tmp_path / "expected")
     assert first_difference(recorded, observed) is None, first_difference(recorded, observed)
-    assert used == _PINS.get(name, set())
+    assert used == _PINS.get(name, set()) | ({"paused_calls_stored_once"} if name in _STORED_REQUIREMENTS else set())
 
 
 @pytest.mark.parametrize("path", SEQUENCES, ids=sequence_id)
@@ -511,13 +722,18 @@ def test_a_converted_end_state_shows_its_last_recorded_observables_but_for_named
     recorded = decode(path.read_text(encoding="utf-8"))
     dump = path.with_suffix(".sql").read_text(encoding="utf-8")
     final = recorded["final"]
-    observed = _end_state(dump, Scenario.from_json(recorded["scenario"]), tmp_path)
+    scenario = Scenario.from_json(recorded["scenario"])
+    observed = _end_state(dump, scenario, tmp_path)
     used: set[str] = set()
-    _mask_session(final, observed, _input_facts(dump), SESSION_ID, used)
+    owner_key = HistoryScope(kind=scenario.kind, scope_id=storage_name_of(dump)).key
+    _mask_session(final, observed, _input_facts(dump), SESSION_ID, owner_key, used)
     _unminted(final)
     _unminted(observed)
     assert first_difference(final, observed) is None, first_difference(final, observed)
-    assert used == _END_STATE_PINS.get(sequence_id(path), frozenset())
+    stored_requirements = (
+        {"paused_calls_stored_once"} if sequence_id(path) in _END_STATES_STORED_REQUIREMENTS else set()
+    )
+    assert used == _END_STATE_PINS.get(sequence_id(path), frozenset()) | stored_requirements
 
 
 def test_a_fold_run_a_retirement_removed_converts_without_a_row(tmp_path: Path) -> None:
@@ -558,4 +774,7 @@ def test_every_mask_is_used_and_every_pin_names_an_input() -> None:
     """Each named mask explains a difference some input shows, and no pin is stale."""
     assert set(_PINS) <= set(_INPUTS)
     assert set(_END_STATE_PINS) <= {sequence_id(path) for path in SEQUENCES}
-    assert set().union(*_PINS.values(), *_END_STATE_PINS.values()) == set(MASKS)
+    assert set(_STORED_REQUIREMENTS) <= set(_INPUTS)
+    assert set(_END_STATES_STORED_REQUIREMENTS) <= {sequence_id(path) for path in SEQUENCES}
+    stored_requirements = {"paused_calls_stored_once"} if _STORED_REQUIREMENTS else set()
+    assert set().union(*_PINS.values(), *_END_STATE_PINS.values(), stored_requirements) == set(MASKS)

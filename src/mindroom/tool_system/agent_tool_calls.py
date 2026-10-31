@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from functools import wraps
 from typing import TYPE_CHECKING, Literal
 
-from mindroom.agent_cli.shell_contract import SHELL_OPERATION_NAMES
+from mindroom.agent_cli.shell_contract import SHELL_FUNCTION
 from mindroom.agent_loop.spec import UnstoredSession
 from mindroom.background_tasks import wait_for_future_until_complete
 from mindroom.llm.events import ReportedCall
@@ -24,11 +24,15 @@ from mindroom.llm.runs import RunRequirement
 from mindroom.tool_jobs.control import job_owns_execution
 from mindroom.tool_system.dedicated_threads import JOB_CALL_EXECUTOR
 from mindroom.tool_system.invocation import execute_tool_call
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, tool_runtime_context
+from mindroom.tool_system.runtime_context import tool_runtime_context
 from mindroom.tool_system.tool_access import ToolKey, UnknownToolError, validate_tool_arguments
-from mindroom.tool_system.tool_function import close_toolkits, connect_toolkits
+from mindroom.tool_system.tool_function import (
+    POLICY_CONFIRMATION_APPROVAL_TYPE,
+    ToolGate,
+    close_toolkits,
+    connect_toolkits,
+)
 from mindroom.tool_system.tool_hooks import owned_sync_tool_completion
-from mindroom.tool_system.worker_routing import tool_execution_identity
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
@@ -158,15 +162,6 @@ class PreparedAgentToolCatalog:
         assert not isinstance(session, UnstoredSession)
         return session
 
-    @contextmanager
-    def execution_context(self) -> Iterator[None]:
-        """Bind trusted runtime and credential routing only while doing owner work."""
-        with (
-            tool_runtime_context(self.runtime_context),
-            tool_execution_identity(build_execution_identity_from_runtime_context(self.runtime_context)),
-        ):
-            yield
-
     def owns(self, binding: PreparedAgentToolBinding) -> bool:
         """Check the exact prepared binding, including its live catalog lifetime."""
         return not self._closed and self._bindings.get(binding.key) is binding
@@ -281,7 +276,7 @@ class PreparedAgentToolCatalog:
                 check_current()
             deferred = self._deferred.get(key.toolkit)
             if deferred is not None:
-                with self.execution_context():
+                with tool_runtime_context(self.runtime_context):
                     toolkit = await deferred.materialize()
                 await connect_toolkits((toolkit,), self._closes)
                 # A deferred toolkit's functions are reached under the name it was listed under, which an agent's
@@ -341,9 +336,12 @@ def _check_resolves(
     call_id: str,
     arguments: dict[str, object],
 ) -> None:
-    """Refuse a decision unless it is a confirmation of exactly this call to this function."""
+    """Refuse a decision unless it is a confirmation of exactly this call to this function.
+
+    The function as offered now must still run in the loop, and confirm, if at all, as the call paused for.
+    """
     execution = requirement.tool_execution
-    function = binding.function
+    paused_for = ToolGate.POLICY if execution.approval_type == POLICY_CONFIRMATION_APPROVAL_TYPE else ToolGate.CONFIRM
     if (
         execution.tool_call_id != call_id
         or execution.tool_name != binding.key.function
@@ -352,8 +350,7 @@ def _check_resolves(
         or execution.requires_confirmation is not True
         or not requirement.is_resolved()
         or requirement.confirmation is None
-        or function.external_execution
-        or (function.requires_confirmation and function.approval_type != execution.approval_type)
+        or binding.function.gate not in (None, ToolGate.JOB, paused_for)
     ):
         msg = "Approval does not resolve this exact prepared call"
         raise ValueError(msg)
@@ -390,8 +387,8 @@ def execute_agent_shell_call(
     Only the response owner supplies this leaf, which runs the binding's own shell
     function, so CLI calls from inside the command can use the catalog meanwhile.
     """
-    if binding.key.function not in SHELL_OPERATION_NAMES:
-        msg = "Shell leaf replacement requires a canonical shell operation"
+    if binding.key.function != SHELL_FUNCTION:
+        msg = "Shell leaf replacement requires the canonical shell function"
         raise ValueError(msg)
     return _execute_agent_tool_call(
         binding,
@@ -457,7 +454,7 @@ async def _execute_agent_tool_call(
             function = replace(function, entrypoint=pinned_leaf)
         # A job's call has no time limit, so what it offloads must not hold a shared pool's thread. The synchronous
         # bodies the call started keep the catalog until they finish, so their threads never outlive the catalog.
-        with catalog.execution_context():
+        with tool_runtime_context(catalog.runtime_context):
             async with owned_sync_tool_completion(JOB_CALL_EXECUTOR if job_owns_execution() else None):
                 with cli_dispatch_scope():
                     outcome = await execute_tool_call(

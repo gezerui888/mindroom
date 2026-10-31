@@ -14,13 +14,14 @@ MindRoom stores data in `mindroom_data/` next to `config.yaml` by default; set `
 - `agents/*/chroma/` - Per-agent Mem0 ChromaDB storage
 - `agents/*/mem0/` - Per-agent Mem0 history, which keeps the text of changed and deleted memories and the recent conversation messages Mem0 reads when it extracts memories
 - `agents/*/workspace/` - Per-agent workspace files, including file-backed memory
+- `team_memory/` - Team memory shared by each team's members: one Mem0 store all teams share (`chroma/`, `mem0/`), each team's records kept apart, and each team's `MEMORY.md` under `team_memory/team_<sorted_members>/`
 - `private_instances/` - The same per-agent directories for private agents, one tree per requester scope
 - `shared_directories/` - [Shared directories](../tools/execution-and-coding.md#shared_directories) at `shared_directories/<agent>/<name>/`; deleting one leaves an empty folder, and the directories of agents removed from the config stay until you delete them
 - `knowledge_db/` - Knowledge base vector stores
 - `knowledge_git/` - Git data of [Git-backed knowledge bases](../knowledge.md#checkout-layout)
 - `tracking/` - Durable response and callback state, including the SQLite event journal, that prevents duplicate replies across restarts
 - `control_state/` - Primary-only control records, such as [external triggers](../external-triggers.md), [background script](../tools/background-scripts.md) runs, and [`matrix_message`](../tools/matrix-message.md#safe-send-retries) send receipts, unless [`MINDROOM_CONTROL_STATE_PATH`](../configuration/index.md#environment-variables) points elsewhere
-- `credentials/` - Secrets synchronized from `.env`
+- `credentials/` - Credentials saved in the dashboard or by tools; keys from the environment are read at each start and not stored (see [Credentials from the Environment](../oauth-framework.md#credentials-from-the-environment))
 - `private_oauth/` - Per-user and per-agent connection credentials, such as OAuth tokens
 - `egress_broker/` - Agent Keys CA, worker token signing key, and request log (see [Resetting broker state](egress-broker.md#resetting-broker-state))
 - `budgets/` - Per-user caps set on the [Budgets](../budgets.md#per-user-caps) page or through the Budget API

@@ -3,19 +3,22 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 from agno.tools import Toolkit
 from agno.tools.function import Function
+from pydantic import ValidationError
 
 from mindroom import agents as agents_module
 from mindroom.agent_loop.build import prompt_for_turn
 from mindroom.agent_loop.tools import PreparedTools, toolkit_instructions
 from mindroom.agents import create_agent
 from mindroom.config import resolution
+from mindroom.config.agent import AgentConfig
 from mindroom.config.main import Config
-from mindroom.config.models import EffectiveToolConfig, ToolConfigEntry
+from mindroom.config.models import _DEFER_PROHIBITED_CONTROL_TOOLS, EffectiveToolConfig, ToolConfigEntry
 from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.credentials.manager import get_runtime_credentials_manager
 from mindroom.custom_tools import update_awareness
@@ -31,11 +34,13 @@ from mindroom.llm.provider import ToolSpec
 from mindroom.mcp.toolkit import MindRoomMCPToolkit
 from mindroom.providers.gemini import wire as gemini_wire
 from mindroom.tool_system.agent_tools import resolve_agent_tools, room_turn_offers, turn_room_flags
-from mindroom.tool_system.agno_toolkits import adapt_function, adapt_toolkit, offered_refusal
+from mindroom.tool_system.agno_toolkits import adapt_toolkit, offered_refusal
 from mindroom.tool_system.dynamic_toolkits import DeferredToolkit, defer_toolkit
-from mindroom.tool_system.metadata import TOOL_METADATA
+from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.registry import builtin_tool_registry
 from mindroom.tool_system.worker_routing import ToolExecutionIdentity
-from tests.agent_tool_helpers import call_entrypoint, offered_function, source_toolkit
+from tests.agent_tool_helpers import call_entrypoint, offered_function, source_toolkit, toolkit_offers
 from tests.conftest import test_runtime_paths
 from tests.identity_helpers import persist_entity_accounts
 from tests.test_generated_agents import _created, _load, _personal, _with_template
@@ -151,7 +156,7 @@ def test_openai_compatible_context_hides_desktop(tmp_path: Path) -> None:
     config = _validated_config(tmp_path, raw)
 
     room_tools, matrix_room_tools = turn_room_flags(identity)
-    candidates = resolve_agent_tools(config, "code").candidates(
+    candidates = resolve_agent_tools(config, "code", builtin_tool_registry()).candidates(
         room_tools=room_tools,
         matrix_room_tools=matrix_room_tools,
     )
@@ -178,7 +183,10 @@ def _runtime_tool_configs(
     portable_search: bool,
 ) -> list[EffectiveToolConfig]:
     return list(
-        resolve_agent_tools(config, agent_name).candidates(deferred=deferred_tools, portable_search=portable_search),
+        resolve_agent_tools(config, agent_name, builtin_tool_registry()).candidates(
+            deferred=deferred_tools,
+            portable_search=portable_search,
+        ),
     )
 
 
@@ -215,20 +223,11 @@ def test_config_rejects_invalid_lazy_flag_locations(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="initial=true requires defer=true"):
         _validated_config(tmp_path, raw)
 
-    raw = _base_config_data()
-    raw["defaults"] = {"tools": [{"shell": {"defer": True}}]}
-    with pytest.raises(ValueError, match=r"defaults\.tools does not support defer or initial flags: shell"):
-        _validated_config(tmp_path, raw)
-
-    raw = _base_config_data()
-    raw["defaults"] = {"tools": [{"shell": {"defer": False}}]}
-    with pytest.raises(ValueError, match=r"defaults\.tools does not support defer or initial flags: shell"):
-        _validated_config(tmp_path, raw)
-
-    raw = _base_config_data()
-    raw["defaults"] = {"tools": [{"shell": {"initial": False}}]}
-    with pytest.raises(ValueError, match=r"defaults\.tools does not support defer or initial flags: shell"):
-        _validated_config(tmp_path, raw)
+    for lazy_flags in ({"defer": True}, {"defer": False}, {"initial": False}):
+        raw = _base_config_data()
+        raw["defaults"] = {"tools": [{"shell": lazy_flags}]}
+        with pytest.raises(ValueError, match=r"defaults\.tools does not support defer or initial flags: shell"):
+            _validated_config(tmp_path, raw)
 
 
 @pytest.mark.parametrize("lazy_flag", ["defer", "initial"])
@@ -244,22 +243,29 @@ def test_config_rejects_lazy_flags_inside_named_tool_overrides(tmp_path: Path, l
         _validated_config(tmp_path, raw)
 
 
-@pytest.mark.parametrize(
-    "tool_name",
-    ["agent_manager", "delegate", "dynamic_tools", "invite_router", "self_config", "skill_manage"],
+_PRESET_MESSAGE = (
+    "'openclaw_compat' is a preset and cannot be deferred; defer/initial are only valid on individual tools."
 )
-def test_config_rejects_deferred_control_plane_tools(tmp_path: Path, tool_name: str) -> None:
+
+
+def _only_validation_error(raw: dict[str, object]) -> tuple[tuple[str | int, ...], str]:
+    with pytest.raises(ValidationError) as exc_info:
+        Config.model_validate(raw)
+    [error] = exc_info.value.errors()
+    return tuple(error["loc"]), error["msg"]
+
+
+@pytest.mark.parametrize("tool_name", sorted(_DEFER_PROHIBITED_CONTROL_TOOLS))
+def test_config_rejects_deferred_control_plane_tools(tool_name: str) -> None:
     """Control-plane tools are injected by runtime policy and cannot be lazy-loading units."""
     raw = _base_config_data()
     raw["agents"]["code"]["tools"] = [{tool_name: {"defer": True}}]  # type: ignore[index]
-    with pytest.raises(
-        ValueError,
-        match=(
-            rf"agents\.code\.tools: '{tool_name}' is a control-plane tool and cannot be deferred; "
-            r"defer/initial are only valid on runtime tools\."
-        ),
-    ):
-        _validated_config(tmp_path, raw)
+
+    assert _only_validation_error(raw) == (
+        ("agents", "code", "tools", 0),
+        f"Value error, '{tool_name}' is a control-plane tool and cannot be deferred; "
+        "defer/initial are only valid on runtime tools.",
+    )
 
 
 @pytest.mark.parametrize(
@@ -273,49 +279,28 @@ def test_config_rejects_deferred_control_plane_tools(tmp_path: Path, tool_name: 
         {"initial": False},
     ],
 )
-def test_config_rejects_deferred_tool_presets(tmp_path: Path, lazy_flags: dict[str, object]) -> None:
-    """Presets are bundles and must not be deferred units."""
+def test_config_rejects_deferred_tool_presets(lazy_flags: dict[str, object]) -> None:
+    """Presets are bundles and must not be deferred units, so even a false flag is rejected before initial's own rule."""
     raw = _base_config_data()
-    raw["agents"]["code"]["tools"] = [{"openclaw_compat": lazy_flags}]  # type: ignore[index]
+    raw["agents"]["code"]["tools"] = ["shell", {"openclaw_compat": lazy_flags}]  # type: ignore[index]
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"agents\.code\.tools: 'openclaw_compat' is a preset and cannot be deferred; "
-            r"defer/initial are only valid on individual tools\."
-        ),
-    ):
-        _validated_config(tmp_path, raw)
+    assert _only_validation_error(raw) == (("agents", "code", "tools", 1), f"Value error, {_PRESET_MESSAGE}")
 
 
-def test_config_rejects_default_tool_preset_lazy_flag_presence(tmp_path: Path) -> None:
-    """Preset lazy-flag presence should be rejected in defaults too."""
+def test_config_rejects_default_tool_preset_lazy_flag_presence() -> None:
+    """Preset lazy-flag presence is rejected in defaults with the preset's own message."""
     raw = _base_config_data()
     raw["defaults"] = {"tools": [{"openclaw_compat": {"defer": False}}]}
 
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"defaults\.tools: 'openclaw_compat' is a preset and cannot be deferred; "
-            r"defer/initial are only valid on individual tools\."
-        ),
-    ):
-        _validated_config(tmp_path, raw)
+    assert _only_validation_error(raw) == (("defaults", "tools", 0), f"Value error, {_PRESET_MESSAGE}")
 
 
-def test_config_rejects_constructed_deferred_tool_preset(tmp_path: Path) -> None:
-    """Post-coercion validation should reject already-normalized preset entries."""
-    raw = _base_config_data()
-    raw["agents"]["code"]["tools"] = [ToolConfigEntry(name="openclaw_compat", defer=True)]  # type: ignore[index]
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"agents\.code\.tools: 'openclaw_compat' is a preset and cannot be deferred; "
-            r"defer/initial are only valid on individual tools\."
-        ),
-    ):
-        _validated_config(tmp_path, raw)
+def test_tool_entries_that_cannot_be_deferred_reject_lazy_flags_however_they_are_built() -> None:
+    """The entry owns the rule, so a constructed entry or a standalone agent is held to it too."""
+    with pytest.raises(ValidationError, match=re.escape(_PRESET_MESSAGE)):
+        ToolConfigEntry(name="openclaw_compat", defer=True)
+    with pytest.raises(ValidationError, match="'delegate' is a control-plane tool and cannot be deferred"):
+        AgentConfig(display_name="Code", tools=[{"delegate": {"initial": False}}])
 
 
 def test_effective_tool_configs_keep_defer_initial_and_authored_order(tmp_path: Path) -> None:
@@ -339,7 +324,7 @@ def test_initial_deferred_tools_attach_under_a_restricted_selection_with_implied
     raw["agents"]["code"]["tools"] = [{"matrix_message": {"defer": True, "initial": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    candidates = resolve_agent_tools(config, "code").candidates(deferred=[])
+    candidates = resolve_agent_tools(config, "code", builtin_tool_registry()).candidates(deferred=[])
 
     assert [entry.name for entry in candidates] == ["matrix_message", "attachments", "matrix_room"]
 
@@ -350,7 +335,7 @@ def test_unrestricted_selection_attaches_every_deferred_tool(tmp_path: Path) -> 
     raw["agents"]["code"]["tools"] = ["sleep", {"shell": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent_tools = resolve_agent_tools(config, "code")
+    agent_tools = resolve_agent_tools(config, "code", builtin_tool_registry())
     plain = agent_tools.candidates()
     searchable = agent_tools.candidates(portable_search=True)
 
@@ -539,6 +524,7 @@ async def test_deferred_desktop_uses_only_requester_agent_credentials(tmp_path: 
         execution_identity=alice_identity,
         knowledge=None,
         model=turn_model(config, runtime_paths, "code"),
+        plugins=config_plugins(config, runtime_paths),
     )
 
     assert "calculator" in _toolkit_names(alice_agent)
@@ -607,6 +593,7 @@ async def test_native_tool_search_keeps_unconfigured_desktop_safe(tmp_path: Path
         execution_identity=identity,
         knowledge=None,
         model=turn_model(config, runtime_paths, "code"),
+        plugins=config_plugins(config, runtime_paths),
     )
     unpaired_desktop = cast("Any", source_toolkit(offered_function(unpaired, "desktop")))
     result = await unpaired_desktop.desktop("status")
@@ -630,6 +617,7 @@ async def test_native_tool_search_keeps_unconfigured_desktop_safe(tmp_path: Path
         execution_identity=identity,
         knowledge=None,
         model=turn_model(config, runtime_paths, "code"),
+        plugins=config_plugins(config, runtime_paths),
     )
     paired_desktop = cast("Any", source_toolkit(offered_function(paired, "desktop")))
     paired_configuration = paired_desktop._current_configuration()
@@ -665,11 +653,27 @@ async def test_deferred_egress_credentials_is_discoverable_only_while_the_broker
         execution_identity=None,
         knowledge=None,
         model=turn_model(config, _runtime_paths(tmp_path, **env), "code"),
+        plugins=config_plugins(config, _runtime_paths(tmp_path, **env)),
     )
 
     searched = await _search(agent, "egress")
     assert ({match["toolkit"] for match in searched["matches"]} == {"egress_credentials"}) is broker_on
     assert ("egress_credentials" in _toolkit_names(agent)) is broker_on
+
+
+def _code_agent(config: Config, tmp_path: Path, **options: Any) -> AgentBuild:  # noqa: ANN401
+    """Build agent ``code`` for no identity or knowledge, on its model with the published plugins."""
+    runtime_paths = _runtime_paths(tmp_path)
+    return create_agent(
+        "code",
+        config,
+        runtime_paths,
+        execution_identity=None,
+        knowledge=None,
+        model=turn_model(config, runtime_paths, "code"),
+        plugins=config_plugins(config, runtime_paths),
+        **options,
+    )
 
 
 def test_a_lone_deferred_egress_credentials_tool_gives_no_dynamic_tools_while_the_broker_is_off(
@@ -680,14 +684,7 @@ def test_a_lone_deferred_egress_credentials_tool_gives_no_dynamic_tools_while_th
     raw["agents"]["code"]["tools"] = [{"egress_credentials": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     assert "dynamic_tools" not in _toolkit_names(agent)
     assert _portable_deferred_names(agent) == frozenset()
@@ -720,6 +717,7 @@ def test_deferred_prompt_names_egress_credentials_only_while_the_broker_is_on(
         execution_identity=None,
         knowledge=None,
         model=turn_model(config, _runtime_paths(tmp_path, **env), "code"),
+        plugins=config_plugins(config, _runtime_paths(tmp_path, **env)),
     )
 
     prompt = _build_prompt(agent)
@@ -746,6 +744,7 @@ def test_an_eager_egress_credentials_tool_is_attached_only_while_the_broker_is_o
         execution_identity=None,
         knowledge=None,
         model=turn_model(config, _runtime_paths(tmp_path, **env), "code"),
+        plugins=config_plugins(config, _runtime_paths(tmp_path, **env)),
     )
 
     assert ("egress_credentials" in _toolkit_names(agent)) is broker_on
@@ -790,16 +789,14 @@ def test_scope_incompatible_deferred_tools_reject_at_config_and_runtime(tmp_path
         match=r"code -> deferred tool 'homeassistant' -> homeassistant \(worker_scope=user\)",
     ) as exc_info:
         _validated_config(tmp_path, raw)
-    error_message = str(exc_info.value)
-    assert "code -> deferred tool 'homeassistant' -> homeassistant (worker_scope=user)" in error_message
-    assert "code -> homeassistant (worker_scope=user)" not in error_message
+    assert "code -> homeassistant (worker_scope=user)" not in str(exc_info.value)
 
     raw = _base_config_data()
     raw["agents"]["code"]["tools"] = [{"homeassistant": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
     config.agents["code"].worker_scope = "user"
 
-    candidates = resolve_agent_tools(config, "code").candidates()
+    candidates = resolve_agent_tools(config, "code", builtin_tool_registry()).candidates()
 
     assert "homeassistant" not in {entry.name for entry in candidates}
 
@@ -835,14 +832,7 @@ def test_native_tool_search_attaches_deferred_toolkits_and_skips_portable_tool_s
     ]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     function_names = _function_names(agent)
     assert "sleep" in function_names
@@ -875,14 +865,7 @@ def test_native_tool_search_prompt_lists_deferred_capability_domains(
     ]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     discovery_block = next(
         block for block in agent.prompt.instructions if block.startswith("## Deferred Tool Discovery")
@@ -959,6 +942,7 @@ def test_native_tool_search_does_not_defer_eager_local_collision_survivor(
         execution_identity=None,
         knowledge=None,
         model=turn_model(config, runtime_paths, "code"),
+        plugins=config_plugins(config, runtime_paths),
     )
 
     expected_deferred_names = frozenset() if collide_all else frozenset({"demo_call_tool", "demo_connection_status"})
@@ -1021,12 +1005,13 @@ async def test_tool_search_lists_only_the_deferred_mcp_functions_the_run_offers(
         execution_identity=None,
         knowledge=None,
         model=turn_model(config, runtime_paths, "code"),
+        plugins=config_plugins(config, runtime_paths),
     )
 
     assert _portable_deferred_names(agent) == frozenset({"demo_call_tool", "demo_connection_status"})
     listed = (await _search(agent, ""))["functions"]
     assert sorted(item["name"] for item in listed) == ["demo_call_tool", "demo_connection_status"]
-    assert "demo_list_tools" in built["mcp_demo"].async_functions
+    assert "demo_list_tools" in built["mcp_demo"].functions
 
 
 @pytest.mark.parametrize(
@@ -1047,14 +1032,7 @@ def test_native_tool_search_keeps_deferred_toolkit_instructions_in_the_prompt(
     raw["agents"]["code"]["tools"] = [{"update_awareness": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     assert _native_deferred_names(agent) == frozenset({"get_mindroom_update_status"})
     assert _build_prompt(agent).count(instruction_marker) == 1
@@ -1163,14 +1141,7 @@ def test_native_tool_search_keeps_initial_toolkit_instructions(
     ]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
     instructions = _toolkit(agent, "update_awareness").instructions
 
     assert instructions is not None
@@ -1193,14 +1164,7 @@ def test_native_tool_search_drops_toolkit_emptied_by_include_filter(
     ]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     assert "update_awareness" not in _toolkit_names(agent)
     assert instruction_marker not in _build_prompt(agent)
@@ -1218,14 +1182,7 @@ async def test_portable_tool_search_returns_rendered_toolkit_instructions(
     raw["agents"]["code"]["tools"] = [{"update_awareness": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     assert instruction_marker not in _build_prompt(agent)
     payload = await _search(agent, "update_awareness")
@@ -1258,21 +1215,16 @@ def test_chat_ui_instructions_map_only_the_enabled_functions(
     raw["agents"]["code"]["tools"] = [tool_entry]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
     prompt = _build_prompt(agent)
 
     assert "chat_ui shows parts of MindRoom Chat to the user." in prompt
-    for name in TOOL_METADATA["chat_ui"].function_names:
+    for name in builtin_tool_registry().entries["chat_ui"].function_names:
         assert (f"\n- {name}(" in prompt) is (name not in excluded)
     assert "open_panel(panel='computer') shows the Computer panel" in prompt
     assert "open_panel(panel='members') shows the Members panel" in prompt
+    # With show_canvas beside open_panel, the agent learns that a real website needs the Computer panel, not a canvas.
+    assert ("a canvas cannot." in prompt) is ("show_canvas" not in excluded)
 
 
 @pytest.mark.parametrize(
@@ -1294,14 +1246,7 @@ def test_chat_ui_names_the_canvas_library_source_only_for_an_agent_with_canvases
     raw["agents"]["code"]["tools"] = [{"chat_ui": options}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
     prompt = _build_prompt(agent)
 
     assert ("https://cdn.jsdelivr.net/npm/" in prompt) is named
@@ -1313,26 +1258,18 @@ def test_excluding_a_disabled_chat_ui_function_keeps_the_toolkit(tmp_path: Path)
     raw["agents"]["code"]["tools"] = [{"chat_ui": {"exclude_tools": ["show_canvas"]}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     assert sorted(function.name for function in _toolkit(agent, "chat_ui").functions) == [
         "open_panel",
         "open_settings",
-        "show_computer",
     ]
 
 
 @pytest.mark.parametrize(
     ("options", "available"),
     [
-        ({"include_tools": ["show_computer"]}, "show_computer"),
+        ({"include_tools": ["open_panel"]}, "open_panel"),
         ({"enable_show_canvas": True, "include_tools": ["show_canvas"]}, "show_canvas"),
     ],
 )
@@ -1346,22 +1283,16 @@ def test_chat_ui_instructions_never_point_at_a_missing_function(
     raw["agents"]["code"]["tools"] = [{"chat_ui": options}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
     instructions = _toolkit(agent, "chat_ui").instructions
     description = offered_function(agent, available).description
 
     assert instructions is not None
     assert description is not None
-    for name in set(TOOL_METADATA["chat_ui"].function_names) - {available}:
+    for name in set(builtin_tool_registry().entries["chat_ui"].function_names) - {available}:
         assert f"{name}(" not in instructions
         assert f"{name}(" not in description
+    assert "a canvas cannot." not in instructions
     assert f"- {available}(" in _build_prompt(agent)
 
 
@@ -1375,7 +1306,7 @@ def test_chat_ui_instructions_name_only_the_functions_a_narrowed_agent_is_offere
     raw["agents"]["code"]["tools"] = ["chat_ui"]  # type: ignore[index]
     if narrowed_by == "approval":
         raw["tool_approval"] = {
-            "rules": [{"match": name, "action": "require_approval"} for name in ("open_panel", "show_computer")],
+            "rules": [{"match": "open_panel", "action": "require_approval"}],
         }
     config = _validated_config(tmp_path, raw)
     narrowing: dict[str, Any] = {
@@ -1391,21 +1322,12 @@ def test_chat_ui_instructions_name_only_the_functions_a_narrowed_agent_is_offere
         "approval": {},
     }[narrowed_by]
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-        **narrowing,
-    )
+    agent = _code_agent(config, tmp_path, **narrowing)
     chat_ui = _toolkit(agent, "chat_ui")
 
     assert [function.name for function in chat_ui.functions] == ["open_settings"]
     for text in (_build_prompt(agent), chat_ui.guidance or ""):
         assert "- open_settings(" in text
-        assert "show_computer(" not in text
         assert "open_panel(" not in text
 
 
@@ -1425,14 +1347,7 @@ def test_openai_native_tool_search_attaches_deferred_toolkits_and_skips_portable
     ]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     function_names = _function_names(agent)
     assert "sleep" in function_names
@@ -1464,14 +1379,7 @@ def test_explicit_openai_api_uses_portable_tool_search_when_native_is_unavailabl
     raw["agents"]["code"]["tools"] = [{"sleep": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     assert _portable_deferred_names(agent) == frozenset({"sleep"})
 
@@ -1484,14 +1392,7 @@ def test_codex_deferred_browser_uses_non_reserved_function_name(tmp_path: Path) 
     raw["agents"]["code"]["tools"] = [{"browser": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     function_names = _function_names(agent)
     assert "browser_control" in function_names
@@ -1508,15 +1409,7 @@ def test_immutable_tool_schema_eagerly_materializes_every_deferred_tool(tmp_path
     ]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        eager_deferred_tools=True,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path, eager_deferred_tools=True)
 
     function_names = _function_names(agent)
     assert "sleep" in function_names
@@ -1532,16 +1425,7 @@ def test_eager_tool_filter_drops_fully_filtered_deferred_toolkit(tmp_path: Path)
     raw["agents"]["code"]["tools"] = [{"sleep": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        eager_deferred_tools=True,
-        tool_function_filter=lambda _function: False,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path, eager_deferred_tools=True, tool_function_filter=lambda _function: False)
 
     function_names = _function_names(agent)
     assert "sleep" not in function_names
@@ -1573,14 +1457,7 @@ def test_unsupported_models_use_portable_tool_search(
     ]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     function_names = _function_names(agent)
     assert {"sleep", "add", "tool_search", "call_tool"} <= function_names
@@ -1588,7 +1465,7 @@ def test_unsupported_models_use_portable_tool_search(
     # initial tools stay ordinary eager tools, so only sleep is hidden behind call_tool.
     assert _portable_deferred_names(agent) == frozenset({"sleep"})
     catalog = next(block for block in agent.prompt.instructions if block.startswith("## Deferred Tools\n"))
-    assert f"sleep - {TOOL_METADATA['sleep'].description}" in catalog
+    assert f"sleep - {builtin_tool_registry().entries['sleep'].description}" in catalog
     assert "calculator" not in catalog
     assert "call_tool(name, arguments)" in catalog
     assert catalog in _build_prompt(agent)
@@ -1604,14 +1481,7 @@ async def test_browser_catalog_points_at_the_deferred_chat_ui_panel(tmp_path: Pa
     ]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     catalog = next(block for block in agent.prompt.instructions if block.startswith("## Deferred Tools\n"))
     assert "chat_ui.open_panel(panel='computer')" in catalog
@@ -1830,8 +1700,7 @@ def test_call_tool_fallback_returns_retry_guidance() -> None:
 
 def test_call_tool_schema_accepts_arbitrary_argument_values() -> None:
     """call_tool's arguments must allow any JSON values, or schema-enforcing servers cannot emit real calls."""
-    function = _search_toolkit().functions["call_tool"].model_copy(deep=True)
-    function.process_entrypoint(strict=False)
+    function = toolkit_offers(_search_toolkit(), "call_tool")
 
     arguments = function.parameters["properties"]["arguments"]
     object_schema = next(option for option in arguments.get("anyOf", [arguments]) if option.get("type") == "object")
@@ -1841,7 +1710,7 @@ def test_call_tool_schema_accepts_arbitrary_argument_values() -> None:
 
 def test_call_tool_schema_reaches_gemini_as_authored() -> None:
     """Gemini receives ``call_tool``'s schema unchanged, so no placeholder argument key is invented."""
-    parameters = adapt_function(_search_toolkit().functions["call_tool"]).parameters
+    parameters = toolkit_offers(_search_toolkit(), "call_tool").parameters
     tool = ToolSpec(name="call_tool", description=None, parameters=parameters, strict=None)
 
     declarations = gemini_wire.function_declarations([tool])
@@ -1948,14 +1817,7 @@ async def test_config_order_decides_which_same_named_function_is_registered(
     raw["agents"]["code"]["tools"] = tools[::-1] if deferred_first else tools  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     assert ("read_file" in agent.request_template.deferred_tools.names) is deferred_first
     if "tool_search" in _function_names(agent):
@@ -1972,14 +1834,7 @@ def test_explicit_dynamic_tools_entry_is_ignored_where_call_tool_cannot_be_rewri
     raw["agents"]["code"]["tools"] = [{"sleep": {"defer": True}}, "dynamic_tools"]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     function_names = _function_names(agent)
     assert "call_tool" not in function_names
@@ -2002,14 +1857,7 @@ def test_static_prompt_estimate_leaves_out_hidden_deferred_definitions(
         raw["models"]["default"] = {"provider": provider, "id": model_id}  # type: ignore[index]
         raw["agents"]["code"]["tools"] = tools  # type: ignore[index]
         config = _validated_config(tmp_path, raw)
-        agent = create_agent(
-            "code",
-            config,
-            _runtime_paths(tmp_path),
-            execution_identity=None,
-            knowledge=None,
-            model=turn_model(config, _runtime_paths(tmp_path), "code"),
-        )
+        agent = _code_agent(config, tmp_path)
         return build_static_token_estimator(
             prompt_for_turn(agent),
             PreparedTools(functions=agent.spec.functions).specs(),
@@ -2060,11 +1908,18 @@ def test_tool_search_joins_instructions_of_toolkits_sharing_one_entry() -> None:
 
 def test_call_tool_fallback_accepts_non_object_arguments() -> None:
     """An unresolved call with list arguments still gets the retry guidance, not a validation error."""
-    function = _search_toolkit().functions["call_tool"]
+    function = toolkit_offers(_search_toolkit(), "call_tool")
 
-    result = function.entrypoint(name="crm_lookup", arguments=[7])  # type: ignore[misc]
+    result = function.entrypoint(name="crm_lookup", arguments=[7])
 
     assert "'crm_lookup' was not called" in _tool_payload(result)["message"]
+
+
+def test_call_tool_fallback_takes_a_name_of_any_type() -> None:
+    """The fallback takes the model's arguments as sent, so a name that is no string still gets the guidance."""
+    function = toolkit_offers(_search_toolkit(), "call_tool")
+
+    assert "'7' was not called" in _tool_payload(function.entrypoint(name=7))["message"]
 
 
 def test_search_toolkit_construction_failure_does_not_stop_the_agent(
@@ -2082,14 +1937,7 @@ def test_search_toolkit_construction_failure_does_not_stop_the_agent(
     raw["agents"]["code"]["tools"] = ["sleep", {"calculator": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
     assert "sleep" in _toolkit_names(agent)
     assert "dynamic_tools" not in _toolkit_names(agent)
@@ -2097,16 +1945,14 @@ def test_search_toolkit_construction_failure_does_not_stop_the_agent(
 
 def test_call_tool_wire_definition_has_a_description() -> None:
     """Providers read the wrapper's description, and some (Cerebras) fail without one."""
-    function = _search_toolkit().functions["call_tool"].model_copy(deep=True)
-    function.process_entrypoint(strict=False)
+    function = toolkit_offers(_search_toolkit(), "call_tool")
 
-    assert function.to_dict().get("description")
+    assert function.definition().description
 
 
 def test_call_tool_fallback_tolerates_missing_name_and_extra_keys() -> None:
     """Malformed wrapper calls still get the retry guidance instead of a Python signature error."""
-    entrypoint = _search_toolkit().functions["call_tool"].entrypoint
-    assert entrypoint is not None
+    entrypoint = toolkit_offers(_search_toolkit(), "call_tool").entrypoint
 
     assert "tool_search" in _tool_payload(entrypoint(customer_id=7))["message"]
     assert "'crm_lookpu' was not called" in _tool_payload(entrypoint(name="crm_lookpu", customer_id=7))["message"]
@@ -2114,32 +1960,17 @@ def test_call_tool_fallback_tolerates_missing_name_and_extra_keys() -> None:
 
 def test_search_toolkit_results_are_never_redirected_to_output_files(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Definitions must reach the model inline, so the search toolkit skips output-file wrapping."""
-    wrapped: list[str] = []
-    original = agents_module.wrap_toolkit_for_output_files
-
-    def recording_wrap(toolkit: Toolkit, policy: object) -> Toolkit:
-        wrapped.append(toolkit.name)
-        return original(toolkit, policy)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(agents_module, "wrap_toolkit_for_output_files", recording_wrap)
     raw = _base_config_data()
     raw["agents"]["code"]["tools"] = ["sleep", {"calculator": {"defer": True}}]  # type: ignore[index]
     config = _validated_config(tmp_path, raw)
 
-    agent = create_agent(
-        "code",
-        config,
-        _runtime_paths(tmp_path),
-        execution_identity=None,
-        knowledge=None,
-        model=turn_model(config, _runtime_paths(tmp_path), "code"),
-    )
+    agent = _code_agent(config, tmp_path)
 
-    assert "dynamic_tools" in _toolkit_names(agent)
-    assert "dynamic_tools" not in wrapped
+    search = _toolkit(agent, "dynamic_tools")
+    assert search.functions
+    assert all(OUTPUT_PATH_ARGUMENT not in function.parameters["properties"] for function in search.functions)
 
 
 def test_agent_manager_functions_follow_what_the_agent_may_do(tmp_path: Path) -> None:
@@ -2158,6 +1989,7 @@ def test_agent_manager_functions_follow_what_the_agent_may_do(tmp_path: Path) ->
             knowledge=None,
             model=turn_model(config, paths, agent_name),
             supports_native_tool_approval=True,
+            plugins=config_plugins(config, paths),
         )
         return {
             function.name

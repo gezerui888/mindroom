@@ -2,22 +2,19 @@
 
 from __future__ import annotations
 
-from contextlib import suppress
+import inspect
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.hooks import HookRegistry, get_hook_metadata
-from mindroom.oauth.registry import load_oauth_providers
-from mindroom.tool_system.catalog import (
-    TOOL_METADATA,
-    clear_resolved_tool_state_cache,
-    ensure_tool_registry_loaded,
-    load_toolkit_class,
-)
-from mindroom.tool_system.plugins import isolated_plugin_runtime
+from mindroom.hooks import get_hook_metadata
+from mindroom.oauth.registry import oauth_provider_registry
+from mindroom.tool_system.agno_toolkits import adapt_callable
+from mindroom.tool_system.authoring import Toolkit, tool_attributes
+from mindroom.tool_system.catalog import load_toolkit_class
+from mindroom.tool_system.plugins import ConfigPlugins, dispose_plugins, staged_plugins
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,8 +28,25 @@ class _PluginCheckResult:
     skill_directories: tuple[str, ...]
 
 
+def _derive_owned_functions(tool_name: str, tool_class: type) -> None:
+    """Derive each ``@tool`` function of an owned toolkit class as an agent build does, without constructing the class.
+
+    A function that does not derive, such as one whose annotation names a type imported only for type checking, leaves
+    every agent without the toolkit. An Agno toolkit names its functions only once constructed, so its build checks them.
+    """
+    if not issubclass(tool_class, Toolkit):
+        return
+    for attribute in tool_attributes(tool_class):
+        try:
+            # Bound as an instance binds it, to a stand-in no derivation reads, so the schema leaves out ``self``.
+            adapt_callable(inspect.getattr_static(tool_class, attribute).__get__(object(), tool_class))
+        except Exception as error:
+            msg = f"Tool {tool_name!r} cannot offer its function {attribute!r}: {error}"
+            raise ValueError(msg) from error
+
+
 def check_plugin(plugin_path: Path) -> _PluginCheckResult:
-    """Strictly load one plugin through every runtime registration surface."""
+    """Strictly load one plugin through every runtime registration surface, leaving the process's plugins as they were."""
     plugin_root = plugin_path.expanduser().resolve()
     with TemporaryDirectory(prefix="mindroom-plugin-check-") as temporary_directory:
         temporary_root = Path(temporary_directory)
@@ -46,36 +60,33 @@ def check_plugin(plugin_path: Path) -> _PluginCheckResult:
             context={"runtime_paths": runtime_paths},
         )
 
-        ensure_tool_registry_loaded(runtime_paths)
-        original_tool_names = set(TOOL_METADATA)
-        try:
-            with isolated_plugin_runtime(
-                config,
-                runtime_paths,
-                skip_broken_plugins=False,
-            ) as loaded_plugins:
-                automations = HookRegistry.from_plugins(loaded_plugins).automations
+        # The checks run while the plugin's modules stay importable, as they are once it is published.
+        with staged_plugins(config, runtime_paths) as generation:
+            try:
+                if generation.skipped:
+                    raise generation.skipped[0].error
+                plugins = ConfigPlugins.of(generation, config, runtime_paths)
+                automations = plugins.hooks.automations
                 if automations.collisions:
                     msg = f"Automation names already taken: {', '.join(automations.collisions)}"
                     raise ValueError(msg)
-                load_oauth_providers(
-                    config,
-                    runtime_paths,
-                    skip_broken_plugins=False,
-                )
+                oauth_provider_registry(plugins, skip_broken_plugins=False)
 
-                if len(loaded_plugins) != 1:
-                    msg = f"Expected one loaded plugin, got {len(loaded_plugins)}"
+                if len(plugins.loaded_plugins) != 1:
+                    msg = f"Expected one loaded plugin, got {len(plugins.loaded_plugins)}"
                     raise ValueError(msg)
-                [plugin] = loaded_plugins
-                tool_names = tuple(sorted(set(TOOL_METADATA) - original_tool_names))
+                [plugin] = plugins.loaded_plugins
+                tool_names = tuple(sorted(plugin.tools))
                 for tool_name in tool_names:
-                    factory = TOOL_METADATA[tool_name].factory
-                    # The registration decorator gives every plugin tool its factory.
+                    factory = plugin.tools[tool_name].factory
+                    # Every plugin tool registration sets its factory.
                     assert factory is not None
-                    # A factory may import a package the user installs after the plugin; its build checks it then.
-                    with suppress(ImportError):
-                        load_toolkit_class(tool_name, factory)
+                    try:
+                        tool_class = load_toolkit_class(tool_name, factory)
+                    except ImportError:
+                        # A factory may import a package the user installs after the plugin; its build checks it then.
+                        continue
+                    _derive_owned_functions(tool_name, tool_class)
                 hook_names = tuple(
                     sorted(
                         metadata.hook_name
@@ -92,5 +103,5 @@ def check_plugin(plugin_path: Path) -> _PluginCheckResult:
                         sorted(str(skill_directory.relative_to(plugin.root)) for skill_directory in plugin.skill_dirs),
                     ),
                 )
-        finally:
-            clear_resolved_tool_state_cache()
+            finally:
+                dispose_plugins(generation)

@@ -1,7 +1,7 @@
 """Characterization pins: same-turn continuations deliver the final body exactly once.
 
-A two-attempt continuation turn (the first attempt ends with a next-turn
-``switch_thread_model`` call, the second completes) is driven through the real
+A two-attempt continuation turn (the first attempt ends with a
+``switch_thread_model`` call for the current response, the second completes) is driven through the real
 response-turn driver (``stream_response_turn``, which the runner collects for
 non-streaming delivery) through ``ResponseRunner.generate_response``, with a spying DeliveryGateway. The pins:
 
@@ -25,10 +25,10 @@ from mindroom.delivery_gateway import (
     FinalizeStreamedResponseRequest,
     StreamingDeliveryRequest,
 )
-from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
 from mindroom.history.session_context import ScopeSessionContext
 from mindroom.history.types import HistoryScope
 from mindroom.llm.runs import ToolExecution
+from mindroom.response_sources import Owned
 from mindroom.response_turn import (
     AttemptResolved,
     CompletedAttempt,
@@ -40,33 +40,32 @@ from mindroom.response_turn import (
     stream_response_turn,
 )
 from tests.conftest import patch_response_runner_module, unwrap_extracted_collaborator
-from tests.response_runner_helpers import _bot, _noop_typing, _plain_request, _target, stream_transport
+from tests.response_runner_helpers import (
+    _bot,
+    _noop_typing,
+    _plain_request,
+    _target,
+    completed_outcome,
+    stream_transport,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Callable
     from pathlib import Path
 
+    from mindroom.final_delivery import FinalDeliveryOutcome, StreamTransportOutcome
+
 
 def _continuing_tool_execution() -> ToolExecution:
-    """Return a next-turn model switch, which forces one more attempt."""
+    """Return a model switch for the current response, which forces one more attempt."""
     return ToolExecution(
-        tool_call_id="call-switch-next-turn",
+        tool_call_id="call-switch-after-toolcall",
         tool_name="switch_thread_model",
-        tool_args={"model_name": "large", "when": "next-turn"},
+        tool_args={"model_name": "large", "when": "after-toolcall"},
         result=json.dumps(
-            {"action": "switch", "model": "large", "status": "ok", "tool": "thread_model", "when": "next-turn"},
+            {"action": "switch", "model": "large", "status": "ok", "tool": "thread_model", "when": "after-toolcall"},
         ),
         stop_after_call=True,
-    )
-
-
-def _completed_outcome(event_id: str, body: str) -> FinalDeliveryOutcome:
-    return FinalDeliveryOutcome(
-        terminal_status="completed",
-        event_id=event_id,
-        is_visible_response=True,
-        final_visible_body=body,
-        delivery_kind="sent",
     )
 
 
@@ -81,16 +80,12 @@ def _load_scope() -> ScopeSessionContext:
     )
 
 
-def _noop(*_args: object) -> None:
-    return None
-
-
 def _stream_turn(
     ctx: ResponseTurnContext,
     sinks: TurnSinks,
     run_attempt: Callable[
         [TurnRunState, TurnContinuationRunState],
-        AsyncGenerator[str | AttemptResolved, None],
+        AsyncGenerator[str | AttemptResolved],
     ],
 ) -> AsyncIterator[str]:
     """Drive the turn as ``ai.stream_agent_response`` does, from the plain request prompt."""
@@ -99,9 +94,9 @@ def _stream_turn(
         TurnAdapter[str](
             load_scope=_load_scope,
             run_attempt=run_attempt,
-            discard_empty_run=_noop,
             make_text_chunk=lambda text: text,
             user_message=ctx.prompt,
+            unexpected_error_text=str,
         ),
         sinks,
         continuation=TurnContinuationRunState.initial(
@@ -128,12 +123,12 @@ async def test_non_streaming_continuation_delivers_final_exactly_once_after_last
     async def spy_deliver_final(_self: DeliveryGateway, request: FinalDeliveryRequest) -> FinalDeliveryOutcome:
         events.append("deliver_final")
         delivered.append(request)
-        return _completed_outcome("$response", body=request.response_text)
+        return completed_outcome("$response", body=request.response_text)
 
     async def run_attempt(
         _run: TurnRunState,
         continuation: TurnContinuationRunState,
-    ) -> AsyncGenerator[str | AttemptResolved, None]:
+    ) -> AsyncGenerator[str | AttemptResolved]:
         attempts.append(continuation.active_prompt)
         events.append(f"attempt:{len(attempts)}")
         # No final delivery may happen before the last attempt settles.
@@ -166,6 +161,7 @@ async def test_non_streaming_continuation_delivers_final_exactly_once_after_last
     ) -> AsyncIterator[str]:
         return _stream_turn(ctx, sinks, run_attempt)
 
+    effects = AsyncMock()
     with (
         patch.object(DeliveryGateway, "send_text", new=AsyncMock(return_value="$placeholder")),
         patch.object(DeliveryGateway, "deliver_final", new=spy_deliver_final),
@@ -173,10 +169,10 @@ async def test_non_streaming_continuation_delivers_final_exactly_once_after_last
             stream_agent_response=fake_stream_agent_response,
             should_use_streaming=AsyncMock(return_value=False),
             typing_indicator=_noop_typing,
-            apply_post_response_effects=AsyncMock(),
+            apply_post_response_effects=effects,
         ),
     ):
-        event_id = await coordinator.generate_response(_plain_request(_target()))
+        fate = await coordinator.generate_response(_plain_request(_target()))
 
     assert attempts[0] == "hello"
     assert len(attempts) == 2
@@ -184,7 +180,9 @@ async def test_non_streaming_continuation_delivers_final_exactly_once_after_last
     assert len(delivered) == 1
     assert delivered[0].response_text == "final answer"
     assert events == ["attempt:1", "attempt:2", "deliver_final"]
-    assert event_id == "$response"
+    assert fate == Owned()
+    # The one delivered answer reached the reply's post-response effects.
+    assert effects.await_args.args[0].final_visible_event_id == "$response"
 
 
 @pytest.mark.asyncio
@@ -208,12 +206,12 @@ async def test_streaming_continuation_finalizes_exactly_once_after_last_attempt(
     ) -> FinalDeliveryOutcome:
         events.append("finalize")
         finalize_requests.append(request)
-        return _completed_outcome("$stream", body=request.stream_transport_outcome.visible_body_text)
+        return completed_outcome("$stream", body=request.stream_transport_outcome.visible_body_text)
 
     async def run_attempt(
         _run: TurnRunState,
         continuation: TurnContinuationRunState,
-    ) -> AsyncGenerator[str | AttemptResolved, None]:
+    ) -> AsyncGenerator[str | AttemptResolved]:
         attempts.append(continuation.active_prompt)
         events.append(f"attempt:{len(attempts)}")
         # No stream finalization may happen between attempts.
@@ -246,6 +244,7 @@ async def test_streaming_continuation_finalizes_exactly_once_after_last_attempt(
     ) -> AsyncIterator[str]:
         return _stream_turn(ctx, sinks, run_attempt)
 
+    effects = AsyncMock()
     with (
         patch.object(DeliveryGateway, "send_text", new=AsyncMock(return_value="$placeholder")),
         patch.object(DeliveryGateway, "deliver_stream", new=spy_deliver_stream),
@@ -254,10 +253,10 @@ async def test_streaming_continuation_finalizes_exactly_once_after_last_attempt(
             stream_agent_response=fake_stream_agent_response,
             should_use_streaming=AsyncMock(return_value=True),
             typing_indicator=_noop_typing,
-            apply_post_response_effects=AsyncMock(),
+            apply_post_response_effects=effects,
         ),
     ):
-        event_id = await coordinator.generate_response(_plain_request(_target()))
+        fate = await coordinator.generate_response(_plain_request(_target()))
 
     assert attempts[0] == "hello"
     assert len(attempts) == 2
@@ -269,4 +268,6 @@ async def test_streaming_continuation_finalizes_exactly_once_after_last_attempt(
     assert "first-attempt terminal text" not in transport.visible_body_text
     assert transport.visible_body_text == "switching models… final answer"
     assert events == ["deliver_stream", "attempt:1", "attempt:2", "finalize"]
-    assert event_id == "$stream"
+    assert fate == Owned()
+    # The one delivered answer reached the reply's post-response effects.
+    assert effects.await_args.args[0].final_visible_event_id == "$stream"

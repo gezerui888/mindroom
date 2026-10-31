@@ -22,10 +22,14 @@ from mindroom.config.agent import AgentConfig
 from mindroom.config.approval import ApprovalRuleConfig, ToolApprovalConfig
 from mindroom.config.models import BackgroundToolJobsConfig
 from mindroom.custom_tools.job import JobTools
+from mindroom.custom_tools.thread_model import ThreadModelTools
 from mindroom.runtime_state import clear_api_server_address, set_api_server_address
-from mindroom.tool_system.agno_toolkits import adapt_function
-from mindroom.tool_system.runtime_context import build_execution_identity_from_runtime_context, tool_runtime_context
+from mindroom.tool_system.agno_toolkits import adapt_callable
+from mindroom.tool_system.plugins import config_plugins
+from mindroom.tool_system.runtime_context import tool_runtime_context
+from mindroom.tool_system.tool_function import ToolGate
 from tests.access_schema_support import with_responder_access
+from tests.agent_tool_helpers import toolkit_offers
 from tests.conftest import test_runtime_paths
 from tests.delegation_helpers import ScriptedAgents
 from tests.fakes.scripted_model import ScriptedModel, answer
@@ -33,7 +37,6 @@ from tests.identity_helpers import persist_entity_accounts
 from tests.minimal_agent_fixtures import ScriptedProvider, offered_tools
 from tests.test_agent_cli_authority import _runtime_context, _turn_context
 from tests.test_agent_cli_shell_access import running_api  # noqa: F401 - pytest fixture
-from tests.tool_job_helpers import job_owner
 from tests.turn_model_helpers import turn_model
 
 if TYPE_CHECKING:
@@ -67,11 +70,11 @@ async def _respond(runtime: ToolRuntimeContext) -> str:
         agent_mode="standard",
         run_id=None,
         prompt="Add two and three",
-        execution_identity=build_execution_identity_from_runtime_context(runtime),
+        execution_identity=runtime.execution_identity,
         supports_native_tool_approval=True,
     )
     with tool_runtime_context(runtime):
-        return await ai.ai_response(turn, runtime.runtime_paths, runtime.config)
+        return (await ai.ai_response(turn, runtime.runtime_paths, runtime.config)).text
 
 
 def _tool_outputs(provider: ScriptedProvider, request: int = 1) -> list[str]:
@@ -302,10 +305,27 @@ async def test_approval_gated_tools_stay_native_only(
     assert '"function":"add"' not in listing, listing
 
 
+def test_the_model_switch_is_not_offered_to_the_cli() -> None:
+    """A switch for the current response stops the run, which a call a shell command makes cannot do."""
+    assert not _cli_callable(toolkit_offers(ThreadModelTools(), "switch_thread_model"))
+
+
 def test_the_job_controls_are_not_offered_to_the_cli(tmp_path: Path) -> None:
     """A job read through the CLI is never saved as the reply's own call, so the reply reads its jobs directly."""
-    job = JobTools(test_runtime_paths(tmp_path), job_owner()).get_async_functions()["job"]
-    assert not _cli_callable(adapt_function(job))
+    assert not _cli_callable(toolkit_offers(JobTools(test_runtime_paths(tmp_path)), "job"))
+
+
+@pytest.mark.parametrize("gate", list(ToolGate))
+def test_a_function_whose_calls_wait_is_not_offered_to_the_cli(gate: ToolGate) -> None:
+    """A call that waits for a decision or runs outside the loop cannot finish inside the shell command."""
+
+    def lookup() -> str:
+        return "found"
+
+    function = adapt_callable(lookup)
+
+    assert _cli_callable(function)
+    assert not _cli_callable(replace(function, gate=gate))
 
 
 @pytest.mark.parametrize("jobs", [False, True], ids=["paused-run", "job-approval"])
@@ -323,11 +343,12 @@ def test_a_shell_that_needs_approval_gets_the_cli_only_as_a_job(tmp_path: Path, 
             "helper",
             runtime.config,
             runtime.runtime_paths,
-            build_execution_identity_from_runtime_context(runtime),
+            runtime.execution_identity,
             agent_cli_in_shell=True,
             supports_native_tool_approval=True,
             knowledge=None,
             model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+            plugins=config_plugins(runtime.config, runtime.runtime_paths),
         )
     finally:
         clear_api_server_address()
@@ -350,11 +371,12 @@ def test_a_shell_gets_the_cli_whether_or_not_it_runs_as_a_job(tmp_path: Path, *,
             "helper",
             runtime.config,
             runtime.runtime_paths,
-            build_execution_identity_from_runtime_context(runtime),
+            runtime.execution_identity,
             agent_cli_in_shell=True,
             supports_native_tool_approval=True,
             knowledge=None,
             model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+            plugins=config_plugins(runtime.config, runtime.runtime_paths),
         )
     finally:
         clear_api_server_address()
@@ -375,7 +397,7 @@ def test_cli_shell_agent_needs_a_matrix_response_turn_and_the_running_api(
 ) -> None:
     """Without the API server, outside Matrix, or outside a response turn (teams, calls), there is no CLI or note."""
     runtime = _helper_runtime(tmp_path, registry=SimpleNamespace())
-    identity = replace(build_execution_identity_from_runtime_context(runtime), channel=channel)
+    identity = replace(runtime.execution_identity, channel=channel)
     if api_running:
         set_api_server_address("127.0.0.1", 8765)
     try:
@@ -387,6 +409,7 @@ def test_cli_shell_agent_needs_a_matrix_response_turn_and_the_running_api(
             agent_cli_in_shell=response_turn,
             knowledge=None,
             model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+            plugins=config_plugins(runtime.config, runtime.runtime_paths),
         )
     finally:
         clear_api_server_address()
@@ -405,11 +428,12 @@ def test_a_subagent_gets_no_cli_of_its_own_or_its_callers(tmp_path: Path) -> Non
             "helper",
             runtime.config,
             runtime.runtime_paths,
-            build_execution_identity_from_runtime_context(runtime),
+            runtime.execution_identity,
             agent_cli_in_shell=True,
             delegation_depth=1,
             knowledge=None,
             model=turn_model(runtime.config, runtime.runtime_paths, "helper"),
+            plugins=config_plugins(runtime.config, runtime.runtime_paths),
         )
     finally:
         clear_api_server_address()

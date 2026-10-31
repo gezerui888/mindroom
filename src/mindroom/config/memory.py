@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from mindroom.config.legacy_fields import drop_retired_auto_flush_fields
+from mindroom.config.legacy_fields import (
+    RETIRED_AUTO_FLUSH_FIELDS,
+    RETIRED_MEMORY_FIELDS,
+    RETIRED_MEMORY_FILE_FIELDS,
+    drop_retired_fields,
+)
 from mindroom.config.models import EmbedderConfig, normalize_api_key_setting
 from mindroom.config.schema_hints import dashboard_hint
 from mindroom.path_globs import validate_safe_relative_pattern
@@ -36,6 +41,9 @@ def _validate_memory_search_includes(value: list[str]) -> list[str]:
     return normalized
 
 
+_MemorySearchIncludes = Annotated[list[str], AfterValidator(_validate_memory_search_includes)]
+
+
 class MemorySearchConfig(BaseModel):
     """Search behavior for file-backed memory."""
 
@@ -45,7 +53,7 @@ class MemorySearchConfig(BaseModel):
         default="keyword",
         description="Search mode for file-backed memory: keyword or semantic",
     )
-    include: list[str] = Field(
+    include: _MemorySearchIncludes = Field(
         default_factory=lambda: ["memory/**/*.md"],
         description="Root-relative glob patterns included in file-memory semantic search",
     )
@@ -54,12 +62,6 @@ class MemorySearchConfig(BaseModel):
         description="When true, include MEMORY.md in file-memory semantic search",
     )
 
-    @field_validator("include")
-    @classmethod
-    def validate_include_patterns(cls, value: list[str]) -> list[str]:
-        """Validate include patterns stay inside the memory root."""
-        return _validate_memory_search_includes(value)
-
 
 class AgentMemorySearchConfig(BaseModel):
     """Optional per-agent override for file-backed memory search."""
@@ -67,14 +69,11 @@ class AgentMemorySearchConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     mode: _MemorySearchMode | None = Field(default=None, description="Per-agent memory search mode override")
-    include: list[str] | None = Field(default=None, description="Per-agent included memory-search glob patterns")
+    include: _MemorySearchIncludes | None = Field(
+        default=None,
+        description="Per-agent included memory-search glob patterns",
+    )
     include_entrypoint: bool | None = Field(default=None, description="Per-agent MEMORY.md indexing override")
-
-    @field_validator("include")
-    @classmethod
-    def validate_include_patterns(cls, value: list[str] | None) -> list[str] | None:
-        """Validate include patterns stay inside the memory root."""
-        return None if value is None else _validate_memory_search_includes(value)
 
 
 class _MemoryEmbedderConfig(BaseModel):
@@ -143,14 +142,12 @@ class _MemoryFileConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    path: str | None = Field(
-        default=None,
-        description=(
-            "Optional fallback root for direct file-memory paths. Relative paths resolve "
-            "from the config directory. Canonical agent and team file memory live under "
-            "their canonical workspace or scope roots."
-        ),
-    )
+    @model_validator(mode="before")
+    @classmethod
+    def drop_retired_memory_file_fields(cls, data: object) -> object:
+        """Drop the retired fallback root older dashboards saved, before unknown keys are rejected."""
+        return drop_retired_fields(data, RETIRED_MEMORY_FILE_FIELDS)
+
     max_entrypoint_lines: int = Field(
         default=200,
         ge=1,
@@ -205,6 +202,7 @@ class _MemoryAutoFlushExtractorConfig(BaseModel):
     model: str | None = Field(
         default=None,
         description="Model config that runs extraction instead of the agent's own model",
+        json_schema_extra=dashboard_hint(reference="model"),
     )
     no_reply_token: str = Field(
         default="NO_REPLY",
@@ -240,7 +238,7 @@ class MemoryAutoFlushConfig(BaseModel):
     @classmethod
     def drop_retired_auto_flush_fields(cls, data: object) -> object:
         """Drop the retired dirty-queue fields older dashboards saved, before unknown keys are rejected."""
-        return drop_retired_auto_flush_fields(data)
+        return drop_retired_fields(data, RETIRED_AUTO_FLUSH_FIELDS)
 
     enabled: bool = Field(default=False, description="Enable background file-memory auto-flush worker")
     flush_interval_seconds: int = Field(
@@ -286,21 +284,15 @@ class MemoryConfig(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_shorthand(cls, data: object) -> object:
-        """Normalize memory: none shorthand into the structured config shape."""
+        """Normalize memory: none shorthand into the structured config shape, without retired fields."""
         if data == "none":
             return {"backend": "none"}
-        return data
+        return drop_retired_fields(data, RETIRED_MEMORY_FIELDS)
 
     backend: MemoryBackend = Field(
         default="mem0",
         description=(
             "Memory backend: 'mem0' (vector memory), 'file' (markdown memory files), or 'none' (disabled memory)"
-        ),
-    )
-    team_reads_member_memory: bool = Field(
-        default=False,
-        description=(
-            "When true, team-context memory reads can access member agent memories in addition to the shared team scope"
         ),
     )
     embedder: _MemoryEmbedderConfig = Field(

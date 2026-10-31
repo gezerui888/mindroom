@@ -17,6 +17,8 @@ from mindroom.custom_tools.matrix_message import MatrixMessageTools
 from mindroom.matrix.state import MatrixState
 from mindroom.tool_system.runtime_context import tool_runtime_context
 from tests.conftest import make_latest_thread_event_id_mock
+from tests.identity_helpers import entity_ids
+from tests.matrix_state_helpers import save_matrix_state
 from tests.test_matrix_agent_discovery import context as context  # noqa: PLC0414
 
 if TYPE_CHECKING:
@@ -205,6 +207,25 @@ async def test_revoked_authority_is_rechecked_for_stored_target(
     assert len(transport.attempts) == 1
 
 
+@pytest.mark.parametrize("pending", [False, True])
+async def test_recipient_moved_to_another_account_fails_closed(
+    context: ToolRuntimeContext,
+    transport: MatrixTransport,
+    pending: bool,
+) -> None:
+    """A retry never sends to or acknowledges a recipient whose name now belongs to another Matrix account."""
+    transport.lose_response = pending
+    with tool_runtime_context(context):
+        await MatrixMessageTools().matrix_message(message="first", recipient="code", idempotency_key="moved")
+        moved = entity_ids(context.config, context.runtime_paths, usernames={"code": "moved_code"})["code"]
+        assert context.room is not None
+        context.room.add_member(moved.full_id, "Code", None)
+        result = json.loads(await MatrixMessageTools().matrix_message(message="retry", idempotency_key="moved"))
+    assert result["status"] == "error"
+    assert result["message"] == "The original Matrix recipient is no longer available."
+    assert len(transport.attempts) == 1
+
+
 async def test_requester_aliases_share_receipts(context: ToolRuntimeContext, transport: MatrixTransport) -> None:
     """Canonical requester identity scopes receipts even across bridge aliases."""
     context.config.authorization.aliases = {"@alice:localhost": ["@bridge_alice:localhost"]}
@@ -249,7 +270,6 @@ async def test_completed_receipts_expire_but_pending_sends_do_not(
         {"idempotency_key": ""},
         {"idempotency_key": " "},
         {"idempotency_key": "x" * 257},
-        {"idempotency_key": 7},
         {"action": "read", "idempotency_key": "key"},
         {"action": "edit", "event_id": "$event", "idempotency_key": "key"},
         {"action": "react", "event_id": "$event", "idempotency_key": "key"},
@@ -267,6 +287,23 @@ async def test_invalid_keyed_sends_never_send(
         result = json.loads(await MatrixMessageTools().matrix_message(**{"message": "text", **arguments}))
     assert result["status"] == "error"
     assert not transport.events
+
+
+async def test_blank_attachments_keep_a_keyed_send_text_only(
+    context: ToolRuntimeContext,
+    transport: MatrixTransport,
+) -> None:
+    """Blank attachment entries are dropped, so a repeated keyed text send still sends once."""
+    with tool_runtime_context(context):
+        first, second = [
+            json.loads(
+                await MatrixMessageTools().matrix_message(message="text", attachments=[" "], idempotency_key="key"),
+            )
+            for _ in range(2)
+        ]
+    assert first["status"] == "ok"
+    assert second == first
+    assert len(transport.events) == len(transport.attempts) == 1
 
 
 async def test_unkeyed_repeats_still_send_each_time(context: ToolRuntimeContext, transport: MatrixTransport) -> None:
@@ -332,7 +369,7 @@ async def test_room_alias_reuses_receipt(context: ToolRuntimeContext, transport:
     """Room names and resolved IDs must address the same receipt scope."""
     state = MatrixState()
     state.add_room("lobby", room_id=context.room_id, alias="#lobby:localhost", name="Lobby")
-    state.save(runtime_paths=context.runtime_paths)
+    save_matrix_state(state, context.runtime_paths)
     with tool_runtime_context(context):
         first = await MatrixMessageTools().matrix_message(message="first", room_id="lobby", idempotency_key="room")
         second = await MatrixMessageTools().matrix_message(

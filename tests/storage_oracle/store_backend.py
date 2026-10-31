@@ -10,19 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass, field
-from functools import partial
 from typing import TYPE_CHECKING, Any, Literal, cast, override
 
-from mindroom.ai_runtime import _finalize_queued_notice_in_runs, _recover_prior_queued_notices
-from mindroom.constants import (
-    MATRIX_RESPONSE_EVENT_ID_METADATA_KEY,
-    MINDROOM_COMPACTION_METADATA_KEY,
-    MINDROOM_MATRIX_HISTORY_METADATA_KEY,
-)
+from mindroom.constants import MATRIX_RESPONSE_EVENT_ID_METADATA_KEY
 from mindroom.delegation.execution import persist_delegation_state
 from mindroom.history.interrupted_replay import persist_interrupted_replay_snapshot
 from mindroom.history.storage import (
@@ -39,11 +32,16 @@ from mindroom.llm.runs import RunStatus
 from mindroom.session_storage.agent_storage import create_state_storage, save_compaction_usage
 from mindroom.session_storage.codec import run_kind
 from mindroom.session_storage.legacy_agno3_schema import AgnoTableNames, agno_runs_sql
+from mindroom.session_storage.legacy_scope_metadata import (
+    LEGACY_COMPACTION_METADATA_KEY,
+    LEGACY_MATRIX_HISTORY_METADATA_KEY,
+)
 from mindroom.session_storage.schema import quote_identifier, usage_table_sql
 from mindroom.session_storage.store import connect_conversation_database
 from mindroom.session_storage.summary_rows import Fold, latest_row
 from mindroom.session_storage.types import session_state_snapshot
-from tests.conftest import seed_session_state
+from tests.conftest import delete_runs, seed_session_state
+from tests.session_storage.agno_layout import replacing_database
 from tests.storage_oracle.backend import (
     REQUESTER_ID,
     SESSION_ID,
@@ -55,7 +53,8 @@ from tests.storage_oracle.backend import (
 from tests.storage_oracle.observe import observe
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Mapping, Sequence
+    import sqlite3
+    from collections.abc import Collection, Mapping, Sequence
     from pathlib import Path
 
     from mindroom.delegation.state import DelegationState
@@ -150,11 +149,6 @@ def redaction_cut(store: ConversationStore, redacted: set[str]) -> list[str]:
     return asyncio.run(remove_history_of_redacted_events(store, session, redacted_history_events))
 
 
-def _rewritten(changed: Sequence[AnyRunRecord]) -> object:
-    """Report a message rewrite as the Agno-layout store reported its saves: one written run per run it changed."""
-    return ["written"] * len(changed) if changed else "unchanged"
-
-
 def replay_view(messages: Sequence[dict[str, Any]], status: str, folded: Collection[str]) -> list[dict[str, Any]]:
     """Return the replay view rule 5 of spec v4 3.6 stores for a run saved with ``messages`` and ``status``.
 
@@ -218,8 +212,8 @@ class StoreBackend(Driver):
     def load(self) -> ConversationSession | None:
         return self.store.load_session(SESSION_ID)
 
-    def _written(self, record: AnyRunRecord, status: str | None = None) -> None:
-        self.saved[record.run_id] = ([message.to_dict() for message in record.messages], status or record.status.value)
+    def _written(self, record: AnyRunRecord) -> None:
+        self.saved[record.run_id] = ([message.to_dict() for message in record.messages], record.status.value)
 
     def _save(
         self,
@@ -262,38 +256,15 @@ class StoreBackend(Driver):
         )
         return ["written"] if patched else "not-stored"
 
-    def _rewrite(self, edit: Callable[[list[AnyRunRecord]], list[AnyRunRecord]]) -> list[AnyRunRecord]:
-        """Rewrite the loaded runs' messages with ``edit``; return the runs the edit changed."""
-        changed: list[AnyRunRecord] = []
-        statuses: dict[str, str] = {}
-
-        def recorded(runs: list[AnyRunRecord]) -> list[AnyRunRecord]:
-            statuses.update((run.run_id, run.status.value) for run in runs)
-            changed.extend(edit(runs))
-            return changed
-
-        self.store.rewrite_run_messages(SESSION_ID, recorded)
-        for run in changed:
-            # Only the loaded runs store, each under its stored status.
-            if run.run_id in statuses:
-                self._written(run, statuses[run.run_id])
-        return changed
-
     @override
     def finalize_notice(self, response_turn_id: str) -> object:
-        # As ``_finalize_queued_notice_in_new_session_storage`` does.
-        if self.store.load_session(SESSION_ID) is None:
-            return "no-session"
-        return _rewritten(self._rewrite(partial(_finalize_queued_notice_in_runs, response_turn_id=response_turn_id)))
+        # MindRoom no longer finalizes a delivered reply's notice: each is stored once, as its run held it.
+        return "unchanged"
 
     @override
     def scrub_notices(self, session: ConversationSession) -> object:
-        # As ``scrub_queued_notice_session_context`` does: the in-memory check first, and a rewrite only when it finds
-        # a crash-left notice. The check's copies are dropped, so the rewrite gets their ids again.
-        recover = partial(_recover_prior_queued_notices, active_response_turn_id=None)
-        with self.determinism.ids_repeated():
-            found = recover(session.runs)
-        return _rewritten(self._rewrite(recover)) if found else "unchanged"
+        # Nor does a reply opening its scope recover a notice a crashed reply left: both markers replay alike.
+        return "unchanged"
 
     @override
     def persist_delegation(self, session: ConversationSession, record: AnyRunRecord, state: DelegationState) -> object:
@@ -349,7 +320,7 @@ class StoreBackend(Driver):
 
     @override
     def discard_run(self, session: ConversationSession, run_id: str) -> object:
-        return sorted(self.store.delete_runs([run_id], session_id=session.session_id, session=session))
+        return sorted(delete_runs(self.store, [run_id], session_id=session.session_id, session=session))
 
     @override
     def chunk_basis(self, session: ConversationSession, run_ids: Sequence[str], previous_summary: str | None) -> object:
@@ -451,8 +422,7 @@ class StoreBackend(Driver):
     def seed_legacy(self, variant: int) -> None:
         # The opened database has no session row yet, so the older one replaces it.
         names = AgnoTableNames(self.owner)
-        self.database.unlink()
-        with closing(sqlite3.connect(self.database)) as connection, connection:
+        with replacing_database(self.database) as connection:
             for statement in (*agno_runs_sql(names), usage_table_sql(names)):
                 connection.execute(statement)
             if variant == 0:
@@ -489,11 +459,11 @@ class StoreBackend(Driver):
         self._insert_session(
             connection,
             {
-                MINDROOM_COMPACTION_METADATA_KEY: {
+                LEGACY_COMPACTION_METADATA_KEY: {
                     "version": 2,
                     "states": {self.scope.key: {"compacted_run_ids": legacy_runs}},
                 },
-                MINDROOM_MATRIX_HISTORY_METADATA_KEY: {
+                LEGACY_MATRIX_HISTORY_METADATA_KEY: {
                     "version": 1,
                     "states": {self.scope.key: {"seen_event_ids": [f"${run_id}" for run_id in legacy_runs]}},
                 },

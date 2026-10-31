@@ -5,10 +5,10 @@ from __future__ import annotations
 import asyncio
 import threading
 from copy import deepcopy
-from dataclasses import dataclass, field, replace
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Literal, Self, cast
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from typing import TYPE_CHECKING, Any, Self, cast
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import nio
 import pytest
@@ -16,15 +16,9 @@ from agno.media import Image
 from agno.tools.function import ToolResult
 from structlog.testing import capture_logs
 
-from mindroom import ai_runtime
 from mindroom.agent_loop.model_loop import EMPTY_REQUEST, LoopHooks
 from mindroom.agent_loop.run import run_agent
-from mindroom.agent_reply_membership import AgentReplyMembershipIndex
-from mindroom.ai_runtime import (
-    queued_message_signal_context,
-    queued_notice_after_tool_batch,
-    register_scope_notice_storage,
-)
+from mindroom.ai_runtime import queued_message_signal_context, queued_notice_after_tool_batch
 from mindroom.bot_runtime_view import BotRuntimeState
 from mindroom.coalescing.batch import (
     CoalescingKey,
@@ -37,6 +31,7 @@ from mindroom.config.judgment import LLMJudgmentConfig
 from mindroom.config.main import Config
 from mindroom.config.mid_turn import MidTurnConfig
 from mindroom.config.models import ModelConfig
+from mindroom.constants import THREAD_SUMMARY_CONTENT_KEY
 from mindroom.conversation_resolver import MessageContext
 from mindroom.dispatch_handoff import PreparedIngress
 from mindroom.dispatch_source import (
@@ -48,18 +43,26 @@ from mindroom.dispatch_source import (
     TRUSTED_INTERNAL_RELAY_SOURCE_KIND,
     VOICE_SOURCE_KIND,
 )
-from mindroom.entity_resolution import current_internal_sender_ids
-from mindroom.final_delivery import FinalDeliveryOutcome
+from mindroom.final_delivery import (
+    Cancelled,
+    Completed,
+    Failed,
+    FailureCause,
+    FinalDeliveryOutcome,
+    Suppressed,
+    Suppression,
+    TurnEnding,
+)
 from mindroom.history.request_messages import TurnMessages, build_request, scope_history_messages
-from mindroom.history.session_context import ScopeSessionContext
+from mindroom.history.run_visibility import is_queued_notice_message
 from mindroom.history.types import HistoryScope
 from mindroom.hooks import MessageEnvelope
 from mindroom.interactive import InteractiveMetadata
 from mindroom.interactive_models import InteractivePrompt
 from mindroom.llm.messages import Message as OwnedMessage
-from mindroom.llm.runs import AnyRunRecord, RunRecord, TeamRunRecord
+from mindroom.llm.runs import AnyRunRecord, RunRecord
 from mindroom.llm.runs import RunStatus as OwnedRunStatus
-from mindroom.matrix.client import ResolvedVisibleMessage
+from mindroom.matrix.client_visible_messages import ResolvedVisibleMessage
 from mindroom.matrix.conversation_hydration import HYDRATED_PROMPT_WINDOW_MESSAGES
 from mindroom.matrix.thread_history_result import ThreadHistoryResult
 from mindroom.matrix.users import AgentMatrixUser
@@ -73,15 +76,13 @@ from mindroom.post_response_effects import (
     apply_post_response_effects,
 )
 from mindroom.prompts import QUEUED_MESSAGE_NOTICE_TEXT
+from mindroom.reply_turn.locked_turn import LockedTurns
+from mindroom.reply_turn.request import ResponseRequest
 from mindroom.response_lifecycle import ResponseLifecycleCoordinator, _QueuedMessageState
 from mindroom.response_payload_preparation import DispatchPayloadInputs, ResponsePayloadPreparation
-from mindroom.response_runner import (
-    PostLockRequestPreparationError,
-    ResponseRequest,
-    ResponseRunner,
-)
-from mindroom.response_sources import ResponseSources
-from mindroom.session_storage.agent_storage import create_agent_state_storage, create_state_storage
+from mindroom.response_runner import ResponseRunner, _PostLockRequestPreparationError
+from mindroom.response_sources import Owned, ResponseSources, SourceFate, Unclaimed, UnclaimedReason
+from mindroom.session_storage.agent_storage import create_agent_state_storage
 from mindroom.session_storage.store import ConversationStore, persist_to
 from mindroom.session_storage.types import ConversationSession, SessionKind
 from mindroom.turn_policy import DispatchPlan, PreparedDispatch, ResponseAction
@@ -100,17 +101,18 @@ from tests.conftest import (
     make_membership_stub,
     make_pending_event,
     message_origin,
-    prepared_dispatch_result,
     request_envelope,
     runtime_paths_for,
     seed_session,
     serve_conversation_reader,
+    summarized_lines,
     test_runtime_paths,
     unwrap_extracted_collaborator,
     wrap_extracted_collaborators,
 )
 from tests.fakes.scripted_model import ScriptedModel, answer, calls, tool_call
 from tests.response_runner_helpers import streamed_answer
+from tests.runtime_fakes import ready_runtime
 from tests.turn_dispatch_helpers import dispatch_test_turn, nothing_else_queued, prepared_turn_recorder
 
 if TYPE_CHECKING:
@@ -119,6 +121,7 @@ if TYPE_CHECKING:
 
     from mindroom.bot import AgentBot
     from mindroom.delivery_gateway import FinalDeliveryRequest
+    from mindroom.matrix.conversation_reads import ConversationReader
     from mindroom.turn_origin import TurnOrigin
 
 
@@ -155,7 +158,7 @@ def _bot(tmp_path: Path) -> AgentBot:
         display_name="General",
         user_id="@mindroom_general:localhost",
     )
-    bot = make_test_agent_bot(agent_user, tmp_path, config, runtime_paths_for(config), rooms=["!room:localhost"])
+    bot = make_test_agent_bot(agent_user, config, runtime_paths_for(config), rooms=["!room:localhost"])
     bot.client = AsyncMock(spec=nio.AsyncClient)
     bot.client.rooms = {}
     install_runtime_journal_support(bot)
@@ -187,6 +190,23 @@ def _envelope(
         agent_name="general",
         dispatch_policy_source_kind=dispatch_policy_source_kind,
         origin=origin or message_origin(sender_id=sender_id, requester_id=requester_id, source_kind=source_kind),
+    )
+
+
+def _request(envelope: MessageEnvelope, **overrides: Any) -> ResponseRequest:  # noqa: ANN401
+    """Return the request answering ``envelope``'s one source; ``overrides`` replace its other fields."""
+    return replace(
+        ResponseRequest(
+            sources=ResponseSources(
+                pending_event_ids=(envelope.source_event_id,),
+                logical_source_event_ids=(envelope.source_event_id,),
+            ),
+            thread_history=[],
+            prompt="hello",
+            user_id="@user:localhost",
+            response_envelope=envelope,
+        ),
+        **overrides,
     )
 
 
@@ -265,7 +285,7 @@ def _reserved_follow_up_case(
         envelope=envelope,
     )
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     queued_signal.begin_response_turn()
     reservation = lifecycle.reserve_waiting_human_message(target=target, response_envelope=envelope)
@@ -278,11 +298,9 @@ def _reserved_follow_up_case(
     )
 
 
-def test_response_lifecycle_rejects_mismatched_reservation_target(tmp_path: Path) -> None:
+def test_response_lifecycle_rejects_mismatched_reservation_target() -> None:
     """Queued notices should use the envelope's canonical lifecycle target."""
-    bot = _bot(tmp_path)
-    coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = ResponseLifecycleCoordinator()
     envelope = _envelope()
     mismatched_target = MessageTarget.resolve("!other:localhost", None, "$event")
 
@@ -294,16 +312,14 @@ def test_response_lifecycle_rejects_mismatched_reservation_target(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_response_lifecycle_rejects_mismatched_locked_response_target(tmp_path: Path) -> None:
+async def test_response_lifecycle_rejects_mismatched_locked_response_target() -> None:
     """Response locking should use the envelope's canonical lifecycle target."""
-    bot = _bot(tmp_path)
-    coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = ResponseLifecycleCoordinator()
     envelope = _envelope()
     mismatched_target = MessageTarget.resolve("!other:localhost", None, "$event")
 
-    async def locked_operation(_target: MessageTarget) -> str:
-        return "$response"
+    async def locked_operation(_target: MessageTarget) -> SourceFate:
+        return Owned()
 
     with pytest.raises(ValueError, match=r"MessageEnvelope\.target"):
         await lifecycle.run_locked_response(
@@ -318,66 +334,24 @@ _QUEUED_NOTICE_MARKER_KEY = "mindroom_queued_message_notice"
 _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY = "mindroom_queued_message_notice_response_turn_id"
 
 
-def _notice_messages(
-    messages: list[OwnedMessage],
-    *,
-    marker: bool | str | None = None,
-    response_turn_id: str | None = None,
-) -> list[OwnedMessage]:
-    matches: list[OwnedMessage] = []
-    for message in messages:
-        provider_data = message.provider_data
-        if not isinstance(provider_data, dict):
-            continue
-        notice_marker = provider_data.get(_QUEUED_NOTICE_MARKER_KEY)
-        if notice_marker not in (True, "persisted"):
-            continue
-        if marker is not None and notice_marker != marker:
-            continue
-        if response_turn_id is not None and provider_data.get(_QUEUED_NOTICE_RESPONSE_TURN_ID_KEY) != response_turn_id:
-            continue
-        matches.append(message)
-    return matches
+def _notice_messages(messages: list[OwnedMessage], *, response_turn_id: str | None = None) -> list[OwnedMessage]:
+    return [
+        message
+        for message in messages
+        if is_queued_notice_message(message)
+        and (
+            response_turn_id is None
+            or (message.provider_data or {}).get(_QUEUED_NOTICE_RESPONSE_TURN_ID_KEY) == response_turn_id
+        )
+    ]
 
 
-def _notice_count(
-    messages: list[OwnedMessage],
-    *,
-    marker: bool | str | None = None,
-    response_turn_id: str | None = None,
-) -> int:
-    return len(
-        _notice_messages(
-            messages,
-            marker=marker,
-            response_turn_id=response_turn_id,
-        ),
-    )
+def _notice_count(messages: list[OwnedMessage], *, response_turn_id: str | None = None) -> int:
+    return len(_notice_messages(messages, response_turn_id=response_turn_id))
 
 
 def _queued_notice_storage(tmp_path: Path) -> ConversationStore:
     return create_agent_state_storage("queued_notice", tmp_path)
-
-
-def _register_notice_storage(
-    store: ConversationStore,
-    *,
-    storage_factory: Callable[[], ConversationStore] | None = None,
-    session_id: str = "session-1",
-    session_kind: SessionKind = "agent",
-    entity_name: str = "general",
-) -> None:
-    """Register the scope a response ran in, whose runs ``store`` holds, for the response's notice finalization."""
-    register_scope_notice_storage(
-        scope_context=ScopeSessionContext(
-            scope=HistoryScope(kind=session_kind, scope_id=entity_name),
-            storage=store,
-            session=None,
-            session_id=session_id,
-            storage_factory=storage_factory or (lambda: store),
-        ),
-        entity_name=entity_name,
-    )
 
 
 async def _after_batch(
@@ -390,55 +364,13 @@ async def _after_batch(
     await queued_notice_after_tool_batch(notice_text)(messages, results)
 
 
-def _owned_notice(response_turn_id: str, *, marker: bool | str = True, from_history: bool = False) -> OwnedMessage:
+def _owned_notice(response_turn_id: str, *, from_history: bool = False) -> OwnedMessage:
     return OwnedMessage(
         role="user",
         content=QUEUED_MESSAGE_NOTICE_TEXT,
-        provider_data={_QUEUED_NOTICE_MARKER_KEY: marker, _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: response_turn_id},
+        provider_data={_QUEUED_NOTICE_MARKER_KEY: True, _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: response_turn_id},
         from_history=from_history,
     )
-
-
-@dataclass(frozen=True, slots=True)
-class _RecordingStore(ConversationStore):
-    """A conversation store that records the runs each message rewrite stores and can hold each rewrite until released.
-
-    A rewrite whose edit returns no run stores nothing, so it records nothing.
-    """
-
-    held: threading.Event | None = None
-    rewriting: threading.Event = field(default_factory=threading.Event)
-    saves: list[list[str]] = field(default_factory=list)
-
-    def rewrite_run_messages(
-        self,
-        session_id: str,
-        edit: Callable[[list[AnyRunRecord]], list[AnyRunRecord]],
-        *,
-        session: ConversationSession | None = None,
-    ) -> None:
-        self.rewriting.set()
-        if self.held is not None:
-            assert self.held.wait(timeout=1)
-
-        def recorded(runs: list[AnyRunRecord]) -> list[AnyRunRecord]:
-            edited = edit(runs)
-            if edited:
-                self.saves.append([run.run_id for run in edited])
-            return edited
-
-        ConversationStore.rewrite_run_messages(self, session_id, recorded, session=session)
-
-
-def _recording_store(
-    tmp_path: Path,
-    name: str,
-    *,
-    held: threading.Event | None = None,
-    kind: SessionKind = "agent",
-) -> _RecordingStore:
-    store = create_state_storage(name, tmp_path, HistoryScope(kind=kind, scope_id=name))
-    return _RecordingStore(store.path, held=held)
 
 
 def _completed(run_id: str, messages: list[OwnedMessage], *, agent_id: str = "general") -> RunRecord:
@@ -461,7 +393,7 @@ def _seed(
     owner = "general" if kind == "agent" else "queued-notice-team"
     for run in runs:
         run.session_id = session_id
-    seeded = seed_session(
+    return seed_session(
         store,
         ConversationSession(
             session_id=session_id,
@@ -471,15 +403,6 @@ def _seed(
             created_at=1,
         ),
     )
-    if isinstance(store, _RecordingStore):
-        store.saves.clear()  # Seeding is setup, not a save the test observes.
-    return seeded
-
-
-def _stored_runs(store: ConversationStore, *, session_id: str = "session-1") -> list[AnyRunRecord]:
-    session = ConversationStore.load_session(store, session_id)
-    assert session is not None
-    return session.runs
 
 
 class _StaticQueuedState:
@@ -661,9 +584,8 @@ async def test_post_response_effects_skip_thread_summary_for_suppressed_delivery
 
     await apply_post_response_effects(
         FinalDeliveryOutcome(
-            terminal_status="cancelled",
+            ending=Suppressed(Suppression.HOOK),
             event_id=None,
-            suppressed=True,
         ),
         ResponseOutcome(
             response_target=MessageTarget.resolve(
@@ -689,7 +611,7 @@ async def test_post_response_effects_report_once_whether_a_question_reply_lost_i
 
     await apply_post_response_effects(
         FinalDeliveryOutcome(
-            terminal_status="completed",
+            ending=Completed(),
             event_id="$response",
             is_visible_response=True,
             final_visible_body="Pick one.\n\nReact with an emoji or type the number to respond.",
@@ -702,39 +624,32 @@ async def test_post_response_effects_report_once_whether_a_question_reply_lost_i
         "Interactive question buttons skipped",
         response_event_id="$response",
         add_interactive_buttons_is_none=False,
-        terminal_status="completed",
+        ending="Completed",
         final_visible_body_is_none=False,
-        suppressed=False,
         interactive_metadata_is_none=True,
     )
 
 
 @pytest.mark.parametrize(
-    ("terminal_status", "run_succeeded"),
-    [
-        ("error", False),
-        ("cancelled", False),
-        ("completed", False),
-    ],
+    "ending",
+    [Failed(FailureCause.ERROR, "boom"), Cancelled("user_stop"), Completed()],
+    ids=["error", "cancelled", "completed"],
 )
 @pytest.mark.asyncio
-async def test_post_response_effects_skip_thread_summary_for_unsuccessful_turn(
-    terminal_status: Literal["error", "cancelled", "completed"],
-    run_succeeded: bool,
-) -> None:
+async def test_post_response_effects_skip_thread_summary_for_unsuccessful_turn(ending: TurnEnding) -> None:
     """Visible failed or cancelled turns must not enqueue thread enrichment."""
     should_queue_thread_summary = MagicMock(return_value=True)
     queue_thread_summary = MagicMock()
 
     await apply_post_response_effects(
         FinalDeliveryOutcome(
-            terminal_status=terminal_status,
+            ending=ending,
             event_id="$response",
             is_visible_response=True,
             final_visible_body="Turn did not complete",
         ),
         ResponseOutcome(
-            run_succeeded=run_succeeded,
+            run_succeeded=False,
             response_target=MessageTarget.resolve(
                 room_id="!room:localhost",
                 thread_id="$thread",
@@ -760,7 +675,7 @@ async def test_post_response_effects_skip_memory_persistence_for_failed_run() ->
 
     await apply_post_response_effects(
         FinalDeliveryOutcome(
-            terminal_status="error",
+            ending=Failed(FailureCause.ERROR, "Provider failed"),
             event_id="$response",
             is_visible_response=True,
             final_visible_body="Provider failed",
@@ -792,7 +707,7 @@ async def test_post_response_effects_add_buttons_for_preserved_stream_success() 
 
     await apply_post_response_effects(
         FinalDeliveryOutcome(
-            terminal_status="completed",
+            ending=Completed(),
             event_id="$stream",
             is_visible_response=True,
             final_visible_body="Choose",
@@ -831,7 +746,7 @@ async def test_post_response_effects_skip_buttons_for_preserved_stream_error() -
 
     await apply_post_response_effects(
         FinalDeliveryOutcome(
-            terminal_status="error",
+            ending=Failed(FailureCause.ERROR),
             event_id="$stream",
             is_visible_response=True,
             final_visible_body="Choose",
@@ -856,13 +771,7 @@ async def test_post_response_effects_skip_buttons_when_prompt_membership_ended(t
     runtime_paths = runtime_paths_for(config)
     client = make_matrix_client_mock()
     config.defaults.enable_streaming = False
-    runtime = BotRuntimeState(
-        client=client,
-        config=config,
-        runtime_paths=runtime_paths,
-        agent_reply_memberships=AgentReplyMembershipIndex(),
-        orchestrator=None,
-    )
+    runtime = BotRuntimeState(orchestrator=ready_runtime(config, runtime_paths), client=client)
     membership = make_membership_stub()
     membership.interactive_prompt_is_current.return_value = False
     support = PostResponseEffectsSupport(
@@ -881,7 +790,7 @@ async def test_post_response_effects_skip_buttons_when_prompt_membership_ended(t
 
     await apply_post_response_effects(
         FinalDeliveryOutcome(
-            terminal_status="completed",
+            ending=Completed(),
             event_id="$response",
             is_visible_response=True,
             final_visible_body="Choose",
@@ -909,37 +818,20 @@ async def test_post_response_effects_skip_buttons_when_prompt_membership_ended(t
     client.room_send.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_post_response_effects_queues_summary_with_stale_hint_inside_margin(tmp_path: Path) -> None:
-    """A stale hint just below threshold should still reach the live summary check."""
-    config = _config(tmp_path)
-    config.defaults.thread_summary_first_threshold = 5
-    runtime_paths = runtime_paths_for(config)
-    client = make_matrix_client_mock()
-    client.room_messages.return_value = nio.RoomMessagesResponse(
-        room_id="!room:localhost",
-        chunk=[
-            nio.RoomMessageText.from_dict(
-                {
-                    "type": "m.room.message",
-                    "event_id": "$thread",
-                    "sender": "@user0:localhost",
-                    "origin_server_ts": 0,
-                    "content": {"msgtype": "m.text", "body": "Thread root"},
-                },
-            ),
-        ],
-        start="",
-        end=None,
-    )
+async def _run_queued_summary(
+    config: Config,
+    client: AsyncMock,
+    room_id: str,
+    *,
+    entity_name: str | None = None,
+) -> tuple[ConversationReader, list[ResolvedVisibleMessage]]:
+    """Deliver an answer in a five-message thread and await the summary pass it queues.
+
+    Returns the reader the pass read the thread through, and the thread history it served.
+    """
     config.defaults.enable_streaming = False
-    runtime = BotRuntimeState(
-        client=client,
-        config=config,
-        runtime_paths=runtime_paths,
-        agent_reply_memberships=AgentReplyMembershipIndex(),
-        orchestrator=None,
-    )
+    runtime_paths = runtime_paths_for(config)
+    runtime = BotRuntimeState(orchestrator=ready_runtime(config, runtime_paths), client=client)
     conversation_reader = make_conversation_reader_mock()
     support = PostResponseEffectsSupport(
         runtime=runtime,
@@ -950,7 +842,7 @@ async def test_post_response_effects_queues_summary_with_stale_hint_inside_margi
         agent_name="agent",
     )
     deps = support.build_deps(
-        room_id="!room:localhost",
+        room_id=room_id,
         membership_turn_id="$turn",
     )
     thread_history = [
@@ -976,17 +868,10 @@ async def test_post_response_effects_queues_summary_with_stale_hint_inside_margi
         scheduled_tasks.append(task)
         return task
 
-    with (
-        patch("mindroom.post_response_effects.create_background_task", side_effect=schedule_background_task),
-        patch("mindroom.thread_summary._generate_summary", new=AsyncMock(return_value="Summary")) as mock_generate,
-        patch(
-            "mindroom.thread_summary._send_thread_summary_event",
-            new=AsyncMock(return_value="$summary"),
-        ) as mock_send,
-    ):
+    with patch("mindroom.post_response_effects.create_background_task", side_effect=schedule_background_task):
         await apply_post_response_effects(
             FinalDeliveryOutcome(
-                terminal_status="completed",
+                ending=Completed(),
                 event_id="$response",
                 is_visible_response=True,
                 final_visible_body="response",
@@ -994,139 +879,86 @@ async def test_post_response_effects_queues_summary_with_stale_hint_inside_margi
             ),
             ResponseOutcome(
                 response_target=MessageTarget.resolve(
-                    room_id="!room:localhost",
+                    room_id=room_id,
                     thread_id="$thread",
                     reply_to_event_id="$event",
                 ),
                 thread_summary_message_count_hint=4,
+                thread_summary_entity_name=entity_name,
             ),
             deps,
         )
 
         assert scheduled_tasks
         await asyncio.gather(*scheduled_tasks)
+    return conversation_reader, thread_history
 
-    conversation_reader.read_strict.assert_awaited_once_with(
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("thread_summary_baselines")
+async def test_post_response_effects_queues_summary_with_stale_hint_inside_margin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale hint just below threshold should still reach the live summary check."""
+    model = ScriptedModel([answer('{"summary": "Summary"}')])
+    install_model_providers(monkeypatch, {"default": model})
+    config = _config(tmp_path)
+    config.defaults.thread_summary_first_threshold = 5
+    client = make_matrix_client_mock()
+    client.room_send.return_value = nio.RoomSendResponse(event_id="$summary", room_id="!room:localhost")
+
+    conversation_reader, thread_history = await _run_queued_summary(config, client, "!room:localhost")
+
+    # One strict read for the gate, one after the pin re-check walked the thread again.
+    expected_read = call(room_id="!room:localhost", thread_id="$thread", limit=HYDRATED_PROMPT_WINDOW_MESSAGES)
+    assert conversation_reader.read_strict.await_args_list == [expected_read, expected_read]
+    conversation_reader.hydrator.rewalk.assert_awaited_once_with(
         room_id="!room:localhost",
         thread_id="$thread",
-        limit=HYDRATED_PROMPT_WINDOW_MESSAGES,
+        edits_of=(),
+        unreadable_is_missing=False,
     )
     # Nothing has echoed the response back, so the projection this pass reads
     # stops one message short of the thread. It summarizes the projected
     # messages plus the answer it was queued for, and counts that answer -- the
     # same number the pre-queue gate above already used.
-    generated_history = mock_generate.await_args.args[0]
-    assert list(generated_history[:-1]) == thread_history
-    assert (generated_history[-1].sender, generated_history[-1].body) == (client.user_id, "response")
-    assert mock_generate.await_args.args[1:] == (config, runtime_paths)
-    assert mock_generate.await_args.kwargs == {
-        "model_name": "default",
-        "tag_vocabulary": None,
-        "trusted_sender_ids": current_internal_sender_ids(config, runtime_paths),
-    }
-    mock_send.assert_awaited_once_with(
-        client,
-        "!room:localhost",
-        "$thread",
-        "Summary",
-        6,
-        "default",
-        conversation_reader,
-        initial_enrichment_complete=None,
-        generated_at=ANY,
-    )
+    (request,) = model.requests
+    assert summarized_lines(request) == [
+        *(f"{message.sender}: {message.body}" for message in thread_history),
+        f"{client.user_id}: response",
+    ]
+    (sent,) = [call.kwargs["content"] for call in client.room_send.await_args_list]
+    assert sent["body"] == "Summary"
+    assert sent["m.relates_to"]["event_id"] == "$thread"
+    assert sent[THREAD_SUMMARY_CONTENT_KEY]["message_count"] == 6
+    assert sent[THREAD_SUMMARY_CONTENT_KEY]["model"] == "default"
+    assert "initial_enrichment_complete" not in sent[THREAD_SUMMARY_CONTENT_KEY]
 
 
 @pytest.mark.asyncio
-async def test_post_response_effects_queues_summary_with_entity_model_for_adhoc_room(tmp_path: Path) -> None:
+@pytest.mark.usefixtures("thread_summary_baselines")
+async def test_post_response_effects_queues_summary_with_entity_model_for_adhoc_room(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Ad-hoc invited rooms should inherit the responding entity's summary model override."""
+    # Only "qwen" is served, so summarizing with the default model would fail to build it.
+    model = ScriptedModel([answer('{"summary": "Summary"}')])
+    install_model_providers(monkeypatch, {"qwen": model})
     config = _config(tmp_path)
     config.defaults.thread_summary_first_threshold = 1
     config.room_thread_summary_models["general"] = "qwen"
     config.models["qwen"] = ModelConfig(provider="openai", id="qwen-test-model")
-    runtime_paths = runtime_paths_for(config)
     client = make_matrix_client_mock()
-    config.defaults.enable_streaming = False
-    runtime = BotRuntimeState(
-        client=client,
-        config=config,
-        runtime_paths=runtime_paths,
-        agent_reply_memberships=AgentReplyMembershipIndex(),
-        orchestrator=None,
-    )
-    conversation_reader = make_conversation_reader_mock()
-    support = PostResponseEffectsSupport(
-        runtime=runtime,
-        logger=MagicMock(),
-        runtime_paths=runtime_paths,
-        conversation_reader=conversation_reader,
-        membership=make_membership_stub(),
-        agent_name="agent",
-    )
-    deps = support.build_deps(
-        room_id="!adhoc:localhost",
-        membership_turn_id="$turn",
-    )
-    thread_history = [
-        ResolvedVisibleMessage.synthetic(
-            sender=f"@user{i}:localhost",
-            body=f"Message {i}",
-            timestamp=i,
-            event_id=f"$message{i}",
-        )
-        for i in range(5)
+
+    _, thread_history = await _run_queued_summary(config, client, "!adhoc:localhost", entity_name="general")
+
+    (request,) = model.requests
+    assert summarized_lines(request) == [
+        *(f"{message.sender}: {message.body}" for message in thread_history),
+        f"{client.user_id}: response",
     ]
-    serve_conversation_reader(conversation_reader, thread_history)
-    scheduled_tasks: list[asyncio.Task[None]] = []
-
-    def schedule_background_task(
-        coro: Coroutine[object, object, None],
-        *,
-        name: str,
-        error_handler: object | None = None,  # noqa: ARG001
-        owner: object | None = None,  # noqa: ARG001
-    ) -> asyncio.Task[None]:
-        task = asyncio.create_task(coro, name=name)
-        scheduled_tasks.append(task)
-        return task
-
-    with (
-        patch("mindroom.post_response_effects.create_background_task", side_effect=schedule_background_task),
-        patch("mindroom.thread_summary._generate_summary", new=AsyncMock(return_value="Summary")) as mock_generate,
-        patch("mindroom.thread_summary._send_thread_summary_event", new=AsyncMock(return_value="$summary")),
-    ):
-        await apply_post_response_effects(
-            FinalDeliveryOutcome(
-                terminal_status="completed",
-                event_id="$response",
-                is_visible_response=True,
-                final_visible_body="response",
-                delivery_kind="sent",
-            ),
-            ResponseOutcome(
-                response_target=MessageTarget.resolve(
-                    room_id="!adhoc:localhost",
-                    thread_id="$thread",
-                    reply_to_event_id="$event",
-                ),
-                thread_summary_message_count_hint=4,
-                thread_summary_entity_name="general",
-            ),
-            deps,
-        )
-
-        assert scheduled_tasks
-        await asyncio.gather(*scheduled_tasks)
-
-    generated_history = mock_generate.await_args.args[0]
-    assert list(generated_history[:-1]) == thread_history
-    assert (generated_history[-1].sender, generated_history[-1].body) == (client.user_id, "response")
-    assert mock_generate.await_args.args[1:] == (config, runtime_paths)
-    assert mock_generate.await_args.kwargs == {
-        "model_name": "qwen",
-        "tag_vocabulary": None,
-        "trusted_sender_ids": current_internal_sender_ids(config, runtime_paths),
-    }
 
 
 @pytest.mark.asyncio
@@ -1136,7 +968,7 @@ async def test_generate_response_sets_queued_signal_for_human_ingress(tmp_path: 
     response_envelope = _envelope()
     response_target = response_envelope.target
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     lifecycle_lock = lifecycle._response_lifecycle_lock(response_target)
     queued_signal = lifecycle._get_or_create_queued_signal(response_target)
     await lifecycle_lock.acquire()
@@ -1144,26 +976,17 @@ async def test_generate_response_sets_queued_signal_for_human_ingress(tmp_path: 
     try:
         with patch.object(
             ResponseRunner,
-            "_generate_response_locked",
-            new=AsyncMock(return_value="$response"),
+            "_run_locked_turn",
+            new=AsyncMock(return_value=Owned()),
         ) as mock_locked:
             task = asyncio.create_task(
                 bot._response_runner.generate_response(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope.source_event_id,),
-                            logical_source_event_ids=(response_envelope.source_event_id,),
-                        ),
-                        prompt="hello",
-                        thread_history=[],
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope,
-                    ),
+                    _request(response_envelope),
                 ),
             )
             await asyncio.wait_for(queued_signal.wait(), timeout=0.2)
             lifecycle_lock.release()
-            assert await task == "$response"
+            assert await task == Owned()
             mock_locked.assert_awaited_once()
     finally:
         if lifecycle_lock.locked():
@@ -1203,7 +1026,7 @@ async def test_generate_response_skips_signal_for_non_human_prompt_ingress(
     bot = _bot(tmp_path)
     response_target = response_envelope.target
     coordinator = unwrap_extracted_collaborator(bot._turn_ingress.deps.response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     lifecycle_lock = lifecycle._response_lifecycle_lock(response_target)
     queued_signal = lifecycle._get_or_create_queued_signal(response_target)
     await lifecycle_lock.acquire()
@@ -1211,21 +1034,12 @@ async def test_generate_response_skips_signal_for_non_human_prompt_ingress(
     try:
         with patch.object(
             ResponseRunner,
-            "_generate_response_locked",
-            new=AsyncMock(return_value="$response"),
+            "_run_locked_turn",
+            new=AsyncMock(return_value=Owned()),
         ):
             task = asyncio.create_task(
                 bot._response_runner.generate_response(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope.source_event_id,),
-                            logical_source_event_ids=(response_envelope.source_event_id,),
-                        ),
-                        prompt="hello",
-                        thread_history=[],
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope,
-                    ),
+                    _request(response_envelope),
                 ),
             )
             with pytest.raises(asyncio.TimeoutError):
@@ -1323,7 +1137,7 @@ async def test_generate_response_sets_queued_signal_for_trusted_router_relay(tmp
     )
     response_target = response_envelope.target
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     lifecycle_lock = lifecycle._response_lifecycle_lock(response_target)
     queued_signal = lifecycle._get_or_create_queued_signal(response_target)
     await lifecycle_lock.acquire()
@@ -1331,26 +1145,17 @@ async def test_generate_response_sets_queued_signal_for_trusted_router_relay(tmp
     try:
         with patch.object(
             ResponseRunner,
-            "_generate_response_locked",
-            new=AsyncMock(return_value="$response"),
+            "_run_locked_turn",
+            new=AsyncMock(return_value=Owned()),
         ):
             task = asyncio.create_task(
                 bot._response_runner.generate_response(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope.source_event_id,),
-                            logical_source_event_ids=(response_envelope.source_event_id,),
-                        ),
-                        prompt="hello",
-                        thread_history=[],
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope,
-                    ),
+                    _request(response_envelope),
                 ),
             )
             await asyncio.wait_for(queued_signal.wait(), timeout=0.2)
             lifecycle_lock.release()
-            assert await task == "$response"
+            assert await task == Owned()
     finally:
         if lifecycle_lock.locked():
             lifecycle_lock.release()
@@ -1367,48 +1172,28 @@ async def test_generate_response_detects_active_turn_before_lock_is_held(tmp_pat
     first_envelope = _envelope(source_event_id="$first")
     second_envelope = _envelope(source_event_id="$second")
 
-    async def fake_generate_response_locked(
+    async def fake_run_locked_turn(
         _self: ResponseRunner,
         request: ResponseRequest,
-        *,
-        resolved_target: MessageTarget,
-        early_placeholder_state: object,
-    ) -> str:
-        del resolved_target, early_placeholder_state
-        return str(request.user_id)
+        **_kwargs: object,
+    ) -> SourceFate:
+        # Each requester's turn returns a fate of its own, so each task is seen to run its own request.
+        return Owned() if request.user_id == "first" else Unclaimed(UnclaimedReason.NOT_DUE)
 
     with (
-        patch.object(coordinator._lifecycle_coordinator, "_response_lifecycle_lock", return_value=lock),
-        patch.object(ResponseRunner, "_generate_response_locked", new=fake_generate_response_locked),
+        patch.object(coordinator.lifecycle_coordinator, "_response_lifecycle_lock", return_value=lock),
+        patch.object(ResponseRunner, "_run_locked_turn", new=fake_run_locked_turn),
     ):
         first_task = asyncio.create_task(
             bot._response_runner.generate_response(
-                ResponseRequest(
-                    sources=ResponseSources(
-                        pending_event_ids=(first_envelope.source_event_id,),
-                        logical_source_event_ids=(first_envelope.source_event_id,),
-                    ),
-                    prompt="hello",
-                    thread_history=[],
-                    user_id="first",
-                    response_envelope=first_envelope,
-                ),
+                _request(first_envelope, user_id="first"),
             ),
         )
         await lock.first_waiting.wait()
 
         second_task = asyncio.create_task(
             bot._response_runner.generate_response(
-                ResponseRequest(
-                    sources=ResponseSources(
-                        pending_event_ids=(second_envelope.source_event_id,),
-                        logical_source_event_ids=(second_envelope.source_event_id,),
-                    ),
-                    prompt="stop",
-                    thread_history=[],
-                    user_id="second",
-                    response_envelope=second_envelope,
-                ),
+                _request(second_envelope, prompt="stop", user_id="second"),
             ),
         )
 
@@ -1416,8 +1201,8 @@ async def test_generate_response_detects_active_turn_before_lock_is_held(tmp_pat
         second_result = await second_task
         first_result = await first_task
 
-    assert second_result == "second"
-    assert first_result == "first"
+    assert second_result == Unclaimed(UnclaimedReason.NOT_DUE)
+    assert first_result == Owned()
 
 
 @pytest.mark.asyncio
@@ -1427,7 +1212,7 @@ async def test_generate_response_waits_for_lock_before_starting_placeholder_life
     response_envelope = _envelope(source_kind=SCHEDULED_SOURCE_KIND)
     response_target = response_envelope.target
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle_lock = coordinator._lifecycle_coordinator._response_lifecycle_lock(response_target)
+    lifecycle_lock = coordinator.lifecycle_coordinator._response_lifecycle_lock(response_target)
     await lifecycle_lock.acquire()
     lifecycle_started = asyncio.Event()
     # Both handoffs this test observes are causal, not timed: the turn is known
@@ -1445,11 +1230,10 @@ async def test_generate_response_waits_for_lock_before_starting_placeholder_life
 
     lifecycle_lock.acquire = announce_lock_wait  # type: ignore[method-assign]
 
-    async def fake_run_cancellable_response(*_args: object, **kwargs: object) -> str:
+    async def fake_run_cancellable_response(*_args: object, **kwargs: object) -> FinalDeliveryOutcome:
         lifecycle_started.set()
         response_function = kwargs["response_function"]
-        await response_function(None)
-        return "$response"
+        return await response_function(None)
 
     try:
         with (
@@ -1458,7 +1242,7 @@ async def test_generate_response_waits_for_lock_before_starting_placeholder_life
                 "_deliver_turn",
                 new=AsyncMock(
                     return_value=FinalDeliveryOutcome(
-                        terminal_status="completed",
+                        ending=Completed(),
                         event_id="$response",
                         is_visible_response=True,
                         final_visible_body="ok",
@@ -1467,7 +1251,7 @@ async def test_generate_response_waits_for_lock_before_starting_placeholder_life
                 ),
             ),
             patch.object(
-                ResponseRunner,
+                LockedTurns,
                 "_run_cancellable_response",
                 new=AsyncMock(side_effect=fake_run_cancellable_response),
             ) as mock_run_cancellable_response,
@@ -1476,16 +1260,7 @@ async def test_generate_response_waits_for_lock_before_starting_placeholder_life
         ):
             task = asyncio.create_task(
                 bot._response_runner.generate_response(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope.source_event_id,),
-                            logical_source_event_ids=(response_envelope.source_event_id,),
-                        ),
-                        prompt="hello",
-                        thread_history=[],
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope,
-                    ),
+                    _request(response_envelope),
                 ),
             )
             await lock_wait_started.wait()
@@ -1494,7 +1269,7 @@ async def test_generate_response_waits_for_lock_before_starting_placeholder_life
             lifecycle_lock.release()
             await lifecycle_started.wait()
             resolution = await task
-            assert resolution == "$response"
+            assert resolution == Owned()
     finally:
         if lifecycle_lock.locked():
             lifecycle_lock.release()
@@ -1523,16 +1298,9 @@ async def test_refresh_model_history_after_lock_refreshes_empty_thread_history(t
         "fetch_thread_history",
         new=AsyncMock(return_value=fresh_history),
     ) as mock_fetch_thread_history:
-        request = await coordinator._refresh_model_history_after_lock(
-            ResponseRequest(
-                sources=ResponseSources(
-                    pending_event_ids=("$event",),
-                    logical_source_event_ids=("$event",),
-                ),
-                thread_history=[],
-                prompt="hello",
-                user_id="@user:localhost",
-                response_envelope=request_envelope(
+        request = await coordinator.locked.refresh_model_history(
+            _request(
+                request_envelope(
                     room_id="!room:localhost",
                     reply_to_event_id="$event",
                     thread_id="$thread",
@@ -1565,18 +1333,8 @@ async def test_refresh_model_history_after_lock_does_not_reprove_room_target(
         "fetch_thread_history",
         new=AsyncMock(side_effect=AssertionError("room targets have no model thread history to refresh")),
     ):
-        request = await coordinator._refresh_model_history_after_lock(
-            ResponseRequest(
-                sources=ResponseSources(
-                    pending_event_ids=(envelope.source_event_id,),
-                    logical_source_event_ids=(envelope.source_event_id,),
-                ),
-                thread_history=[],
-                prompt="hello",
-                user_id="@user:localhost",
-                response_envelope=envelope,
-                requires_model_history_refresh=True,
-            ),
+        request = await coordinator.locked.refresh_model_history(
+            _request(envelope, requires_model_history_refresh=True),
         )
 
     assert request.thread_id is None
@@ -1584,30 +1342,35 @@ async def test_refresh_model_history_after_lock_does_not_reprove_room_target(
     assert request.response_envelope.target.resolved_thread_id is None
 
 
+def _recording_run_targets(observed: list[MessageTarget]) -> Callable[..., Awaitable[FinalDeliveryOutcome]]:
+    """Return a ``_run_cancellable_response`` stand-in that records each run's target and runs its attempt directly."""
+
+    async def run_cancellable_response(**kwargs: object) -> FinalDeliveryOutcome:
+        target = kwargs["target"]
+        assert isinstance(target, MessageTarget)
+        observed.append(target)
+        response_function = cast(
+            "Callable[[object | None], Awaitable[FinalDeliveryOutcome]]",
+            kwargs["response_function"],
+        )
+        return await response_function(None)
+
+    return run_cancellable_response
+
+
 @pytest.mark.asyncio
-async def test_generate_response_uses_post_lock_reproof_target(tmp_path: Path) -> None:
+async def test_generate_response_keeps_room_target_through_run_and_delivery(tmp_path: Path) -> None:
     """Agent delivery must enter the runner with the finalized stable room target."""
     bot = _bot(tmp_path)
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
     stable_target = MessageTarget.resolve("!room:localhost", None, "$event", room_mode=True)
     observed_run_targets: list[MessageTarget] = []
-    observed_delivery_targets: list[MessageTarget | None] = []
-
-    async def fake_run_cancellable_response(**kwargs: object) -> str:
-        target = kwargs["target"]
-        assert isinstance(target, MessageTarget)
-        observed_run_targets.append(target)
-        response_function = cast(
-            "Callable[[object | None], Awaitable[object]]",
-            kwargs["response_function"],
-        )
-        await response_function(None)
-        return "$response"
+    observed_delivery_targets: list[MessageTarget] = []
 
     async def fake_deliver_turn(turn: object, **_kwargs: object) -> FinalDeliveryOutcome:
-        observed_delivery_targets.append(cast("Any", turn).delivery_request.response_envelope.target)
+        observed_delivery_targets.append(cast("Any", turn).request.response_envelope.target)
         return FinalDeliveryOutcome(
-            terminal_status="completed",
+            ending=Completed(),
             event_id="$response",
             is_visible_response=True,
             final_visible_body="ok",
@@ -1615,34 +1378,24 @@ async def test_generate_response_uses_post_lock_reproof_target(tmp_path: Path) -
         )
 
     with (
-        patch.object(coordinator, "build_lifecycle", MagicMock(return_value=_NoopResponseLifecycle())),
+        patch.object(LockedTurns, "build_lifecycle", MagicMock(return_value=_NoopResponseLifecycle())),
         patch.object(
-            coordinator,
+            LockedTurns,
             "_run_cancellable_response",
-            new=AsyncMock(side_effect=fake_run_cancellable_response),
+            new=AsyncMock(side_effect=_recording_run_targets(observed_run_targets)),
         ),
         patch.object(coordinator, "_deliver_turn", new=AsyncMock(side_effect=fake_deliver_turn)),
         patch("mindroom.response_runner.should_use_streaming", AsyncMock(return_value=False)),
     ):
         result = await coordinator.generate_response(
-            ResponseRequest(
-                sources=ResponseSources(
-                    pending_event_ids=("$event",),
-                    logical_source_event_ids=("$event",),
-                ),
-                thread_history=[],
-                prompt="hello",
-                user_id="@user:localhost",
-                response_envelope=_envelope(source_event_id="$event", target=stable_target),
-            ),
+            _request(_envelope(source_event_id="$event", target=stable_target)),
         )
 
-    assert result == "$response"
+    assert result == Owned()
     assert [target.resolved_thread_id for target in observed_run_targets] == [None]
-    assert [target.resolved_thread_id if target is not None else None for target in observed_delivery_targets] == [None]
-    lock_keys = set(coordinator._lifecycle_coordinator._response_lifecycle_locks)
+    assert [target.resolved_thread_id for target in observed_delivery_targets] == [None]
+    lock_keys = set(coordinator.lifecycle_coordinator._response_lifecycle_locks)
     assert ResponseLifecycleKey(room_id="!room:localhost", thread_id=None) in lock_keys
-    assert ResponseLifecycleKey(room_id="!room:localhost", thread_id="$plain_root") not in lock_keys
 
 
 @pytest.mark.asyncio
@@ -1653,7 +1406,7 @@ async def test_generate_response_keeps_locked_target_when_payload_preparation_re
     stable_target = MessageTarget.resolve("!room:localhost", None, "$event", room_mode=True)
     retarget = MessageTarget.resolve("!room:localhost", "$other_thread", "$event")
     observed_run_targets: list[MessageTarget] = []
-    observed_delivery_targets: list[MessageTarget | None] = []
+    observed_delivery_targets: list[MessageTarget] = []
     observed_lifecycle_targets: list[MessageTarget] = []
 
     async def fake_prepare(request: ResponseRequest) -> ResponseRequest:
@@ -1663,73 +1416,54 @@ async def test_generate_response_keeps_locked_target_when_payload_preparation_re
             payload_preparation=None,
         )
 
-    async def fake_run_cancellable_response(**kwargs: object) -> str:
-        target = kwargs["target"]
-        assert isinstance(target, MessageTarget)
-        observed_run_targets.append(target)
-        response_function = cast(
-            "Callable[[object | None], Awaitable[object]]",
-            kwargs["response_function"],
-        )
-        await response_function(None)
-        return "$response"
-
     async def fake_deliver_turn(turn: object, **_kwargs: object) -> FinalDeliveryOutcome:
-        observed_delivery_targets.append(cast("Any", turn).delivery_request.response_envelope.target)
+        observed_delivery_targets.append(cast("Any", turn).request.response_envelope.target)
         return FinalDeliveryOutcome(
-            terminal_status="completed",
+            ending=Completed(),
             event_id="$response",
             is_visible_response=True,
             final_visible_body="ok",
             delivery_kind="sent",
         )
 
-    def fake_build_lifecycle(**kwargs: object) -> _NoopResponseLifecycle:
-        request = kwargs["request"]
+    def fake_build_lifecycle(request: object, **_kwargs: object) -> _NoopResponseLifecycle:
         assert isinstance(request, ResponseRequest)
         observed_lifecycle_targets.append(request.response_envelope.target)
         return _NoopResponseLifecycle()
 
     with (
-        patch.object(coordinator, "build_lifecycle", MagicMock(side_effect=fake_build_lifecycle)),
+        patch.object(LockedTurns, "build_lifecycle", MagicMock(side_effect=fake_build_lifecycle)),
         patch.object(
             coordinator.deps.request_preparer,
             "prepare",
             new=AsyncMock(side_effect=fake_prepare),
         ),
         patch.object(
-            coordinator,
+            LockedTurns,
             "_run_cancellable_response",
-            new=AsyncMock(side_effect=fake_run_cancellable_response),
+            new=AsyncMock(side_effect=_recording_run_targets(observed_run_targets)),
         ),
         patch.object(coordinator, "_deliver_turn", new=AsyncMock(side_effect=fake_deliver_turn)),
         patch("mindroom.response_runner.should_use_streaming", AsyncMock(return_value=False)),
     ):
         result = await coordinator.generate_response(
-            ResponseRequest(
-                sources=ResponseSources(
-                    pending_event_ids=("$event",),
-                    logical_source_event_ids=("$event",),
-                ),
-                thread_history=[],
-                prompt="hello",
-                user_id="@user:localhost",
-                response_envelope=_envelope(source_event_id="$event", target=stable_target),
+            _request(
+                _envelope(source_event_id="$event", target=stable_target),
                 payload_preparation=_payload_preparation(stable_target),
             ),
         )
 
-    assert result == "$response"
+    assert result == Owned()
     assert observed_run_targets == [stable_target]
     assert observed_delivery_targets == [stable_target]
     assert observed_lifecycle_targets == [stable_target]
-    lock_keys = set(coordinator._lifecycle_coordinator._response_lifecycle_locks)
+    lock_keys = set(coordinator.lifecycle_coordinator._response_lifecycle_locks)
     assert ResponseLifecycleKey(room_id="!room:localhost", thread_id=None) in lock_keys
     assert ResponseLifecycleKey(room_id="!room:localhost", thread_id="$other_thread") not in lock_keys
 
 
 @pytest.mark.asyncio
-async def test_generate_team_response_uses_post_lock_reproof_target(tmp_path: Path) -> None:
+async def test_generate_team_response_keeps_room_target_through_run_and_delivery(tmp_path: Path) -> None:
     """Team delivery/session setup must enter the runner with the finalized stable room target."""
     bot = _bot(tmp_path)
     bot.client = MagicMock()
@@ -1737,28 +1471,16 @@ async def test_generate_team_response_uses_post_lock_reproof_target(tmp_path: Pa
     bot.client.rooms = {"!room:localhost": cached_room}
     bot.client.room_send = AsyncMock()
     bot.client.room_typing = AsyncMock()
-    bot.orchestrator = MagicMock()
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
     stable_target = MessageTarget.resolve("!room:localhost", None, "$event", room_mode=True)
     lifecycle = _NoopResponseLifecycle()
     observed_run_targets: list[MessageTarget] = []
     observed_delivery_targets: list[MessageTarget] = []
 
-    async def fake_run_cancellable_response(**kwargs: object) -> str:
-        target = kwargs["target"]
-        assert isinstance(target, MessageTarget)
-        observed_run_targets.append(target)
-        response_function = cast(
-            "Callable[[object | None], Awaitable[object]]",
-            kwargs["response_function"],
-        )
-        await response_function(None)
-        return "$response"
-
     async def fake_deliver_final(request: FinalDeliveryRequest) -> FinalDeliveryOutcome:
         observed_delivery_targets.append(request.target)
         return FinalDeliveryOutcome(
-            terminal_status="completed",
+            ending=Completed(),
             event_id="$response",
             is_visible_response=True,
             final_visible_body=request.response_text,
@@ -1766,11 +1488,11 @@ async def test_generate_team_response_uses_post_lock_reproof_target(tmp_path: Pa
         )
 
     with (
-        patch.object(coordinator, "build_lifecycle", MagicMock(return_value=lifecycle)),
+        patch.object(LockedTurns, "build_lifecycle", MagicMock(return_value=lifecycle)),
         patch.object(
-            coordinator,
+            LockedTurns,
             "_run_cancellable_response",
-            new=AsyncMock(side_effect=fake_run_cancellable_response),
+            new=AsyncMock(side_effect=_recording_run_targets(observed_run_targets)),
         ),
         patch("mindroom.delivery_gateway.DeliveryGateway.deliver_final", new=AsyncMock(side_effect=fake_deliver_final)),
         patch("mindroom.response_runner.should_use_streaming", AsyncMock(return_value=False)),
@@ -1780,26 +1502,16 @@ async def test_generate_team_response_uses_post_lock_reproof_target(tmp_path: Pa
         ),
     ):
         result = await coordinator.generate_team_response_helper(
-            ResponseRequest(
-                sources=ResponseSources(
-                    pending_event_ids=("$event",),
-                    logical_source_event_ids=("$event",),
-                ),
-                thread_history=[],
-                prompt="hello",
-                user_id="@user:localhost",
-                response_envelope=_envelope(source_event_id="$event", target=stable_target),
-            ),
+            _request(_envelope(source_event_id="$event", target=stable_target)),
             member_names=[bot.agent_name],
             team_mode="coordinate",
         )
 
-    assert result == "$response"
+    assert result == Owned()
     assert [target.resolved_thread_id for target in observed_run_targets] == [None]
     assert [target.resolved_thread_id for target in observed_delivery_targets] == [None]
-    lock_keys = set(coordinator._lifecycle_coordinator._response_lifecycle_locks)
+    lock_keys = set(coordinator.lifecycle_coordinator._response_lifecycle_locks)
     assert ResponseLifecycleKey(room_id="!room:localhost", thread_id=None) in lock_keys
-    assert ResponseLifecycleKey(room_id="!room:localhost", thread_id="$plain_root") not in lock_keys
 
 
 @pytest.mark.asyncio
@@ -1811,7 +1523,6 @@ async def test_generate_team_response_keeps_locked_target_when_payload_preparati
     bot.client.rooms = {"!room:localhost": cached_room}
     bot.client.room_send = AsyncMock()
     bot.client.room_typing = AsyncMock()
-    bot.orchestrator = MagicMock()
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
     stable_target = MessageTarget.resolve("!room:localhost", None, "$event", room_mode=True)
     retarget = MessageTarget.resolve("!room:localhost", "$other_thread", "$event")
@@ -1826,21 +1537,10 @@ async def test_generate_team_response_keeps_locked_target_when_payload_preparati
             payload_preparation=None,
         )
 
-    async def fake_run_cancellable_response(**kwargs: object) -> str:
-        target = kwargs["target"]
-        assert isinstance(target, MessageTarget)
-        observed_run_targets.append(target)
-        response_function = cast(
-            "Callable[[object | None], Awaitable[object]]",
-            kwargs["response_function"],
-        )
-        await response_function(None)
-        return "$response"
-
     async def fake_deliver_final(request: FinalDeliveryRequest) -> FinalDeliveryOutcome:
         observed_delivery_targets.append(request.target)
         return FinalDeliveryOutcome(
-            terminal_status="completed",
+            ending=Completed(),
             event_id="$response",
             is_visible_response=True,
             final_visible_body=request.response_text,
@@ -1848,16 +1548,16 @@ async def test_generate_team_response_keeps_locked_target_when_payload_preparati
         )
 
     with (
-        patch.object(coordinator, "build_lifecycle", MagicMock(return_value=lifecycle)),
+        patch.object(LockedTurns, "build_lifecycle", MagicMock(return_value=lifecycle)),
         patch.object(
             coordinator.deps.request_preparer,
             "prepare",
             new=AsyncMock(side_effect=fake_prepare),
         ),
         patch.object(
-            coordinator,
+            LockedTurns,
             "_run_cancellable_response",
-            new=AsyncMock(side_effect=fake_run_cancellable_response),
+            new=AsyncMock(side_effect=_recording_run_targets(observed_run_targets)),
         ),
         patch("mindroom.delivery_gateway.DeliveryGateway.deliver_final", new=AsyncMock(side_effect=fake_deliver_final)),
         patch("mindroom.response_runner.should_use_streaming", AsyncMock(return_value=False)),
@@ -1867,25 +1567,18 @@ async def test_generate_team_response_keeps_locked_target_when_payload_preparati
         ),
     ):
         result = await coordinator.generate_team_response_helper(
-            ResponseRequest(
-                sources=ResponseSources(
-                    pending_event_ids=("$event",),
-                    logical_source_event_ids=("$event",),
-                ),
-                thread_history=[],
-                prompt="hello",
-                user_id="@user:localhost",
-                response_envelope=_envelope(source_event_id="$event", target=stable_target),
+            _request(
+                _envelope(source_event_id="$event", target=stable_target),
                 payload_preparation=_payload_preparation(stable_target),
             ),
             member_names=[bot.agent_name],
             team_mode="coordinate",
         )
 
-    assert result == "$response"
+    assert result == Owned()
     assert observed_run_targets == [stable_target]
     assert observed_delivery_targets == [stable_target]
-    lock_keys = set(coordinator._lifecycle_coordinator._response_lifecycle_locks)
+    lock_keys = set(coordinator.lifecycle_coordinator._response_lifecycle_locks)
     assert ResponseLifecycleKey(room_id="!room:localhost", thread_id=None) in lock_keys
     assert ResponseLifecycleKey(room_id="!room:localhost", thread_id="$other_thread") not in lock_keys
 
@@ -1903,18 +1596,11 @@ async def test_prepare_request_after_lock_wraps_refresh_failures(tmp_path: Path)
             "fetch_thread_history",
             new=AsyncMock(side_effect=RuntimeError("repair required")),
         ),
-        pytest.raises(PostLockRequestPreparationError) as excinfo,
+        pytest.raises(_PostLockRequestPreparationError) as excinfo,
     ):
         await coordinator._prepare_request_after_lock(
-            ResponseRequest(
-                sources=ResponseSources(
-                    pending_event_ids=("$event",),
-                    logical_source_event_ids=("$event",),
-                ),
-                thread_history=[],
-                prompt="hello",
-                user_id="@user:localhost",
-                response_envelope=request_envelope(
+            _request(
+                request_envelope(
                     room_id="!room:localhost",
                     reply_to_event_id="$event",
                     thread_id="$thread",
@@ -1935,7 +1621,7 @@ async def test_generate_team_response_helper_sets_queued_signal(tmp_path: Path) 
     response_envelope = _envelope()
     response_target = response_envelope.target
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     lifecycle_lock = lifecycle._response_lifecycle_lock(response_target)
     queued_signal = lifecycle._get_or_create_queued_signal(response_target)
     await lifecycle_lock.acquire()
@@ -1944,27 +1630,18 @@ async def test_generate_team_response_helper_sets_queued_signal(tmp_path: Path) 
         with patch.object(
             ResponseRunner,
             "_run_locked_turn",
-            new=AsyncMock(return_value="$team-response"),
+            new=AsyncMock(return_value=Owned()),
         ) as mock_locked:
             task = asyncio.create_task(
                 bot._response_runner.generate_team_response_helper(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope.source_event_id,),
-                            logical_source_event_ids=(response_envelope.source_event_id,),
-                        ),
-                        thread_history=[],
-                        prompt="hello",
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope,
-                    ),
+                    _request(response_envelope),
                     member_names=[],
                     team_mode="coordinate",
                 ),
             )
             await asyncio.wait_for(queued_signal.wait(), timeout=0.2)
             lifecycle_lock.release()
-            assert await task == "$team-response"
+            assert await task == Owned()
             mock_locked.assert_awaited_once()
     finally:
         if lifecycle_lock.locked():
@@ -1974,138 +1651,45 @@ async def test_generate_team_response_helper_sets_queued_signal(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
-async def test_generate_response_without_reservation_does_not_drain_human_backlog(tmp_path: Path) -> None:
-    """Unreserved direct responses should serialize normally instead of owning active follow-up backlog."""
+@pytest.mark.parametrize("team", [False, True], ids=["agent", "team"])
+async def test_response_without_reservation_does_not_drain_human_backlog(tmp_path: Path, team: bool) -> None:
+    """Unreserved direct agent or team responses serialize normally instead of owning active follow-up backlog."""
     bot = _bot(tmp_path)
     response_envelope_b = _envelope(source_event_id="$event-b")
     response_envelope_c = _envelope(source_event_id="$event-c")
     response_target = response_envelope_b.target
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     lifecycle_lock = lifecycle._response_lifecycle_lock(response_target)
     queued_signal = lifecycle._get_or_create_queued_signal(response_target)
     observed_pending: list[bool] = []
+    ran_sources: list[str] = []
     second_turn_started = asyncio.Event()
     allow_turns_to_finish = asyncio.Event()
 
-    async def fake_locked(_self: ResponseRunner, *_args: object, **_kwargs: object) -> str:
+    async def fake_locked(_self: ResponseRunner, request: ResponseRequest, **_kwargs: object) -> SourceFate:
         observed_pending.append(queued_signal.has_pending_human_messages())
+        ran_sources.append(request.response_envelope.source_event_id)
         if len(observed_pending) == 1:
             second_turn_started.set()
         await allow_turns_to_finish.wait()
-        return f"$response-{len(observed_pending)}"
+        return Owned()
 
-    await lifecycle_lock.acquire()
-    try:
-        with patch.object(ResponseRunner, "_generate_response_locked", new=fake_locked):
-            task_b = asyncio.create_task(
-                bot._response_runner.generate_response(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope_b.source_event_id,),
-                            logical_source_event_ids=(response_envelope_b.source_event_id,),
-                        ),
-                        prompt="hello",
-                        thread_history=[],
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope_b,
-                    ),
-                ),
+    async def respond(request: ResponseRequest) -> SourceFate:
+        if team:
+            return await bot._response_runner.generate_team_response_helper(
+                request,
+                member_names=[],
+                team_mode="coordinate",
             )
-            await asyncio.wait_for(queued_signal.wait(), timeout=0.2)
-            task_c = asyncio.create_task(
-                bot._response_runner.generate_response(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope_c.source_event_id,),
-                            logical_source_event_ids=(response_envelope_c.source_event_id,),
-                        ),
-                        prompt="hello again",
-                        thread_history=[],
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope_c,
-                    ),
-                ),
-            )
-            for _ in range(20):
-                if queued_signal.pending_human_messages == 2:
-                    break
-                await asyncio.sleep(0)
-            assert queued_signal.pending_human_messages == 2
-
-            lifecycle_lock.release()
-            await asyncio.wait_for(second_turn_started.wait(), timeout=0.2)
-            assert observed_pending == [True]
-
-            allow_turns_to_finish.set()
-            assert await task_b == "$response-1"
-            assert await task_c == "$response-2"
-    finally:
-        if lifecycle_lock.locked():
-            lifecycle_lock.release()
-
-    assert observed_pending == [True, False]
-    assert not queued_signal.has_pending_human_messages()
-
-
-@pytest.mark.asyncio
-async def test_generate_team_response_without_reservation_does_not_drain_human_backlog(tmp_path: Path) -> None:
-    """Unreserved direct team responses should serialize without owning active follow-up backlog."""
-    bot = _bot(tmp_path)
-    response_envelope_b = _envelope(source_event_id="$team-event-b")
-    response_envelope_c = _envelope(source_event_id="$team-event-c")
-    response_target = response_envelope_b.target
-    coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
-    lifecycle_lock = lifecycle._response_lifecycle_lock(response_target)
-    queued_signal = lifecycle._get_or_create_queued_signal(response_target)
-    observed_pending: list[bool] = []
-    second_turn_started = asyncio.Event()
-    allow_turns_to_finish = asyncio.Event()
-
-    async def fake_locked(_self: ResponseRunner, *_args: object, **_kwargs: object) -> str:
-        observed_pending.append(queued_signal.has_pending_human_messages())
-        if len(observed_pending) == 1:
-            second_turn_started.set()
-        await allow_turns_to_finish.wait()
-        return f"$team-response-{len(observed_pending)}"
+        return await bot._response_runner.generate_response(request)
 
     await lifecycle_lock.acquire()
     try:
         with patch.object(ResponseRunner, "_run_locked_turn", new=fake_locked):
-            task_b = asyncio.create_task(
-                bot._response_runner.generate_team_response_helper(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope_b.source_event_id,),
-                            logical_source_event_ids=(response_envelope_b.source_event_id,),
-                        ),
-                        thread_history=[],
-                        prompt="hello",
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope_b,
-                    ),
-                    member_names=[],
-                    team_mode="coordinate",
-                ),
-            )
+            task_b = asyncio.create_task(respond(_request(response_envelope_b)))
             await asyncio.wait_for(queued_signal.wait(), timeout=0.2)
-            task_c = asyncio.create_task(
-                bot._response_runner.generate_team_response_helper(
-                    ResponseRequest(
-                        sources=ResponseSources(
-                            pending_event_ids=(response_envelope_c.source_event_id,),
-                            logical_source_event_ids=(response_envelope_c.source_event_id,),
-                        ),
-                        thread_history=[],
-                        prompt="hello again",
-                        user_id="@user:localhost",
-                        response_envelope=response_envelope_c,
-                    ),
-                    member_names=[],
-                    team_mode="coordinate",
-                ),
-            )
+            task_c = asyncio.create_task(respond(_request(response_envelope_c, prompt="hello again")))
             for _ in range(20):
                 if queued_signal.pending_human_messages == 2:
                     break
@@ -2117,13 +1701,14 @@ async def test_generate_team_response_without_reservation_does_not_drain_human_b
             assert observed_pending == [True]
 
             allow_turns_to_finish.set()
-            assert await task_b == "$team-response-1"
-            assert await task_c == "$team-response-2"
+            assert await task_b == Owned()
+            assert await task_c == Owned()
     finally:
         if lifecycle_lock.locked():
             lifecycle_lock.release()
 
     assert observed_pending == [True, False]
+    assert ran_sources == [response_envelope_b.source_event_id, response_envelope_c.source_event_id]
     assert not queued_signal.has_pending_human_messages()
 
 
@@ -2135,7 +1720,7 @@ async def test_reserved_human_follow_up_reaches_active_turn_before_dispatch(tmp_
     follow_up_envelope = _envelope(source_event_id="$followup")
     response_target = active_envelope.target
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(response_target)
     active_started = asyncio.Event()
     active_saw_follow_up = asyncio.Event()
@@ -2197,7 +1782,7 @@ async def test_response_lifecycle_reservations_clear_individual_notices(tmp_path
     """Lifecycle reservations only own queued-message notices, not coalesced follow-up batching."""
     bot = _bot(tmp_path)
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     target = MessageTarget.resolve("!room:localhost", "$thread", "$active")
     active_envelope = _envelope(source_event_id="$active", target=target)
     active_started = asyncio.Event()
@@ -2274,7 +1859,7 @@ async def test_non_human_lock_owner_does_not_clear_pending_human_notice(tmp_path
     """Scheduled or hook turns sharing the target lock must not clear human follow-up notices."""
     bot = _bot(tmp_path)
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     target = MessageTarget.resolve("!room:localhost", "$thread", "$active")
     active_envelope = _envelope(source_event_id="$active", target=target)
     human_envelope = _envelope(
@@ -2358,60 +1943,28 @@ async def test_reserved_command_follow_up_cleanup_when_dispatch_returns(tmp_path
     bot = _bot(tmp_path)
     room = MagicMock(spec=nio.MatrixRoom)
     room.room_id = "!room:localhost"
-    target = MessageTarget.resolve(room.room_id, "$thread", "$command")
-    envelope = _envelope(
-        dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
-        source_event_id="$command",
-        target=target,
-    )
-    event = PreparedIngress(
-        sender="@user:localhost",
-        event_id="$command",
-        body="!help",
-        source={"content": {"body": "!help"}},
-        server_timestamp=1234,
-    )
-    dispatch = PreparedDispatch(
-        requester_user_id="@user:localhost",
-        context=MessageContext(
-            am_i_mentioned=False,
-            is_thread=True,
-            thread_id="$thread",
-            thread_history=[],
-            mentioned_agents=[],
-            has_non_agent_mentions=False,
-        ),
-        target=target,
-        correlation_id="$command",
-        envelope=envelope,
-    )
-    coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
-    queued_signal = lifecycle._get_or_create_queued_signal(target)
-    queued_signal.begin_response_turn()
+    case = _reserved_follow_up_case(bot, room, event_id="$command", body="!help")
     try:
-        reservation = lifecycle.reserve_waiting_human_message(target=target, response_envelope=envelope)
-        assert reservation is not None
         with (
             patch.object(
                 bot._turn_dispatcher,
                 "_prepare_dispatch",
-                new=AsyncMock(return_value=prepared_dispatch_result(dispatch)),
+                new=AsyncMock(return_value=case.dispatch),
             ),
             patch("mindroom.turn_policy.TurnPolicy.plan_turn", new=AsyncMock()) as mock_plan_turn,
         ):
             await dispatch_test_turn(
                 bot._turn_dispatcher,
                 room,
-                event,
+                case.event,
                 "@user:localhost",
-                queued_notice_reservation=reservation,
+                queued_notice_reservation=case.reservation,
             )
     finally:
-        queued_signal.finish_response_turn()
+        case.queued_signal.finish_response_turn()
 
     mock_plan_turn.assert_not_awaited()
-    assert not queued_signal.has_pending_human_messages()
+    assert not case.queued_signal.has_pending_human_messages()
 
 
 @pytest.mark.asyncio
@@ -2420,45 +1973,13 @@ async def test_reserved_superseded_follow_up_cleanup_when_dispatch_returns(tmp_p
     bot = _bot(tmp_path)
     room = MagicMock(spec=nio.MatrixRoom)
     room.room_id = "!room:localhost"
-    target = MessageTarget.resolve(room.room_id, "$thread", "$older")
-    envelope = _envelope(
-        dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
-        source_event_id="$older",
-        target=target,
-    )
-    event = PreparedIngress(
-        sender="@user:localhost",
-        event_id="$older",
-        body="older follow-up",
-        source={"content": {"body": "older follow-up"}},
-        server_timestamp=1234,
-    )
-    dispatch = PreparedDispatch(
-        requester_user_id="@user:localhost",
-        context=MessageContext(
-            am_i_mentioned=False,
-            is_thread=True,
-            thread_id="$thread",
-            thread_history=[],
-            mentioned_agents=[],
-            has_non_agent_mentions=False,
-        ),
-        target=target,
-        correlation_id="$older",
-        envelope=envelope,
-    )
-    coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
-    queued_signal = lifecycle._get_or_create_queued_signal(target)
-    queued_signal.begin_response_turn()
+    case = _reserved_follow_up_case(bot, room, event_id="$older", body="older follow-up")
     try:
-        reservation = lifecycle.reserve_waiting_human_message(target=target, response_envelope=envelope)
-        assert reservation is not None
         with (
             patch.object(
                 bot._turn_dispatcher,
                 "_prepare_dispatch",
-                new=AsyncMock(return_value=prepared_dispatch_result(dispatch)),
+                new=AsyncMock(return_value=case.dispatch),
             ),
             patch.object(bot._turn_dispatcher, "_has_newer_unresponded_in_thread", return_value=True),
             patch.object(bot._turn_policy, "plan_turn", new=AsyncMock()) as mock_plan_turn,
@@ -2466,15 +1987,15 @@ async def test_reserved_superseded_follow_up_cleanup_when_dispatch_returns(tmp_p
             await dispatch_test_turn(
                 bot._turn_dispatcher,
                 room,
-                event,
+                case.event,
                 "@user:localhost",
-                queued_notice_reservation=reservation,
+                queued_notice_reservation=case.reservation,
             )
     finally:
-        queued_signal.finish_response_turn()
+        case.queued_signal.finish_response_turn()
 
     mock_plan_turn.assert_not_awaited()
-    assert not queued_signal.has_pending_human_messages()
+    assert not case.queued_signal.has_pending_human_messages()
 
 
 @pytest.mark.asyncio
@@ -2515,7 +2036,7 @@ async def test_reserved_follow_up_cleanup_when_plan_ignores_before_response(tmp_
             patch.object(
                 bot._turn_dispatcher,
                 "_prepare_dispatch",
-                new=AsyncMock(return_value=prepared_dispatch_result(case.dispatch)),
+                new=AsyncMock(return_value=case.dispatch),
             ),
             patch(
                 "mindroom.turn_policy.TurnPolicy.plan_turn",
@@ -2547,7 +2068,7 @@ async def test_reserved_follow_up_cleanup_when_route_returns_before_response(tmp
             patch.object(
                 bot._turn_dispatcher,
                 "_prepare_dispatch",
-                new=AsyncMock(return_value=prepared_dispatch_result(case.dispatch)),
+                new=AsyncMock(return_value=case.dispatch),
             ),
             patch(
                 "mindroom.turn_policy.TurnPolicy.plan_turn",
@@ -2581,7 +2102,7 @@ async def test_reserved_follow_up_cleanup_when_dispatch_raises_before_lifecycle(
             patch.object(
                 bot._turn_dispatcher,
                 "_prepare_dispatch",
-                new=AsyncMock(return_value=prepared_dispatch_result(case.dispatch)),
+                new=AsyncMock(return_value=case.dispatch),
             ),
             patch(
                 "mindroom.turn_policy.TurnPolicy.plan_turn",
@@ -2624,7 +2145,7 @@ async def test_reserved_follow_up_cleanup_when_dispatch_cancelled_before_lifecyc
             patch.object(
                 bot._turn_dispatcher,
                 "_prepare_dispatch",
-                new=AsyncMock(return_value=prepared_dispatch_result(case.dispatch)),
+                new=AsyncMock(return_value=case.dispatch),
             ),
             patch(
                 "mindroom.turn_policy.TurnPolicy.plan_turn",
@@ -2668,7 +2189,7 @@ async def test_reserved_follow_up_cleanup_when_prepare_dispatch_raises(tmp_path:
     )
     event = _prepared_text_event(event_id="$prepare")
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     queued_signal.begin_response_turn()
     try:
@@ -2711,7 +2232,7 @@ async def test_reserved_follow_up_cleanup_when_handle_prepared_turn_fails_before
     )
     event = _prepared_text_event(event_id="$handoff")
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     queued_signal.begin_response_turn()
     try:
@@ -2764,7 +2285,7 @@ async def test_coalesced_batch_consumes_queued_notice_for_batch_thread(tmp_path:
         target=post_target,
     )
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     pre_signal = lifecycle._get_or_create_queued_signal(pre_target)
     post_signal = lifecycle._get_or_create_queued_signal(post_target)
     typed_event = _prepared_text_event(event_id="$typed")
@@ -2849,7 +2370,7 @@ async def test_room_scoped_root_voice_consumes_final_target_queued_notice(tmp_pa
         target=target,
     )
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     captured_dispatches: list[str] = []
 
@@ -2900,7 +2421,7 @@ async def test_active_follow_up_reservation_cancelled_when_enqueue_is_cancelled(
     envelope = _envelope(source_kind=MESSAGE_SOURCE_KIND, source_event_id="$cancelled", target=target)
     event = _prepared_text_event(event_id="$cancelled")
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = coordinator.lifecycle_coordinator
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     queued_signal.begin_response_turn()
     reserved_before_enqueue: list[int] = []
@@ -2936,17 +2457,15 @@ async def test_active_follow_up_reservation_cancelled_when_enqueue_is_cancelled(
     assert not queued_signal.has_pending_human_messages()
 
 
-def test_queued_human_reservation_is_idempotent(tmp_path: Path) -> None:
+def test_queued_human_reservation_is_idempotent() -> None:
     """Reservation consume/cancel operations should clear the notice at most once."""
-    bot = _bot(tmp_path)
     target = MessageTarget.resolve("!room:localhost", "$thread", "$event")
     envelope = _envelope(
         dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
         source_event_id="$event",
         target=target,
     )
-    coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = ResponseLifecycleCoordinator()
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     queued_signal.begin_response_turn()
     try:
@@ -2968,9 +2487,8 @@ def test_queued_human_reservation_is_idempotent(tmp_path: Path) -> None:
     assert not queued_signal.has_pending_human_messages()
 
 
-def test_managed_message_does_not_reserve_queued_human_notice(tmp_path: Path) -> None:
+def test_managed_message_does_not_reserve_queued_human_notice() -> None:
     """Managed chatter should not count as a queued human follow-up."""
-    bot = _bot(tmp_path)
     target = MessageTarget.resolve("!room:localhost", "$thread", "$event")
     envelope = _envelope(
         source_event_id="$event",
@@ -2985,8 +2503,7 @@ def test_managed_message_does_not_reserve_queued_human_notice(tmp_path: Path) ->
             source_kind=MESSAGE_SOURCE_KIND,
         ),
     )
-    coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = ResponseLifecycleCoordinator()
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     queued_signal.begin_response_turn()
     try:
@@ -3000,17 +2517,15 @@ def test_managed_message_does_not_reserve_queued_human_notice(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_notice_is_cancelled_when_lock_wait_is_cancelled(tmp_path: Path) -> None:
+async def test_lifecycle_notice_is_cancelled_when_lock_wait_is_cancelled() -> None:
     """A lifecycle-owned notice should not leak if lock acquisition is cancelled."""
-    bot = _bot(tmp_path)
     target = MessageTarget.resolve("!room:localhost", "$thread", "$event")
     envelope = _envelope(
         dispatch_policy_source_kind=ACTIVE_THREAD_FOLLOW_UP_SOURCE_KIND,
         source_event_id="$event",
         target=target,
     )
-    coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    lifecycle = coordinator._lifecycle_coordinator
+    lifecycle = ResponseLifecycleCoordinator()
     queued_signal = lifecycle._get_or_create_queued_signal(target)
     queued_signal.begin_response_turn()
     reservation = lifecycle.reserve_waiting_human_message(target=target, response_envelope=envelope)
@@ -3021,7 +2536,7 @@ async def test_lifecycle_notice_is_cancelled_when_lock_wait_is_cancelled(tmp_pat
     lock = lifecycle._response_lifecycle_lock(target)
     await lock.acquire()
 
-    async def locked_operation(_target: MessageTarget) -> str:
+    async def locked_operation(_target: MessageTarget) -> SourceFate:
         msg = "lock wait should be cancelled before the operation runs"
         raise AssertionError(msg)
 
@@ -3068,7 +2583,7 @@ async def test_coalesced_dispatch_never_creates_queued_signal(tmp_path: Path) ->
         patch.object(
             bot._turn_dispatcher,
             "_prepare_dispatch",
-            new=AsyncMock(return_value=prepared_dispatch_result(dispatch)),
+            new=AsyncMock(return_value=dispatch),
         ),
         patch.object(bot._turn_dispatcher, "_has_newer_unresponded_in_thread", return_value=True),
         patch.object(
@@ -3087,7 +2602,7 @@ async def test_coalesced_dispatch_never_creates_queued_signal(tmp_path: Path) ->
     assert not await bot._turn_store.is_handled(room.room_id, "$older")
     mock_plan.assert_not_awaited()
     coordinator = unwrap_extracted_collaborator(bot._response_runner)
-    assert coordinator._lifecycle_coordinator._thread_queued_signals == {}
+    assert coordinator.lifecycle_coordinator._thread_queued_signals == {}
 
 
 @pytest.mark.asyncio
@@ -3150,21 +2665,21 @@ async def test_notice_hook_uses_configured_notice_text() -> None:
 async def test_notice_hook_scopes_dedupe_to_response_turn_id() -> None:
     """Tool-round dedupe should remove only notices owned by the active response."""
     with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        prior_notice = _owned_notice("prior-response", marker="persisted", from_history=True)
-        current_stale_notice = _owned_notice(notice_context.response_turn_id, marker="persisted")
+        prior_notice = _owned_notice("prior-response", from_history=True)
+        current_stale_notice = _owned_notice(notice_context.response_turn_id)
         messages = [prior_notice, current_stale_notice]
         await _after_batch(messages, OwnedMessage(role="tool", content="result"))
 
     assert messages[0] is prior_notice
-    assert _notice_count(messages, marker="persisted", response_turn_id="prior-response") == 1
-    assert _notice_count(messages, marker="persisted", response_turn_id=notice_context.response_turn_id) == 0
-    assert _notice_count(messages, marker=True, response_turn_id=notice_context.response_turn_id) == 1
+    assert all(message is not current_stale_notice for message in messages)
+    assert _notice_count(messages, response_turn_id="prior-response") == 1
+    assert _notice_count(messages, response_turn_id=notice_context.response_turn_id) == 1
 
 
 @pytest.mark.asyncio
-async def test_notice_hook_preserves_prior_persisted_replay() -> None:
-    """A prior persisted notice should survive later tool-result formatting byte-for-byte."""
-    prior_notice = _owned_notice("prior-response", marker="persisted", from_history=True)
+async def test_notice_hook_preserves_a_prior_replayed_notice() -> None:
+    """A prior reply's replayed notice should survive later tool-result formatting byte-for-byte."""
+    prior_notice = _owned_notice("prior-response", from_history=True)
     original = prior_notice.to_dict()
 
     with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
@@ -3173,8 +2688,22 @@ async def test_notice_hook_preserves_prior_persisted_replay() -> None:
             await _after_batch(messages, OwnedMessage(role="tool", content=f"result {index}"))
 
     assert prior_notice.to_dict() == original
-    assert _notice_count(messages, marker="persisted", response_turn_id="prior-response") == 1
-    assert _notice_count(messages, marker=True, response_turn_id=notice_context.response_turn_id) == 1
+    assert _notice_count(messages, response_turn_id="prior-response") == 1
+    assert _notice_count(messages, response_turn_id=notice_context.response_turn_id) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("waiting", [True, False])
+async def test_a_replayed_notice_of_the_same_reply_moves_last_only_while_a_message_waits(*, waiting: bool) -> None:
+    """A run replaying its reply's stored notice moves that copy last while a newer message waits, and adds none."""
+    with queued_message_signal_context(_StaticQueuedState(pending=waiting)) as notice_context:
+        stored = _owned_notice(notice_context.response_turn_id, from_history=True)
+        messages = [stored, OwnedMessage(role="user", content="Continue the same task.")]
+        await _after_batch(messages, OwnedMessage(role="tool", content="result"))
+
+    assert _notice_count(messages) == 1
+    assert (messages[-1] is stored) is waiting
+    assert stored.from_history
 
 
 @pytest.mark.asyncio
@@ -3245,389 +2774,6 @@ async def test_notice_follows_a_tool_batch_media_follow_up_message() -> None:
     assert messages[-1].content == QUEUED_MESSAGE_NOTICE_TEXT
 
 
-@pytest.mark.asyncio
-async def test_response_finalization_collapses_a_team_runs_current_notice_state(tmp_path: Path) -> None:
-    """Outer finalization should leave one exact notice in the top-level completed run; its members hold none."""
-    store = _recording_store(tmp_path, "queued-notice-team", kind="team")
-
-    with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        messages: list[OwnedMessage] = []
-        await _after_batch(messages, OwnedMessage(role="tool", content="result"))
-        member = _completed("member-run-1", [], agent_id="member")
-        member.parent_run_id = "run-1"
-        _seed(
-            store,
-            TeamRunRecord(
-                run_id="run-1",
-                session_id="session-1",
-                team_id="queued-notice-team",
-                status=OwnedRunStatus.completed,
-                messages=deepcopy(messages),
-            ),
-            member,
-            kind="team",
-        )
-        _register_notice_storage(store, session_kind="team", entity_name="queued-notice-team")
-        assert _notice_count(messages, marker=True) == 1
-        await ai_runtime.finalize_queued_notice_response_turn_async(notice_context)
-
-    stored = {run.run_id: run for run in _stored_runs(store)}
-    assert set(stored) == {"run-1", "member-run-1"}
-    stored_team_run = stored["run-1"]
-    assert isinstance(stored_team_run, TeamRunRecord)
-    assert _notice_count(stored_team_run.messages, marker=True) == 0
-    assert _notice_count(stored_team_run.messages, marker="persisted") == 1
-    assert _notice_count(stored["member-run-1"].messages) == 0
-
-
-@pytest.mark.asyncio
-async def test_response_finalization_does_not_copy_notice_to_untouched_target(tmp_path: Path) -> None:
-    """Finalization should persist a notice only in storage that contains its live marker."""
-    untouched_store = _recording_store(tmp_path, "delegated-agent")
-    noticed_store = _recording_store(tmp_path, "outer-agent")
-
-    with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        noticed_messages = [OwnedMessage(role="user", content="Outer request")]
-        await _after_batch(noticed_messages, OwnedMessage(role="tool", content="Outer tool result"))
-        delegated = [
-            OwnedMessage(role="user", content="Delegated request"),
-            OwnedMessage(role="assistant", content="Delegated answer"),
-        ]
-        _seed(untouched_store, _completed("untouched-run", delegated), session_id="shared-session")
-        _seed(noticed_store, _completed("noticed-run", noticed_messages), session_id="shared-session")
-        for name, store in (("delegated-agent", untouched_store), ("outer-agent", noticed_store)):
-            _register_notice_storage(store, session_id="shared-session", entity_name=name)
-
-        await ai_runtime.finalize_queued_notice_response_turn_async(notice_context)
-
-    assert untouched_store.saves == []
-    [untouched_run] = _stored_runs(untouched_store, session_id="shared-session")
-    assert [(message.role, message.content) for message in untouched_run.messages] == [
-        ("user", "Delegated request"),
-        ("assistant", "Delegated answer"),
-    ]
-    assert noticed_store.saves == [["noticed-run"]]
-    # The live list the model saw is left untouched; the finalized stored copy changed.
-    assert _notice_count(noticed_messages, marker=True) == 1
-    [persisted_run] = _stored_runs(noticed_store, session_id="shared-session")
-    assert _notice_count(persisted_run.messages, marker=True) == 0
-    assert _notice_count(persisted_run.messages, marker="persisted") == 1
-
-
-@pytest.mark.asyncio
-async def test_response_finalization_uses_newest_completed_same_turn_run_and_original_notice_position(
-    tmp_path: Path,
-) -> None:
-    """Two completed attempts should leave one exact notice at the newest notice position."""
-    store = _recording_store(tmp_path, "general")
-
-    with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        first_messages = [
-            OwnedMessage(role="user", content="First request"),
-            OwnedMessage(role="assistant", content="First tool call"),
-        ]
-        await _after_batch(first_messages, OwnedMessage(role="tool", content="First result"))
-        first_messages.append(OwnedMessage(role="assistant", content="First final"))
-        second_messages = [
-            OwnedMessage(role="user", content="Second request"),
-            OwnedMessage(role="assistant", content="Second tool call"),
-        ]
-        await _after_batch(second_messages, OwnedMessage(role="tool", content="Second result"))
-        second_messages.append(OwnedMessage(role="assistant", content="Second final"))
-        _seed(
-            store,
-            _completed("first-completed-run", first_messages),
-            _completed("second-completed-run", second_messages),
-        )
-        _register_notice_storage(store)
-
-        await ai_runtime.finalize_queued_notice_response_turn_async(notice_context)
-
-    # Both attempts change: the first loses its notice, the second gets the persisted one.
-    assert [sorted(saved) for saved in store.saves] == [["first-completed-run", "second-completed-run"]]
-    stored_first, stored_second = _stored_runs(store)
-    assert _notice_count(stored_first.messages) == 0
-    assert [(message.role, message.content) for message in stored_second.messages] == [
-        ("user", "Second request"),
-        ("assistant", "Second tool call"),
-        ("tool", "Second result"),
-        ("user", QUEUED_MESSAGE_NOTICE_TEXT),
-        ("assistant", "Second final"),
-    ]
-    assert (
-        _notice_count(stored_second.messages, marker="persisted", response_turn_id=notice_context.response_turn_id) == 1
-    )
-
-
-@pytest.mark.asyncio
-async def test_async_cleanup_keeps_session_storage_io_off_event_loop(tmp_path: Path) -> None:
-    """Slow response-boundary storage finalization must stay off the event loop."""
-    release = threading.Event()
-    store = _recording_store(tmp_path, "queued-notice-agent", held=release)
-    factory_threads: list[int] = []
-    event_loop_thread_id = threading.get_ident()
-
-    def storage_factory() -> ConversationStore:
-        factory_threads.append(threading.get_ident())
-        return store
-
-    with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        messages: list[OwnedMessage] = []
-        await _after_batch(messages, OwnedMessage(role="tool", content="result"))
-        _seed(store, _completed("run-1", messages))
-        _register_notice_storage(store, storage_factory=storage_factory, entity_name="queued-notice-agent")
-        cleanup_task = asyncio.create_task(
-            ai_runtime.finalize_queued_notice_response_turn_async(notice_context),
-        )
-        try:
-            assert await asyncio.to_thread(store.rewriting.wait, 1)
-            await asyncio.wait_for(asyncio.sleep(0), timeout=0.1)
-            assert not cleanup_task.done()
-        finally:
-            release.set()
-
-        await asyncio.wait_for(cleanup_task, timeout=1)
-    assert factory_threads
-    assert event_loop_thread_id not in factory_threads
-    assert store.saves == [["run-1"]]
-
-
-@pytest.mark.asyncio
-async def test_response_turn_finalization_completes_when_cancelled_during_storage_io(tmp_path: Path) -> None:
-    """Cancellation during storage I/O must not leave a durable live imperative behind."""
-    release = threading.Event()
-    store = _recording_store(tmp_path, "general", held=release)
-
-    with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        messages: list[OwnedMessage] = []
-        await _after_batch(messages, OwnedMessage(role="tool", content="result"))
-        _seed(store, _completed("completed-run", messages))
-        _register_notice_storage(store)
-        finalization_task = asyncio.create_task(
-            ai_runtime.finalize_queued_notice_response_turn_async(notice_context),
-        )
-        assert await asyncio.to_thread(store.rewriting.wait, 1)
-        finalization_task.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await finalization_task
-
-    # Cancellation is re-raised only after the stored run was finalized.
-    [stored] = _stored_runs(store)
-    assert _notice_count(stored.messages, marker=True) == 0
-    assert _notice_count(stored.messages, marker="persisted", response_turn_id=notice_context.response_turn_id) == 1
-
-
-@pytest.mark.asyncio
-async def test_response_turn_finalization_defers_repeated_cancellation_during_storage_io(tmp_path: Path) -> None:
-    """Repeated cancellation must not release the caller before durable finalization finishes."""
-    release = threading.Event()
-    store = _recording_store(tmp_path, "general", held=release)
-    first_cancel_observed = asyncio.Event()
-    original_shield = asyncio.shield
-
-    async def observed_shield(task: asyncio.Task[None]) -> None:
-        try:
-            await original_shield(task)
-        except asyncio.CancelledError:
-            first_cancel_observed.set()
-            raise
-
-    with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        messages: list[OwnedMessage] = []
-        await _after_batch(messages, OwnedMessage(role="tool", content="result"))
-        _seed(store, _completed("completed-run", messages))
-        _register_notice_storage(store)
-        with patch.object(ai_runtime.asyncio, "shield", new=observed_shield):
-            finalization_task = asyncio.create_task(
-                ai_runtime.finalize_queued_notice_response_turn_async(notice_context),
-            )
-            assert await asyncio.to_thread(store.rewriting.wait, 1)
-            finalization_task.cancel()
-            await asyncio.wait_for(first_cancel_observed.wait(), timeout=1)
-            finalization_task.cancel()
-            completed, _ = await asyncio.wait({finalization_task}, timeout=0.05)
-            try:
-                assert finalization_task not in completed
-            finally:
-                release.set()
-            with pytest.raises(asyncio.CancelledError):
-                await finalization_task
-
-    assert store.saves == [["completed-run"]]
-    [stored] = _stored_runs(store)
-    assert _notice_count(stored.messages, marker=True) == 0
-    assert _notice_count(stored.messages, marker="persisted", response_turn_id=notice_context.response_turn_id) == 1
-
-
-@pytest.mark.asyncio
-async def test_storage_registration_deduplicates_one_session_across_fresh_factories(tmp_path: Path) -> None:
-    """Fresh storage-factory closures for one session should cause one boundary open."""
-    store = _recording_store(tmp_path, "general")
-    factory_calls = 0
-
-    with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        messages: list[OwnedMessage] = []
-        await _after_batch(messages, OwnedMessage(role="tool", content="result"))
-        _seed(store, _completed("completed-run", messages))
-
-        def fresh_storage_factory() -> Callable[[], ConversationStore]:
-            def storage_factory() -> ConversationStore:
-                nonlocal factory_calls
-                factory_calls += 1
-                return store
-
-            return storage_factory
-
-        for _ in range(2):
-            _register_notice_storage(store, storage_factory=fresh_storage_factory())
-        await ai_runtime.finalize_queued_notice_response_turn_async(notice_context)
-
-    assert factory_calls == 1
-
-
-@pytest.mark.asyncio
-async def test_error_responses_never_attach_notices_to_prior_completed_run(tmp_path: Path) -> None:
-    """Failed responses must not accumulate their notice facts on an earlier turn."""
-    store = _recording_store(tmp_path, "general")
-    session = _seed(
-        store,
-        _completed(
-            "prior-completed",
-            [
-                OwnedMessage(role="user", content="Prior request"),
-                OwnedMessage(role="assistant", content="Prior answer"),
-            ],
-        ),
-    )
-
-    for index in range(3):
-        with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-            messages: list[OwnedMessage] = []
-            await _after_batch(messages, OwnedMessage(role="tool", content=f"failed result {index}"))
-            error_run = _completed(f"error-run-{index}", messages)
-            error_run.status = OwnedRunStatus.error
-            store.save_run(session, error_run, record_usage=False)
-            _register_notice_storage(store)
-            await ai_runtime.finalize_queued_notice_response_turn_async(notice_context)
-
-    stored = _stored_runs(store)
-    assert [run.run_id for run in stored] == ["prior-completed", "error-run-0", "error-run-1", "error-run-2"]
-    assert sum(_notice_count(run.messages) for run in stored) == 0
-
-
-@pytest.mark.asyncio
-async def test_response_lifecycle_finalizes_notice_after_locked_operation(tmp_path: Path) -> None:
-    """The lifecycle boundary should persist the exact notice shown to the model."""
-    lifecycle = ResponseLifecycleCoordinator()
-    target = MessageTarget.resolve("!room:localhost", "$thread", "$event")
-    envelope = _envelope(source_event_id="$event", target=target)
-    store = _recording_store(tmp_path, "general")
-    notice_text = "Custom queued notice."
-    observed_live_counts: list[int] = []
-
-    async def locked_operation(_target: MessageTarget) -> str:
-        lifecycle._get_or_create_queued_signal(target).add_waiting_human_message("$newer")
-        messages: list[OwnedMessage] = []
-        await _after_batch(messages, OwnedMessage(role="tool", content="result"), notice_text=notice_text)
-        _seed(store, _completed("completed-run", messages))
-        _register_notice_storage(store)
-        observed_live_counts.append(_notice_count(messages, marker=True))
-        return "$response"
-
-    result = await lifecycle.run_locked_response(
-        target=target,
-        response_envelope=envelope,
-        pipeline_timing=None,
-        locked_operation=locked_operation,
-    )
-
-    assert result == "$response"
-    assert observed_live_counts == [1]
-    [stored_run] = _stored_runs(store)
-    assert _notice_count(stored_run.messages, marker=True) == 0
-    persisted_notices = _notice_messages(stored_run.messages, marker="persisted")
-    assert [message.content for message in persisted_notices] == [notice_text]
-    assert len(store.saves) == 1
-
-
-@pytest.mark.asyncio
-async def test_response_lifecycle_finalizes_error_state_when_operation_raises(tmp_path: Path) -> None:
-    """The lifecycle finally block should remove live state when the operation raises."""
-    lifecycle = ResponseLifecycleCoordinator()
-    target = MessageTarget.resolve("!room:localhost", "$thread", "$event")
-    envelope = _envelope(source_event_id="$event", target=target)
-    store = _recording_store(tmp_path, "general")
-
-    async def locked_operation(_target: MessageTarget) -> str:
-        lifecycle._get_or_create_queued_signal(target).add_waiting_human_message("$newer")
-        messages: list[OwnedMessage] = []
-        await _after_batch(messages, OwnedMessage(role="tool", content="failed result"))
-        error_run = _completed("error-run", messages)
-        error_run.status = OwnedRunStatus.error
-        _seed(store, error_run)
-        _register_notice_storage(store)
-        error_message = "provider failed"
-        raise RuntimeError(error_message)
-
-    with pytest.raises(RuntimeError, match="provider failed"):
-        await lifecycle.run_locked_response(
-            target=target,
-            response_envelope=envelope,
-            pipeline_timing=None,
-            locked_operation=locked_operation,
-        )
-
-    [stored_run] = _stored_runs(store)
-    assert _notice_count(stored_run.messages) == 0
-
-
-@pytest.mark.asyncio
-async def test_response_turn_finalization_is_idempotent_for_one_persisted_notice(tmp_path: Path) -> None:
-    """Repeated boundary finalization should not rewrite an already-normalized response."""
-    store = _recording_store(tmp_path, "general")
-
-    with queued_message_signal_context(_StaticQueuedState(pending=True)) as notice_context:
-        await _after_batch([], OwnedMessage(role="tool", content="result"))
-        persisted_notice = _owned_notice(notice_context.response_turn_id, marker="persisted")
-        _seed(store, _completed("completed-run", [persisted_notice]))
-        original_stored = _stored_runs(store)[0].messages[0].to_dict()
-        _register_notice_storage(store)
-        await ai_runtime.finalize_queued_notice_response_turn_async(notice_context)
-        await ai_runtime.finalize_queued_notice_response_turn_async(notice_context)
-
-    assert store.saves == []
-    assert _stored_runs(store)[0].messages[0].to_dict() == original_stored
-
-
-def test_pre_replay_crash_recovery_preserves_prior_persisted_and_active_live_notice(tmp_path: Path) -> None:
-    """Recovery should persist prior live state without touching prior records or the active response."""
-    store = _recording_store(tmp_path, "general")
-
-    with queued_message_signal_context(_StaticQueuedState(pending=False)) as notice_context:
-        prior_persisted = _owned_notice("already-persisted", marker="persisted")
-        prior_dump = prior_persisted.to_dict()
-        active_live = _owned_notice(notice_context.response_turn_id)
-        session = _seed(store, _completed("completed-run", [_owned_notice("crash-left"), prior_persisted, active_live]))
-        ai_runtime.scrub_queued_notice_session_context(
-            scope_context=ScopeSessionContext(
-                scope=HistoryScope(kind="agent", scope_id="general"),
-                storage=store,
-                session=session,
-                session_id=session.session_id,
-                storage_factory=lambda: store,
-            ),
-            entity_name="general",
-        )
-
-    stored_messages = _stored_runs(store)[0].messages
-    assert prior_persisted.to_dict() == prior_dump
-    assert _notice_count(stored_messages, marker="persisted", response_turn_id="already-persisted") == 1
-    assert _notice_count(stored_messages, marker="persisted", response_turn_id="crash-left") == 1
-    assert _notice_count(stored_messages, marker=True, response_turn_id="crash-left") == 0
-    assert _notice_count(stored_messages, marker=True, response_turn_id=notice_context.response_turn_id) == 1
-
-
 def test_notice_provider_data_survives_mindroom_sqlite_round_trip(tmp_path: Path) -> None:
     """MindRoom's prompt-sanitizing SQLite storage should preserve notice ownership metadata."""
     response_turn_id = "response-1"
@@ -3655,7 +2801,7 @@ async def _persist_notice_bearing_response(tmp_path: Path) -> str:
         lifecycle._get_or_create_queued_signal(target).add_waiting_human_message("$newer")
         messages = [OwnedMessage(role="user", content="First request")]
         await _after_batch(messages, OwnedMessage(role="tool", content="First tool result"))
-        notices = _notice_messages(messages, marker=True)
+        notices = _notice_messages(messages)
         assert len(notices) == 1
         provider_data = notices[0].provider_data
         assert isinstance(provider_data, dict)
@@ -3665,7 +2811,6 @@ async def _persist_notice_bearing_response(tmp_path: Path) -> str:
         messages.append(OwnedMessage(role="assistant", content="First response handoff"))
         store = _queued_notice_storage(tmp_path)
         _seed(store, _completed("run-1", messages))
-        _register_notice_storage(store, storage_factory=lambda: _queued_notice_storage(tmp_path))
         return "First response handoff"
 
     response_1 = await lifecycle.run_locked_response(
@@ -3717,7 +2862,7 @@ async def test_prior_notice_survives_actual_next_provider_request_and_tool_round
         prior = next(message for message in seen if message.content == QUEUED_MESSAGE_NOTICE_TEXT)
         assert prior.from_history is True
         assert prior.provider_data == {
-            _QUEUED_NOTICE_MARKER_KEY: "persisted",
+            _QUEUED_NOTICE_MARKER_KEY: True,
             _QUEUED_NOTICE_RESPONSE_TURN_ID_KEY: response_1_id,
         }
         assert [
@@ -3734,7 +2879,7 @@ async def test_prior_notice_survives_actual_next_provider_request_and_tool_round
         await _after_batch(seen, OwnedMessage(role="tool", content="Second tool result"))
 
         assert prior.to_dict() == original_prior
-        assert _notice_count(seen, marker="persisted", response_turn_id=response_1_id) == 1
+        assert _notice_count(seen, response_turn_id=response_1_id) == 1
         assert _notice_count(seen, response_turn_id=response_2_context.response_turn_id) == 0
 
     persisted = _queued_notice_storage(tmp_path).load_session("session-1")
@@ -3742,7 +2887,7 @@ async def test_prior_notice_survives_actual_next_provider_request_and_tool_round
     response_1_run, response_2_run = persisted.runs
     assert response_2_run.content == "ok"
     assert all(message.content != QUEUED_MESSAGE_NOTICE_TEXT for message in response_2_run.messages)
-    persisted_notices = _notice_messages(response_1_run.messages, marker="persisted", response_turn_id=response_1_id)
+    persisted_notices = _notice_messages(response_1_run.messages, response_turn_id=response_1_id)
     assert [message.content for message in persisted_notices] == [QUEUED_MESSAGE_NOTICE_TEXT]
 
 
@@ -3781,11 +2926,10 @@ async def test_response_runner_binds_agent_mid_turn_judge(  # noqa: PLR0915
     preparation = _payload_preparation(envelope.target)
     if pending_media:
         preparation = replace(preparation, payload_inputs=replace(preparation.payload_inputs, raw_audio_fallback=True))
-    request = ResponseRequest(
-        sources=ResponseSources(("$event",), ("$event",)),
+    request = _request(
+        envelope,
         prompt=prompt,
-        thread_history=[],
-        response_envelope=envelope,
+        user_id=None,
         payload_preparation=preparation if pending_media else None,
     )
     monkeypatch.setattr(
@@ -3804,7 +2948,7 @@ async def test_response_runner_binds_agent_mid_turn_judge(  # noqa: PLR0915
     reservations = []
 
     def note_progress(text: str) -> None:
-        progress = runner._lifecycle_coordinator.visible_progress_callback(envelope.target)
+        progress = runner.lifecycle_coordinator.visible_progress_callback(envelope.target)
         assert (progress is not None) is enabled
         if progress is not None:
             progress(text, ())
@@ -3822,7 +2966,7 @@ async def test_response_runner_binds_agent_mid_turn_judge(  # noqa: PLR0915
 
     model = ScriptedModel([calls(tool_call("queue_followup", "call")), answer("Done")])
 
-    async def locked_operation(_target: MessageTarget, _placeholder: object) -> str:
+    async def locked_operation(_target: MessageTarget) -> SourceFate:
         await runner._prepare_request_after_lock(replace(request, payload_preparation=None))
         note_progress("I have located the requested file")
         await collect(
@@ -3835,16 +2979,16 @@ async def test_response_runner_binds_agent_mid_turn_judge(  # noqa: PLR0915
                 request_template=EMPTY_REQUEST,
             ),
         )
-        return "$response"
+        return Owned()
 
     try:
         assert (
-            await runner.run_locked_response_lifecycle(
+            await runner._run_locked_response_lifecycle(
                 request,
                 response_kind="agent",
                 locked_operation=locked_operation,
             )
-            == "$response"
+            == Owned()
         )
         assert len(model.requests) == 2
         reactions = [
@@ -3861,7 +3005,7 @@ async def test_response_runner_binds_agent_mid_turn_judge(  # noqa: PLR0915
             pending_media or not enabled
         )
         assert len(judge.requests) == (1 if enabled and not pending_media else 0)
-        assert runner._lifecycle_coordinator.visible_progress_callback(envelope.target) is None
+        assert runner.lifecycle_coordinator.visible_progress_callback(envelope.target) is None
         if enabled and not pending_media:
             evidence = "\n".join(str(message.content) for message in judge.requests[0].messages)
             assert "I have located the requested file" in evidence

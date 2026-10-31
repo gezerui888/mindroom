@@ -12,6 +12,7 @@ import pytest
 
 from mindroom.config.agent import TeamConfig
 from mindroom.config.models import CompactionConfig, CompactionOverrideConfig, ModelConfig
+from mindroom.config.resolution import entity_model_name
 from mindroom.history.native import configure_native_history, restore_native_history, with_native_history
 from mindroom.history.replay import compaction_marker
 from mindroom.history.request_messages import scope_history_messages
@@ -23,9 +24,9 @@ from mindroom.history.runtime import (
     resolve_entity_preparation_inputs,
 )
 from mindroom.history.session_context import ScopeSessionContext
-from mindroom.history.storage import _with_scope_state
+from mindroom.history.storage import with_force_compaction
 from mindroom.history.summary_message import compaction_summary_message
-from mindroom.history.types import HistoryScope, HistoryScopeState, ScopeSummary
+from mindroom.history.types import HistoryScope, ScopeSummary
 from mindroom.llm.messages import Message
 from mindroom.llm.provider import ModelRequest
 from mindroom.llm.runs import RunStatus
@@ -73,12 +74,11 @@ def _no_provider_environment() -> Iterator[None]:
 def _inputs(config: Config) -> HistoryPreparationInputs:
     """Resolve the configured test agent's history inputs for a 100-token static prompt."""
     return resolve_entity_preparation_inputs(
-        entity_name="test_agent",
         history_settings=config.resolve_scope("test_agent").history_settings,
         config=config,
         runtime_paths=runtime_paths_for(config),
         static_prompt_tokens=100,
-        active_model_name=None,
+        active_model_name=entity_model_name(config, "test_agent"),
         active_context_window=None,
     )
 
@@ -436,11 +436,7 @@ async def test_native_activation_respects_history_policy(
     )
     session = _session("session", runs=[_completed_run("old")])
     if case == "manual":
-        session.metadata = _with_scope_state(
-            session.metadata,
-            _SCOPE,
-            HistoryScopeState(force_compact_before_next_run=True),
-        )
+        session.metadata = with_force_compaction(session.metadata)
     db = create_agent_state_storage("test_agent", tmp_path)
     seed_session(db, session)
     # A manual request must reach the portable text owner, which returns no outcome here.
@@ -631,7 +627,6 @@ async def test_team_native_activation_uses_team_model(tmp_path: Path) -> None:
 
     prepared = await prepare_bound_scope_history(
         model=leader,
-        team_name="team",
         history_settings=config.resolve_scope("team").history_settings,
         config=config,
         runtime_paths=paths,

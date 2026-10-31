@@ -59,7 +59,6 @@ WebRTC cannot send UDP from these browsers.
 
 `website` exposes `read_url(url)` and returns JSON page documents from MindRoom's WebsiteReader variant, which drops search UI, navigation, headers, footers, sidebars, hidden content, and modals before choosing the page text.
 Pages larger than 2 MiB fail, as do pages a server sends compressed.
-An entry that sets the retired `website.knowledge` option fails config load until you remove it.
 
 ```yaml
 agents:
@@ -200,7 +199,7 @@ agents:
 
 `spider` exposes `search_web(query, max_results=5)`, `scrape(url)`, and `crawl(url, limit=None)`, returning Markdown.
 Search results do not include full page content.
-It requires `SPIDER_API_KEY` in the environment even though the dashboard lists it as needing no setup, and it has no `api_key` field.
+It requires `SPIDER_API_KEY` in the process environment, which the `.env` does not set, even though the dashboard lists it as needing no setup, and it has no `api_key` field.
 
 | Option | Type | Default | Notes |
 | --- | --- | --- | --- |
@@ -265,8 +264,8 @@ It requires `api_key` or `BRIGHT_DATA_API_KEY`.
 | `enable_search_engine` | `boolean` | `true` | Enable `search_engine()`. |
 | `enable_web_data_feed` | `boolean` | `true` | Enable `web_data_feed()`. |
 | `all` | `boolean` | `false` | Enable every function. |
-| `serp_zone` | `text` | `serp_api` | SERP zone; `BRIGHT_DATA_SERP_ZONE` overrides it. |
-| `web_unlocker_zone` | `text` | `web_unlocker1` | Web unlocker zone; `BRIGHT_DATA_WEB_UNLOCKER_ZONE` overrides it. |
+| `serp_zone` | `text` | `serp_api` | SERP zone; `BRIGHT_DATA_SERP_ZONE` in the process environment overrides it, while a `.env` value applies only when no zone is set. |
+| `web_unlocker_zone` | `text` | `web_unlocker1` | Web unlocker zone; `BRIGHT_DATA_WEB_UNLOCKER_ZONE` in the process environment overrides it, while a `.env` value applies only when no zone is set. |
 | `verbose` | `boolean` | `false` | Log extra request detail. |
 | `timeout` | `number` | `600` | Timeout in seconds. |
 
@@ -350,6 +349,7 @@ Call `action="help"` or `action="actions"` to list the actions and `act` request
 
 On the host target, `snapshot()` returns `ai` or `aria` format with element refs that later `act()` and `screenshot()` calls can use.
 `act()` takes `request.kind` set to `click`, `type`, `press`, `hover`, `drag`, `select`, `fill`, `resize`, `wait`, `evaluate`, or `close`.
+A host-target call that has not finished after 120 seconds fails with an error, and the reply continues.
 The desktop target returns the browser's native accessibility snapshot and rejects `targetId` and host-only options such as `profile`, snapshot format hints, `inputRef`, and `timeoutMs`.
 Desktop-target calls always run in the primary process, so routing `browser` to a worker isolates only host-target calls.
 To show the worker browser to the user, see [Agent Chat UI Actions](chat-ui.md#show-the-worker-browser).
@@ -386,6 +386,7 @@ browser_control(action="screenshot")
 Host-target profiles are named, with `mindroom` as the default; names starting with a dot are rejected.
 In the primary process a profile lives at `browser-profiles/<profile>` under the agent's state root, so every requester of a shared agent shares its signed-in sessions, while different agents never share them.
 This holds even with `worker_scope: user` or `user_agent` unless `browser` is in `worker_tools`, which gives each worker scope its own profiles.
+In the primary process a started profile keeps running, with its tabs, across replies until `action="stop"` or a MindRoom restart, and replies using it at the same time share it.
 Use a private agent when requesters need separate browser sessions.
 Chromium is taken from `BROWSER_EXECUTABLE_PATH`, `chromium`, or `google-chrome-stable`.
 

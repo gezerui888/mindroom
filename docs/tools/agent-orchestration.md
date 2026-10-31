@@ -181,9 +181,11 @@ Authoring errors:
 
 Each child turn writes `run.json`, `events.jsonl`, and `transcript.md` to `.mindroom/delegations/YYYY-MM-DD/<delegation-id>/` in the child's workspace, dated by the delegation's start in UTC.
 `run.json` and `events.jsonl` update as the child runs, and `transcript.md` is written when the turn finishes.
-The `usage` in `run.json` and in each `usage` event of `events.jsonl` reports the child turn's token counts (`input_tokens`, `output_tokens`, `total_tokens`, `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, and the audio counts), `uncached_input_tokens` (input not read from the provider's cache), a `cost` when the provider reports one, and `time_to_first_token` and `duration` in seconds.
-Fractional values are decimal strings; a token count of zero and an unreported value are left out, while `uncached_input_tokens` and a reported cost or timing appear even when zero once the turn reported any usage.
-The caller receives a receipt at `.mindroom/delegation_receipts/YYYY-MM-DD/<delegation-id>.json` in its own workspace.
+The `usage` in `run.json` reports the child turn's token counts (`input_tokens`, `output_tokens`, `total_tokens`, `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens`, and the audio counts), `uncached_input_tokens` (input not read from the provider's cache), and `time_to_first_token` and `duration` in seconds.
+It covers every model run of the turn, also across an approval pause.
+Each `usage` event of `events.jsonl` reports the same values for one model run as it stood when the event was written, so a run's last `usage` event is that run's total.
+Fractional values are decimal strings; a token count of zero and an unreported value are left out, while `uncached_input_tokens` and a reported timing appear even when zero once the turn reported any usage.
+The caller receives a receipt at `.mindroom/delegation_receipts/YYYY-MM-DD/<delegation-id>.json` in its own workspace, with the child's `subagent_id` for `continue_subagent`.
 Sensitive fields are redacted, and large outputs are stored as referenced artifacts.
 Each follow-up turn gets its own record, linked to earlier turns by `subagent_id` and `previous_delegation_id`.
 For an [authored subagent](#authored-subagents), `run.json` records the persona's source, tools, skills, knowledge bases, redacted system prompt, and that prompt's SHA-256, and `transcript.md` shows the prompt.
@@ -201,7 +203,7 @@ Tools that can run as background jobs accept an optional `background_after` argu
 It is how many seconds the call may hold the reply before it continues in the background, separate from a tool's own execution or network timeout.
 The name `background_after` is reserved on managed tools.
 If a custom or plugin tool already declares that application parameter, exclude its toolkit as shown below or rename the parameter; the affected call is rejected before execution without breaking the agent's other tools.
-Tools that stop the current model step, such as model switching, stay inline so the continuation receives their actual control result.
+Tools that can stop the current model step, such as model switching, stay inline so the continuation receives their actual control result.
 Their schemas omit `background_after`, and a value for it is rejected before execution.
 Knowledge search, skill access, team delegation, and toolkits whose connection lasts only for one run, such as `postgres` and `redshift`, always run inline without `background_after`.
 
@@ -301,7 +303,7 @@ The reply waits for the decision for `background_tool_jobs.approval_wait_timeout
 The setting is a non-negative number of seconds, defaulting to `300`; `0` goes on at once, and `null` waits until the decision or a newer human message.
 A call's own `background_after`, or a newer human message, releases the reply the same way.
 Cancelling the job before the decision denies its card.
-Calls that must finish inside the run keep pausing it for their approval: tools that always ask for confirmation themselves, such as an agent updating its own configuration, tools that stop the current model step or ask the user for input, run-connected toolkits, excluded toolkits, subagent calls, and minimal mode.
+Calls that must finish inside the run keep pausing it for their approval: tools that always ask for confirmation themselves, such as an agent updating its own configuration, tools that can stop the current model step (such as model switching) or ask the user for input, run-connected toolkits, excluded toolkits, subagent calls, and minimal mode.
 
 A managed child that needs approval also stays inside its job: the job posts one approval card per gated call into the conversation, reports `awaiting_approval`, and resumes the child with the decisions.
 Cancelling the job denies its open cards.
@@ -343,7 +345,7 @@ agents:
 
 The tool exposes `create_workflow()`, `validate_workflow()`, `update_workflow()`, `run_workflow()`, `get_workflow_run()`, `list_workflows()`, and `list_workflow_revisions()`, each returning JSON with a `status` field.
 `validate_workflow()` reports every validation error in a spec without saving it.
-Workflows belong to the calling agent; `scope="agent"` is the default and the only scope agent tools can use, and `room` or `tenant` returns an error.
+Workflows belong to the calling agent.
 `update_workflow(workflow_id, patch, reason)` merges `patch` into the current spec: nested objects merge, but a list such as `workflow` or `participants` replaces the old list, so pass the complete list when changing one entry.
 Each `update_workflow()` publishes a new immutable revision, and each run uses the revision active when it starts.
 Saved workflows and run records live under `MINDROOM_STORAGE_PATH/dynamic_workflows/`.
@@ -356,8 +358,9 @@ Use [`report_publishing`](#report_publishing) to share a completed run's report 
 
 Workflow specs are JSON or YAML objects with `schema_version: 1` and `kind: workflow`.
 The top-level fields are `id`, `name`, `description`, `kind`, `inputs`, `participants`, `workflow`, `outputs`, and `permissions`, and `id`, `name`, `participants`, and `workflow` are required.
+`description` is text or `null`.
 
-- **`inputs`**: An object schema with `required` and `properties`; each property supports `type`, `description`, and `enum`.
+- **`inputs`**: An object schema with `required` and `properties`; each property supports `type`, a text `description`, and `enum`.
 - **`participants`**: Up to 8 entries with `kind` set to `subagent` (the default) or `room_agent`.
   - A `subagent` is an [authored subagent](#authored-subagents) of the caller: it declares `id`, an optional `description`, and either `profile`, naming a `subagents/<name>.md` profile in the caller's workspace, or an inline `system_prompt` with optional `tools`, `skills`, `model`, and `mode`.
     Its `tools` must be the caller's own toolkits or `toolkit.function` entries, never `memory`, `delegate`, `self_config`, `agent_manager`, `skill_manage`, `compact_context`, `dynamic_workflow`, `dynamic_tools`, `invite_router`, or `thread_model`, and a participant that names no tools, inline or in its profile, gets none.
@@ -476,7 +479,7 @@ Anyone with the link can open it without signing in until it is revoked.
 Only the user who requested the source run or published the link can revoke it.
 The tool never accepts arbitrary filesystem paths; it publishes only these sources, and only when the current requester may read them:
 
-- **`dynamic_workflow_run`**: `source` takes `workflow_id`, `run_id`, and optional `scope` (default `agent`), and the run must be completed.
+- **`dynamic_workflow_run`**: `source` takes `workflow_id` and `run_id`, and the run must be completed.
 - **`static_site`**: `source` takes a workspace-relative `path` and a required `title`.
   The path is a directory containing `index.html` plus optional CSS, JavaScript, images, fonts, or JSON, or a single HTML file served as `index.html`.
   Publishing copies the site, so later workspace edits need a new `publish_report()` call.
@@ -518,11 +521,15 @@ agents:
     model: sonnet
     tools:
       - config_manager
+    skills:
+      - mindroom-docs
 ```
+
+The bundled `mindroom-docs` skill gives the agent MindRoom's documentation, which `config_manager` does not provide.
 
 The tool exposes four functions:
 
-- **`get_info(info_type, name=None, agent_scope="current_room")`**: `info_type` is `mindroom_docs`, `config_schema`, `available_models`, `agents`, `teams`, `available_tools`, `tool_details`, `agent_config`, or `agent_template`.
+- **`get_info(info_type, name=None, agent_scope="current_room")`**: `info_type` is `config_schema`, `available_models`, `agents`, `teams`, `available_tools`, `tool_details`, `agent_config`, or `agent_template`.
   `agents` lists agents in the current room unless `agent_scope="all"`.
   `tool_details` takes a tool name and shows its config fields and status.
   `agent_config` returns one agent's redacted YAML.
@@ -574,6 +581,7 @@ Redacted output masks every value inside fields the config schema marks secret, 
 It also masks free-form map entries whose key names look like credentials, and credential patterns such as URL credentials and bearer tokens in any text.
 A write whose value contains the `***redacted***` marker or masked URL credentials such as `***@host` is refused, so copying redacted output back cannot overwrite a hidden real value.
 Every write is validated against the full runtime config before `config.yaml` is saved, and an invalid change saves nothing.
+A write is refused and saves nothing when `config.yaml` changed after the tool read it, for example through a dashboard save or a hand edit; the agent can read the configuration again and retry.
 Saved changes take effect through the normal config hot reload after the current response.
 When a plain list of tool names replaces an agent's tools, inline overrides for tools that stay in the list are kept.
 

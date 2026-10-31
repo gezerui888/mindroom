@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -22,6 +23,11 @@ from mindroom.config.resolution import ResolvedAgent, entity_model_name, memory_
 from mindroom.constants import ROUTER_AGENT_NAME
 from mindroom.history.types import HistoryPolicy
 from mindroom.tool_system.agent_tools import resolve_agent_tools
+from mindroom.tool_system.registry import builtin_tool_registry
+from tests.conftest import test_runtime_paths
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _representative_config() -> Config:
@@ -172,7 +178,10 @@ def test_tool_resolution() -> None:
     assert "shell" not in tools.scope_incompatible
 
     # The agent's toolkits receive its authored agent-only list joined into the tool's string setting.
-    candidates = {entry.name: entry for entry in resolve_agent_tools(config, "overriding_agent").candidates()}
+    candidates = {
+        entry.name: entry
+        for entry in resolve_agent_tools(config, "overriding_agent", builtin_tool_registry()).candidates()
+    }
     assert candidates["shell"].tool_config_overrides == {"shell_path_prepend": "/run/wrappers/bin"}
     assert candidates["calculator"].tool_config_overrides == {}
 
@@ -314,3 +323,9 @@ def test_file_access_global_default_is_inherited() -> None:
 def test_file_access_rejects_unknown_values() -> None:
     with pytest.raises(ValueError, match="file_access"):
         Config.model_validate({"defaults": {"file_access": "readonly"}})
+
+
+def test_thread_mode_of_an_unknown_entity_is_thread(tmp_path: Path) -> None:
+    config = Config.model_validate({"agents": {"chat": {"display_name": "Chat", "thread_mode": "room"}}})
+    assert config.get_entity_thread_mode(ROUTER_AGENT_NAME, test_runtime_paths(tmp_path)) == "room"
+    assert config.get_entity_thread_mode("nobody", test_runtime_paths(tmp_path)) == "thread"

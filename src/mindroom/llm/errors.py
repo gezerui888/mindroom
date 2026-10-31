@@ -34,10 +34,13 @@ class ProviderError(Exception):
     """A model provider rejected or failed a request.
 
     ``retryable`` tells the loop whether the same request may succeed later, and each error class fixes it;
-    ``provider`` is the metrics provider name of the adapter that raised. ``code`` is a marker MindRoom sets for a failure
+    ``provider`` is the provider name of the adapter that raised. ``code`` is a marker MindRoom sets for a failure
     its type alone does not tell apart, one of those above or the pipeline's stall marker, and ``provider_code`` is the
     code the provider sent, such as ``context_length_exceeded``, kept apart so it never reads as a marker.
     ``retry_after_seconds`` is how long the provider's ``Retry-After`` header asked to wait before a retry.
+    ``rejected_media`` holds the ids of the request's media items the failure points to: an attachment MindRoom could
+    not read or download, or the attachments a provider's rejection names. For an ``InvalidRequest`` the media fallback
+    leaves out only those, when the rest of the request's media can still go.
     """
 
     retryable: ClassVar[bool] = False
@@ -51,6 +54,7 @@ class ProviderError(Exception):
         code: str | None = None,
         provider_code: str | None = None,
         retry_after_seconds: float | None = None,
+        rejected_media: frozenset[str] = frozenset(),
     ) -> None:
         super().__init__(message)
         self.provider = provider
@@ -58,6 +62,7 @@ class ProviderError(Exception):
         self.code = code
         self.provider_code = provider_code
         self.retry_after_seconds = retry_after_seconds
+        self.rejected_media = rejected_media
 
 
 class AuthenticationFailed(ProviderError):  # noqa: N818

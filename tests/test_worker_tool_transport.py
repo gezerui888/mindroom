@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -27,12 +29,15 @@ from mindroom.tool_jobs.execution import agent_tool_middleware
 from mindroom.tool_system import sandbox_proxy
 from mindroom.tool_system.agno_toolkits import ToolCallActor
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
+from mindroom.tool_system.output_files import OUTPUT_PATH_ARGUMENT
+from mindroom.tool_system.plugins import config_plugins
 from mindroom.tool_system.runtime_context import (
-    build_execution_identity_from_runtime_context,
     get_tool_runtime_context,
     tool_runtime_context,
 )
-from mindroom.tool_system.worker_routing import descriptive_worker_id_for_key, resolve_worker_key
+from mindroom.tool_system.tool_function import ToolGate
+from mindroom.tools import agno_compat_openai
+from mindroom.voice.openai_realtime_speech import pcm_to_wav
 from tests.agent_tool_helpers import offered_function, run_offered, source_toolkit
 from tests.api.sandbox_runner_support import execute_call
 from tests.authorization_helpers import make_test_tool_runtime_context
@@ -228,7 +233,7 @@ async def test_routing_preserves_sql_memory_database_across_calls(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("media_kind", ["image", "audio"])
+@pytest.mark.parametrize("media_kind", ["image", "audio", "speech_endpoint_audio"])
 async def test_worker_openai_media_preserves_typed_result_without_primary_secrets(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -246,14 +251,20 @@ async def test_worker_openai_media_preserves_typed_result_without_primary_secret
         audio=SimpleNamespace(speech=SimpleNamespace(create=lambda **_kwargs: SimpleNamespace(content=content))),
     )
     monkeypatch.setattr(agno_openai, "OpenAIClient", lambda **_kwargs: provider)
+    monkeypatch.setattr(agno_compat_openai, "synthesize_realtime_speech", AsyncMock(return_value=content))
     agent = _create_routing_agent(
         tmp_path / "primary",
         {
             "MINDROOM_SANDBOX_PROXY_URL": "http://sandbox.invalid",
             "MINDROOM_SANDBOX_PROXY_TOKEN": "dummy-worker-token",
-            "OPENAI_API_KEY": _TOOL_KEY,
         },
-        agent_settings={"tools": ["openai"]},
+        agent_settings={
+            "tools": [
+                {"openai": {"text_to_speech_model": "gpt-4o-mini-tts", "text_to_speech_format": "mp3"}}
+                if media_kind == "speech_endpoint_audio"
+                else "openai",
+            ],
+        },
     )
     name, arguments = (
         ("generate_image", {"prompt": "Offline image"})
@@ -268,10 +279,13 @@ async def test_worker_openai_media_preserves_typed_result_without_primary_secret
     assert len(worker_requests) == 1
     assert _MODEL_KEY not in json.dumps(worker_requests)
     if media_kind == "audio":
+        # A Realtime model's speech takes no agent.
+        assert "agent" not in worker_requests[0]["kwargs"]
+    if media_kind == "speech_endpoint_audio":
         assert worker_requests[0]["kwargs"]["agent"] is None
     media = response.images if media_kind == "image" else response.audios
     assert len(media) == 1
-    assert media[0].content == content
+    assert media[0].content == (pcm_to_wav(content) if media_kind == "audio" else content)
 
 
 @pytest.mark.parametrize("shape", ["value", "nested", "key", "nonfinite", "positional", "actor", "context"])
@@ -319,9 +333,18 @@ def test_invalid_arguments_rejected_before_worker_side_effects(
         )
 
 
+@pytest.mark.parametrize(
+    "output_path",
+    [{}, {OUTPUT_PATH_ARGUMENT: "saved.wav"}],
+    ids=["no-output-path", "output-path"],
+)
 @pytest.mark.parametrize("positional", [True, False])
-def test_declared_unused_agent_keeps_call_arguments(positional: bool, tmp_path: Path) -> None:
-    """Discard only the declared runtime slot while retaining normal call data."""
+def test_declared_unused_agent_keeps_call_arguments(
+    positional: bool,
+    output_path: dict[str, object],
+    tmp_path: Path,
+) -> None:
+    """Discard only the declared runtime slot while retaining normal call data and the call's output path."""
 
     def entrypoint(agent: object, path: Path, *, options: object) -> None:
         del agent, path, options
@@ -334,7 +357,7 @@ def test_declared_unused_agent_keeps_call_arguments(positional: bool, tmp_path: 
 
     encoded_args, encoded_kwargs = sandbox_proxy._worker_call_arguments(
         args,
-        kwargs,
+        {**kwargs, **output_path},
         entrypoint=entrypoint,
         inert_agent=True,
     )
@@ -342,7 +365,9 @@ def test_declared_unused_agent_keeps_call_arguments(positional: bool, tmp_path: 
     expected_options = {"values": [1, True, None, 2.5]}
     assert encoded_args == ([None, str(path)] if positional else [])
     assert encoded_kwargs == (
-        {"options": expected_options} if positional else {"agent": None, "path": str(path), "options": expected_options}
+        {"options": expected_options, **output_path}
+        if positional
+        else {"agent": None, "path": str(path), "options": expected_options, **output_path}
     )
 
 
@@ -358,7 +383,6 @@ def _context_agent(
     *,
     routing: str = "url",
     tool_config: dict[str, object] | None = None,
-    extra_env: dict[str, str] | None = None,
     roomless: bool = False,
     require_approval: bool = False,
 ) -> tuple[AgentBuild, ToolRuntimeContext]:
@@ -366,7 +390,6 @@ def _context_agent(
     process_env = {
         "MINDROOM_SANDBOX_PROXY_URL": "http://sandbox.invalid",
         "MINDROOM_SANDBOX_PROXY_TOKEN": "dummy-worker-token",
-        **(extra_env or {}),
     }
     if routing != "url":
         process_env["MINDROOM_SANDBOX_EXECUTION_MODE"] = "off" if routing == "explicit" else "all"
@@ -410,12 +433,12 @@ def _context_agent(
         "routing",
         config,
         runtime_paths,
-        execution_identity=None if roomless else build_execution_identity_from_runtime_context(context),
+        execution_identity=None if roomless else context.execution_identity,
         include_interactive_questions=False,
-        persist_runtime_state=False,
         supports_native_tool_approval=True,
         knowledge=None,
         model=turn_model(config, runtime_paths, "routing"),
+        plugins=config_plugins(config, runtime_paths),
     )
     return agent, context
 
@@ -504,54 +527,6 @@ async def test_config_manager_remains_available_for_roomless_inspection(tmp_path
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("forbid_worker_lease")
 @pytest.mark.parametrize("routing", ["url", "all", "explicit"])
-async def test_vault_access_uses_primary_owner_token_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    routing: str,
-) -> None:
-    """Self-service grants keep the primary-mounted owner token and requester worker identity."""
-    token_file = tmp_path / "owner-token"
-    token_file.write_text("owner-token-value\n")
-    requests: list[httpx.Request] = []
-
-    def handle(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(201, json={})
-
-    client_type = httpx.AsyncClient
-    transport = httpx.MockTransport(handle)
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_type(transport=transport, **kwargs))
-    agent, context = _context_agent(
-        tmp_path,
-        "agent_vault_access",
-        routing=routing,
-        extra_env={
-            "MATRIX_HOMESERVER": "https://example.test",
-            "MINDROOM_AGENT_VAULT_ACCESS_API_URL": "https://vault.example.test",
-            "MINDROOM_AGENT_VAULT_ACCESS_ADMIN_TOKEN_FILE": str(token_file),
-            "MINDROOM_AGENT_VAULT_ACCESS_UI_BASE_URL": "https://vault.example.test/ui",
-            "MINDROOM_AGENT_VAULT_ACCESS_EMAIL_DOMAIN": "example.test",
-        },
-    )
-    with tool_runtime_context(context):
-        response = await run_offered(agent, "request_vault_access")
-
-    assert not response.is_error
-    payload = json.loads(response.content)
-    assert payload["access"] == "granted"
-    identity = build_execution_identity_from_runtime_context(context)
-    worker_key = resolve_worker_key("user_agent", identity)
-    assert worker_key is not None
-    assert payload["vault"] == descriptive_worker_id_for_key(worker_key, prefix="agent-vault")
-    assert requests
-    assert {request.headers["authorization"] for request in requests} == {"Bearer owner-token-value"}
-    grants = [json.loads(request.content) for request in requests if request.url.path.endswith("/users")]
-    assert grants == [{"email": "alice@example.test", "role": "admin"}]
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("forbid_worker_lease")
-@pytest.mark.parametrize("routing", ["url", "all", "explicit"])
 @pytest.mark.parametrize(("default_target", "target"), [("desktop", None), ("host", "desktop")])
 async def test_browser_desktop_keeps_primary_matrix_context(
     tmp_path: Path,
@@ -597,10 +572,11 @@ async def test_browser_host_override_keeps_worker_transport_schema_and_hooks(
         require_approval=True,
     )
     function = offered_function(agent, "browser_control")
-    assert isinstance(source_toolkit(function), BrowserTools)
+    toolkit = source_toolkit(function)
+    assert isinstance(toolkit, BrowserTools)
+    assert inspect.unwrap(function.entrypoint) == toolkit.browser
     schema = json.loads(json.dumps(function.parameters))
-    assert function.requires_confirmation is True
-    assert function.approval_type == "mindroom_policy"
+    assert function.gate is ToolGate.POLICY
     assert agent_tool_middleware(agent)
     hook_calls: list[tuple[str, str]] = []
 
@@ -632,7 +608,7 @@ async def test_browser_host_override_keeps_worker_transport_schema_and_hooks(
     assert worker_requests[0]["kwargs"]["target"] == "host"
     assert hook_calls == [("before", "desktop"), ("after", "desktop"), ("before", "host"), ("after", "host")]
     assert function.parameters == schema
-    assert function.requires_confirmation is True
+    assert function.gate is ToolGate.POLICY
 
 
 @pytest.mark.asyncio
@@ -645,7 +621,7 @@ async def test_browser_primary_placement_binds_positional_arguments(
     agent, context = _context_agent(tmp_path, "browser", tool_config=_DESKTOP_CONFIG)
     function = offered_function(agent, "browser_control")
     with tool_runtime_context(context):
-        result = await function.entrypoint("snapshot", " desktop ")
+        result = await function.entrypoint("snapshot", "desktop")
 
     assert json.loads(result)["provider"] == "desktop"
     assert len(desktop_commands) == 1
@@ -656,7 +632,6 @@ async def test_browser_primary_placement_binds_positional_arguments(
 @pytest.mark.parametrize(
     ("arguments", "error"),
     [
-        ({"target": "sandbox"}, "does not support sandbox or node"),
         ({"target": "host", "node": "unsupported"}, "node parameter is not supported"),
         ({"target": "desktop"}, "configured Matrix desktop device identity"),
     ],
@@ -682,7 +657,7 @@ async def test_browser_discovery_keeps_existing_worker_behavior(
     worker_requests: list[dict[str, object]],
     action: str,
 ) -> None:
-    """Discovery ignores target/node hints as before, including a desktop default."""
+    """Discovery ignores target/node hints, including a desktop default."""
     agent, context = _context_agent(
         tmp_path / "primary",
         "browser",
@@ -692,7 +667,7 @@ async def test_browser_discovery_keeps_existing_worker_behavior(
         response = await run_offered(
             agent,
             "browser_control",
-            {"action": action, "target": "sandbox", "node": "ignored"},
+            {"action": action, "target": "desktop", "node": "ignored"},
         )
 
     assert not response.is_error

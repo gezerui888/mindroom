@@ -1,25 +1,32 @@
-"""Drive agent replies with the scripted provider: read their runs and text, register a probe toolkit, and stop a turn."""
+"""Drive agent replies with the scripted provider: read their runs and text, register a probe toolkit, stop a turn.
+
+A test can also end the process right after a run's terminal record is stored (``crash_after_first_terminal_store``).
+"""
 
 from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from agno.tools import Toolkit
 
+from mindroom import run_storage
 from mindroom.cancellation import request_task_cancel
 from mindroom.custom_tools.tool_payloads import custom_tool_payload
 from mindroom.llm.events import TextDelta
 from mindroom.session_storage.agent_storage import create_session_storage
-from mindroom.tool_system.declarations import ToolFileAccess
-from mindroom.tool_system.metadata import ToolCategory
+from mindroom.tool_system.declarations import ToolCategory, ToolFileAccess
+from mindroom.tool_system.events import FailedReply
 from mindroom.tool_system.registration import register_tool_with_metadata
-from mindroom.tool_system.registry_state import capture_tool_registry_snapshot, restore_tool_registry_snapshot
+from mindroom.tool_system.tool_function import ToolOutcome
+from tests.conftest import preserved_builtin_tools
 from tests.fakes.scripted_model import Await
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Awaitable, Callable, Iterable, Iterator
+
+    import pytest
 
     from mindroom.ai import AIStreamChunk
     from mindroom.cancellation import TaskCancelSource
@@ -42,33 +49,26 @@ def stored_runs(
 
 
 def streamed_text(chunks: Iterable[AIStreamChunk]) -> list[str]:
-    """Return the text a reply streamed, in order: its deltas, and a failed run's reply, which is a bare string."""
-    return [chunk if isinstance(chunk, str) else chunk.text for chunk in chunks if isinstance(chunk, str | TextDelta)]
+    """Return the text a reply streamed, in order: its deltas, and a failed turn's reply."""
+    return [chunk.text for chunk in chunks if isinstance(chunk, TextDelta | FailedReply)]
 
 
 @contextmanager
 def registered_toolkit(name: str, toolkit: type[Toolkit]) -> Iterator[None]:
-    """Register ``toolkit`` as the tool ``name`` for one test and restore every tool registry afterwards.
+    """Register ``toolkit`` as the built-in tool ``name`` for one block and restore the built-in tools afterwards."""
+    with preserved_builtin_tools():
 
-    Registration also records the tool as a built-in, which later registry resolutions copy back, so the whole
-    registry state is restored rather than only the active registry.
-    """
-    snapshot = capture_tool_registry_snapshot()
+        @register_tool_with_metadata(
+            name=name,
+            file_access=ToolFileAccess.NONE,
+            display_name=name,
+            description=f"The {name} test toolkit.",
+            category=ToolCategory.DEVELOPMENT,
+        )
+        def factory() -> type[Toolkit]:
+            return toolkit
 
-    @register_tool_with_metadata(
-        name=name,
-        file_access=ToolFileAccess.NONE,
-        display_name=name,
-        description=f"The {name} test toolkit.",
-        category=ToolCategory.DEVELOPMENT,
-    )
-    def factory() -> type[Toolkit]:
-        return toolkit
-
-    try:
         yield
-    finally:
-        restore_tool_registry_snapshot(snapshot)
 
 
 PROBE_TOOL = "agent_path_probe"
@@ -78,7 +78,8 @@ class ProbeTools(Toolkit):
     """Tools an agent-path reply calls: a shell that answers or keeps running, a save that keeps running, and more.
 
     A call that keeps running sets ``running`` and waits to be cancelled, so a test can stop the turn mid-call.
-    ``switch_thread_model`` answers as the thread-model tool does and stops the run after it, as that tool does.
+    ``switch_thread_model`` answers as the thread-model tool does, and as that tool does, a switch for the current
+    response stops the run after it.
     """
 
     running: ClassVar[asyncio.Event]
@@ -95,7 +96,6 @@ class ProbeTools(Toolkit):
                 self.switch_thread_model,
             ],
         )
-        self.async_functions["switch_thread_model"].stop_after_tool_call = True
 
     @classmethod
     async def _keep_running(cls) -> str:
@@ -150,7 +150,7 @@ class ProbeTools(Toolkit):
         """
         return f"did {value}"
 
-    async def switch_thread_model(self, model_name: str, when: str = "next-turn") -> str:
+    async def switch_thread_model(self, model_name: str, when: str = "next-turn") -> str | ToolOutcome:
         """Switch the thread's model.
 
         Args:
@@ -165,7 +165,8 @@ class ProbeTools(Toolkit):
                 action="switch",
                 message=f"Unknown model '{model_name}'.",
             )
-        return custom_tool_payload("thread_model", "ok", action="switch", model=model_name, when=when)
+        payload = custom_tool_payload("thread_model", "ok", action="switch", model=model_name, when=when)
+        return ToolOutcome(content=payload, stop_after_call=True) if when == "after-toolcall" else payload
 
 
 @contextmanager
@@ -197,9 +198,35 @@ def stop_turn(cancel_source: TaskCancelSource | None = None) -> Await:
     return Await(stop)
 
 
+class ProcessCrash(BaseException):
+    """The process dying, which no handler of the turn catches."""
+
+
+def crash_after_first_terminal_store(monkeypatch: pytest.MonkeyPatch) -> None:
+    """End the process with ``ProcessCrash`` right after the first terminal record a run hands over is stored."""
+    store_persist = run_storage.persist_to
+    crashed = False
+
+    def persist_to(*args: Any, **kwargs: Any) -> Callable[[AnyRunRecord], Awaitable[None]]:  # noqa: ANN401
+        persist = store_persist(*args, **kwargs)
+
+        async def persist_then_crash(record: AnyRunRecord) -> None:
+            nonlocal crashed
+            await persist(record)
+            if not crashed:
+                crashed = True
+                raise ProcessCrash
+
+        return persist_then_crash
+
+    monkeypatch.setattr(run_storage, "persist_to", persist_to)
+
+
 __all__ = [
     "PROBE_TOOL",
     "ProbeTools",
+    "ProcessCrash",
+    "crash_after_first_terminal_store",
     "raising",
     "registered_probe_tools",
     "registered_toolkit",

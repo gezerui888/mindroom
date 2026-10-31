@@ -6,7 +6,6 @@ v2026.10.683's readers, which filled absent fields on every read, showed of them
 
 from __future__ import annotations
 
-import importlib
 import json
 import sqlite3
 from contextlib import closing
@@ -24,6 +23,7 @@ from mindroom.delegation.legacy_snapshots import migrate_subagent_sessions
 from mindroom.delegation.sessions import update_subagent_turn_sync
 from mindroom.delegation.state import DELEGATION_STATE_KEY, DelegationChild, DelegationState, SubagentPersona
 from mindroom.history.types import HistoryScope
+from mindroom.orchestration import storage_preparation
 from mindroom.session_storage.agent_storage import create_session_storage, create_state_storage
 from mindroom.session_storage.legacy_agno3_conversion import migrate_conversation_storage
 from mindroom.session_storage.schema import LOG_VERSION, TableNames
@@ -361,20 +361,24 @@ async def test_a_database_from_any_older_layout_takes_the_paused_run_rewrite_too
 
 @pytest.mark.asyncio
 async def test_a_database_at_version_5_takes_only_the_paused_run_rewrite(tmp_path: Path) -> None:
-    """The snapshot step ran when the database reached version 5, so the step to version 6 runs only its own rewrite.
+    """The snapshot step ran when the database reached version 5, so the steps after it run only their own rewrites.
 
-    v2026.10.683's children hold a null requested model, which only the snapshot step fills.
+    v2026.10.683's children hold a null requested model, which only the snapshot step fills; the step to version 8
+    only drops the pending calls' second copy from the delegation state.
     """
     paths = _restore("v2026.10.683", tmp_path)
     database = _database(paths)
     _store_paused_notice(database)
     with closing(sqlite3.connect(database)) as connection, connection:
         connection.execute('UPDATE "leader_sessions_log_meta" SET version = 5')
-    metadata = _query(database, 'SELECT metadata FROM "leader_sessions_log_runs"')
+    metadata = [json.loads(text) for (text,) in _query(database, 'SELECT metadata FROM "leader_sessions_log_runs"')]
+    for run_metadata in metadata:
+        del run_metadata[DELEGATION_STATE_KEY]["pending_requirements"]
 
     await migrate_conversation_storage(paths)
 
-    assert _query(database, 'SELECT metadata FROM "leader_sessions_log_runs"') == metadata
+    stored = _query(database, 'SELECT metadata FROM "leader_sessions_log_runs"')
+    assert [json.loads(text) for (text,) in stored] == metadata
     assert _parent_content(paths) is None
     assert _query(database, 'SELECT version FROM "leader_sessions_log_meta"') == [(LOG_VERSION,)]
 
@@ -406,29 +410,20 @@ class _RewriteRanError(Exception):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entrypoint", ["api", "orchestrator"])
-async def test_both_entry_points_rewrite_session_files_before_serving(
+async def test_startup_rewrites_session_files_before_serving(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    entrypoint: str,
 ) -> None:
-    """Standalone API and orchestrator startup both rewrite the session files before anything reads them."""
+    """Startup rewrites the session files before anything reads them."""
     paths = _paths(tmp_path)
-    module = importlib.import_module(f"mindroom.{'api.main' if entrypoint == 'api' else 'orchestrator'}")
 
     async def rewrite(runtime_paths: RuntimePaths) -> None:
         assert runtime_paths == paths
         raise _RewriteRanError
 
-    monkeypatch.setattr(module, "migrate_subagent_sessions", rewrite)
-    if entrypoint == "api":
-        monkeypatch.setattr(module, "_app_runtime_paths", lambda _app: paths)
-        with pytest.raises(_RewriteRanError):
-            async with module._lifespan(module.app):
-                pytest.fail("API admitted runtime work")
-    else:
-        with pytest.raises(_RewriteRanError):
-            await module.main("ERROR", paths, api=False)
+    monkeypatch.setattr(storage_preparation, "migrate_subagent_sessions", rewrite)
+    with pytest.raises(_RewriteRanError):
+        await storage_preparation.prepare_runtime_storage(paths)
 
 
 @pytest.mark.parametrize(
@@ -450,6 +445,7 @@ def test_the_readers_take_only_the_current_shape(field: str | None, persona_fiel
         requested_model_name="default",
         depth=1,
         execution_identity={},
+        subagent_id="d",
         agent_mode="standard",
         persona=persona,
     )

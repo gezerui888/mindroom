@@ -69,10 +69,7 @@ function coerceEditValue(
         .filter((entry) => entry.length > 0);
     return [];
   }
-  if (field.type === "boolean") {
-    if (typeof value === "boolean") return String(value);
-    return "";
-  }
+  if (field.type === "boolean") return String(value === true);
   if (field.type === "number") {
     if (typeof value === "number") return String(value);
     return "";
@@ -80,22 +77,22 @@ function coerceEditValue(
   return typeof value === "string" ? value : "";
 }
 
-/** Normalize a draft value back to what should be persisted (or null to clear). */
+/**
+ * The value a ticked field stores, which is the value it shows: a list stores
+ * its non-blank entries, even none, and a boolean the state of its box. A blank
+ * input shows no value and stores none (null clears the key), because a stored
+ * blank string would replace the tool's saved setting or default.
+ */
 function normalizePersistedValue(
   field: ToolFieldSchema,
   value: string | string[],
 ): unknown | null {
   if (field.type === "string[]") {
-    const values = (Array.isArray(value) ? value : [])
+    return (Array.isArray(value) ? value : [])
       .map((entry) => entry.trim())
       .filter((entry) => entry.length > 0);
-    return values.length > 0 ? values : null;
   }
-  if (field.type === "boolean") {
-    if (value === "true") return true;
-    if (value === "false") return false;
-    return null;
-  }
+  if (field.type === "boolean") return value === "true";
   if (field.type === "number") {
     const trimmed = typeof value === "string" ? value.trim() : "";
     if (trimmed.length === 0) return null;
@@ -232,9 +229,7 @@ export function ToolConfigPanel({
           {isEnabled && (
             <>
               {items.length === 0 && (
-                <div className="text-xs text-muted-foreground">
-                  No values. Add one to create an override.
-                </div>
+                <div className="text-xs text-muted-foreground">No values.</div>
               )}
               {items.map((item, index) => (
                 <div
